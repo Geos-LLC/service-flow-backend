@@ -2,6 +2,7 @@ const express = require('express');
 
 const cors = require('cors');
 const { supabase, db } = require('./supabase');
+const { BUCKETS, ensureBuckets, uploadToStorage, deleteFromStorage, getFileUrl } = require('./supabase-storage');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -72,6 +73,13 @@ async function testEmailConnection() {
 
 // Test email connection on startup
 testEmailConnection();
+
+// Initialize Supabase Storage buckets on startup
+ensureBuckets().then(() => {
+  console.log('✅ Supabase Storage buckets initialized');
+}).catch(error => {
+  console.error('❌ Error initializing Supabase Storage buckets:', error);
+});
 
 // Cron job for recurring billing
 cron.schedule('0 9 * * *', async () => {
@@ -1515,29 +1523,29 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       console.error('Error processing team assignments:', error);
     }
 
-    // For backward compatibility, set the primary team member
+        // For backward compatibility, set the primary team member
     try {
-      const primaryAssignment = teamAssignments.find(ta => ta.is_primary);
-      if (primaryAssignment) {
-        job.team_member_first_name = primaryAssignment.first_name;
-        job.team_member_last_name = primaryAssignment.last_name;
+        const primaryAssignment = teamAssignments.find(ta => ta.is_primary);
+        if (primaryAssignment) {
+          job.team_member_first_name = primaryAssignment.first_name;
+          job.team_member_last_name = primaryAssignment.last_name;
+        }
+      } catch (error) {
+        console.error('Error processing team assignments:', error);
+        
+        // Fallback: create team assignment from the single team_member_id if it exists
+        if (job.team_member_id && job.team_member_first_name) {
+          teamAssignments = [{
+            team_member_id: job.team_member_id,
+            is_primary: true,
+            first_name: job.team_member_first_name,
+            last_name: job.team_member_last_name,
+            email: null,
+            phone: null,
+            role: null
+          }];
+        }
       }
-    } catch (error) {
-      console.error('Error processing team assignments:', error);
-      
-      // Fallback: create team assignment from the single team_member_id if it exists
-      if (job.team_member_id && job.team_member_first_name) {
-        teamAssignments = [{
-          team_member_id: job.team_member_id,
-          is_primary: true,
-          first_name: job.team_member_first_name,
-          last_name: job.team_member_last_name,
-          email: null,
-          phone: null,
-          role: null
-        }];
-      }
-    }
 
       const jobData = {
         ...job,
@@ -1551,7 +1559,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       console.error('Get job error:', error);
       res.status(500).json({ error: 'Failed to fetch job' });
     }
-  }
+    }
 );
 
 // Create job endpoint
@@ -2040,7 +2048,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     console.log('🔄 Received update data:', updateData);
     console.log('🔄 Available field mappings:', Object.keys(fieldMappings));
-    
+
     Object.keys(updateData).forEach(key => {
       console.log(`🔄 Processing field: ${key}, value: ${updateData[key]}, mapped: ${fieldMappings[key]}`);
       if (fieldMappings[key] && updateData[key] !== undefined) {
@@ -2066,7 +2074,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     });
 
     console.log('🔄 Final update data to send:', updateDataToSend);
-    
+
     if (Object.keys(updateDataToSend).length === 0) {
       console.log('🔄 No valid fields to update - all fields were filtered out');
       return res.status(400).json({ error: 'No valid fields to update' });
@@ -4452,11 +4460,11 @@ app.post('/api/territories', async (req, res) => {
       console.error('Supabase insert error:', error);
       return res.status(500).json({ error: 'Failed to create territory' });
     }
-    
-    res.status(201).json({
-      message: 'Territory created successfully',
+      
+      res.status(201).json({
+        message: 'Territory created successfully',
       territoryId: result.id
-    });
+      });
   } catch (error) {
     console.error('Create territory error:', error);
     res.status(500).json({ error: 'Failed to create territory' });
@@ -4501,8 +4509,8 @@ app.put('/api/territories/:id', async (req, res) => {
       console.error('Supabase update error:', error);
       return res.status(500).json({ error: 'Failed to update territory' });
     }
-    
-    res.json({ message: 'Territory updated successfully' });
+      
+      res.json({ message: 'Territory updated successfully' });
   } catch (error) {
     console.error('Update territory error:', error);
     res.status(500).json({ error: 'Failed to update territory' });
@@ -8394,8 +8402,9 @@ app.post('/api/upload-logo', authenticateToken, upload.single('logo'), async (re
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
-    res.json({ url: fileUrl });
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.LOGOS, 'logos');
+    res.json({ url: result.imageUrl });
   } catch (error) {
     console.error('Error uploading logo:', error);
     res.status(500).json({ error: 'Failed to upload logo' });
@@ -8408,8 +8417,9 @@ app.post('/api/upload-favicon', authenticateToken, upload.single('favicon'), asy
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
-    res.json({ url: fileUrl });
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.FAVICONS, 'favicons');
+    res.json({ url: result.imageUrl });
   } catch (error) {
     console.error('Error uploading favicon:', error);
     res.status(500).json({ error: 'Failed to upload favicon' });
@@ -8422,8 +8432,9 @@ app.post('/api/upload-hero-image', authenticateToken, upload.single('heroImage')
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
-    res.json({ url: fileUrl });
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.HERO_IMAGES, 'hero');
+    res.json({ url: result.imageUrl });
   } catch (error) {
     console.error('Error uploading hero image:', error);
     res.status(500).json({ error: 'Failed to upload hero image' });
@@ -8921,7 +8932,7 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
     const { teamMemberId } = req.body;
     const userId = req.user.userId;
     
-    // Check if job exists and belongs to user
+      // Check if job exists and belongs to user
     const { data: jobCheck, error: jobError } = await supabase
       .from('jobs')
       .select('id, user_id')
@@ -8934,15 +8945,15 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
     }
     
     if (!jobCheck || jobCheck.length === 0) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    if (jobCheck[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    // Check if team member exists (if teamMemberId is provided)
-    if (teamMemberId) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      
+      if (jobCheck[0].user_id !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Check if team member exists (if teamMemberId is provided)
+      if (teamMemberId) {
       const { data: memberCheck, error: memberError } = await supabase
         .from('team_members')
         .select('id')
@@ -8956,11 +8967,11 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
       }
       
       if (!memberCheck || memberCheck.length === 0) {
-        return res.status(404).json({ error: 'Team member not found' });
+          return res.status(404).json({ error: 'Team member not found' });
+        }
       }
-    }
-    
-    // Remove existing assignments for this job
+      
+      // Remove existing assignments for this job
     const { error: deleteError } = await supabase
       .from('job_team_assignments')
       .delete()
@@ -8970,8 +8981,8 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
       console.error('Error removing existing assignments:', deleteError);
       return res.status(500).json({ error: 'Failed to remove existing assignments' });
     }
-    
-    // Update the job with team member assignment (for backward compatibility)
+      
+      // Update the job with team member assignment (for backward compatibility)
     const { error: updateError } = await supabase
       .from('jobs')
       .update({ team_member_id: teamMemberId || null })
@@ -8981,9 +8992,9 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
       console.error('Error updating job:', updateError);
       return res.status(500).json({ error: 'Failed to update job' });
     }
-    
-    // Create assignment in job_team_assignments table
-    if (teamMemberId) {
+      
+      // Create assignment in job_team_assignments table
+      if (teamMemberId) {
       const { error: insertError } = await supabase
         .from('job_team_assignments')
         .insert({
@@ -8999,9 +9010,9 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
       }
       
       console.log('🔄 Created team assignment for job:', jobId, 'team member:', teamMemberId);
-    }
-    
-    res.json({ message: 'Job assigned successfully' });
+      }
+      
+      res.json({ message: 'Job assigned successfully' });
   } catch (error) {
     console.error('Job assignment error:', error);
     res.status(500).json({ error: 'Failed to assign job' });
@@ -9025,7 +9036,7 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
     const { jobId, teamMemberId } = req.params;
     const userId = req.user.userId;
     
-    // Check if job exists and belongs to user
+      // Check if job exists and belongs to user
     const { data: jobCheck, error: jobError } = await supabase
       .from('jobs')
       .select('id, user_id')
@@ -9038,14 +9049,14 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
     }
     
     if (!jobCheck || jobCheck.length === 0) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    if (jobCheck[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    // Check if team member exists and belongs to user
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      
+      if (jobCheck[0].user_id !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Check if team member exists and belongs to user
     const { data: memberCheck, error: memberError } = await supabase
       .from('team_members')
       .select('id')
@@ -9059,10 +9070,10 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
     }
     
     if (!memberCheck || memberCheck.length === 0) {
-      return res.status(404).json({ error: 'Team member not found' });
-    }
-    
-    // Remove the specific assignment
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+      
+      // Remove the specific assignment
     const { data: deleteResult, error: deleteError } = await supabase
       .from('job_team_assignments')
       .delete()
@@ -9076,10 +9087,10 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
     }
     
     if (!deleteResult || deleteResult.length === 0) {
-      return res.status(404).json({ error: 'Team member assignment not found' });
-    }
-    
-    // Check if this was the primary assignment and update jobs table accordingly
+        return res.status(404).json({ error: 'Team member assignment not found' });
+      }
+      
+      // Check if this was the primary assignment and update jobs table accordingly
     const { data: primaryCheck, error: primaryError } = await supabase
       .from('job_team_assignments')
       .select('id')
@@ -9092,7 +9103,7 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
     }
     
     if (!primaryCheck || primaryCheck.length === 0) {
-      // No more primary assignments, clear the team_member_id in jobs table
+        // No more primary assignments, clear the team_member_id in jobs table
       const { error: updateError } = await supabase
         .from('jobs')
         .update({ team_member_id: null })
@@ -9102,8 +9113,8 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
         console.error('Error clearing team member from job:', updateError);
         return res.status(500).json({ error: 'Failed to clear team member from job' });
       }
-    } else {
-      // Set the first remaining assignment as primary
+      } else {
+        // Set the first remaining assignment as primary
       const { data: remainingAssignments, error: remainingError } = await supabase
         .from('job_team_assignments')
         .select('team_member_id')
@@ -9126,11 +9137,11 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
           console.error('Error updating job with new primary team member:', updateError);
           return res.status(500).json({ error: 'Failed to update job with new primary team member' });
         }
+        }
       }
-    }
-    
-    console.log('🔄 Removed team assignment for job:', jobId, 'team member:', teamMemberId);
-    res.json({ message: 'Team member assignment removed successfully' });
+      
+      console.log('🔄 Removed team assignment for job:', jobId, 'team member:', teamMemberId);
+      res.json({ message: 'Team member assignment removed successfully' });
   } catch (error) {
     console.error('Remove team assignment error:', error);
     res.status(500).json({ error: 'Failed to remove team member assignment' });
@@ -10201,24 +10212,9 @@ app.post('/api/upload/profile-picture', upload.single('profilePicture'), async (
       return res.status(400).json({ error: 'No profile picture file provided' });
     }
 
-    // ✅ Generate unique filename
-    const timestamp = Date.now();
-    const filename = `profile-${userId}-${timestamp}-${req.file.originalname}`;
-    const profilePictureUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
-    
-    // ✅ Move uploaded file to uploads directory with the new filename
-    const fs = require('fs');
-    const path = require('path');
-    const uploadsDir = path.join(__dirname, 'uploads');
-    const newFilePath = path.join(uploadsDir, filename);
-    
-    // Ensure uploads directory exists
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-    
-    // Move file
-    fs.renameSync(req.file.path, newFilePath);
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.PROFILE_PICTURES, 'profiles');
+    const profilePictureUrl = result.imageUrl;
 
     // ✅ Save file info to database using Supabase
     const { error: updateError } = await supabase
@@ -10251,32 +10247,10 @@ app.post('/api/upload-service-image', authenticateToken, upload.single('image'),
       return res.status(400).json({ error: 'No image uploaded' });
     }
 
-    // Generate unique filename
-    const timestamp = Date.now();
-    const randomString = Math.random().toString(36).substring(2, 15);
-    const extension = path.extname(req.file.originalname);
-    const filename = `service-image-${timestamp}-${randomString}${extension}`;
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.SERVICE_IMAGES, 'services');
 
-    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
-
-    // Move uploaded file to uploads directory with the new filename
-    const oldFilePath = req.file.path;
-    const uploadsDir = path.join(__dirname, 'uploads');
-    const newFilePath = path.join(uploadsDir, filename);
-
-    // Ensure uploads directory exists
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-
-    // Move the uploaded file to the uploads directory
-    fs.renameSync(oldFilePath, newFilePath);
-
-    res.json({
-      success: true,
-      imageUrl: imageUrl,
-      message: 'Service image uploaded successfully'
-    });
+    res.json(result);
   } catch (error) {
     console.error('Error uploading service image:', error);
     res.status(500).json({ error: 'Failed to upload service image' });
@@ -10295,33 +10269,11 @@ app.post('/api/upload-modifier-image', authenticateToken, upload.single('image')
       return res.status(400).json({ error: 'No image uploaded' });
     }
 
-    // Generate unique filename
-    const timestamp = Date.now();
-    const randomString = Math.random().toString(36).substring(2, 15);
-    const extension = path.extname(req.file.originalname);
-    const filename = `modifier-image-${timestamp}-${randomString}${extension}`;
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.MODIFIER_IMAGES, 'modifiers');
 
-    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
-
-    // Move uploaded file to uploads directory with the new filename
-    const oldFilePath = req.file.path;
-    const uploadsDir = path.join(__dirname, 'uploads');
-    const newFilePath = path.join(uploadsDir, filename);
-
-    // Ensure uploads directory exists
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-
-    // Move the uploaded file to the uploads directory
-    fs.renameSync(oldFilePath, newFilePath);
-
-    console.log('✅ Modifier image uploaded successfully:', imageUrl);
-    res.json({
-      success: true,
-      imageUrl: imageUrl,
-      message: 'Modifier image uploaded successfully'
-    });
+    console.log('✅ Modifier image uploaded successfully:', result.imageUrl);
+    res.json(result);
   } catch (error) {
     console.error('❌ Error uploading modifier image:', error);
     res.status(500).json({ error: 'Failed to upload modifier image' });
@@ -10340,33 +10292,11 @@ app.post('/api/upload-intake-image', authenticateToken, upload.single('image'), 
       return res.status(400).json({ error: 'No image uploaded' });
     }
 
-    // Generate unique filename
-    const timestamp = Date.now();
-    const randomString = Math.random().toString(36).substring(2, 15);
-    const extension = path.extname(req.file.originalname);
-    const filename = `intake-image-${timestamp}-${randomString}${extension}`;
+    // Upload to Supabase Storage
+    const result = await uploadToStorage(req.file, BUCKETS.INTAKE_IMAGES, 'intake');
 
-    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
-
-    // Move uploaded file to uploads directory with the new filename
-    const oldFilePath = req.file.path;
-    const uploadsDir = path.join(__dirname, 'uploads');
-    const newFilePath = path.join(uploadsDir, filename);
-
-    // Ensure uploads directory exists
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-
-    // Move the uploaded file to the uploads directory
-    fs.renameSync(oldFilePath, newFilePath);
-
-    console.log('✅ Intake image uploaded successfully:', imageUrl);
-    res.json({
-      success: true,
-      imageUrl: imageUrl,
-      message: 'Intake image uploaded successfully'
-    });
+    console.log('✅ Intake image uploaded successfully:', result.imageUrl);
+    res.json(result);
   } catch (error) {
     console.error('❌ Error uploading intake image:', error);
     res.status(500).json({ error: 'Failed to upload intake image' });
