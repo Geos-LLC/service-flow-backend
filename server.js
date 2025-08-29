@@ -1,6 +1,7 @@
 const express = require('express');
+
 const cors = require('cors');
-const mysql = require('mysql2/promise');
+const { supabase, db } = require('./supabase');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -76,46 +77,74 @@ testEmailConnection();
 cron.schedule('0 9 * * *', async () => {
   console.log('Running recurring billing check...');
   try {
-    const connection = await pool.getConnection();
-    const [recurringJobs] = await connection.query(`
-      SELECT j.*, c.email, c.first_name, c.last_name, s.name as service_name, s.price
-      FROM jobs j
-      JOIN customers c ON j.customer_id = c.id
-      JOIN services s ON j.service_id = s.id
-      WHERE j.is_recurring = 1 
-      AND j.next_billing_date <= CURDATE()
-      AND j.status = 'completed'
-    `);
-    
-    for (const job of recurringJobs) {
-      // Create new job for recurring service
-      await connection.query(`
-        INSERT INTO jobs (user_id, customer_id, service_id, scheduled_date, notes, status, is_recurring, recurring_frequency)
-        VALUES (?, ?, ?, DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, 'pending', 1, ?)
-      `, [job.user_id, job.customer_id, job.service_id, job.recurring_frequency, job.notes, job.recurring_frequency]);
+    // Get recurring jobs that need to be processed
+    const { data: recurringJobs, error } = await supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!inner(email, first_name, last_name),
+        services!inner(name, price)
+      `)
+      .eq('is_recurring', true)
+      .lte('next_billing_date', new Date().toISOString().split('T')[0])
+      .eq('status', 'completed');
+
+    if (error) {
+      console.error('Error fetching recurring jobs:', error);
+      return;
+    }
+
+    for (const job of recurringJobs || []) {
+      // Calculate new scheduled date
+      const newScheduledDate = new Date();
+      newScheduledDate.setDate(newScheduledDate.getDate() + job.recurring_frequency);
       
+      // Create new job for recurring service
+      const { error: insertError } = await supabase
+        .from('jobs')
+        .insert({
+          user_id: job.user_id,
+          customer_id: job.customer_id,
+          service_id: job.service_id,
+          scheduled_date: newScheduledDate.toISOString(),
+          notes: job.notes,
+          status: 'pending',
+          is_recurring: true,
+          recurring_frequency: job.recurring_frequency
+        });
+
+      if (insertError) {
+        console.error('Error creating recurring job:', insertError);
+        continue;
+      }
+
       // Update next billing date
-      await connection.query(`
-        UPDATE jobs SET next_billing_date = DATE_ADD(next_billing_date, INTERVAL ? DAY)
-        WHERE id = ?
-      `, [job.recurring_frequency, job.id]);
+      const newNextBillingDate = new Date(job.next_billing_date);
+      newNextBillingDate.setDate(newNextBillingDate.getDate() + job.recurring_frequency);
+      
+      const { error: updateError } = await supabase
+        .from('jobs')
+        .update({ next_billing_date: newNextBillingDate.toISOString().split('T')[0] })
+        .eq('id', job.id);
+
+      if (updateError) {
+        console.error('Error updating next billing date:', updateError);
+      }
       
       // Send email notification
       await sendEmail({
-        to: job.email,
+        to: job.customers.email,
         subject: 'Recurring Service Scheduled',
         html: `
           <h2>Your recurring service has been scheduled</h2>
-          <p>Hello ${job.first_name},</p>
-          <p>Your recurring ${job.service_name} service has been scheduled for ${new Date().toLocaleDateString()}.</p>
-          <p>Service: ${job.service_name}</p>
-          <p>Price: $${job.price}</p>
+          <p>Hello ${job.customers.first_name},</p>
+          <p>Your recurring ${job.services.name} service has been scheduled for ${new Date().toLocaleDateString()}.</p>
+          <p>Service: ${job.services.name}</p>
+          <p>Price: $${job.services.price}</p>
           <p>Thank you for choosing our services!</p>
         `
       });
     }
-    
-    connection.release();
   } catch (error) {
     console.error('Recurring billing error:', error);
   }
@@ -160,6 +189,9 @@ async function sendEmail({ to, subject, html, text }) {
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
+
+// Upload URL configuration
+const UPLOAD_BASE_URL = process.env.UPLOAD_BASE_URL || 'http://localhost:5000';
 
 // Security middleware
 app.use(helmet());
@@ -414,33 +446,35 @@ app.use('/api', generalLimiter);
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Database connection pool
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || '127.0.0.1',
-  user: process.env.DB_USER || 'nowcodeo_Justweb1',
-  password: process.env.DB_PASSWORD || 'Just web08107370125',
-  database: process.env.DB_NAME || 'nowcodeo_zenbooker'
-});
+// Supabase connection is handled in supabase.js
+// Test Supabase connection
+async function testSupabaseConnection() {
+  try {
+    console.log('Testing Supabase connection...');
+    const { data, error } = await supabase
+      .from('users')
+      .select('count')
+      .limit(1);
+    
+    if (error) {
+      console.error('Supabase connection test failed:', error);
+      return false;
+    }
+    
+    console.log('Supabase connected successfully');
+    console.log('Supabase config:', {
+      url: process.env.SUPABASE_URL,
+      hasServiceKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY
+    });
+    return true;
+  } catch (error) {
+    console.error('Supabase connection test failed:', error);
+    return false;
+  }
+}
 
-// Test database connection
-pool.getConnection()
-  .then(connection => {
-    console.log('Database connected successfully');
-    console.log('Database config:', {
-      host: process.env.DB_HOST || '127.0.0.1',
-      database: process.env.DB_NAME || 'nowcodeo_zenbooker',
-      port: process.env.DB_PORT || 3306
-    });
-    connection.release();
-  })
-  .catch(err => {
-    console.error('Database connection failed:', err);
-    console.error('Database connection error details:', {
-      message: err.message,
-      code: err.code,
-      errno: err.errno
-    });
-  });
+// Test connection on startup
+testSupabaseConnection();
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -520,11 +554,12 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
   try {
-    // Test database connection
-    const connection = await pool.getConnection();
-    connection.release();
-    
-    res.json({ status: 'OK', message: 'Server is healthy' });
+    // Simple health check without external dependencies
+    res.json({ 
+      status: 'OK', 
+      message: 'Server is healthy',
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
     console.error('Health check error:', error);
     res.status(500).json({ status: 'ERROR', message: 'Server is not healthy' });
@@ -559,56 +594,68 @@ app.post('/api/auth/signup', async (req, res) => {
     const sanitizedLastName = sanitizeInput(lastName);
     const sanitizedBusinessName = sanitizeInput(businessName);
     
-    const connection = await pool.getConnection();
+    // Check if user already exists
+    const { data: existingUsers, error: checkError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', sanitizedEmail)
+      .limit(1);
     
-    try {
-      // Check if user already exists
-      const [existingUsers] = await connection.query(
-        'SELECT id FROM users WHERE email = ?',
-        [sanitizedEmail]
-      );
-      
-      if (existingUsers.length > 0) {
-        return res.status(400).json({ error: 'An account with this email already exists' });
-      }
-      
-      // Hash password
-      const saltRounds = 12;
-      const hashedPassword = await bcrypt.hash(password, saltRounds);
-      
-      // Create new user
-      const [result] = await connection.query(
-        'INSERT INTO users (email, password, first_name, last_name, business_name, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-        [sanitizedEmail, hashedPassword, sanitizedFirstName, sanitizedLastName, sanitizedBusinessName]
-      );
-      
-      // Generate JWT token
-      const token = jwt.sign(
-        { 
-          userId: result.insertId, 
-          email: sanitizedEmail,
-          firstName: sanitizedFirstName,
-          lastName: sanitizedLastName,
-          businessName: sanitizedBusinessName
-        },
-        JWT_SECRET,
-        { expiresIn: '1d' }
-      );
-      
-      res.status(201).json({ 
-        message: 'Account created successfully',
-        token,
-        user: {
-          id: result.insertId,
-          email: sanitizedEmail,
-          firstName: sanitizedFirstName,
-          lastName: sanitizedLastName,
-          businessName: sanitizedBusinessName
-        }
-      });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing user:', checkError);
+      return res.status(500).json({ error: 'Failed to create account. Please try again.' });
     }
+    
+    if (existingUsers && existingUsers.length > 0) {
+      return res.status(400).json({ error: 'An account with this email already exists' });
+    }
+    
+    // Hash password
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    
+    // Create new user
+    const { data: newUser, error: insertError } = await supabase
+      .from('users')
+      .insert({
+        email: sanitizedEmail,
+        password: hashedPassword,
+        first_name: sanitizedFirstName,
+        last_name: sanitizedLastName,
+        business_name: sanitizedBusinessName
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating user:', insertError);
+      return res.status(500).json({ error: 'Failed to create account. Please try again.' });
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: newUser.id, 
+        email: sanitizedEmail,
+        firstName: sanitizedFirstName,
+        lastName: sanitizedLastName,
+        businessName: sanitizedBusinessName
+      },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    
+    res.status(201).json({ 
+      message: 'Account created successfully',
+      token,
+      user: {
+        id: newUser.id,
+        email: sanitizedEmail,
+        firstName: sanitizedFirstName,
+        lastName: sanitizedLastName,
+        businessName: sanitizedBusinessName
+      }
+    });
   } catch (error) {
     console.error('Signup error:', error);
     res.status(500).json({ error: 'Failed to create account. Please try again.' });
@@ -631,56 +678,56 @@ app.post('/api/auth/signin', async (req, res) => {
     // Sanitize email
     const sanitizedEmail = email.toLowerCase().trim();
     
-    const connection = await pool.getConnection();
+    // Get user with hashed password
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, email, password, first_name, last_name, business_name')
+      .eq('email', sanitizedEmail)
+      .limit(1);
     
-    try {
-      // Get user with hashed password
-      const [users] = await connection.query(
-        'SELECT id, email, password, first_name, last_name, business_name FROM users WHERE email = ?',
-        [sanitizedEmail]
-      );
-      
-      if (users.length === 0) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-      
-      const user = users[0];
-      
-      // Verify password
-      const isPasswordValid = await bcrypt.compare(password, user.password);
-      
-      if (!isPasswordValid) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-      
-      // Generate JWT token
-      const token = jwt.sign(
-        { 
-          userId: user.id, 
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name
-        },
-        JWT_SECRET,
-        { expiresIn: '1d' }
-      );
-      
-      res.json({ 
-        message: 'Login successful',
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name,
-          business_name: user.business_name // Add both for compatibility
-        }
-      });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching user:', error);
+      return res.status(500).json({ error: 'Login failed. Please try again.' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    const user = users[0];
+    
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name
+      },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    
+    res.json({ 
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name,
+        business_name: user.business_name // Add both for compatibility
+      }
+    });
   } catch (error) {
     console.error('Signin error:', error);
     console.error('Error details:', {
@@ -696,48 +743,48 @@ app.post('/api/auth/signin', async (req, res) => {
 // Token refresh endpoint
 app.post('/api/auth/refresh', authenticateToken, async (req, res) => {
   try {
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get updated user data
-      const [users] = await connection.query(
-        'SELECT id, email, first_name, last_name, business_name FROM users WHERE id = ?',
-        [req.user.userId]
-      );
+    // Get updated user data
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, business_name')
+      .eq('id', req.user.userId)
+      .limit(1);
       
-      if (users.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      
-      const user = users[0];
-      
-      // Generate new token
-      const token = jwt.sign(
-        { 
-          userId: user.id, 
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name
-        },
-        JWT_SECRET,
-        { expiresIn: '1d' }
-      );
-      
-      res.json({ 
-        message: 'Token refreshed successfully',
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name
-        }
-      });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching user:', error);
+      return res.status(500).json({ error: 'Failed to refresh token' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = users[0];
+    
+    // Generate new token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name
+      },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    
+    res.json({ 
+      message: 'Token refreshed successfully',
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name
+      }
+    });
   } catch (error) {
     console.error('Token refresh error:', error);
     res.status(500).json({ error: 'Failed to refresh token' });
@@ -759,33 +806,33 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 // Verify token endpoint
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   try {
-    const connection = await pool.getConnection();
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, business_name')
+      .eq('id', req.user.userId)
+      .limit(1);
     
-    try {
-      const [users] = await connection.query(
-        'SELECT id, email, first_name, last_name, business_name FROM users WHERE id = ?',
-        [req.user.userId]
-      );
-      
-      if (users.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      
-      const user = users[0];
-      
-      res.json({ 
-        message: 'Token is valid',
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name
-        }
-      });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching user:', error);
+      return res.status(500).json({ error: 'Token verification failed' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = users[0];
+    
+    res.json({ 
+      message: 'Token is valid',
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name
+      }
+    });
   } catch (error) {
     console.error('Token verification error:', error);
     res.status(500).json({ error: 'Token verification failed' });
@@ -801,78 +848,127 @@ app.get('/api/services', async (req, res) => {
     console.log('🔄 Backend: User ID:', userId);
     console.log('🔄 Backend: All query params:', req.query);
     
-    const connection = await pool.getConnection();
+    // Build Supabase query
+    let query = supabase
+      .from('services')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT 
-          id,
-          user_id,
-          name,
-          description,
-          price,
-          duration,
-          category,
-          category_id,
-          modifiers,
-          intake_questions,
-          require_payment_method,
-          image,
-          created_at,
-          updated_at
-        FROM services
-        WHERE user_id = ?
-      `;
-      let params = [userId];
-      
-      if (search) {
-        query += ' AND (name LIKE ? OR description LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm);
-      }
-      
-      // Add sorting
-      query += ` ORDER BY ${sortBy} ${sortOrder}`;
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ` LIMIT ? OFFSET ?`;
-      params.push(parseInt(limit), offset);
-      
-      const [services] = await connection.query(query, params);
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total
-        FROM services
-        WHERE user_id = ?
-      `;
-      let countParams = [userId];
-      
-      if (search) {
-        countQuery += ' AND (name LIKE ? OR description LIKE ?)';
-        const searchTerm = `%${search}%`;
-        countParams.push(searchTerm, searchTerm);
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
-      
-      res.json({
-        services,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      });
-    } finally {
-      connection.release();
+    // Add search filter
+    if (search) {
+      query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%`);
     }
+    
+    // Add sorting
+    query = query.order(sortBy, { ascending: sortOrder === 'ASC' });
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    const { data: services, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching services:', error);
+      return res.status(500).json({ error: 'Failed to get services' });
+    }
+    
+    // Map the services data to ensure proper field names and types
+    const mappedServices = (services || []).map(service => {
+      // Parse modifiers if it's a string
+      let parsedModifiers = [];
+      if (service.modifiers) {
+        try {
+          parsedModifiers = typeof service.modifiers === 'string' ? JSON.parse(service.modifiers) : service.modifiers;
+        } catch (error) {
+          console.error('Error parsing modifiers for service', service.id, ':', error);
+          parsedModifiers = [];
+        }
+      }
+      
+      return {
+        id: service.id,
+        userId: service.user_id,
+        name: service.name,
+        description: service.description,
+        price: parseFloat(service.price) || 0,
+        duration: parseInt(service.duration) || 0,
+        category: service.category,
+        image: service.image,
+        modifiers: parsedModifiers,
+        isActive: service.is_active,
+        visible: service.is_active, // Add visible field for frontend compatibility
+        requirePaymentMethod: service.require_payment_method,
+        intakeQuestions: service.intake_questions,
+        categoryId: service.category_id,
+        createdAt: service.created_at,
+        updatedAt: service.updated_at
+      };
+    });
+
+    res.json({
+      services: mappedServices,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
+      }
+    });
   } catch (error) {
     console.error('Get services error:', error);
     res.status(500).json({ error: 'Failed to get services' });
+  }
+});
+
+// Service Categories endpoints
+app.get('/api/services/categories', async (req, res) => {
+  const { userId } = req.query;
+  console.log('🔄 Categories request for user:', userId);
+
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  try {
+    // ✅ Get categories with service count
+    const { data: categories, error } = await supabase
+      .from('service_categories')
+      .select(`
+        id,
+        name,
+        description,
+        color,
+        created_at,
+        updated_at,
+        services!left(id)
+      `)
+      .eq('user_id', userId)
+      .order('name', { ascending: true });
+    
+    if (error) {
+      console.error('❌ Get categories error for user:', userId, error);
+      return res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+    
+    // ✅ Process the data to add service count
+    const processedCategories = (categories || []).map(category => ({
+      id: category.id,
+      name: category.name,
+      description: category.description,
+      color: category.color,
+      created_at: category.created_at,
+      updated_at: category.updated_at,
+      serviceCount: category.services ? category.services.length : 0
+    }));
+
+    console.log('✅ Found categories:', processedCategories.length, 'for user:', userId);
+
+    res.json({ data: processedCategories });
+
+  } catch (error) {
+    console.error('🔥 Unexpected error fetching categories for user:', userId, error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
   }
 });
 
@@ -882,66 +978,42 @@ app.get('/api/services/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     
-    const connection = await pool.getConnection();
+    const { data: services, error } = await supabase
+      .from('services')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      const [services] = await connection.query(
-        'SELECT * FROM services WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (services.length === 0) {
-        return res.status(404).json({ error: 'Service not found' });
-      }
-      
-      const service = services[0];
-      
-      // Debug logging for modifiers
-      console.log('🔍 Service endpoint - Raw service data:', {
-        id: service.id,
-        name: service.name,
-        modifiers: service.modifiers,
-        modifiersType: typeof service.modifiers,
-        modifiersLength: service.modifiers ? service.modifiers.length : 'null/undefined'
-      });
-      
-      // Special debug for service ID 38
-      if (service.id == 38) {
-        console.log('🔍 Service 38 - Special debug:');
-        console.log('🔍 Service 38 - All fields:', Object.keys(service));
-        console.log('🔍 Service 38 - Modifiers field:', service.modifiers);
-        console.log('🔍 Service 38 - Modifiers field type:', typeof service.modifiers);
-        console.log('🔍 Service 38 - Modifiers field value:', JSON.stringify(service.modifiers));
-        
-        // Try to query the database directly for this service
-        try {
-          const [directQuery] = await connection.query(
-            'SELECT id, name, modifiers FROM services WHERE id = 38'
-          );
-          console.log('🔍 Service 38 - Direct database query result:', directQuery);
-        } catch (error) {
-          console.log('🔍 Service 38 - Direct query error:', error.message);
-        }
-      }
-      
-      if (service.modifiers) {
-        try {
-          const parsedModifiers = JSON.parse(service.modifiers);
-          console.log('🔍 Service endpoint - Parsed modifiers:', parsedModifiers);
-          console.log('🔍 Service endpoint - Is array?', Array.isArray(parsedModifiers));
-          console.log('🔍 Service endpoint - Parsed modifiers length:', Array.isArray(parsedModifiers) ? parsedModifiers.length : 'not an array');
-        } catch (error) {
-          console.log('🔍 Service endpoint - Error parsing modifiers:', error.message);
-          console.log('🔍 Service endpoint - Raw modifiers string:', service.modifiers);
-        }
-      } else {
-        console.log('🔍 Service endpoint - No modifiers field or modifiers is null/undefined');
-      }
-      
-      res.json(service);
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching service:', error);
+      return res.status(500).json({ error: 'Failed to fetch service' });
     }
+    
+    if (!services || services.length === 0) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+    
+    const service = services[0];
+    
+    // Parse modifiers if it's a string
+    let parsedModifiers = [];
+    if (service.modifiers) {
+      try {
+        parsedModifiers = typeof service.modifiers === 'string' ? JSON.parse(service.modifiers) : service.modifiers;
+      } catch (error) {
+        console.error('Error parsing modifiers for service', service.id, ':', error);
+        parsedModifiers = [];
+      }
+    }
+    
+    // Return service with parsed modifiers
+    const responseService = {
+      ...service,
+      modifiers: parsedModifiers
+    };
+    
+    res.json(responseService);
   } catch (error) {
     console.error('Get service error:', error);
     res.status(500).json({ error: 'Failed to fetch service' });
@@ -971,28 +1043,45 @@ app.post('/api/services', authenticateToken, async (req, res) => {
     const sanitizedDescription = description ? sanitizeInput(description) : null;
     const sanitizedCategory = category ? sanitizeInput(category) : null;
     
-    const connection = await pool.getConnection();
-    
-    try {
-      // Create new service
-      const [result] = await connection.query(
-        'INSERT INTO services (user_id, name, description, price, duration, category, modifiers, intake_questions, require_payment_method, image, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())',
-        [userId, sanitizedName, sanitizedDescription, price || 0, duration || 60, sanitizedCategory, modifiers ? JSON.stringify(modifiers) : null, intake_questions ? JSON.stringify(intake_questions) : null, require_payment_method || false, image]
-      );
-      
-      // Get the created service
-      const [services] = await connection.query(
-        'SELECT * FROM services WHERE id = ?',
-        [result.insertId]
-      );
-      
-      res.status(201).json({
-        message: 'Service created successfully',
-        service: services[0]
-      });
-    } finally {
-      connection.release();
+    // Prepare modifiers for storage
+    let modifiersToStore = null;
+    if (modifiers) {
+      try {
+        // If modifiers is already a string, use it; otherwise stringify it
+        modifiersToStore = typeof modifiers === 'string' ? modifiers : JSON.stringify(modifiers);
+      } catch (error) {
+        console.error('Error preparing modifiers for storage:', error);
+        modifiersToStore = null;
+      }
     }
+    
+    // Create new service
+    const { data: newService, error: insertError } = await supabase
+      .from('services')
+      .insert({
+        user_id: userId,
+        name: sanitizedName,
+        description: sanitizedDescription,
+        price: price || 0,
+        duration: duration || 60,
+        category: sanitizedCategory,
+        modifiers: modifiersToStore,
+        intake_questions: intake_questions,
+        require_payment_method: require_payment_method || false,
+        image: image
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating service:', insertError);
+      return res.status(500).json({ error: 'Failed to create service' });
+    }
+    
+    res.status(201).json({
+      message: 'Service created successfully',
+      service: newService
+    });
   } catch (error) {
     console.error('Create service error:', error);
     res.status(500).json({ error: 'Failed to create service' });
@@ -1023,38 +1112,64 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
     const sanitizedDescription = description ? sanitizeInput(description) : null;
     const sanitizedCategory = category ? sanitizeInput(category) : null;
     
-    const connection = await pool.getConnection();
+    // Check if service exists and belongs to user
+    const { data: existingServices, error: checkError } = await supabase
+      .from('services')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Check if service exists and belongs to user
-      const [existingServices] = await connection.query(
-        'SELECT id FROM services WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (existingServices.length === 0) {
-        return res.status(404).json({ error: 'Service not found' });
-      }
-      
-      // Update service
-      await connection.query(
-        'UPDATE services SET name = ?, description = ?, price = ?, duration = ?, category = ?, modifiers = ?, intake_questions = ?, require_payment_method = ?, image = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
-        [sanitizedName, sanitizedDescription, price || 0, duration || 60, sanitizedCategory, modifiers ? JSON.stringify(modifiers) : null, intake_questions ? JSON.stringify(intake_questions) : null, require_payment_method || false, image, id, userId]
-      );
-      
-      // Get the updated service
-      const [services] = await connection.query(
-        'SELECT * FROM services WHERE id = ?',
-        [id]
-      );
-      
-      res.json({
-        message: 'Service updated successfully',
-        service: services[0]
-      });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing service:', checkError);
+      return res.status(500).json({ error: 'Failed to update service' });
     }
+    
+    if (!existingServices || existingServices.length === 0) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+    
+    // Prepare modifiers for storage
+    let modifiersToStore = null;
+    if (modifiers) {
+      try {
+        // If modifiers is already a string, use it; otherwise stringify it
+        modifiersToStore = typeof modifiers === 'string' ? modifiers : JSON.stringify(modifiers);
+      } catch (error) {
+        console.error('Error preparing modifiers for storage:', error);
+        modifiersToStore = null;
+      }
+    }
+    
+    // Update service
+    const { data: updatedService, error: updateError } = await supabase
+      .from('services')
+      .update({
+        name: sanitizedName,
+        description: sanitizedDescription,
+        price: price || 0,
+        duration: duration || 60,
+        category: sanitizedCategory,
+        modifiers: modifiersToStore,
+        intake_questions: intake_questions,
+        require_payment_method: require_payment_method || false,
+        image: image,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+    
+    if (updateError) {
+      console.error('Error updating service:', updateError);
+      return res.status(500).json({ error: 'Failed to update service' });
+    }
+    
+    res.json({
+      message: 'Service updated successfully',
+      service: updatedService
+    });
   } catch (error) {
     console.error('Update service error:', error);
     res.status(500).json({ error: 'Failed to update service' });
@@ -1066,39 +1181,51 @@ app.delete('/api/services/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     
-    const connection = await pool.getConnection();
+    // Check if service exists and belongs to user
+    const { data: existingServices, error: checkError } = await supabase
+      .from('services')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Check if service exists and belongs to user
-      const [existingServices] = await connection.query(
-        'SELECT id FROM services WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (existingServices.length === 0) {
-        return res.status(404).json({ error: 'Service not found' });
-      }
-      
-      // Check if service is being used in any jobs
-      const [jobsUsingService] = await connection.query(
-        'SELECT COUNT(*) as count FROM jobs WHERE service_id = ?',
-        [id]
-      );
-      
-      if (jobsUsingService[0].count > 0) {
-        return res.status(400).json({ error: 'Cannot delete service that is being used in jobs' });
-      }
-      
-      // Delete service
-      await connection.query(
-        'DELETE FROM services WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      res.json({ message: 'Service deleted successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing service:', checkError);
+      return res.status(500).json({ error: 'Failed to delete service' });
     }
+    
+    if (!existingServices || existingServices.length === 0) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+    
+    // Check if service is being used in any jobs
+    const { count: jobsUsingService, error: countError } = await supabase
+      .from('jobs')
+      .select('*', { count: 'exact', head: true })
+      .eq('service_id', id);
+    
+    if (countError) {
+      console.error('Error checking jobs using service:', countError);
+      return res.status(500).json({ error: 'Failed to delete service' });
+    }
+    
+    if (jobsUsingService > 0) {
+      return res.status(400).json({ error: 'Cannot delete service that is being used in jobs' });
+    }
+    
+    // Delete service
+    const { error: deleteError } = await supabase
+      .from('services')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+    
+    if (deleteError) {
+      console.error('Error deleting service:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete service' });
+    }
+    
+    res.json({ message: 'Service deleted successfully' });
   } catch (error) {
     console.error('Delete service error:', error);
     res.status(500).json({ error: 'Failed to delete service' });
@@ -1126,292 +1253,169 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     console.log('🔄 Backend: Status filter:', status);
     console.log('🔄 Backend: Date filter:', dateFilter);
     console.log('🔄 Backend: All query params:', req.query);
-    const connection = await pool.getConnection();
+    // Build Supabase query with joins
+    let query = supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        services!left(name, price, duration),
+        team_members!left(first_name, last_name, email)
+      `, { count: 'exact' })
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT 
-          j.id,
-          j.user_id,
-          j.customer_id,
-          j.service_id,
-          j.team_member_id,
-          j.territory_id,
-          j.notes,
-          j.status,
-          j.invoice_status,
-          j.invoice_id,
-          j.invoice_amount,
-          j.invoice_date,
-          j.payment_date,
-          j.created_at,
-          j.updated_at,
-          j.is_recurring,
-          j.recurring_frequency,
-          j.next_billing_date,
-          j.stripe_payment_intent_id,
-          DATE_FORMAT(j.scheduled_date, '%Y-%m-%d %H:%i:%s') as scheduled_date,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          c.address as customer_address,
-          c.city as customer_city,
-          c.state as customer_state,
-          c.zip_code as customer_zip_code,
-          COALESCE(s.name, 'Service Not Available') as service_name,
-          COALESCE(s.price, 0.00) as service_price,
-          COALESCE(s.duration, 60) as service_duration,
-          tm.first_name as team_member_first_name,
-          tm.last_name as team_member_last_name,
-          tm.email as team_member_email
-        FROM jobs j
-        LEFT JOIN customers c ON j.customer_id = c.id
-        LEFT JOIN services s ON j.service_id = s.id
-        LEFT JOIN team_members tm ON j.team_member_id = tm.id
-        WHERE j.user_id = ?
-      `;
-      let params = [userId];
-      
-      if (status) {
-        const statusArray = status.split(',');
-        const placeholders = statusArray.map(() => '?').join(',');
-        query += ` AND j.status IN (${placeholders})`;
-        params.push(...statusArray);
-      }
-      
-      if (search) {
-        query += ' AND (c.first_name LIKE ? OR c.last_name LIKE ? OR COALESCE(s.name, j.service_name) LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm, searchTerm);
-      }
-      
-      // Handle customer filtering
-      if (customerId) {
-        query += ' AND j.customer_id = ?';
-        params.push(customerId);
-      }
-      // Handle territory filtering
-      if (territoryId) {
-        query += ' AND j.territory_id = ?';
-        params.push(territoryId);
-      }
-      
-      // Handle team member assignment filtering
-      if (teamMember) {
-        switch (teamMember) {
-          case 'assigned':
-            query += ' AND j.team_member_id IS NOT NULL';
-            break;
-          case 'unassigned':
-            query += ' AND j.team_member_id IS NULL';
-            break;
-          case 'web':
-            // Jobs created through web booking (you can customize this logic)
-            query += ' AND j.team_member_id IS NULL';
-            break;
+    // Add status filter
+    if (status) {
+      const statusArray = status.split(',');
+      // Map frontend status values to database enum values
+      const mappedStatusArray = statusArray.map(s => {
+        switch (s) {
+          case 'in_progress':
+            return 'in-progress';
+          default:
+            return s;
         }
+      });
+      query = query.in('status', mappedStatusArray);
+    }
+    
+    // Add search filter
+    if (search) {
+      query = query.or(`customers.first_name.ilike.%${search}%,customers.last_name.ilike.%${search}%,services.name.ilike.%${search}%`);
+    }
+    
+    // Add customer filter
+    if (customerId) {
+      query = query.eq('customer_id', customerId);
+    }
+    
+    // Add territory filter
+    if (territoryId) {
+      query = query.eq('territory_id', territoryId);
+    }
+    
+    // Add team member filter
+    if (teamMember) {
+      switch (teamMember) {
+        case 'assigned':
+          query = query.not('team_member_id', 'is', null);
+          break;
+        case 'unassigned':
+          query = query.is('team_member_id', null);
+          break;
+        case 'web':
+          query = query.is('team_member_id', null);
+          break;
       }
-      
-      // Handle invoice status filtering
-      if (invoiceStatus) {
-        switch (invoiceStatus) {
-          case 'invoiced':
-            query += ' AND j.invoice_status IN ("invoiced", "paid", "unpaid")';
-            break;
-          case 'not_invoiced':
-            query += ' AND j.invoice_status = "not_invoiced"';
-            break;
-          case 'paid':
-            query += ' AND j.invoice_status = "paid"';
-            break;
-          case 'unpaid':
-            query += ' AND j.invoice_status = "unpaid"';
-            break;
-        }
+    }
+    
+    // Add invoice status filter
+    if (invoiceStatus) {
+      switch (invoiceStatus) {
+        case 'invoiced':
+          query = query.in('invoice_status', ['invoiced', 'paid', 'unpaid']);
+          break;
+        case 'not_invoiced':
+          query = query.eq('invoice_status', 'not_invoiced');
+          break;
+        case 'paid':
+          query = query.eq('invoice_status', 'paid');
+          break;
+        case 'unpaid':
+          query = query.eq('invoice_status', 'unpaid');
+          break;
       }
-      
-      // Handle date filtering
-      if (dateFilter === 'future') {
-        query += ' AND DATE(j.scheduled_date) >= CURDATE()';
-      } else if (dateFilter === 'past') {
-        query += ' AND DATE(j.scheduled_date) < CURDATE()';
-      } else if (dateRange) {
-        const [startDate, endDate] = dateRange.split(':');
-        if (startDate && endDate) {
-          query += ' AND DATE(j.scheduled_date) BETWEEN ? AND ?';
-          params.push(startDate, endDate);
-        }
+    }
+    
+    // Add date filter
+    if (dateFilter === 'future') {
+      query = query.gte('scheduled_date', new Date().toISOString().split('T')[0]);
+    } else if (dateFilter === 'past') {
+      query = query.lt('scheduled_date', new Date().toISOString().split('T')[0]);
+    } else if (dateRange) {
+      const [startDate, endDate] = dateRange.split(':');
+      if (startDate && endDate) {
+        query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
       }
-      
-      // Handle sorting
-      const allowedSortFields = ['scheduled_date', 'customer_first_name', 'service_price', 'created_at'];
-      const allowedSortOrders = ['ASC', 'DESC'];
-      
-      if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
-        query += ` ORDER BY ${sortBy} ${sortOrder.toUpperCase()}`;
-      } else {
-        query += ' ORDER BY j.scheduled_date ASC';
-      }
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ' LIMIT ? OFFSET ?';
-      params.push(parseInt(limit), offset);
-      
-      console.log('🔄 Backend: Final SQL Query:', query);
-      console.log('🔄 Backend: Query Parameters:', params);
-      
-      const [jobs] = await connection.query(query, params);
+    }
+    
+    // Add sorting
+    const allowedSortFields = ['scheduled_date', 'created_at'];
+    const allowedSortOrders = ['ASC', 'DESC'];
+    
+    if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
+      query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+    } else {
+      query = query.order('scheduled_date', { ascending: true });
+    }
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    console.log('🔄 Backend: Supabase query built');
+    
+    const { data: jobs, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching jobs:', error);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
       
       console.log('🔄 Backend: Jobs query executed');
-      console.log('🔄 Backend: Jobs found:', jobs.length);
-      console.log('🔄 Backend: First job:', jobs[0]);
+      console.log('🔄 Backend: Jobs found:', jobs ? jobs.length : 0);
+      console.log('🔄 Backend: First job:', jobs ? jobs[0] : null);
       
-      // Fetch team assignments for all jobs
-      for (let job of jobs) {
-        try {
-          // First try to get team assignments from job_team_assignments table
-          const [teamAssignments] = await connection.query(`
-            SELECT 
-              jta.team_member_id,
-              jta.is_primary,
-              tm.first_name,
-              tm.last_name,
-              tm.email
-            FROM job_team_assignments jta
-            LEFT JOIN team_members tm ON jta.team_member_id = tm.id
-            WHERE jta.job_id = ?
-            ORDER BY jta.is_primary DESC, jta.assigned_at ASC
-          `, [job.id]);
-          
-          job.team_assignments = teamAssignments;
-          
-          // For backward compatibility, set the primary team member
-          const primaryAssignment = teamAssignments.find(ta => ta.is_primary);
-          if (primaryAssignment) {
-            job.team_member_first_name = primaryAssignment.first_name;
-            job.team_member_last_name = primaryAssignment.last_name;
-            job.team_member_email = primaryAssignment.email;
-          }
-        } catch (error) {
-          console.log('Could not fetch team assignments for job:', job.id, error.message);
-          
-          // Fallback: create team assignment from the single team_member_id if it exists
-          if (job.team_member_id && job.team_member_first_name) {
-            job.team_assignments = [{
-              team_member_id: job.team_member_id,
-              is_primary: true,
-              first_name: job.team_member_first_name,
-              last_name: job.team_member_last_name,
-              email: job.team_member_email
-            }];
-          } else {
-          job.team_assignments = [];
-          }
-        }
-      }
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total 
-        FROM jobs j
-        LEFT JOIN customers c ON j.customer_id = c.id
-        LEFT JOIN services s ON j.service_id = s.id
-        WHERE j.user_id = ?
-      `;
-      let countParams = [userId];
-      
-      if (status) {
-        const statusArray = status.split(',');
-        const placeholders = statusArray.map(() => '?').join(',');
-        countQuery += ` AND j.status IN (${placeholders})`;
-        countParams.push(...statusArray);
-      }
-      
-      if (search) {
-        countQuery += ' AND (c.first_name LIKE ? OR c.last_name LIKE ? OR COALESCE(s.name, j.service_name) LIKE ?)';
-        const searchTerm = `%${search}%`;
-        countParams.push(searchTerm, searchTerm, searchTerm);
-      }
-      
-      // Handle customer filtering for count query
-      if (customerId) {
-        countQuery += ' AND j.customer_id = ?';
-        countParams.push(customerId);
-      }
-      // Handle territory filtering for count query
-      if (territoryId) {
-        countQuery += ' AND j.territory_id = ?';
-        countParams.push(territoryId);
-      }
-      
-      // Handle team member assignment filtering for count query
-      if (teamMember) {
-        switch (teamMember) {
-          case 'assigned':
-            countQuery += ' AND j.team_member_id IS NOT NULL';
-            break;
-          case 'unassigned':
-            countQuery += ' AND j.team_member_id IS NULL';
-            break;
-          case 'web':
-            countQuery += ' AND j.team_member_id IS NULL';
-            break;
-        }
-      }
-      
-      // Handle invoice status filtering for count query
-      if (invoiceStatus) {
-        switch (invoiceStatus) {
-          case 'invoiced':
-            countQuery += ' AND j.invoice_status IN ("invoiced", "paid", "unpaid")';
-            break;
-          case 'not_invoiced':
-            countQuery += ' AND j.invoice_status = "not_invoiced"';
-            break;
-          case 'paid':
-            countQuery += ' AND j.invoice_status = "paid"';
-            break;
-          case 'unpaid':
-            countQuery += ' AND j.invoice_status = "unpaid"';
-            break;
-        }
-      }
-      
-      // Handle date filtering for count query
-      if (dateFilter === 'future') {
-        countQuery += ' AND DATE(j.scheduled_date) >= CURDATE()';
-      } else if (dateFilter === 'past') {
-        countQuery += ' AND DATE(j.scheduled_date) < CURDATE()';
-      } else if (dateRange) {
-        const [startDate, endDate] = dateRange.split(':');
-        if (startDate && endDate) {
-          countQuery += ' AND DATE(j.scheduled_date) BETWEEN ? AND ?';
-          countParams.push(startDate, endDate);
-        }
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
+      // Process jobs to add team assignments and format data
+      const processedJobs = (jobs || []).map(job => {
+        // Format customer data
+        const customer = job.customers || {};
+        const service = job.services || {};
+        const teamMember = job.team_members || {};
+        
+        // Create team assignments array for backward compatibility
+        const teamAssignments = teamMember.id ? [{
+          team_member_id: teamMember.id,
+          is_primary: true,
+          first_name: teamMember.first_name,
+          last_name: teamMember.last_name,
+          email: teamMember.email
+        }] : [];
+        
+        return {
+          ...job,
+          customer_first_name: customer.first_name,
+          customer_last_name: customer.last_name,
+          customer_email: customer.email,
+          customer_phone: customer.phone,
+          customer_address: customer.address,
+          customer_city: customer.city,
+          customer_state: customer.state,
+          customer_zip_code: customer.zip_code,
+          service_name: service.name || 'Service Not Available',
+          service_price: service.price || 0.00,
+          service_duration: service.duration || 60,
+          team_member_first_name: teamMember.first_name,
+          team_member_last_name: teamMember.last_name,
+          team_member_email: teamMember.email,
+          team_assignments: teamAssignments
+        };
+      });
       
       const response = {
-        jobs,
+        jobs: processedJobs,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total,
-          totalPages: Math.ceil(total / limit)
+          total: count || 0,
+          totalPages: Math.ceil((count || 0) / limit)
         }
       };
       
-      console.log('🔄 Backend: Sending response with', jobs.length, 'jobs');
+      console.log('🔄 Backend: Sending response with', processedJobs.length, 'jobs');
       console.log('🔄 Backend: Response structure:', response);
       
       res.json(response);
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('Get jobs error:', error);
     res.status(500).json({ error: 'Failed to fetch jobs' });
@@ -1434,143 +1438,121 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     
-    const connection = await pool.getConnection();
+    const { data: jobs, error } = await supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        services!left(name, price, duration),
+        team_members!left(first_name, last_name, email)
+      `)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
+    if (error) {
+      console.error('Error fetching job:', error);
+      return res.status(500).json({ error: 'Failed to fetch job' });
+    }
+    
+    if (!jobs || jobs.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    const job = jobs[0];
+    
+    // Get intake answers from job_answers table
+    const { data: intakeAnswers, error: answersError } = await supabase
+      .from('job_answers')
+      .select('question_id, question_text, question_type, answer')
+      .eq('job_id', id)
+      .order('created_at', { ascending: true });
+    
+    if (answersError) {
+      console.error('Error fetching intake answers:', answersError);
+    }
+    
+    // Parse JSON answers
+    const parsedIntakeAnswers = (intakeAnswers || []).map(answer => ({
+      ...answer,
+      answer: answer.answer ? (answer.answer.startsWith('[') || answer.answer.startsWith('{') ? JSON.parse(answer.answer) : answer.answer) : null
+    }));
+
+    // Get intake questions and answers from job_answers table
+    const intakeQuestionsAndAnswers = parsedIntakeAnswers.map(answer => ({
+      id: answer.question_id,
+      question: answer.question_text,
+      questionType: answer.question_type,
+      answer: answer.answer
+    }));
+
+    // Get team assignments for this job
+    let teamAssignments = [];
     try {
-      const [jobs] = await connection.query(
-        `SELECT 
-          j.id,
-          j.user_id,
-          j.customer_id,
-          j.service_id,
-          j.team_member_id,
-          j.territory_id,
-          j.notes,
-          j.status,
-          j.invoice_status,
-          j.invoice_id,
-          j.invoice_amount,
-          j.invoice_date,
-          j.payment_date,
-          j.created_at,
-          j.updated_at,
-          j.is_recurring,
-          j.recurring_frequency,
-          j.next_billing_date,
-          j.stripe_payment_intent_id,
-          DATE_FORMAT(j.scheduled_date, '%Y-%m-%d %H:%i:%s') as scheduled_date,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          c.address as customer_address,
-          c.city as customer_city,
-          c.state as customer_state,
-          c.zip_code as customer_zip_code,
-          s.name as service_name,
-          s.price as service_price,
-          s.duration as service_duration,
-          tm.first_name as team_member_first_name,
-          tm.last_name as team_member_last_name
-        FROM jobs j
-        LEFT JOIN customers c ON j.customer_id = c.id
-        LEFT JOIN services s ON j.service_id = s.id
-        LEFT JOIN team_members tm ON j.team_member_id = tm.id
-        WHERE j.id = ? AND j.user_id = ?`,
-        [id, userId]
-      );
+      const { data: assignmentsResult, error: assignmentsError } = await supabase
+        .from('job_team_assignments')
+        .select(`
+          team_member_id,
+          is_primary,
+          team_members!left(first_name, last_name, email)
+        `)
+        .eq('job_id', id)
+        .order('is_primary', { ascending: false })
+        .order('assigned_at', { ascending: true });
       
-      if (jobs.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
+      if (assignmentsError) {
+        console.error('Error fetching team assignments:', assignmentsError);
+      } else {
+        teamAssignments = (assignmentsResult || []).map(assignment => ({
+          team_member_id: assignment.team_member_id,
+          is_primary: assignment.is_primary,
+          first_name: assignment.team_members?.first_name,
+          last_name: assignment.team_members?.last_name,
+          email: assignment.team_members?.email
+        }));
       }
+    } catch (error) {
+      console.error('Error processing team assignments:', error);
+    }
+
+    // For backward compatibility, set the primary team member
+    try {
+      const primaryAssignment = teamAssignments.find(ta => ta.is_primary);
+      if (primaryAssignment) {
+        job.team_member_first_name = primaryAssignment.first_name;
+        job.team_member_last_name = primaryAssignment.last_name;
+      }
+    } catch (error) {
+      console.error('Error processing team assignments:', error);
       
-      // Get intake answers from job_answers table
-      const [intakeAnswers] = await connection.query(
-        `SELECT 
-          question_id,
-          question_text,
-          question_type,
-          answer
-        FROM job_answers 
-        WHERE job_id = ?
-        ORDER BY created_at ASC`,
-        [id]
-      );
-
-      // Parse JSON answers
-      const parsedIntakeAnswers = intakeAnswers.map(answer => ({
-        ...answer,
-        answer: answer.answer ? (answer.answer.startsWith('[') || answer.answer.startsWith('{') ? JSON.parse(answer.answer) : answer.answer) : null
-      }));
-
-      // Get intake questions and answers from job_answers table
-      // The job_answers table contains both the question details and the answers
-      const intakeQuestionsAndAnswers = parsedIntakeAnswers.map(answer => ({
-        id: answer.question_id,
-        question: answer.question_text,
-        questionType: answer.question_type,
-        answer: answer.answer
-      }));
-
-      // Get team assignments for this job
-      let teamAssignments = [];
-      try {
-        const [assignmentsResult] = await connection.query(`
-          SELECT 
-            jta.team_member_id,
-            jta.is_primary,
-            tm.first_name,
-            tm.last_name,
-            tm.email,
-            tm.phone,
-            tm.role
-          FROM job_team_assignments jta
-          LEFT JOIN team_members tm ON jta.team_member_id = tm.id
-          WHERE jta.job_id = ?
-          ORDER BY jta.is_primary DESC, jta.assigned_at ASC
-        `, [id]);
-        
-        teamAssignments = assignmentsResult;
-        
-        // For backward compatibility, set the primary team member
-        const primaryAssignment = teamAssignments.find(ta => ta.is_primary);
-        if (primaryAssignment) {
-          jobs[0].team_member_first_name = primaryAssignment.first_name;
-          jobs[0].team_member_last_name = primaryAssignment.last_name;
-        }
-      } catch (assignmentError) {
-        console.log('Could not fetch team assignments for job:', id, assignmentError.message);
-        
-        // Fallback: create team assignment from the single team_member_id if it exists
-        if (jobs[0].team_member_id && jobs[0].team_member_first_name) {
-          teamAssignments = [{
-            team_member_id: jobs[0].team_member_id,
-            is_primary: true,
-            first_name: jobs[0].team_member_first_name,
-            last_name: jobs[0].team_member_last_name,
-            email: null,
-            phone: null,
-            role: null
-          }];
-        }
+      // Fallback: create team assignment from the single team_member_id if it exists
+      if (job.team_member_id && job.team_member_first_name) {
+        teamAssignments = [{
+          team_member_id: job.team_member_id,
+          is_primary: true,
+          first_name: job.team_member_first_name,
+          last_name: job.team_member_last_name,
+          email: null,
+          phone: null,
+          role: null
+        }];
       }
+    }
 
       const jobData = {
-        ...jobs[0],
+        ...job,
         team_assignments: teamAssignments,
         intake_answers: parsedIntakeAnswers,
         service_intake_questions: intakeQuestionsAndAnswers // Use the questions from job_answers table
       };
       
       res.json(jobData);
-    } finally {
-      connection.release();
+    } catch (error) {
+      console.error('Get job error:', error);
+      res.status(500).json({ error: 'Failed to fetch job' });
     }
-  } catch (error) {
-    console.error('Get job error:', error);
-    res.status(500).json({ error: 'Failed to fetch job' });
   }
-});
+);
 
 // Create job endpoint
 app.post('/api/jobs', authenticateToken, async (req, res) => {
@@ -1640,113 +1622,114 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
     console.log('🔄 DEBUG: intakeQuestionAnswers in req.body:', req.body.intakeQuestionAnswers);
     console.log('🔄 DEBUG: originalIntakeQuestionIds in req.body:', req.body.originalIntakeQuestionIds);
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Combine scheduled date and time - save exactly as user chose
-      let fullScheduledDate;
-      if (scheduledDate && scheduledTime) {
-        // Simply combine date and time as-is, no timezone conversion
-        fullScheduledDate = `${scheduledDate} ${scheduledTime}:00`;
-        console.log(`🕐 Saving time as chosen: ${scheduledDate} ${scheduledTime}`);
-      } else {
-        fullScheduledDate = scheduledDate;
-      }
+    // Combine scheduled date and time - save exactly as user chose
+    let fullScheduledDate;
+    if (scheduledDate && scheduledTime) {
+      // Simply combine date and time as-is, no timezone conversion
+      fullScheduledDate = `${scheduledDate} ${scheduledTime}:00`;
+      console.log(`🕐 Saving time as chosen: ${scheduledDate} ${scheduledTime}`);
+    } else {
+      fullScheduledDate = scheduledDate;
+    }
 
-      // Process modifiers and intake questions to calculate final price and duration
-      let finalPrice = parseFloat(price) || 0;
-      let finalDuration = parseFloat(duration) || 0;
-      let processedModifiers = [];
-      let processedIntakeQuestions = [];
+    // Process modifiers and intake questions to calculate final price and duration
+    let finalPrice = parseFloat(price) || 0;
+    let finalDuration = parseFloat(duration) || 0;
+    let processedModifiers = [];
+    let processedIntakeQuestions = [];
 
-      // Process selected modifiers to calculate price and duration
-      if (serviceModifiers && Array.isArray(serviceModifiers)) {
-        processedModifiers = serviceModifiers.map(modifier => {
-          const selectedOptions = req.body.selectedModifiers?.[modifier.id] || [];
-          let modifierPrice = 0;
-          let modifierDuration = 0;
-          let selectedOptionsData = [];
+    // Process selected modifiers to calculate price and duration
+    if (serviceModifiers && Array.isArray(serviceModifiers)) {
+      processedModifiers = serviceModifiers.map(modifier => {
+        const selectedOptions = req.body.selectedModifiers?.[modifier.id] || [];
+        let modifierPrice = 0;
+        let modifierDuration = 0;
+        let selectedOptionsData = [];
 
-          if (modifier.selectionType === 'quantity') {
-            // Handle quantity selection
-            Object.entries(selectedOptions).forEach(([optionId, quantity]) => {
-              const option = modifier.options?.find(o => o.id == optionId);
-              if (option && quantity > 0) {
-                const optionPrice = parseFloat(option.price) || 0;
-                const optionDuration = parseFloat(option.duration) || 0;
-                modifierPrice += optionPrice * quantity;
-                modifierDuration += optionDuration * quantity;
-                selectedOptionsData.push({
-                  ...option,
-                  selectedQuantity: quantity,
-                  totalPrice: optionPrice * quantity,
-                  totalDuration: optionDuration * quantity
-                });
-              }
-            });
-          } else {
-            // Handle single/multi selection
-            const selectedOptionIds = Array.isArray(selectedOptions) ? selectedOptions : [selectedOptions];
-            selectedOptionIds.forEach(optionId => {
-              const option = modifier.options?.find(o => o.id == optionId);
-              if (option) {
-                const optionPrice = parseFloat(option.price) || 0;
-                const optionDuration = parseFloat(option.duration) || 0;
-                modifierPrice += optionPrice;
-                modifierDuration += optionDuration;
-                selectedOptionsData.push({
-                  ...option,
-                  selected: true,
-                  totalPrice: optionPrice,
-                  totalDuration: optionDuration
-                });
-              }
-            });
-          }
-
-          finalPrice += modifierPrice;
-          finalDuration += modifierDuration;
-
-          return {
-            ...modifier,
-            selectedOptions: selectedOptionsData,
-            totalModifierPrice: modifierPrice,
-            totalModifierDuration: modifierDuration
-          };
-        });
-      }
-
-      // Process intake questions with answers
-      console.log('🔄 DEBUG: serviceIntakeQuestions type:', typeof serviceIntakeQuestions);
-      console.log('🔄 DEBUG: serviceIntakeQuestions value:', serviceIntakeQuestions);
-      console.log('🔄 DEBUG: Array.isArray(serviceIntakeQuestions):', Array.isArray(serviceIntakeQuestions));
-      
-      // If serviceIntakeQuestions is not provided, try to get it from the service
-      if (!serviceIntakeQuestions && serviceId) {
-        try {
-          const [serviceData] = await connection.query(
-            'SELECT intake_questions FROM services WHERE id = ?',
-            [serviceId]
-          );
-          
-          if (serviceData.length > 0 && serviceData[0].intake_questions) {
-            try {
-              if (typeof serviceData[0].intake_questions === 'string') {
-                serviceIntakeQuestions = JSON.parse(serviceData[0].intake_questions);
-              } else if (Array.isArray(serviceData[0].intake_questions)) {
-                serviceIntakeQuestions = serviceData[0].intake_questions;
-              }
-              console.log('🔄 DEBUG: Retrieved serviceIntakeQuestions from service:', serviceIntakeQuestions);
-            } catch (parseError) {
-              console.error('Error parsing service intake questions:', parseError);
-              serviceIntakeQuestions = [];
+        if (modifier.selectionType === 'quantity') {
+          // Handle quantity selection
+          Object.entries(selectedOptions).forEach(([optionId, quantity]) => {
+            const option = modifier.options?.find(o => o.id == optionId);
+            if (option && quantity > 0) {
+              const optionPrice = parseFloat(option.price) || 0;
+              const optionDuration = parseFloat(option.duration) || 0;
+              modifierPrice += optionPrice * quantity;
+              modifierDuration += optionDuration * quantity;
+              selectedOptionsData.push({
+                ...option,
+                selectedQuantity: quantity,
+                totalPrice: optionPrice * quantity,
+                totalDuration: optionDuration * quantity
+              });
             }
-          }
-        } catch (serviceError) {
+          });
+        } else {
+          // Handle single/multi selection
+          const selectedOptionIds = Array.isArray(selectedOptions) ? selectedOptions : [selectedOptions];
+          selectedOptionIds.forEach(optionId => {
+            const option = modifier.options?.find(o => o.id == optionId);
+            if (option) {
+              const optionPrice = parseFloat(option.price) || 0;
+              const optionDuration = parseFloat(option.duration) || 0;
+              modifierPrice += optionPrice;
+              modifierDuration += optionDuration;
+              selectedOptionsData.push({
+                ...option,
+                selected: true,
+                totalPrice: optionPrice,
+                totalDuration: optionDuration
+              });
+            }
+          });
+        }
+
+        finalPrice += modifierPrice;
+        finalDuration += modifierDuration;
+
+        return {
+          ...modifier,
+          selectedOptions: selectedOptionsData,
+          totalModifierPrice: modifierPrice,
+          totalModifierDuration: modifierDuration
+        };
+      });
+    }
+
+    // Process intake questions with answers
+    console.log('🔄 DEBUG: serviceIntakeQuestions type:', typeof serviceIntakeQuestions);
+    console.log('🔄 DEBUG: serviceIntakeQuestions value:', serviceIntakeQuestions);
+    console.log('🔄 DEBUG: Array.isArray(serviceIntakeQuestions):', Array.isArray(serviceIntakeQuestions));
+    
+    // If serviceIntakeQuestions is not provided, try to get it from the service
+    if (!serviceIntakeQuestions && serviceId) {
+      try {
+        const { data: serviceData, error: serviceError } = await supabase
+          .from('services')
+          .select('intake_questions')
+          .eq('id', serviceId)
+          .limit(1);
+        
+        if (serviceError) {
           console.error('Error fetching service intake questions:', serviceError);
           serviceIntakeQuestions = [];
+        } else if (serviceData && serviceData.length > 0 && serviceData[0].intake_questions) {
+          try {
+            if (typeof serviceData[0].intake_questions === 'string') {
+              serviceIntakeQuestions = JSON.parse(serviceData[0].intake_questions);
+            } else if (Array.isArray(serviceData[0].intake_questions)) {
+              serviceIntakeQuestions = serviceData[0].intake_questions;
+            }
+            console.log('🔄 DEBUG: Retrieved serviceIntakeQuestions from service:', serviceIntakeQuestions);
+          } catch (parseError) {
+            console.error('Error parsing service intake questions:', parseError);
+            serviceIntakeQuestions = [];
+          }
         }
+      } catch (error) {
+        console.error('Error fetching service intake questions:', error);
+        serviceIntakeQuestions = [];
       }
+    }
       
         const intakeAnswers = req.body.intakeQuestionAnswers || {};
         const originalQuestionIds = req.body.originalIntakeQuestionIds || [];
@@ -1793,52 +1776,100 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       const recurringEndDateValue = recurringEndDate && recurringEndDate !== '' ? recurringEndDate : null;
 
       // Create the job
-      const [result] = await connection.query(`
-        INSERT INTO jobs (
-          user_id, customer_id, service_id, team_member_id, scheduled_date, notes, status,
-          duration, workers_needed, skills_required, price, discount, additional_fees, taxes, total,
-          payment_method, territory, is_recurring, schedule_type, let_customer_schedule,
-          offer_to_providers, internal_notes, service_address_street, service_address_city,
-          service_address_state, service_address_zip, service_name, invoice_status, payment_status,
-          priority, estimated_duration, skills, special_instructions, customer_notes, tags,
-          recurring_end_date, auto_invoice, auto_reminders, customer_signature,
-          photos_required, quality_check, service_modifiers, service_intake_questions,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-      `, [
-        userId, customerId, serviceId, teamMemberIdValue, fullScheduledDate, notes, status,
-        finalDuration, workers, skillsRequired, finalPrice, discount, additionalFees, taxes, finalPrice,
-        paymentMethod, territory, recurringJob, scheduleType, letCustomerSchedule,
-        offerToProviders, internalNotes, 
-        serviceAddress?.street, serviceAddress?.city, serviceAddress?.state, serviceAddress?.zipCode,
-        serviceName, invoiceStatus, paymentStatus, priority, finalDuration,
-        skills ? JSON.stringify(skills) : null, specialInstructions, customerNotes,
-        tags ? JSON.stringify(tags) : null, recurringEndDateValue,
-        autoInvoice, autoReminders, customerSignature, photosRequired, qualityCheck,
-        processedModifiers.length > 0 ? JSON.stringify(processedModifiers) : null,
-        null // Don't save intake questions to jobs table anymore - use job_answers table instead
-      ]);
+      const jobData = {
+        user_id: userId,
+        customer_id: customerId,
+        service_id: serviceId,
+        team_member_id: teamMemberIdValue,
+        scheduled_date: fullScheduledDate,
+        notes: notes,
+        status: status,
+        duration: finalDuration,
+        workers_needed: workers,
+        skills_required: skillsRequired,
+        price: finalPrice,
+        discount: discount,
+        additional_fees: additionalFees,
+        taxes: taxes,
+        total: finalPrice,
+        payment_method: paymentMethod,
+        territory: territory,
+        is_recurring: recurringJob,
+        schedule_type: scheduleType,
+        let_customer_schedule: letCustomerSchedule,
+        offer_to_providers: offerToProviders,
+        internal_notes: internalNotes,
+        service_address_street: serviceAddress?.street,
+        service_address_city: serviceAddress?.city,
+        service_address_state: serviceAddress?.state,
+        service_address_zip: serviceAddress?.zipCode,
+        service_name: serviceName,
+        invoice_status: invoiceStatus,
+        payment_status: paymentStatus,
+        priority: priority,
+        estimated_duration: finalDuration,
+        skills: skills,
+        special_instructions: specialInstructions,
+        customer_notes: customerNotes,
+        tags: tags,
+        recurring_end_date: recurringEndDateValue,
+        auto_invoice: autoInvoice,
+        auto_reminders: autoReminders,
+        customer_signature: customerSignature,
+        photos_required: photosRequired,
+        quality_check: qualityCheck,
+        service_modifiers: processedModifiers.length > 0 ? processedModifiers : null
+      };
+
+      const { data: result, error: insertError } = await supabase
+        .from('jobs')
+        .insert(jobData)
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Error creating job:', insertError);
+        return res.status(500).json({ error: 'Failed to create job' });
+      }
 
       // Create team member assignments in job_team_assignments table
       if (teamMemberIdValue || teamMemberIds.length > 0) {
         try {
           // If we have a single team member ID, add it as primary
           if (teamMemberIdValue) {
-            await connection.query(`
-              INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-              VALUES (?, ?, 1, ?)
-            `, [result.insertId, teamMemberIdValue, userId]);
-            console.log('🔄 DEBUG: Created primary team assignment for job:', result.insertId);
+            const { error: assignmentError } = await supabase
+              .from('job_team_assignments')
+              .insert({
+                job_id: result.id,
+                team_member_id: teamMemberIdValue,
+                is_primary: true,
+                assigned_by: userId
+              });
+            
+            if (assignmentError) {
+              console.error('Error creating primary team assignment:', assignmentError);
+            } else {
+              console.log('🔄 DEBUG: Created primary team assignment for job:', result.id);
+            }
           }
           
           // Add additional team members from the array
           for (const memberId of teamMemberIds) {
             if (memberId && memberId !== teamMemberIdValue) {
-              await connection.query(`
-                INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-                VALUES (?, ?, 0, ?)
-              `, [result.insertId, memberId, userId]);
-              console.log('🔄 DEBUG: Created additional team assignment for job:', result.insertId);
+              const { error: assignmentError } = await supabase
+                .from('job_team_assignments')
+                .insert({
+                  job_id: result.id,
+                  team_member_id: memberId,
+                  is_primary: false,
+                  assigned_by: userId
+                });
+              
+              if (assignmentError) {
+                console.error('Error creating additional team assignment:', assignmentError);
+              } else {
+                console.log('🔄 DEBUG: Created additional team assignment for job:', result.id);
+              }
             }
           }
         } catch (assignmentError) {
@@ -1863,12 +1894,21 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               try {
                 // Use the original question ID for consistency in the database
                 const originalQuestionId = originalQuestionIds[index] || question.id;
-                await connection.query(`
-                  INSERT INTO job_answers (
-                    job_id, question_id, question_text, question_type, answer, created_at
-                  ) VALUES (?, ?, ?, ?, ?, NOW())
-                `, [result.insertId, originalQuestionId, question.question, question.questionType, answerToSave]);
-                console.log('🔄 DEBUG: Successfully saved job answer for question:', question.id, 'with original ID:', originalQuestionId);
+                const { error: answerError } = await supabase
+                  .from('job_answers')
+                  .insert({
+                    job_id: result.id,
+                    question_id: originalQuestionId,
+                    question_text: question.question,
+                    question_type: question.questionType,
+                    answer: answerToSave
+                  });
+                
+                if (answerError) {
+                  console.error('Error inserting job answer:', answerError);
+                } else {
+                  console.log('🔄 DEBUG: Successfully saved job answer for question:', question.id, 'with original ID:', originalQuestionId);
+                }
               } catch (insertError) {
                 console.error('Error inserting job answer:', insertError);
                 // Continue processing other answers even if one fails
@@ -1886,32 +1926,27 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       }
 
       // Get the created job
-      const [jobs] = await connection.query(
-        `SELECT 
-          j.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          COALESCE(s.name, j.service_name) as service_name,
-          COALESCE(s.price, j.service_price) as service_price,
-          COALESCE(s.duration, j.duration) as service_duration
-        FROM jobs j
-        LEFT JOIN customers c ON j.customer_id = c.id
-        LEFT JOIN services s ON j.service_id = s.id
-        WHERE j.id = ?`,
-        [result.insertId]
-      );
+      const { data: createdJob, error: fetchError } = await supabase
+        .from('jobs')
+        .select(`
+          *,
+          customers!left(first_name, last_name, email, phone),
+          services!left(name, price, duration)
+        `)
+        .eq('id', result.id)
+        .limit(1);
 
-      console.log('🔄 Job created successfully:', result.insertId);
+      if (fetchError) {
+        console.error('Error fetching created job:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch created job' });
+      }
+
+      console.log('🔄 Job created successfully:', result.id);
       
       res.status(201).json({
         message: 'Job created successfully',
-        job: jobs[0]
+        job: createdJob[0]
       });
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('Create job error:', error);
     res.status(500).json({ error: 'Failed to create job' });
@@ -1939,171 +1974,196 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     console.log('🔄 Updating job:', id);
     console.log('🔄 Update data:', updateData);
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if job exists and belongs to user
-      const [existingJobs] = await connection.query(
-        'SELECT id FROM jobs WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
 
-      if (existingJobs.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
-      }
-
-      // Build update query dynamically
-      const updateFields = [];
-      const updateValues = [];
-
-      // Map frontend fields to database fields
-      const fieldMappings = {
-        customerId: 'customer_id',
-        serviceId: 'service_id',
-        teamMemberId: 'team_member_id',
-        scheduledDate: 'scheduled_date',
-        notes: 'notes',
-        status: 'status',
-        duration: 'duration',
-        workers: 'workers_needed',
-        skillsRequired: 'skills_required',
-        price: 'price',
-        discount: 'discount',
-        additionalFees: 'additional_fees',
-        taxes: 'taxes',
-        total: 'total',
-        paymentMethod: 'payment_method',
-        territory: 'territory',
-        recurringJob: 'recurring_job',
-        scheduleType: 'schedule_type',
-        letCustomerSchedule: 'let_customer_schedule',
-        offerToProviders: 'offer_to_providers',
-        internalNotes: 'internal_notes',
-        serviceName: 'service_name',
-        invoiceStatus: 'invoice_status',
-        paymentStatus: 'payment_status',
-        priority: 'priority',
-        estimatedDuration: 'estimated_duration',
-        skills: 'skills',
-        specialInstructions: 'special_instructions',
-        customerNotes: 'customer_notes',
-        tags: 'tags',
-        recurringFrequency: 'recurring_frequency',
-        recurringEndDate: 'recurring_end_date',
-        autoInvoice: 'auto_invoice',
-        autoReminders: 'auto_reminders',
-        customerSignature: 'customer_signature',
-        photosRequired: 'photos_required',
-        qualityCheck: 'quality_check',
-        serviceModifiers: 'service_modifiers',
-        serviceIntakeQuestions: 'service_intake_questions'
-      };
-
-      Object.keys(updateData).forEach(key => {
-        if (fieldMappings[key] && updateData[key] !== undefined) {
-          updateFields.push(`${fieldMappings[key]} = ?`);
-          
-          // Handle special cases
-          if (key === 'scheduledDate' && updateData.scheduledTime) {
-            // Simply combine date and time as-is, no timezone conversion
-            updateValues.push(`${updateData[key]} ${updateData.scheduledTime}:00`);
-            console.log(`🕐 Update saving time as chosen: ${updateData[key]} ${updateData.scheduledTime}`);
-          } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
-            updateValues.push(JSON.stringify(updateData[key]));
-          } else if (key === 'serviceAddress') {
-            // Handle nested service address
-            if (updateData[key]) {
-              updateFields.push('service_address_street = ?');
-              updateFields.push('service_address_city = ?');
-              updateFields.push('service_address_state = ?');
-              updateFields.push('service_address_zip = ?');
-              updateValues.push(updateData[key].street || null);
-              updateValues.push(updateData[key].city || null);
-              updateValues.push(updateData[key].state || null);
-              updateValues.push(updateData[key].zipCode || null);
-            }
-          } else {
-            updateValues.push(updateData[key]);
-          }
-        }
-      });
-
-      if (updateFields.length === 0) {
-        return res.status(400).json({ error: 'No valid fields to update' });
-      }
-
-      // Handle team member assignments update
-      if (updateData.teamMemberId !== undefined || updateData.teamMemberIds !== undefined) {
-        try {
-          // Remove existing assignments
-          await connection.query('DELETE FROM job_team_assignments WHERE job_id = ?', [id]);
-          
-          // Add new assignments
-          const teamMemberId = updateData.teamMemberId;
-          const teamMemberIds = updateData.teamMemberIds || [];
-          
-          // If we have a single team member ID, add it as primary
-          if (teamMemberId && teamMemberId !== '') {
-            await connection.query(`
-              INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-              VALUES (?, ?, 1, ?)
-            `, [id, teamMemberId, userId]);
-          }
-          
-          // Add additional team members from the array
-          for (const memberId of teamMemberIds) {
-            if (memberId && memberId !== teamMemberId) {
-              await connection.query(`
-                INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-                VALUES (?, ?, 0, ?)
-              `, [id, memberId, userId]);
-            }
-          }
-          
-          console.log('🔄 Updated team assignments for job:', id);
-        } catch (assignmentError) {
-          console.error('Error updating team assignments:', assignmentError);
-          // Don't fail the job update if team assignment fails
-        }
-      }
-
-      updateFields.push('updated_at = NOW()');
-      updateValues.push(id, userId);
-
-      const query = `UPDATE jobs SET ${updateFields.join(', ')} WHERE id = ? AND user_id = ?`;
-      
-      console.log('🔄 Update query:', query);
-      console.log('🔄 Update values:', updateValues);
-
-      await connection.query(query, updateValues);
-
-      // Get updated job
-      const [jobs] = await connection.query(
-        `SELECT 
-          j.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          COALESCE(s.name, j.service_name) as service_name,
-          COALESCE(s.price, j.service_price) as service_price,
-          COALESCE(s.duration, j.duration) as service_duration
-        FROM jobs j
-        LEFT JOIN customers c ON j.customer_id = c.id
-        LEFT JOIN services s ON j.service_id = s.id
-        WHERE j.id = ?`,
-        [id]
-      );
-
-      console.log('🔄 Job updated successfully');
-      
-      res.json({
-        message: 'Job updated successfully',
-        job: jobs[0]
-      });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking job existence:', checkError);
+      return res.status(500).json({ error: 'Failed to update job' });
     }
+
+    if (!existingJob || existingJob.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Build update data object
+    const updateDataToSend = {};
+
+    // Map frontend fields to database fields
+    const fieldMappings = {
+      customerId: 'customer_id',
+      serviceId: 'service_id',
+      teamMemberId: 'team_member_id',
+      scheduledDate: 'scheduled_date',
+      notes: 'notes',
+      status: 'status',
+      duration: 'duration',
+      workers: 'workers_needed',
+      skillsRequired: 'skills_required',
+      price: 'price',
+      discount: 'discount',
+      additionalFees: 'additional_fees',
+      taxes: 'taxes',
+      total: 'total',
+      paymentMethod: 'payment_method',
+      territory: 'territory',
+      territoryId: 'territory_id',
+      recurringJob: 'recurring_job',
+      scheduleType: 'schedule_type',
+      letCustomerSchedule: 'let_customer_schedule',
+      offerToProviders: 'offer_to_providers',
+      internalNotes: 'internal_notes',
+      serviceName: 'service_name',
+      invoiceStatus: 'invoice_status',
+      paymentStatus: 'payment_status',
+      priority: 'priority',
+      estimatedDuration: 'estimated_duration',
+      skills: 'skills',
+      specialInstructions: 'special_instructions',
+      customerNotes: 'customer_notes',
+      tags: 'tags',
+      recurringFrequency: 'recurring_frequency',
+      recurringEndDate: 'recurring_end_date',
+      autoInvoice: 'auto_invoice',
+      autoReminders: 'auto_reminders',
+      customerSignature: 'customer_signature',
+      photosRequired: 'photos_required',
+      qualityCheck: 'quality_check',
+      serviceModifiers: 'service_modifiers',
+      serviceIntakeQuestions: 'service_intake_questions'
+    };
+
+    console.log('🔄 Received update data:', updateData);
+    console.log('🔄 Available field mappings:', Object.keys(fieldMappings));
+    
+    Object.keys(updateData).forEach(key => {
+      console.log(`🔄 Processing field: ${key}, value: ${updateData[key]}, mapped: ${fieldMappings[key]}`);
+      if (fieldMappings[key] && updateData[key] !== undefined) {
+        // Handle special cases
+        if (key === 'scheduledDate' && updateData.scheduledTime) {
+          // Simply combine date and time as-is, no timezone conversion
+          updateDataToSend[fieldMappings[key]] = `${updateData[key]} ${updateData.scheduledTime}:00`;
+          console.log(`🕐 Update saving time as chosen: ${updateData[key]} ${updateData.scheduledTime}`);
+        } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
+          updateDataToSend[fieldMappings[key]] = updateData[key];
+        } else if (key === 'serviceAddress') {
+          // Handle nested service address
+          if (updateData[key]) {
+            updateDataToSend.service_address_street = updateData[key].street || null;
+            updateDataToSend.service_address_city = updateData[key].city || null;
+            updateDataToSend.service_address_state = updateData[key].state || null;
+            updateDataToSend.service_address_zip = updateData[key].zipCode || null;
+          }
+        } else {
+          updateDataToSend[fieldMappings[key]] = updateData[key];
+        }
+      }
+    });
+
+    console.log('🔄 Final update data to send:', updateDataToSend);
+    
+    if (Object.keys(updateDataToSend).length === 0) {
+      console.log('🔄 No valid fields to update - all fields were filtered out');
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    // Handle team member assignments update
+    if (updateData.teamMemberId !== undefined || updateData.teamMemberIds !== undefined) {
+      try {
+        // Remove existing assignments
+        const { error: deleteError } = await supabase
+          .from('job_team_assignments')
+          .delete()
+          .eq('job_id', id);
+        
+        if (deleteError) {
+          console.error('Error removing existing team assignments:', deleteError);
+        }
+        
+        // Add new assignments
+        const teamMemberId = updateData.teamMemberId;
+        const teamMemberIds = updateData.teamMemberIds || [];
+        
+        // If we have a single team member ID, add it as primary
+        if (teamMemberId && teamMemberId !== '') {
+          const { error: insertError } = await supabase
+            .from('job_team_assignments')
+            .insert({
+              job_id: id,
+              team_member_id: teamMemberId,
+              is_primary: true,
+              assigned_by: userId
+            });
+          
+          if (insertError) {
+            console.error('Error creating primary team assignment:', insertError);
+          }
+        }
+        
+        // Add additional team members from the array
+        for (const memberId of teamMemberIds) {
+          if (memberId && memberId !== teamMemberId) {
+            const { error: insertError } = await supabase
+              .from('job_team_assignments')
+              .insert({
+                job_id: id,
+                team_member_id: memberId,
+                is_primary: false,
+                assigned_by: userId
+              });
+            
+            if (insertError) {
+              console.error('Error creating additional team assignment:', insertError);
+            }
+          }
+        }
+        
+        console.log('🔄 Updated team assignments for job:', id);
+      } catch (assignmentError) {
+        console.error('Error updating team assignments:', assignmentError);
+        // Don't fail the job update if team assignment fails
+      }
+    }
+
+    // Update the job
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update(updateDataToSend)
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (updateError) {
+      console.error('Error updating job:', updateError);
+      return res.status(500).json({ error: 'Failed to update job' });
+    }
+
+    // Get updated job
+    const { data: updatedJob, error: fetchError } = await supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        services!left(name, price, duration)
+      `)
+      .eq('id', id)
+      .limit(1);
+
+    if (fetchError) {
+      console.error('Error fetching updated job:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch updated job' });
+    }
+
+    console.log('🔄 Job updated successfully');
+    
+    res.json({
+      message: 'Job updated successfully',
+      job: updatedJob[0]
+    });
   } catch (error) {
     console.error('Update job error:', error);
     res.status(500).json({ error: 'Failed to update job' });
@@ -2129,28 +2189,38 @@ app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     console.log('🔄 Deleting job:', id);
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if job exists and belongs to user
-      const [existingJobs] = await connection.query(
-        'SELECT id FROM jobs WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
 
-      if (existingJobs.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
-      }
-
-      // Delete the job
-      await connection.query('DELETE FROM jobs WHERE id = ? AND user_id = ?', [id, userId]);
-
-      console.log('🔄 Job deleted successfully');
-      
-      res.json({ message: 'Job deleted successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking job existence:', checkError);
+      return res.status(500).json({ error: 'Failed to delete job' });
     }
+
+    if (!existingJob || existingJob.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Delete the job
+    const { error: deleteError } = await supabase
+      .from('jobs')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (deleteError) {
+      console.error('Error deleting job:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete job' });
+    }
+
+    console.log('🔄 Job deleted successfully');
+    
+    res.json({ message: 'Job deleted successfully' });
   } catch (error) {
     console.error('Delete job error:', error);
     res.status(500).json({ error: 'Failed to delete job' });
@@ -2167,99 +2237,57 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
     console.log('🔄 Backend: User ID:', userId);
     console.log('🔄 Backend: All query params:', req.query);
     
-    const connection = await pool.getConnection();
+    // Build Supabase query
+    let query = supabase
+      .from('customers')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT 
-          id,
-          user_id,
-          first_name,
-          last_name,
-          email,
-          phone,
-          address,
-          suite,
-          city,
-          state,
-          zip_code,
-          notes,
-          status,
-          created_at,
-          updated_at
-        FROM customers
-        WHERE user_id = ?
-      `;
-      let params = [userId];
-      
-      if (status && status !== 'all') {
-        query += ' AND status = ?';
-        params.push(status);
-      }
-      
-      if (search) {
-        query += ' AND (first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm, searchTerm, searchTerm);
-      }
-      
-      // Add sorting
-      const allowedSortFields = ['first_name', 'last_name', 'email', 'created_at', 'updated_at'];
-      const allowedSortOrders = ['ASC', 'DESC'];
-      
-      if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
-        query += ` ORDER BY ${sortBy} ${sortOrder.toUpperCase()}`;
-      } else {
-        query += ' ORDER BY created_at DESC';
-      }
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ' LIMIT ? OFFSET ?';
-      params.push(parseInt(limit), offset);
-      
-      console.log('🔄 Backend: Final SQL Query:', query);
-      console.log('🔄 Backend: Query Parameters:', params);
-      
-      const [customers] = await connection.query(query, params);
-      
-      console.log('🔄 Backend: Customers query executed');
-      console.log('🔄 Backend: Customers found:', customers.length);
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total
-        FROM customers
-        WHERE user_id = ?
-      `;
-      let countParams = [userId];
-      
-      if (status && status !== 'all') {
-        countQuery += ' AND status = ?';
-        countParams.push(status);
-      }
-      
-      if (search) {
-        countQuery += ' AND (first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ?)';
-        const searchTerm = `%${search}%`;
-        countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
-      
-      res.json({
-        customers,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      });
-    } finally {
-      connection.release();
+    // Add status filter
+    if (status && status !== 'all') {
+      query = query.eq('status', status);
     }
+    
+    // Add search filter
+    if (search) {
+      query = query.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+    }
+    
+    // Add sorting
+    const allowedSortFields = ['first_name', 'last_name', 'email', 'created_at', 'updated_at'];
+    const allowedSortOrders = ['ASC', 'DESC'];
+    
+    if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
+      query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+    } else {
+      query = query.order('created_at', { ascending: false });
+    }
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    console.log('🔄 Backend: Supabase query built');
+    
+    const { data: customers, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching customers:', error);
+      return res.status(500).json({ error: 'Failed to fetch customers' });
+    }
+    
+    console.log('🔄 Backend: Customers query executed');
+    console.log('🔄 Backend: Customers found:', customers ? customers.length : 0);
+    
+    res.json({
+      customers: customers || [],
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
+      }
+    });
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to get customers' });
@@ -2300,31 +2328,38 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
     const sanitizedState = state ? sanitizeInput(state) : null;
     const sanitizedZipCode = zipCode ? sanitizeInput(zipCode) : null;
     
-    const connection = await pool.getConnection();
+    // Note: Multiple customers can have the same email address
+    // No email uniqueness check needed
     
-    try {
-      // Note: Multiple customers can have the same email address
-      // No email uniqueness check needed
-      
-      // Create new customer
-      const [result] = await connection.query(
-        'INSERT INTO customers (user_id, first_name, last_name, email, phone, address, suite, notes, city, state, zip_code, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "active", NOW())',
-        [userId, sanitizedFirstName, sanitizedLastName, sanitizedEmail, sanitizedPhone, sanitizedAddress, sanitizedSuite, sanitizedNotes, sanitizedCity, sanitizedState, sanitizedZipCode]
-      );
-      
-      // Get the created customer
-      const [customers] = await connection.query(
-        'SELECT * FROM customers WHERE id = ?',
-        [result.insertId]
-      );
-      
-      res.status(201).json({
-        message: 'Customer created successfully',
-        customer: customers[0]
-      });
-    } finally {
-      connection.release();
+    // Create new customer
+    const { data: newCustomer, error } = await supabase
+      .from('customers')
+      .insert({
+        user_id: userId,
+        first_name: sanitizedFirstName,
+        last_name: sanitizedLastName,
+        email: sanitizedEmail,
+        phone: sanitizedPhone,
+        address: sanitizedAddress,
+        suite: sanitizedSuite,
+        notes: sanitizedNotes,
+        city: sanitizedCity,
+        state: sanitizedState,
+        zip_code: sanitizedZipCode,
+        status: 'active'
+      })
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Error creating customer:', error);
+      return res.status(500).json({ error: 'Failed to create customer' });
     }
+    
+    res.status(201).json({
+      message: 'Customer created successfully',
+      customer: newCustomer
+    });
   } catch (error) {
     console.error('Create customer error:', error);
     res.status(500).json({ error: 'Failed to create customer' });
@@ -2336,22 +2371,23 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     
-    const connection = await pool.getConnection();
+    const { data: customers, error } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      const [customers] = await connection.query(
-        'SELECT * FROM customers WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (customers.length === 0) {
-        return res.status(404).json({ error: 'Customer not found' });
-      }
-      
-      res.json(customers[0]);
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching customer:', error);
+      return res.status(500).json({ error: 'Failed to fetch customer' });
     }
+    
+    if (!customers || customers.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    res.json(customers[0]);
   } catch (error) {
     console.error('Get customer error:', error);
     res.status(500).json({ error: 'Failed to fetch customer' });
@@ -2393,42 +2429,53 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
     const sanitizedState = state ? sanitizeInput(state) : null;
     const sanitizedZipCode = zipCode ? sanitizeInput(zipCode) : null;
     
-    const connection = await pool.getConnection();
+    // Check if customer exists and belongs to user
+    const { data: existingCustomers, error: checkError } = await supabase
+      .from('customers')
+      .select('id, email')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Check if customer exists and belongs to user
-      const [existingCustomers] = await connection.query(
-        'SELECT id, email FROM customers WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (existingCustomers.length === 0) {
-        return res.status(404).json({ error: 'Customer not found' });
-      }
-      
-      const currentCustomer = existingCustomers[0];
-      
-      // Note: Multiple customers can have the same email address
-      // No email uniqueness check needed when updating
-      
-      await connection.query(
-        'UPDATE customers SET first_name = ?, last_name = ?, email = ?, phone = ?, address = ?, suite = ?, notes = ?, status = ?, city = ?, state = ?, zip_code = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
-        [sanitizedFirstName, sanitizedLastName, sanitizedEmail, sanitizedPhone, sanitizedAddress, sanitizedSuite, sanitizedNotes, status, sanitizedCity, sanitizedState, sanitizedZipCode, id, userId]
-      );
-      
-      // Get updated customer
-      const [customers] = await connection.query(
-        'SELECT * FROM customers WHERE id = ?',
-        [id]
-      );
-      
-      res.json({ 
-        message: 'Customer updated successfully',
-        customer: customers[0]
-      });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking customer:', checkError);
+      return res.status(500).json({ error: 'Failed to update customer' });
     }
+    
+    if (!existingCustomers || existingCustomers.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    // Update customer
+    const { data: updatedCustomer, error: updateError } = await supabase
+      .from('customers')
+      .update({
+        first_name: sanitizedFirstName,
+        last_name: sanitizedLastName,
+        email: sanitizedEmail,
+        phone: sanitizedPhone,
+        address: sanitizedAddress,
+        suite: sanitizedSuite,
+        notes: sanitizedNotes,
+        status: status,
+        city: sanitizedCity,
+        state: sanitizedState,
+        zip_code: sanitizedZipCode
+      })
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+    
+    if (updateError) {
+      console.error('Error updating customer:', updateError);
+      return res.status(500).json({ error: 'Failed to update customer' });
+    }
+    
+    res.json({ 
+      message: 'Customer updated successfully',
+      customer: updatedCustomer
+    });
   } catch (error) {
     console.error('Update customer error:', error);
     res.status(500).json({ error: 'Failed to update customer' });
@@ -2440,46 +2487,58 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { id } = req.params;
     
-    const connection = await pool.getConnection();
+    // Check if customer exists and belongs to user
+    const { data: existingCustomers, error: checkError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Check if customer exists and belongs to user
-      const [existingCustomers] = await connection.query(
-        'SELECT id FROM customers WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      if (existingCustomers.length === 0) {
-        return res.status(404).json({ error: 'Customer not found' });
-      }
-      
-      // Check if customer has associated jobs or estimates
-      const [jobs] = await connection.query(
-        'SELECT COUNT(*) as count FROM jobs WHERE customer_id = ?',
-        [id]
-      );
-      
-      const [estimates] = await connection.query(
-        'SELECT COUNT(*) as count FROM estimates WHERE customer_id = ?',
-        [id]
-      );
-      
-      if (jobs[0].count > 0 || estimates[0].count > 0) {
-        return res.status(400).json({ 
-          error: 'Cannot delete customer with associated jobs or estimates. Please delete the associated records first.' 
-        });
-      }
-      
-      // Soft delete by setting status to 'archived' instead of hard delete
-      await connection.query(
-        'UPDATE customers SET status = "archived", updated_at = NOW() WHERE id = ? AND user_id = ?',
-        [id, userId]
-      );
-      
-      res.json({ message: 'Customer deleted successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking customer:', checkError);
+      return res.status(500).json({ error: 'Failed to delete customer' });
     }
+    
+    if (!existingCustomers || existingCustomers.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    // Check if customer has associated jobs or estimates
+    const { data: jobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select('id', { count: 'exact' })
+      .eq('customer_id', id);
+    
+    const { data: estimates, error: estimatesError } = await supabase
+      .from('estimates')
+      .select('id', { count: 'exact' })
+      .eq('customer_id', id);
+    
+    if (jobsError || estimatesError) {
+      console.error('Error checking associated records:', jobsError || estimatesError);
+      return res.status(500).json({ error: 'Failed to delete customer' });
+    }
+    
+    if ((jobs && jobs.length > 0) || (estimates && estimates.length > 0)) {
+      return res.status(400).json({ 
+        error: 'Cannot delete customer with associated jobs or estimates. Please delete the associated records first.' 
+      });
+    }
+    
+    // Soft delete by setting status to 'archived' instead of hard delete
+    const { error: updateError } = await supabase
+      .from('customers')
+      .update({ status: 'archived' })
+      .eq('id', id)
+      .eq('user_id', userId);
+    
+    if (updateError) {
+      console.error('Error updating customer:', updateError);
+      return res.status(500).json({ error: 'Failed to delete customer' });
+    }
+    
+    res.json({ message: 'Customer deleted successfully' });
   } catch (error) {
     console.error('Delete customer error:', error);
     res.status(500).json({ error: 'Failed to delete customer' });
@@ -2500,72 +2559,75 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Cannot import more than 1000 customers at once' });
     }
     
-    const connection = await pool.getConnection();
+    const importedCustomers = [];
+    const errors = [];
     
-    try {
-      const importedCustomers = [];
-      const errors = [];
+    for (let i = 0; i < customers.length; i++) {
+      const customer = customers[i];
       
-      for (let i = 0; i < customers.length; i++) {
-        const customer = customers[i];
-        
-        try {
-          // Validate required fields
-          if (!customer.firstName || !customer.lastName) {
-            errors.push(`Row ${i + 1}: First name and last name are required`);
-            continue;
-          }
-          
-          // Validate email if provided
-          if (customer.email && !validateEmail(customer.email)) {
-            errors.push(`Row ${i + 1}: Invalid email format`);
-            continue;
-          }
-          
-          // Validate phone if provided
-          if (customer.phone && customer.phone.trim().length < 10) {
-            errors.push(`Row ${i + 1}: Invalid phone format (at least 10 digits)`);
-            continue;
-          }
-          
-          // Sanitize inputs
-          const sanitizedFirstName = sanitizeInput(customer.firstName);
-          const sanitizedLastName = sanitizeInput(customer.lastName);
-          const sanitizedEmail = customer.email ? customer.email.toLowerCase().trim() : null;
-          const sanitizedPhone = customer.phone ? customer.phone.trim() : null;
-          const sanitizedAddress = customer.address ? sanitizeInput(customer.address) : null;
-          const sanitizedNotes = customer.notes ? sanitizeInput(customer.notes) : null;
-          
-          // Note: Multiple customers can have the same email address
-          // No email uniqueness check needed during import
-          
-          // Insert customer
-          const [result] = await connection.query(
-            'INSERT INTO customers (user_id, first_name, last_name, email, phone, address, notes, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())',
-            [userId, sanitizedFirstName, sanitizedLastName, sanitizedEmail, sanitizedPhone, sanitizedAddress, sanitizedNotes, customer.status || 'active']
-          );
-          
-          // Get created customer
-          const [newCustomers] = await connection.query(
-            'SELECT * FROM customers WHERE id = ?',
-            [result.insertId]
-          );
-          
-          importedCustomers.push(newCustomers[0]);
-        } catch (error) {
-          errors.push(`Row ${i + 1}: ${error.message}`);
+      try {
+        // Validate required fields
+        if (!customer.firstName || !customer.lastName) {
+          errors.push(`Row ${i + 1}: First name and last name are required`);
+          continue;
         }
+        
+        // Validate email if provided
+        if (customer.email && !validateEmail(customer.email)) {
+          errors.push(`Row ${i + 1}: Invalid email format`);
+          continue;
+        }
+        
+        // Validate phone if provided
+        if (customer.phone && customer.phone.trim().length < 10) {
+          errors.push(`Row ${i + 1}: Invalid phone format (at least 10 digits)`);
+          continue;
+        }
+        
+        // Sanitize inputs
+        const sanitizedFirstName = sanitizeInput(customer.firstName);
+        const sanitizedLastName = sanitizeInput(customer.lastName);
+        const sanitizedEmail = customer.email ? customer.email.toLowerCase().trim() : null;
+        const sanitizedPhone = customer.phone ? customer.phone.trim() : null;
+        const sanitizedAddress = customer.address ? sanitizeInput(customer.address) : null;
+        const sanitizedNotes = customer.notes ? sanitizeInput(customer.notes) : null;
+        
+        // Note: Multiple customers can have the same email address
+        // No email uniqueness check needed during import
+        
+        // Insert customer
+        const { data: newCustomer, error: insertError } = await supabase
+          .from('customers')
+          .insert({
+            user_id: userId,
+            first_name: sanitizedFirstName,
+            last_name: sanitizedLastName,
+            email: sanitizedEmail,
+            phone: sanitizedPhone,
+            address: sanitizedAddress,
+            notes: sanitizedNotes,
+            status: customer.status || 'active'
+          })
+          .select()
+          .single();
+        
+        if (insertError) {
+          errors.push(`Row ${i + 1}: ${insertError.message}`);
+          continue;
+        }
+        
+        importedCustomers.push(newCustomer);
+      } catch (error) {
+        errors.push(`Row ${i + 1}: ${error.message}`);
       }
-      
-      res.json({
-        message: `Successfully imported ${importedCustomers.length} customers`,
-        imported: importedCustomers.length,
-        errors: errors.length > 0 ? errors : null,
-        customers: importedCustomers
-      });
-    } finally {
-      connection.release();
     }
+    
+    res.json({
+      message: `Successfully imported ${importedCustomers.length} customers`,
+      imported: importedCustomers.length,
+      errors: errors.length > 0 ? errors : null,
+      customers: importedCustomers
+    });
   } catch (error) {
     console.error('Import customers error:', error);
     res.status(500).json({ error: 'Failed to import customers' });
@@ -2577,20 +2639,23 @@ app.get('/api/customers/export', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { format = 'json' } = req.query;
     
-    const connection = await pool.getConnection();
+    const { data: customers, error } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
     
-    try {
-      const [customers] = await connection.query(
-        'SELECT * FROM customers WHERE user_id = ? ORDER BY created_at DESC',
-        [userId]
-      );
-      
-      if (format === 'csv') {
-        // Generate CSV
-        const csvHeader = 'First Name,Last Name,Email,Phone,Address,Notes,Status,Created At\n';
-        const csvRows = customers.map(customer => 
-          `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}"`
-        ).join('\n');
+    if (error) {
+      console.error('Error fetching customers for export:', error);
+      return res.status(500).json({ error: 'Failed to fetch customers for export' });
+    }
+    
+    if (format === 'csv') {
+      // Generate CSV
+      const csvHeader = 'First Name,Last Name,Email,Phone,Address,Notes,Status,Created At\n';
+      const csvRows = (customers || []).map(customer => 
+        `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}"`
+      ).join('\n');
         
         res.setHeader('Content-Type', 'text/csv');
         res.setHeader('Content-Disposition', 'attachment; filename="customers.csv"');
@@ -2603,9 +2668,6 @@ app.get('/api/customers/export', authenticateToken, async (req, res) => {
           exportedAt: new Date().toISOString()
         });
       }
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('Export customers error:', error);
     res.status(500).json({ error: 'Failed to export customers' });
@@ -2616,18 +2678,19 @@ app.get('/api/customers/export', authenticateToken, async (req, res) => {
 app.get('/api/team', async (req, res) => {
   try {
     const { userId } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE user_id = ? ORDER BY created_at DESC',
-        [userId]
-      );
-      
-      res.json(teamMembers);
-    } finally {
-      connection.release();
+    const { data: teamMembers, error } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching team members:', error);
+      return res.status(500).json({ error: 'Failed to fetch team members' });
     }
+    
+    res.json(teamMembers || []);
   } catch (error) {
     console.error('Get team members error:', error);
     res.status(500).json({ error: 'Failed to fetch team members' });
@@ -2637,21 +2700,29 @@ app.get('/api/team', async (req, res) => {
 app.post('/api/team', async (req, res) => {
   try {
     const { userId, firstName, lastName, email, phone, role } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      const [result] = await connection.query(
-        'INSERT INTO team_members (user_id, first_name, last_name, email, phone, role, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())',
-        [userId, firstName, lastName, email, phone, role]
-      );
-      
-      res.status(201).json({ 
-        message: 'Team member created successfully',
-        teamMemberId: result.insertId 
-      });
-    } finally {
-      connection.release();
+    const { data: teamMember, error } = await supabase
+      .from('team_members')
+      .insert({
+        user_id: userId,
+        first_name: firstName,
+        last_name: lastName,
+        email: email,
+        phone: phone,
+        role: role
+      })
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Error creating team member:', error);
+      return res.status(500).json({ error: 'Failed to create team member' });
     }
+    
+    res.status(201).json({ 
+      message: 'Team member created successfully',
+      teamMemberId: teamMember.id 
+    });
   } catch (error) {
     console.error('Create team member error:', error);
     res.status(500).json({ error: 'Failed to create team member' });
@@ -2669,90 +2740,61 @@ app.get('/api/estimates', async (req, res) => {
     
     console.log('Fetching estimates for user:', userId, 'with filters:', { status, customerId, page, limit, sortBy, sortOrder });
     
-    const connection = await pool.getConnection();
+    // Build Supabase query
+    let query = supabase
+      .from('estimates')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone)
+      `, { count: 'exact' })
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT 
-          e.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone
-        FROM estimates e
-        LEFT JOIN customers c ON e.customer_id = c.id
-        WHERE e.user_id = ?
-      `;
-      let params = [userId];
-      
-      if (status) {
-        query += ' AND e.status = ?';
-        params.push(status);
-      }
-      
-      if (customerId) {
-        query += ' AND e.customer_id = ?';
-        params.push(customerId);
-      }
-      
-      // Handle sorting
-      const allowedSortFields = ['created_at', 'total_amount', 'status', 'valid_until'];
-      const allowedSortOrders = ['ASC', 'DESC'];
-      
-      if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
-        query += ` ORDER BY e.${sortBy} ${sortOrder.toUpperCase()}`;
-      } else {
-        query += ' ORDER BY e.created_at DESC';
-      }
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ' LIMIT ? OFFSET ?';
-      params.push(parseInt(limit), offset);
-      
-      console.log('Executing query:', query);
-      console.log('With params:', params);
-      
-      const [estimates] = await connection.query(query, params);
-      
-      console.log('Found estimates:', estimates.length);
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total 
-        FROM estimates e
-        WHERE e.user_id = ?
-      `;
-      let countParams = [userId];
-      
-      if (status) {
-        countQuery += ' AND e.status = ?';
-        countParams.push(status);
-      }
-      
-      if (customerId) {
-        countQuery += ' AND e.customer_id = ?';
-        countParams.push(customerId);
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
-      
-      const response = {
-        estimates,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      };
-      
-      console.log('Sending response with', estimates.length, 'estimates');
-      res.json(response);
-    } finally {
-      connection.release();
+    // Add filters
+    if (status) {
+      query = query.eq('status', status);
     }
+    
+    if (customerId) {
+      query = query.eq('customer_id', customerId);
+    }
+    
+    // Handle sorting
+    const allowedSortFields = ['created_at', 'total_amount', 'status', 'valid_until'];
+    const allowedSortOrders = ['ASC', 'DESC'];
+    
+    if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
+      query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+    } else {
+      query = query.order('created_at', { ascending: false });
+    }
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    console.log('Executing Supabase query for estimates');
+    
+    const { data: estimates, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching estimates:', error);
+      return res.status(500).json({ error: 'Failed to fetch estimates' });
+    }
+    
+    console.log('Found estimates:', estimates ? estimates.length : 0);
+    
+    const response = {
+      estimates: estimates || [],
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
+      }
+    };
+    
+    console.log('Sending response with', estimates ? estimates.length : 0, 'estimates');
+    res.json(response);
   } catch (error) {
     console.error('Get estimates error:', error);
     res.status(500).json({ 
@@ -2766,55 +2808,57 @@ app.get('/api/estimates', async (req, res) => {
 app.get('/api/estimates/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    const { data: estimates, error } = await supabase
+      .from('estimates')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, address)
+      `)
+      .eq('id', id)
+      .limit(1);
     
-    try {
-      const [estimates] = await connection.query(`
-        SELECT 
-          e.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          c.address as customer_address
-        FROM estimates e
-        LEFT JOIN customers c ON e.customer_id = c.id
-        WHERE e.id = ?
-      `, [id]);
-      
-      if (estimates.length === 0) {
-        return res.status(404).json({ error: 'Estimate not found' });
-      }
-      
-      const estimate = estimates[0];
-      
-      // Parse services JSON and get service details
-      if (estimate.services) {
+    if (error) {
+      console.error('Error fetching estimate:', error);
+      return res.status(500).json({ error: 'Failed to fetch estimate' });
+    }
+    
+    if (!estimates || estimates.length === 0) {
+      return res.status(404).json({ error: 'Estimate not found' });
+    }
+    
+    const estimate = estimates[0];
+    
+    // Parse services JSON and get service details
+    if (estimate.services) {
+      try {
         const servicesData = JSON.parse(estimate.services);
         const serviceIds = servicesData.map(service => service.serviceId);
         
         if (serviceIds.length > 0) {
-          const [services] = await connection.query(`
-            SELECT id, name, description, price, duration
-            FROM services 
-            WHERE id IN (${serviceIds.map(() => '?').join(',')})
-          `, serviceIds);
+          const { data: services, error: servicesError } = await supabase
+            .from('services')
+            .select('id, name, description, price, duration')
+            .in('id', serviceIds);
           
-          // Map service details to the estimate services
-          estimate.services = servicesData.map(service => {
-            const serviceDetails = services.find(s => s.id === service.serviceId);
-            return {
-              ...service,
-              serviceDetails
-            };
-          });
+          if (servicesError) {
+            console.error('Error fetching services:', servicesError);
+          } else {
+            // Map service details to the estimate services
+            estimate.services = servicesData.map(service => {
+              const serviceDetails = services.find(s => s.id === service.serviceId);
+              return {
+                ...service,
+                serviceDetails
+              };
+            });
+          }
         }
+      } catch (parseError) {
+        console.error('Error parsing services JSON:', parseError);
       }
-      
-      res.json(estimate);
-    } finally {
-      connection.release();
     }
+    
+    res.json(estimate);
   } catch (error) {
     console.error('Get estimate error:', error);
     res.status(500).json({ error: 'Failed to fetch estimate' });
@@ -2841,68 +2885,80 @@ app.post('/api/estimates', async (req, res) => {
       return res.status(400).json({ error: 'Services must be a non-empty array' });
     }
     
-    const connection = await pool.getConnection();
+    // Validate customer exists
+    const { data: customer, error: customerError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', customerId)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Validate customer exists
-      const [customers] = await connection.query(
-        'SELECT id FROM customers WHERE id = ? AND user_id = ?',
-        [customerId, userId]
-      );
-      
-      if (customers.length === 0) {
-        return res.status(400).json({ error: 'Customer not found' });
-      }
-      
-      // Validate services exist
-      const serviceIds = services.map(service => service.serviceId);
-      const [existingServices] = await connection.query(
-        `SELECT id FROM services WHERE id IN (${serviceIds.map(() => '?').join(',')}) AND user_id = ?`,
-        [...serviceIds, userId]
-      );
-      
-      if (existingServices.length !== serviceIds.length) {
-        return res.status(400).json({ error: 'One or more services not found' });
-      }
-      
-      // Calculate valid until date (default to 30 days from now)
-      const validUntilDate = validUntil || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-      
-      const [result] = await connection.query(
-        `INSERT INTO estimates (
-          user_id, customer_id, services, total_amount, 
-          valid_until, notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [
-          userId, 
-          customerId, 
-          JSON.stringify(services), 
-          totalAmount,
-          validUntilDate,
-          notes || null
-        ]
-      );
+    if (customerError) {
+      console.error('Error checking customer:', customerError);
+      return res.status(500).json({ error: 'Failed to validate customer' });
+    }
+    
+    if (!customer || customer.length === 0) {
+      return res.status(400).json({ error: 'Customer not found' });
+    }
+    
+    // Validate services exist
+    const serviceIds = services.map(service => service.serviceId);
+    const { data: existingServices, error: servicesError } = await supabase
+      .from('services')
+      .select('id')
+      .in('id', serviceIds)
+      .eq('user_id', userId);
+    
+    if (servicesError) {
+      console.error('Error checking services:', servicesError);
+      return res.status(500).json({ error: 'Failed to validate services' });
+    }
+    
+    if (!existingServices || existingServices.length !== serviceIds.length) {
+      return res.status(400).json({ error: 'One or more services not found' });
+    }
+    
+    // Calculate valid until date (default to 30 days from now)
+    const validUntilDate = validUntil || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    const { data: result, error: insertError } = await supabase
+      .from('estimates')
+      .insert({
+        user_id: userId,
+        customer_id: customerId,
+        services: services,
+        total_amount: totalAmount,
+        valid_until: validUntilDate,
+        notes: notes || null
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating estimate:', insertError);
+      return res.status(500).json({ error: 'Failed to create estimate' });
+    }
       
       // Get the created estimate with customer details
-      const [estimates] = await connection.query(`
-        SELECT 
-          e.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone
-        FROM estimates e
-        LEFT JOIN customers c ON e.customer_id = c.id
-        WHERE e.id = ?
-      `, [result.insertId]);
+      const { data: createdEstimate, error: fetchError } = await supabase
+        .from('estimates')
+        .select(`
+          *,
+          customers!left(first_name, last_name, email, phone)
+        `)
+        .eq('id', result.id)
+        .limit(1);
+      
+      if (fetchError) {
+        console.error('Error fetching created estimate:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch created estimate' });
+      }
       
       res.status(201).json({
         message: 'Estimate created successfully',
-        estimate: estimates[0]
+        estimate: createdEstimate[0]
       });
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('Create estimate error:', error);
     res.status(500).json({ error: 'Failed to create estimate' });
@@ -2921,53 +2977,44 @@ app.put('/api/estimates/:id', async (req, res) => {
       notes 
     } = req.body;
     
-    const connection = await pool.getConnection();
+    // Build update data object
+    const updateData = {};
     
-    try {
-      const updateFields = [];
-      const updateValues = [];
-      
-      if (customerId) {
-        updateFields.push('customer_id = ?');
-        updateValues.push(customerId);
-      }
-      
-      if (services) {
-        updateFields.push('services = ?');
-        updateValues.push(JSON.stringify(services));
-      }
-      
-      if (totalAmount !== undefined) {
-        updateFields.push('total_amount = ?');
-        updateValues.push(totalAmount);
-      }
-      
-      if (status) {
-        updateFields.push('status = ?');
-        updateValues.push(status);
-      }
-      
-      if (validUntil !== undefined) {
-        updateFields.push('valid_until = ?');
-        updateValues.push(validUntil);
-      }
-      
-      if (notes !== undefined) {
-        updateFields.push('notes = ?');
-        updateValues.push(notes);
-      }
-      
-      updateFields.push('updated_at = NOW()');
-      updateValues.push(id);
-      
-      const query = `UPDATE estimates SET ${updateFields.join(', ')} WHERE id = ?`;
-      
-      await connection.query(query, updateValues);
-      
-      res.json({ message: 'Estimate updated successfully' });
-    } finally {
-      connection.release();
+    if (customerId) {
+      updateData.customer_id = customerId;
     }
+    
+    if (services) {
+      updateData.services = services;
+    }
+    
+    if (totalAmount !== undefined) {
+      updateData.total_amount = totalAmount;
+    }
+    
+    if (status) {
+      updateData.status = status;
+    }
+    
+    if (validUntil !== undefined) {
+      updateData.valid_until = validUntil;
+    }
+    
+    if (notes !== undefined) {
+      updateData.notes = notes;
+    }
+    
+    const { error: updateError } = await supabase
+      .from('estimates')
+      .update(updateData)
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('Error updating estimate:', updateError);
+      return res.status(500).json({ error: 'Failed to update estimate' });
+    }
+    
+    res.json({ message: 'Estimate updated successfully' });
   } catch (error) {
     console.error('Update estimate error:', error);
     res.status(500).json({ error: 'Failed to update estimate' });
@@ -2977,27 +3024,34 @@ app.put('/api/estimates/:id', async (req, res) => {
 app.delete('/api/estimates/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    // Check if estimate has been converted to invoice
+    const { data: invoices, error: checkError } = await supabase
+      .from('invoices')
+      .select('id', { count: 'exact' })
+      .eq('estimate_id', id);
     
-    try {
-      // Check if estimate has been converted to invoice
-      const [invoices] = await connection.query(
-        'SELECT COUNT(*) as count FROM invoices WHERE estimate_id = ?',
-        [id]
-      );
-      
-      if (invoices[0].count > 0) {
-        return res.status(400).json({ 
-          error: 'Cannot delete estimate that has been converted to invoice' 
-        });
-      }
-      
-      await connection.query('DELETE FROM estimates WHERE id = ?', [id]);
-      
-      res.json({ message: 'Estimate deleted successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking invoices:', checkError);
+      return res.status(500).json({ error: 'Failed to delete estimate' });
     }
+    
+    if (invoices && invoices.length > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete estimate that has been converted to invoice' 
+      });
+    }
+    
+    const { error: deleteError } = await supabase
+      .from('estimates')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      console.error('Error deleting estimate:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete estimate' });
+    }
+    
+    res.json({ message: 'Estimate deleted successfully' });
   } catch (error) {
     console.error('Delete estimate error:', error);
     res.status(500).json({ error: 'Failed to delete estimate' });
@@ -3008,217 +3062,166 @@ app.delete('/api/estimates/:id', async (req, res) => {
 app.post('/api/estimates/:id/send', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get estimate details with customer and user information
-      const [estimates] = await connection.query(`
-        SELECT 
-          e.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          u.first_name as user_first_name,
-          u.last_name as user_last_name,
-          u.business_name
-        FROM estimates e
-        LEFT JOIN customers c ON e.customer_id = c.id
-        LEFT JOIN users u ON e.user_id = u.id
-        WHERE e.id = ?
-      `, [id]);
-      
-      if (estimates.length === 0) {
-        return res.status(404).json({ error: 'Estimate not found' });
-      }
-      
-      const estimate = estimates[0];
-      
-      // Update estimate status to 'sent'
-      await connection.query(
-        'UPDATE estimates SET status = "sent", updated_at = NOW() WHERE id = ?',
-        [id]
-      );
-      
-      let emailSent = false;
-      let emailError = null;
-      
-              // Send email to customer if email is available and email is configured
-        if (estimate.customer_email && process.env.EMAIL_USER && process.env.EMAIL_PASSWORD) {
-        try {
-          const services = JSON.parse(estimate.services || '[]');
-          const servicesList = services.map(service => 
-            `• ${service.name} - $${service.price} x ${service.quantity}`
-          ).join('\n');
-          
-          const emailHtml = `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <div style="background-color: #f8f9fa; padding: 20px; text-align: center;">
-                <h1 style="color: #333; margin: 0;">Your Estimate is Ready!</h1>
-              </div>
-              
-              <div style="padding: 20px;">
-                <p style="color: #333; font-size: 16px;">Hi ${estimate.customer_first_name},</p>
-                
-                <p style="color: #666; line-height: 1.6;">
-                  Great news! We've prepared your estimate and it's ready for your review.
-                </p>
-                
-                <div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                  <h3 style="color: #333; margin-top: 0;">Estimate Details:</h3>
-                  <p style="color: #666; margin: 5px 0;"><strong>Estimate ID:</strong> #${estimate.id}</p>
-                  <p style="color: #666; margin: 5px 0;"><strong>Date:</strong> ${new Date(estimate.created_at).toLocaleDateString()}</p>
-                  <p style="color: #666; margin: 5px 0;"><strong>Valid Until:</strong> ${new Date(estimate.valid_until).toLocaleDateString()}</p>
-                </div>
-                
-                <div style="background-color: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                  <h3 style="color: #333; margin-top: 0;">Services:</h3>
-                  <div style="color: #666; line-height: 1.6;">
-                    ${servicesList}
-                  </div>
-                  <hr style="border: none; border-top: 1px solid #ddd; margin: 15px 0;">
-                  <p style="color: #333; font-size: 18px; font-weight: bold; margin: 0;">
-                    <strong>Total Amount: $${estimate.total_amount}</strong>
-                  </p>
-                </div>
-                
-                ${estimate.notes ? `
-                <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                  <h3 style="color: #856404; margin-top: 0;">Notes:</h3>
-                  <p style="color: #856404; margin: 0;">${estimate.notes}</p>
-                </div>
-                ` : ''}
-                
-                <p style="color: #666; line-height: 1.6;">
-                  This estimate is valid for 30 days. If you have any questions or need modifications, 
-                  please don't hesitate to contact us.
-                </p>
-                
-                <p style="color: #666; line-height: 1.6;">
-                  Thank you for considering ${estimate.business_name || 'our services'}!
-                </p>
-                
-                <p style="color: #666; line-height: 1.6;">
-                  Best regards,<br>
-                  ${estimate.user_first_name} ${estimate.user_last_name}<br>
-                  ${estimate.business_name || 'ZenBooker'}
-                </p>
-              </div>
-            </div>
-          `;
-          
-          await sendEmail({
-            to: estimate.customer_email,
-            subject: `Your Estimate #${estimate.id} is Ready - ${estimate.business_name || 'ZenBooker'}`,
-            html: emailHtml,
-            text: `
-              Your Estimate is Ready!
-              
-              Hi ${estimate.customer_first_name},
-              
-              Great news! We've prepared your estimate and it's ready for your review.
-              
-              Estimate Details:
-              - Estimate ID: #${estimate.id}
-              - Date: ${new Date(estimate.created_at).toLocaleDateString()}
-              - Valid Until: ${new Date(estimate.valid_until).toLocaleDateString()}
-              
-              Services:
-              ${servicesList}
-              
-              Total Amount: $${estimate.total_amount}
-              
-              ${estimate.notes ? `Notes: ${estimate.notes}` : ''}
-              
-              This estimate is valid for 30 days. If you have any questions or need modifications, 
-              please don't hesitate to contact us.
-              
-              Thank you for considering ${estimate.business_name || 'our services'}!
-              
-              Best regards,
-              ${estimate.user_first_name} ${estimate.user_last_name}
-              ${estimate.business_name || 'ZenBooker'}
-            `
-          });
-          
-          emailSent = true;
-          console.log(`✅ Estimate email sent to ${estimate.customer_email}`);
-        } catch (emailError) {
-          console.error('Email sending failed:', emailError);
-          emailError = emailError.message;
-        }
-      } else if (estimate.customer_email) {
-        console.log('⚠️ Email not configured - estimate status updated but no email sent');
-      } else {
-        console.log('⚠️ No customer email available - estimate status updated but no email sent');
-      }
-      
-      res.json({ 
-        message: 'Estimate sent successfully',
-        emailSent,
-        customerEmail: estimate.customer_email,
-        emailError: emailError
-      });
-    } finally {
-      connection.release();
+
+    // Fetch estimate with related customer & user
+    const { data: estimates, error: fetchError } = await supabase
+      .from('estimates')
+      .select(`
+        *,
+        customers:customer_id (first_name, last_name, email, phone),
+        users:user_id (first_name, last_name, business_name)
+      `)
+      .eq('id', id)
+      .limit(1);
+
+    if (fetchError) {
+      console.error('Error fetching estimate:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch estimate' });
     }
+
+    if (!estimates || estimates.length === 0) {
+      return res.status(404).json({ error: 'Estimate not found' });
+    }
+
+    const estimate = estimates[0];
+
+    // Update estimate status to 'sent'
+    const { error: updateError } = await supabase
+      .from('estimates')
+      .update({ status: 'sent' })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('Error updating estimate status:', updateError);
+      return res.status(500).json({ error: 'Failed to update estimate status' });
+    }
+
+    let emailSent = false;
+    let emailErrorMsg = null;
+
+    if (estimate.customers?.email && process.env.EMAIL_USER && process.env.EMAIL_PASSWORD) {
+      try {
+        // Parse services safely
+        let services = [];
+        try {
+          services = JSON.parse(estimate.services || '[]');
+        } catch (e) {
+          console.warn('Invalid services JSON, skipping parse');
+        }
+
+        const servicesList = services.map(service =>
+          `• ${service.name} - $${service.price} x ${service.quantity}`
+        ).join('\n');
+
+        const emailHtml = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h1>Your Estimate is Ready!</h1>
+            <p>Hi ${estimate.customers.first_name},</p>
+            <p>Estimate ID: #${estimate.id}</p>
+            <p>Total: $${estimate.total_amount}</p>
+            <p>Services:</p>
+            <pre>${servicesList}</pre>
+          </div>
+        `;
+
+        await sendEmail({
+          to: estimate.customers.email,
+          subject: `Your Estimate #${estimate.id} is Ready - ${estimate.users?.business_name || 'ZenBooker'}`,
+          html: emailHtml,
+          text: `
+            Hi ${estimate.customers.first_name},
+            Your estimate #${estimate.id} is ready.
+            Total: $${estimate.total_amount}
+          `
+        });
+
+        emailSent = true;
+        console.log(`✅ Estimate email sent to ${estimate.customers.email}`);
+      } catch (err) {
+        console.error('Email sending failed:', err);
+        emailErrorMsg = err.message;
+      }
+    } else if (estimate.customers?.email) {
+      console.log('⚠️ Email not configured - estimate status updated but no email sent');
+    } else {
+      console.log('⚠️ No customer email available - estimate status updated but no email sent');
+    }
+
+    res.json({
+      message: 'Estimate sent successfully',
+      emailSent,
+      customerEmail: estimate.customers?.email || null,
+      emailError: emailErrorMsg
+    });
+
   } catch (error) {
     console.error('Send estimate error:', error);
     res.status(500).json({ error: 'Failed to send estimate' });
   }
 });
 
+
 // Convert estimate to invoice
 app.post('/api/estimates/:id/convert-to-invoice', async (req, res) => {
   try {
     const { id } = req.params;
     const { dueDate } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      // Get estimate details
-      const [estimates] = await connection.query(`
-        SELECT * FROM estimates WHERE id = ?
-      `, [id]);
-      
-      if (estimates.length === 0) {
-        return res.status(404).json({ error: 'Estimate not found' });
-      }
-      
-      const estimate = estimates[0];
-      
-      // Calculate due date (default to 15 days from now)
-      const calculatedDueDate = dueDate || new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-      
-      // Create invoice
-      const [result] = await connection.query(
-        `INSERT INTO invoices (
-          user_id, customer_id, estimate_id, amount, 
-          total_amount, due_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-        [
-          estimate.user_id,
-          estimate.customer_id,
-          estimate.id,
-          estimate.total_amount,
-          estimate.total_amount, // No tax for now
-          calculatedDueDate
-        ]
-      );
-      
-      // Update estimate status to 'accepted'
-      await connection.query(
-        'UPDATE estimates SET status = "accepted", updated_at = NOW() WHERE id = ?',
-        [id]
-      );
-      
-      res.status(201).json({
-        message: 'Estimate converted to invoice successfully',
-        invoiceId: result.insertId
-      });
-    } finally {
-      connection.release();
+    // Get estimate details
+    const { data: estimates, error: fetchError } = await supabase
+      .from('estimates')
+      .select('*')
+      .eq('id', id)
+      .limit(1);
+    
+    if (fetchError) {
+      console.error('Error fetching estimate:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch estimate' });
     }
+    
+    if (!estimates || estimates.length === 0) {
+      return res.status(404).json({ error: 'Estimate not found' });
+    }
+    
+    const estimate = estimates[0];
+    
+    // Calculate due date (default to 15 days from now)
+    const calculatedDueDate = dueDate || new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    // Create invoice
+    const { data: invoice, error: insertError } = await supabase
+      .from('invoices')
+      .insert({
+        user_id: estimate.user_id,
+        customer_id: estimate.customer_id,
+        estimate_id: estimate.id,
+        amount: estimate.total_amount,
+        total_amount: estimate.total_amount, // No tax for now
+        due_date: calculatedDueDate
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating invoice:', insertError);
+      return res.status(500).json({ error: 'Failed to create invoice' });
+    }
+    
+    // Update estimate status to 'accepted'
+    const { error: updateError } = await supabase
+      .from('estimates')
+      .update({ status: 'accepted' })
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('Error updating estimate status:', updateError);
+      return res.status(500).json({ error: 'Failed to update estimate status' });
+    }
+    
+    res.status(201).json({
+      message: 'Estimate converted to invoice successfully',
+      invoiceId: invoice.id
+    });
   } catch (error) {
     console.error('Convert estimate to invoice error:', error);
     res.status(500).json({ error: 'Failed to convert estimate to invoice' });
@@ -3229,20 +3232,19 @@ app.post('/api/estimates/:id/convert-to-invoice', async (req, res) => {
 app.get('/api/public/services', async (req, res) => {
   try {
     const { userId = 1 } = req.query; // Default to user ID 1 for public booking
-    const connection = await pool.getConnection();
     
-    try {
-      const [services] = await connection.query(`
-        SELECT id, name, description, price, duration, category
-        FROM services 
-        WHERE user_id = ?
-        ORDER BY name
-      `, [userId]);
-      
-      res.json(services);
-    } finally {
-      connection.release();
+    const { data: services, error } = await supabase
+      .from('services')
+      .select('id, name, description, price, duration, category')
+      .eq('user_id', userId)
+      .order('name');
+    
+    if (error) {
+      console.error('Error fetching public services:', error);
+      return res.status(500).json({ error: 'Failed to fetch services' });
     }
+    
+    res.json(services || []);
   } catch (error) {
     console.error('Get public services error:', error);
     res.status(500).json({ error: 'Failed to fetch services' });
@@ -3252,53 +3254,69 @@ app.get('/api/public/services', async (req, res) => {
 app.get('/api/public/availability', async (req, res) => {
   try {
     const { userId = 1, date } = req.query;
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get business hours and availability settings
-      const [availabilitySettings] = await connection.query(`
-        SELECT business_hours, timeslot_templates
-        FROM user_availability 
-        WHERE user_id = ?
-      `, [userId]);
-      
-      // Get existing bookings for the date
-      const [existingBookings] = await connection.query(`
-        SELECT scheduled_date
-        FROM jobs 
-        WHERE user_id = ? AND DATE(scheduled_date) = ?
-      `, [userId, date]);
-      
-      // Generate available time slots (9 AM to 5 PM, 30-minute intervals)
-      const availableSlots = [];
-      const startHour = 9;
-      const endHour = 17;
-      
-      for (let hour = startHour; hour < endHour; hour++) {
-        for (let minute = 0; minute < 60; minute += 30) {
-          const time = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-          const slotDateTime = `${date} ${time}:00`;
-          
-          // Check if slot is available (not booked)
-          const isBooked = existingBookings.some(booking => 
-            booking.scheduled_date === slotDateTime
-          );
-          
-          if (!isBooked) {
-            availableSlots.push(time);
-          }
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
+    }
+
+    // Get availability settings
+    const { data: availabilitySettings, error: availabilityError } = await supabase
+      .from('user_availability')
+      .select('business_hours, timeslot_templates')
+      .eq('user_id', userId)
+      .maybeSingle(); // fetch one row
+
+    if (availabilityError) {
+      console.error('Error fetching availability settings:', availabilityError);
+      return res.status(500).json({ error: 'Failed to fetch availability settings' });
+    }
+
+    // Get existing bookings
+    const { data: existingBookings, error: bookingsError } = await supabase
+      .from('jobs')
+      .select('scheduled_date')
+      .eq('user_id', userId)
+      .gte('scheduled_date', `${date} 00:00:00`)
+      .lte('scheduled_date', `${date} 23:59:59`);
+
+    if (bookingsError) {
+      console.error('Error fetching existing bookings:', bookingsError);
+      return res.status(500).json({ error: 'Failed to fetch existing bookings' });
+    }
+
+    // Normalize booked times to "HH:MM"
+    const bookedSlots = (existingBookings || []).map(booking => {
+      const dt = new Date(booking.scheduled_date);
+      return dt.toISOString().substring(11, 16); // "HH:MM"
+    });
+
+    // Generate available slots (9 AM - 5 PM, 30 mins)
+    const availableSlots = [];
+    const startHour = 9;
+    const endHour = 17;
+
+    for (let hour = startHour; hour < endHour; hour++) {
+      for (let minute = 0; minute < 60; minute += 30) {
+        const time = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+        if (!bookedSlots.includes(time)) {
+          availableSlots.push(time);
         }
       }
-      
-      res.json({ availableSlots });
-    } finally {
-      connection.release();
     }
+
+    res.json({
+      date,
+      userId,
+      availableSlots,
+      settings: availabilitySettings || {}
+    });
+
   } catch (error) {
     console.error('Get availability error:', error);
     res.status(500).json({ error: 'Failed to fetch availability' });
   }
 });
+
 
 app.post('/api/public/bookings', async (req, res) => {
   try {
@@ -3445,23 +3463,23 @@ app.post('/api/public/bookings', async (req, res) => {
 app.get('/api/public/business-info', async (req, res) => {
   try {
     const { userId = 1 } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      const [users] = await connection.query(`
-        SELECT business_name, email, phone
-        FROM users 
-        WHERE id = ?
-      `, [userId]);
-      
-      if (users.length === 0) {
-        return res.status(404).json({ error: 'Business not found' });
-      }
-      
-      res.json(users[0]);
-    } finally {
-      connection.release();
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('business_name, email, phone')
+      .eq('id', userId)
+      .limit(1);
+    
+    if (error) {
+      console.error('Error fetching business info:', error);
+      return res.status(500).json({ error: 'Failed to fetch business information' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+    
+    res.json(users[0]);
   } catch (error) {
     console.error('Get business info error:', error);
     res.status(500).json({ error: 'Failed to fetch business information' });
@@ -3472,85 +3490,75 @@ app.get('/api/public/business-info', async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
-    
-    try {
-      // First try with the new columns
-      try {
-        const [users] = await connection.query(
-          'SELECT id, email, first_name, last_name, business_name, phone, email_notifications, sms_notifications, profile_picture FROM users WHERE id = ?',
-          [userId]
-        );
-        
-        if (users.length === 0) {
-          return res.status(404).json({ error: 'User not found' });
-        }
-        
-        const user = users[0];
-        res.json({
-          id: user.id,
-          email: user.email,
-          firstName: user.first_name,
-          lastName: user.last_name,
-          businessName: user.business_name,
-          phone: user.phone || '',
-          emailNotifications: user.email_notifications === 1,
-          smsNotifications: user.sms_notifications === 1,
-          profilePicture: user.profile_picture
-        });
-      } catch (columnError) {
-        // If new columns don't exist, fall back to basic columns
-        if (columnError.code === 'ER_BAD_FIELD_ERROR') {
-          const [users] = await connection.query(
-            'SELECT id, email, first_name, last_name, business_name FROM users WHERE id = ?',
-            [userId]
-          );
-          
-          if (users.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
-          }
-          
-          const user = users[0];
-          res.json({
-            id: user.id,
-            email: user.email,
-            firstName: user.first_name,
-            lastName: user.last_name,
-            businessName: user.business_name,
-            phone: '',
-            emailNotifications: true,
-            smsNotifications: false,
-            profilePicture: null
-          });
-        } else {
-          throw columnError;
-        }
-      }
-    } finally {
-      connection.release();
+
+    // Query Supabase directly
+    const { data: user, error } = await supabase
+      .from('users')
+      .select(`
+        id,
+        email,
+        first_name,
+        last_name,
+        business_name,
+        phone,
+        email_notifications,
+        sms_notifications,
+        profile_picture
+      `)
+      .eq('id', userId)
+      .maybeSingle(); // fetch a single row instead of array
+
+    if (error) {
+      console.error('Error fetching user profile:', error);
+      return res.status(500).json({ error: 'Failed to fetch user profile' });
     }
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Return normalized JSON
+    res.json({
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      businessName: user.business_name,
+      phone: user.phone || '',
+      emailNotifications: !!user.email_notifications,
+      smsNotifications: !!user.sms_notifications,
+      profilePicture: user.profile_picture
+    });
+
   } catch (error) {
     console.error('Get user profile error:', error);
     res.status(500).json({ error: 'Failed to fetch user profile' });
   }
 });
 
+
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { firstName, lastName, phone, emailNotifications, smsNotifications } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      await connection.query(
-        'UPDATE users SET first_name = ?, last_name = ?, phone = ?, email_notifications = ?, sms_notifications = ?, updated_at = NOW() WHERE id = ?',
-        [firstName, lastName, phone, emailNotifications ? 1 : 0, smsNotifications ? 1 : 0, userId]
-      );
-      
-      res.json({ message: 'Profile updated successfully' });
-    } finally {
-      connection.release();
+    const { error } = await supabase
+      .from('users')
+      .update({
+        first_name: firstName,
+        last_name: lastName,
+        phone: phone,
+        email_notifications: emailNotifications,
+        sms_notifications: smsNotifications
+      })
+      .eq('id', userId);
+    
+    if (error) {
+      console.error('Error updating user profile:', error);
+      return res.status(500).json({ error: 'Failed to update profile' });
     }
+    
+    res.json({ message: 'Profile updated successfully' });
   } catch (error) {
     console.error('Update user profile error:', error);
     res.status(500).json({ error: 'Failed to update profile' });
@@ -3567,40 +3575,45 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters long' });
     }
     
-    const connection = await pool.getConnection();
+    // First verify current password
+    const { data: users, error: fetchError } = await supabase
+      .from('users')
+      .select('password')
+      .eq('id', userId)
+      .limit(1);
     
-    try {
-      // First verify current password
-      const [users] = await connection.query(
-        'SELECT password FROM users WHERE id = ?',
-        [userId]
-      );
-      
-      if (users.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      
-      // Verify current password using bcrypt
-      const isCurrentPasswordValid = await bcrypt.compare(currentPassword, users[0].password);
-      
-      if (!isCurrentPasswordValid) {
-        return res.status(400).json({ error: 'Current password is incorrect' });
-      }
-      
-      // Hash new password
-      const saltRounds = 12;
-      const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
-      
-      // Update password
-      await connection.query(
-        'UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?',
-        [hashedNewPassword, userId]
-      );
-      
-      res.json({ message: 'Password updated successfully' });
-    } finally {
-      connection.release();
+    if (fetchError) {
+      console.error('Error fetching user password:', fetchError);
+      return res.status(500).json({ error: 'Failed to verify current password' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Verify current password using bcrypt
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, users[0].password);
+    
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+    
+    // Hash new password
+    const saltRounds = 12;
+    const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
+    
+    // Update password
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ password: hashedNewPassword })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating password:', updateError);
+      return res.status(500).json({ error: 'Failed to update password' });
+    }
+    
+    res.json({ message: 'Password updated successfully' });
   } catch (error) {
     console.error('Update password error:', error);
     res.status(500).json({ error: 'Failed to update password' });
@@ -3624,46 +3637,57 @@ app.put('/api/user/email', authenticateToken, async (req, res) => {
     // Sanitize email
     const sanitizedNewEmail = newEmail.toLowerCase().trim();
     
-    const connection = await pool.getConnection();
+    // Verify password first
+    const { data: users, error: fetchError } = await supabase
+      .from('users')
+      .select('password')
+      .eq('id', userId)
+      .limit(1);
     
-    try {
-      // Verify password first
-      const [users] = await connection.query(
-        'SELECT password FROM users WHERE id = ?',
-        [userId]
-      );
-      
-      if (users.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      
-      // Verify password using bcrypt
-      const isPasswordValid = await bcrypt.compare(password, users[0].password);
-      
-      if (!isPasswordValid) {
-        return res.status(400).json({ error: 'Password is incorrect' });
-      }
-      
-      // Check if new email already exists
-      const [existingUsers] = await connection.query(
-        'SELECT id FROM users WHERE email = ? AND id != ?',
-        [sanitizedNewEmail, userId]
-      );
-      
-      if (existingUsers.length > 0) {
-        return res.status(400).json({ error: 'Email already exists' });
-      }
-      
-      // Update email
-      await connection.query(
-        'UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?',
-        [sanitizedNewEmail, userId]
-      );
-      
-      res.json({ message: 'Email updated successfully' });
-    } finally {
-      connection.release();
+    if (fetchError) {
+      console.error('Error fetching user password:', fetchError);
+      return res.status(500).json({ error: 'Failed to verify password' });
     }
+    
+    if (!users || users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Verify password using bcrypt
+    const isPasswordValid = await bcrypt.compare(password, users[0].password);
+    
+    if (!isPasswordValid) {
+      return res.status(400).json({ error: 'Password is incorrect' });
+    }
+    
+    // Check if new email already exists
+    const { data: existingUsers, error: checkError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', sanitizedNewEmail)
+      .neq('id', userId);
+    
+    if (checkError) {
+      console.error('Error checking existing email:', checkError);
+      return res.status(500).json({ error: 'Failed to check email availability' });
+    }
+    
+    if (existingUsers && existingUsers.length > 0) {
+      return res.status(400).json({ error: 'Email already exists' });
+    }
+    
+    // Update email
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ email: sanitizedNewEmail })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating email:', updateError);
+      return res.status(500).json({ error: 'Failed to update email' });
+    }
+    
+    res.json({ message: 'Email updated successfully' });
   } catch (error) {
     console.error('Update email error:', error);
     res.status(500).json({ error: 'Failed to update email' });
@@ -3678,25 +3702,24 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const connection = await pool.getConnection();
+    // Get the file URL
+    const fileUrl = `http://localhost:5000/uploads/${req.file.filename}`;
     
-    try {
-      // Get the file URL
-      const fileUrl = `http://localhost:5000/uploads/${req.file.filename}`;
-      
-      // Update user's profile picture
-      await connection.query(
-        'UPDATE users SET profile_picture = ?, updated_at = NOW() WHERE id = ?',
-        [fileUrl, userId]
-      );
-      
-      res.json({ 
-        message: 'Profile picture updated successfully',
-        profilePicture: fileUrl
-      });
-    } finally {
-      connection.release();
+    // Update user's profile picture
+    const { error } = await supabase
+      .from('users')
+      .update({ profile_picture: fileUrl })
+      .eq('id', userId);
+    
+    if (error) {
+      console.error('Error updating profile picture:', error);
+      return res.status(500).json({ error: 'Failed to update profile picture' });
     }
+    
+    res.json({ 
+      message: 'Profile picture updated successfully',
+      profilePicture: fileUrl
+    });
   } catch (error) {
     console.error('Profile picture upload error:', error);
     res.status(500).json({ error: 'Failed to upload profile picture' });
@@ -3707,42 +3730,42 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
 app.get('/api/user/billing', async (req, res) => {
   try {
     const { userId } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      const [billingInfo] = await connection.query(
-        'SELECT subscription_plan, trial_end_date, is_trial, monthly_price, card_last4 FROM user_billing WHERE user_id = ?',
-        [userId]
-      );
-      
-      if (billingInfo.length === 0) {
-        // Return default trial info
-        return res.json({
-          currentPlan: 'Standard',
-          isTrial: true,
-          trialDaysLeft: 14,
-          trialEndDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
-          monthlyPrice: 29,
-          cardNumber: ''
-        });
-      }
-      
-      const billing = billingInfo[0];
-      const trialEnd = new Date(billing.trial_end_date);
-      const now = new Date();
-      const daysLeft = Math.max(0, Math.ceil((trialEnd - now) / (1000 * 60 * 60 * 24)));
-      
-      res.json({
-        currentPlan: billing.subscription_plan || 'Standard',
-        isTrial: billing.is_trial === 1,
-        trialDaysLeft: daysLeft,
-        trialEndDate: trialEnd.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
-        monthlyPrice: billing.monthly_price || 29,
-        cardNumber: billing.card_last4 ? `****${billing.card_last4}` : ''
-      });
-    } finally {
-      connection.release();
+    const { data: billingInfo, error } = await supabase
+      .from('user_billing')
+      .select('subscription_plan, trial_end_date, is_trial, monthly_price, card_last4')
+      .eq('user_id', userId);
+    
+    if (error) {
+      console.error('Error fetching billing info:', error);
+      return res.status(500).json({ error: 'Failed to fetch billing information' });
     }
+    
+    if (!billingInfo || billingInfo.length === 0) {
+      // Return default trial info
+      return res.json({
+        currentPlan: 'Standard',
+        isTrial: true,
+        trialDaysLeft: 14,
+        trialEndDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
+        monthlyPrice: 29,
+        cardNumber: ''
+      });
+    }
+    
+    const billing = billingInfo[0];
+    const trialEnd = new Date(billing.trial_end_date);
+    const now = new Date();
+    const daysLeft = Math.max(0, Math.ceil((trialEnd - now) / (1000 * 60 * 60 * 24)));
+    
+    res.json({
+      currentPlan: billing.subscription_plan || 'Standard',
+      isTrial: billing.is_trial === true,
+      trialDaysLeft: daysLeft,
+      trialEndDate: trialEnd.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
+      monthlyPrice: billing.monthly_price || 29,
+      cardNumber: billing.card_last4 ? `****${billing.card_last4}` : ''
+    });
   } catch (error) {
     console.error('Get billing error:', error);
     res.status(500).json({ error: 'Failed to fetch billing information' });
@@ -3752,24 +3775,62 @@ app.get('/api/user/billing', async (req, res) => {
 app.post('/api/user/billing/subscription', async (req, res) => {
   try {
     const { userId, plan, cardNumber, expiryMonth, expiryYear, cvc } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      // In a real application, you would integrate with a payment processor here
-      // For now, we'll just store the subscription info
-      
-      const cardLast4 = cardNumber.slice(-4);
-      const trialEndDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
-      
-      await connection.query(
-        'INSERT INTO user_billing (user_id, subscription_plan, monthly_price, card_last4, trial_end_date, is_trial, created_at) VALUES (?, ?, ?, ?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE subscription_plan = ?, monthly_price = ?, card_last4 = ?, trial_end_date = ?, is_trial = 0, updated_at = NOW()',
-        [userId, plan, 29, cardLast4, trialEndDate, plan, 29, cardLast4, trialEndDate]
-      );
-      
-      res.json({ message: 'Subscription created successfully' });
-    } finally {
-      connection.release();
+    // In a real application, you would integrate with a payment processor here
+    // For now, we'll just store the subscription info
+    
+    const cardLast4 = cardNumber.slice(-4);
+    const trialEndDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+    
+    // Check if billing record exists
+    const { data: existingBilling, error: checkError } = await supabase
+      .from('user_billing')
+      .select('id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (checkError) {
+      console.error('Error checking existing billing:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing subscription' });
     }
+    
+    if (existingBilling && existingBilling.length > 0) {
+      // Update existing billing record
+      const { error: updateError } = await supabase
+        .from('user_billing')
+        .update({
+          subscription_plan: plan,
+          monthly_price: 29,
+          card_last4: cardLast4,
+          trial_end_date: trialEndDate,
+          is_trial: false
+        })
+        .eq('user_id', userId);
+      
+      if (updateError) {
+        console.error('Error updating subscription:', updateError);
+        return res.status(500).json({ error: 'Failed to update subscription' });
+      }
+    } else {
+      // Create new billing record
+      const { error: insertError } = await supabase
+        .from('user_billing')
+        .insert({
+          user_id: userId,
+          subscription_plan: plan,
+          monthly_price: 29,
+          card_last4: cardLast4,
+          trial_end_date: trialEndDate,
+          is_trial: true
+        });
+      
+      if (insertError) {
+        console.error('Error creating subscription:', insertError);
+        return res.status(500).json({ error: 'Failed to create subscription' });
+      }
+    }
+    
+    res.json({ message: 'Subscription created successfully' });
   } catch (error) {
     console.error('Create subscription error:', error);
     res.status(500).json({ error: 'Failed to create subscription' });
@@ -3780,46 +3841,46 @@ app.post('/api/user/billing/subscription', async (req, res) => {
 app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      const [settings] = await connection.query(
-        'SELECT * FROM user_payment_settings WHERE user_id = ?',
-        [userId]
-      );
-      
-      if (settings.length === 0) {
-        // Return default settings
-        return res.json({
-          onlineBookingTips: false,
-          invoicePaymentTips: false,
-          showServicePrices: true,
-          showServiceDescriptions: false,
-          paymentDueDays: 15,
-          paymentDueUnit: 'days',
-          defaultMemo: '',
-          invoiceFooter: '',
-          paymentProcessor: null,
-          paymentProcessorConnected: false
-        });
-      }
-      
-      const setting = settings[0];
-      res.json({
-        onlineBookingTips: setting.online_booking_tips === 1,
-        invoicePaymentTips: setting.invoice_payment_tips === 1,
-        showServicePrices: setting.show_service_prices === 1,
-        showServiceDescriptions: setting.show_service_descriptions === 1,
-        paymentDueDays: setting.payment_due_days,
-        paymentDueUnit: setting.payment_due_unit,
-        defaultMemo: setting.default_memo || '',
-        invoiceFooter: setting.invoice_footer || '',
-        paymentProcessor: setting.payment_processor,
-        paymentProcessorConnected: setting.payment_processor_connected === 1
-      });
-    } finally {
-      connection.release();
+    const { data: settings, error } = await supabase
+      .from('user_payment_settings')
+      .select('*')
+      .eq('user_id', userId);
+    
+    if (error) {
+      console.error('Error fetching payment settings:', error);
+      return res.status(500).json({ error: 'Failed to fetch payment settings' });
     }
+    
+    if (!settings || settings.length === 0) {
+      // Return default settings
+      return res.json({
+        onlineBookingTips: false,
+        invoicePaymentTips: false,
+        showServicePrices: true,
+        showServiceDescriptions: false,
+        paymentDueDays: 15,
+        paymentDueUnit: 'days',
+        defaultMemo: '',
+        invoiceFooter: '',
+        paymentProcessor: null,
+        paymentProcessorConnected: false
+      });
+    }
+    
+    const setting = settings[0];
+    res.json({
+      onlineBookingTips: setting.online_booking_tips === true,
+      invoicePaymentTips: setting.invoice_payment_tips === true,
+      showServicePrices: setting.show_service_prices === true,
+      showServiceDescriptions: setting.show_service_descriptions === true,
+      paymentDueDays: setting.payment_due_days,
+      paymentDueUnit: setting.payment_due_unit,
+      defaultMemo: setting.default_memo || '',
+      invoiceFooter: setting.invoice_footer || '',
+      paymentProcessor: setting.payment_processor,
+      paymentProcessorConnected: setting.payment_processor_connected === true
+    });
   } catch (error) {
     console.error('Get payment settings error:', error);
     res.status(500).json({ error: 'Failed to fetch payment settings' });
@@ -3841,69 +3902,92 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       paymentProcessor,
       paymentProcessorConnected
     } = req.body;
-    
-    const connection = await pool.getConnection();
-    
-    try {
-      await connection.query(
-        `INSERT INTO user_payment_settings (
-          user_id, online_booking_tips, invoice_payment_tips, show_service_prices, 
-          show_service_descriptions, payment_due_days, payment_due_unit, default_memo, 
-          invoice_footer, payment_processor, payment_processor_connected, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        ON DUPLICATE KEY UPDATE
-          online_booking_tips = VALUES(online_booking_tips),
-          invoice_payment_tips = VALUES(invoice_payment_tips),
-          show_service_prices = VALUES(show_service_prices),
-          show_service_descriptions = VALUES(show_service_descriptions),
-          payment_due_days = VALUES(payment_due_days),
-          payment_due_unit = VALUES(payment_due_unit),
-          default_memo = VALUES(default_memo),
-          invoice_footer = VALUES(invoice_footer),
-          payment_processor = VALUES(payment_processor),
-          payment_processor_connected = VALUES(payment_processor_connected),
-          updated_at = NOW()`,
-        [
-          userId,
-          onlineBookingTips ? 1 : 0,
-          invoicePaymentTips ? 1 : 0,
-          showServicePrices ? 1 : 0,
-          showServiceDescriptions ? 1 : 0,
-          paymentDueDays,
-          paymentDueUnit,
-          defaultMemo,
-          invoiceFooter,
-          paymentProcessor,
-          paymentProcessorConnected ? 1 : 0
-        ]
-      );
-      
-      res.json({ message: 'Payment settings updated successfully' });
-    } finally {
-      connection.release();
+
+    // Check if settings exist
+    const { data: existingSettings, error: checkError } = await supabase
+      .from('user_payment_settings')
+      .select('id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (checkError) {
+      console.error('Error checking existing payment settings:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing settings' });
     }
+
+    if (existingSettings) {
+      // Update existing settings
+      const { error: updateError } = await supabase
+        .from('user_payment_settings')
+        .update({
+          online_booking_tips: onlineBookingTips,
+          invoice_payment_tips: invoicePaymentTips,
+          show_service_prices: showServicePrices,
+          show_service_descriptions: showServiceDescriptions,
+          payment_due_days: paymentDueDays,
+          payment_due_unit: paymentDueUnit,
+          default_memo: defaultMemo,
+          invoice_footer: invoiceFooter,
+          payment_processor: paymentProcessor,
+          payment_processor_connected: paymentProcessorConnected
+        })
+        .eq('user_id', userId);
+
+      if (updateError) {
+        console.error('Error updating payment settings:', updateError);
+        return res.status(500).json({ error: 'Failed to update payment settings' });
+      }
+    } else {
+      // Insert new settings
+      const { error: insertError } = await supabase
+        .from('user_payment_settings')
+        .insert({
+          user_id: userId,
+          online_booking_tips: onlineBookingTips,
+          invoice_payment_tips: invoicePaymentTips,
+          show_service_prices: showServicePrices,
+          show_service_descriptions: showServiceDescriptions,
+          payment_due_days: paymentDueDays,
+          payment_due_unit: paymentDueUnit,
+          default_memo: defaultMemo,
+          invoice_footer: invoiceFooter,
+          payment_processor: paymentProcessor,
+          payment_processor_connected: paymentProcessorConnected
+        });
+
+      if (insertError) {
+        console.error('Error creating payment settings:', insertError);
+        return res.status(500).json({ error: 'Failed to create payment settings' });
+      }
+    }
+
+    res.json({ message: 'Payment settings updated successfully' });
+
   } catch (error) {
     console.error('Update payment settings error:', error);
     res.status(500).json({ error: 'Failed to update payment settings' });
   }
 });
 
+
 // Custom payment methods endpoints
 app.get('/api/user/payment-methods', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      const [methods] = await connection.query(
-        'SELECT id, name, description, is_active FROM custom_payment_methods WHERE user_id = ? AND is_active = 1 ORDER BY created_at ASC',
-        [userId]
-      );
-      
-      res.json(methods);
-    } finally {
-      connection.release();
+    const { data: methods, error } = await supabase
+      .from('custom_payment_methods')
+      .select('id, name, description, is_active')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: true });
+    
+    if (error) {
+      console.error('Error fetching payment methods:', error);
+      return res.status(500).json({ error: 'Failed to fetch payment methods' });
     }
+    
+    res.json(methods || []);
   } catch (error) {
     console.error('Get payment methods error:', error);
     res.status(500).json({ error: 'Failed to fetch payment methods' });
@@ -3919,23 +4003,22 @@ app.post('/api/user/payment-methods', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Payment method name is required' });
     }
     
-    const connection = await pool.getConnection();
+    const { data: newMethod, error } = await supabase
+      .from('custom_payment_methods')
+      .insert({
+        user_id: userId,
+        name: name.trim(),
+        description: description || null
+      })
+      .select('id, name, description')
+      .single();
     
-    try {
-      const [result] = await connection.query(
-        'INSERT INTO custom_payment_methods (user_id, name, description) VALUES (?, ?, ?)',
-        [userId, name.trim(), description || null]
-      );
-      
-      const [newMethod] = await connection.query(
-        'SELECT id, name, description FROM custom_payment_methods WHERE id = ?',
-        [result.insertId]
-      );
-      
-      res.status(201).json(newMethod[0]);
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error creating payment method:', error);
+      return res.status(500).json({ error: 'Failed to create payment method' });
     }
+    
+    res.status(201).json(newMethod);
   } catch (error) {
     console.error('Create payment method error:', error);
     res.status(500).json({ error: 'Failed to create payment method' });
@@ -3952,22 +4035,25 @@ app.put('/api/user/payment-methods/:id', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'Payment method name is required' });
     }
     
-    const connection = await pool.getConnection();
+    const { data, error } = await supabase
+      .from('custom_payment_methods')
+      .update({
+        name: name.trim(),
+        description: description || null
+      })
+      .eq('id', methodId)
+      .eq('user_id', userId);
     
-    try {
-      const [result] = await connection.query(
-        'UPDATE custom_payment_methods SET name = ?, description = ?, updated_at = NOW() WHERE id = ? AND user_id = ?',
-        [name.trim(), description || null, methodId, userId]
-      );
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Payment method not found' });
-      }
-      
-      res.json({ message: 'Payment method updated successfully' });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error updating payment method:', error);
+      return res.status(500).json({ error: 'Failed to update payment method' });
     }
+    
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    res.json({ message: 'Payment method updated successfully' });
   } catch (error) {
     console.error('Update payment method error:', error);
     res.status(500).json({ error: 'Failed to update payment method' });
@@ -4011,29 +4097,56 @@ app.post('/api/user/payment-processor/setup', authenticateToken, async (req, res
       return res.status(400).json({ error: 'Invalid payment processor' });
     }
     
-    const connection = await pool.getConnection();
+    // In a real application, you would integrate with the payment processor here
+    // For now, we'll just mark it as connected
     
-    try {
-      // In a real application, you would integrate with the payment processor here
-      // For now, we'll just mark it as connected
-      await connection.query(
-        `INSERT INTO user_payment_settings (user_id, payment_processor, payment_processor_connected, updated_at) 
-         VALUES (?, ?, 1, NOW())
-         ON DUPLICATE KEY UPDATE 
-           payment_processor = VALUES(payment_processor),
-           payment_processor_connected = VALUES(payment_processor_connected),
-           updated_at = NOW()`,
-        [userId, processor]
-      );
-      
-      res.json({ 
-        message: 'Payment processor connected successfully',
-        processor: processor,
-        connected: true
-      });
-    } finally {
-      connection.release();
+    // Check if settings exist
+    const { data: existingSettings, error: checkError } = await supabase
+      .from('user_payment_settings')
+      .select('id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (checkError) {
+      console.error('Error checking existing payment settings:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing settings' });
     }
+    
+    if (existingSettings && existingSettings.length > 0) {
+      // Update existing settings
+      const { error: updateError } = await supabase
+        .from('user_payment_settings')
+        .update({
+          payment_processor: processor,
+          payment_processor_connected: true
+        })
+        .eq('user_id', userId);
+      
+      if (updateError) {
+        console.error('Error updating payment processor:', updateError);
+        return res.status(500).json({ error: 'Failed to update payment processor' });
+      }
+    } else {
+      // Create new settings
+      const { error: insertError } = await supabase
+        .from('user_payment_settings')
+        .insert({
+          user_id: userId,
+          payment_processor: processor,
+          payment_processor_connected: true
+        });
+      
+      if (insertError) {
+        console.error('Error creating payment processor settings:', insertError);
+        return res.status(500).json({ error: 'Failed to create payment processor settings' });
+      }
+    }
+    
+    res.json({ 
+      message: 'Payment processor connected successfully',
+      processor: processor,
+      connected: true
+    });
   } catch (error) {
     console.error('Setup payment processor error:', error);
     res.status(500).json({ error: 'Failed to setup payment processor' });
@@ -4044,37 +4157,37 @@ app.post('/api/user/payment-processor/setup', authenticateToken, async (req, res
 app.get('/api/user/availability', async (req, res) => {
   try {
     const { userId } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      const [availabilityInfo] = await connection.query(
-        'SELECT business_hours, timeslot_templates FROM user_availability WHERE user_id = ?',
-        [userId]
-      );
-      
-      if (availabilityInfo.length === 0) {
-        return res.json({
-          businessHours: {
-            monday: { start: '09:00', end: '17:00', enabled: true },
-            tuesday: { start: '09:00', end: '17:00', enabled: true },
-            wednesday: { start: '09:00', end: '17:00', enabled: true },
-            thursday: { start: '09:00', end: '17:00', enabled: true },
-            friday: { start: '09:00', end: '17:00', enabled: true },
-            saturday: { start: '09:00', end: '17:00', enabled: false },
-            sunday: { start: '09:00', end: '17:00', enabled: false }
-          },
-          timeslotTemplates: []
-        });
-      }
-      
-      const availability = availabilityInfo[0];
-      res.json({
-        businessHours: JSON.parse(availability.business_hours || '{}'),
-        timeslotTemplates: JSON.parse(availability.timeslot_templates || '[]')
-      });
-    } finally {
-      connection.release();
+    const { data: availabilityInfo, error } = await supabase
+      .from('user_availability')
+      .select('business_hours, timeslot_templates')
+      .eq('user_id', userId);
+    
+    if (error) {
+      console.error('Error fetching availability info:', error);
+      return res.status(500).json({ error: 'Failed to fetch availability information' });
     }
+    
+    if (!availabilityInfo || availabilityInfo.length === 0) {
+      return res.json({
+        businessHours: {
+          monday: { start: '09:00', end: '17:00', enabled: true },
+          tuesday: { start: '09:00', end: '17:00', enabled: true },
+          wednesday: { start: '09:00', end: '17:00', enabled: true },
+          thursday: { start: '09:00', end: '17:00', enabled: true },
+          friday: { start: '09:00', end: '17:00', enabled: true },
+          saturday: { start: '09:00', end: '17:00', enabled: false },
+          sunday: { start: '09:00', end: '17:00', enabled: false }
+        },
+        timeslotTemplates: []
+      });
+    }
+    
+    const availability = availabilityInfo[0];
+    res.json({
+      businessHours: JSON.parse(availability.business_hours || '{}'),
+      timeslotTemplates: JSON.parse(availability.timeslot_templates || '[]')
+    });
   } catch (error) {
     console.error('Get availability error:', error);
     res.status(500).json({ error: 'Failed to fetch availability information' });
@@ -4084,18 +4197,50 @@ app.get('/api/user/availability', async (req, res) => {
 app.put('/api/user/availability', async (req, res) => {
   try {
     const { userId, businessHours, timeslotTemplates } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      await connection.query(
-        'INSERT INTO user_availability (user_id, business_hours, timeslot_templates, created_at) VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE business_hours = ?, timeslot_templates = ?, updated_at = NOW()',
-        [userId, JSON.stringify(businessHours), JSON.stringify(timeslotTemplates), JSON.stringify(businessHours), JSON.stringify(timeslotTemplates)]
-      );
-      
-      res.json({ message: 'Availability updated successfully' });
-    } finally {
-      connection.release();
+    // Check if availability record exists
+    const { data: existingAvailability, error: checkError } = await supabase
+      .from('user_availability')
+      .select('id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (checkError) {
+      console.error('Error checking existing availability:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing availability' });
     }
+    
+    if (existingAvailability && existingAvailability.length > 0) {
+      // Update existing availability
+      const { error: updateError } = await supabase
+        .from('user_availability')
+        .update({
+          business_hours: JSON.stringify(businessHours),
+          timeslot_templates: JSON.stringify(timeslotTemplates)
+        })
+        .eq('user_id', userId);
+      
+      if (updateError) {
+        console.error('Error updating availability:', updateError);
+        return res.status(500).json({ error: 'Failed to update availability' });
+      }
+    } else {
+      // Create new availability record
+      const { error: insertError } = await supabase
+        .from('user_availability')
+        .insert({
+          user_id: userId,
+          business_hours: JSON.stringify(businessHours),
+          timeslot_templates: JSON.stringify(timeslotTemplates)
+        });
+      
+      if (insertError) {
+        console.error('Error creating availability:', insertError);
+        return res.status(500).json({ error: 'Failed to create availability' });
+      }
+    }
+    
+    res.json({ message: 'Availability updated successfully' });
   } catch (error) {
     console.error('Update availability error:', error);
     res.status(500).json({ error: 'Failed to update availability' });
@@ -4106,58 +4251,80 @@ app.put('/api/user/availability', async (req, res) => {
 app.get('/api/territories', async (req, res) => {
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      let query = `
-        SELECT 
-          t.*,
-          COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
-          SUM(CASE WHEN j.status = 'completed' THEN COALESCE(i.total_amount, 0) ELSE 0 END) as total_revenue,
-          AVG(CASE WHEN j.status = 'completed' THEN i.total_amount ELSE NULL END) as avg_job_value
-        FROM territories t
-        LEFT JOIN jobs j ON t.id = j.territory_id
-        LEFT JOIN invoices i ON j.id = i.job_id
-        WHERE t.user_id = ?
-      `;
-      let params = [userId];
-      
-      if (status) {
-        query += ' AND t.status = ?';
-        params.push(status);
-      }
-      
-      if (search) {
-        query += ' AND (t.name LIKE ? OR t.location LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm);
-      }
-      
-      query += ` GROUP BY t.id ORDER BY t.${sortBy} ${sortOrder}`;
-      
-      const [territories] = await connection.query(query, params);
-      
-      // Get territory statistics
-      const territoryStats = territories.map(territory => ({
-        ...territory,
-        zip_codes: JSON.parse(territory.zip_codes || '[]'),
-        business_hours: JSON.parse(territory.business_hours || '{}'),
-        team_members: JSON.parse(territory.team_members || '[]'),
-        services: JSON.parse(territory.services || '[]')
-      }));
-      
-      res.json({
-        territories: territoryStats,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: territoryStats.length
-        }
-      });
-    } finally {
-      connection.release();
+    // Build Supabase query
+    let query = supabase
+      .from('territories')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId);
+    
+    // Add status filter
+    if (status) {
+      query = query.eq('status', status);
     }
+    
+    // Add search filter
+    if (search) {
+      query = query.or(`name.ilike.%${search}%,location.ilike.%${search}%`);
+    }
+    
+    // Add sorting
+    query = query.order(sortBy, { ascending: sortOrder === 'ASC' });
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    const { data: territories, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching territories:', error);
+      return res.status(500).json({ error: 'Failed to fetch territories' });
+    }
+    
+    // Get territory statistics by fetching jobs and invoices separately
+    const territoryStats = await Promise.all((territories || []).map(async (territory) => {
+      // Get jobs for this territory
+      const { data: jobs, error: jobsError } = await supabase
+        .from('jobs')
+        .select('id, status, invoice_amount')
+        .eq('territory_id', territory.id);
+      
+      if (jobsError) {
+        console.error('Error fetching jobs for territory:', jobsError);
+        return {
+          ...territory,
+          total_jobs: 0,
+          completed_jobs: 0,
+          total_revenue: 0,
+          avg_job_value: 0
+        };
+      }
+      
+      const totalJobs = jobs.length;
+      const completedJobs = jobs.filter(job => job.status === 'completed');
+      const completedJobsCount = completedJobs.length;
+      const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0);
+      const avgJobValue = completedJobsCount > 0 ? totalRevenue / completedJobsCount : 0;
+      
+      return {
+        ...territory,
+        total_jobs: totalJobs,
+        completed_jobs: completedJobsCount,
+        total_revenue: totalRevenue,
+        avg_job_value: avgJobValue
+      };
+    }));
+    
+    res.json({
+      territories: territoryStats,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
+      }
+    });
   } catch (error) {
     console.error('Get territories error:', error);
     res.status(500).json({ error: 'Failed to fetch territories' });
@@ -4167,47 +4334,72 @@ app.get('/api/territories', async (req, res) => {
 app.get('/api/territories/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
     
-    try {
-      const [territories] = await connection.query(`
-        SELECT 
-          t.*,
-          COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
-          SUM(CASE WHEN j.status = 'completed' THEN COALESCE(i.total_amount, 0) ELSE 0 END) as total_revenue,
-          AVG(CASE WHEN j.status = 'completed' THEN i.total_amount ELSE NULL END) as avg_job_value
-        FROM territories t
-        LEFT JOIN jobs j ON t.id = j.territory_id
-        LEFT JOIN invoices i ON j.id = i.job_id
-        WHERE t.id = ?
-        GROUP BY t.id
-      `, [id]);
-      
-      if (territories.length === 0) {
-        return res.status(404).json({ error: 'Territory not found' });
-      }
-      
-      const territory = territories[0];
-      territory.zip_codes = JSON.parse(territory.zip_codes || '[]');
-      territory.business_hours = JSON.parse(territory.business_hours || '{}');
-      territory.team_members = JSON.parse(territory.team_members || '[]');
-      territory.services = JSON.parse(territory.services || '[]');
-      
-      // Get territory pricing
-      const [pricing] = await connection.query(`
-        SELECT tp.*, s.name as service_name, s.description as service_description
-        FROM territory_pricing tp
-        JOIN services s ON tp.service_id = s.id
-        WHERE tp.territory_id = ?
-      `, [id]);
-      
-      territory.pricing = pricing;
-      
-      res.json(territory);
-    } finally {
-      connection.release();
+    // Get territory
+    const { data: territories, error } = await supabase
+      .from('territories')
+      .select('*')
+      .eq('id', id)
+      .limit(1);
+    
+    if (error) {
+      console.error('Error fetching territory:', error);
+      return res.status(500).json({ error: 'Failed to fetch territory' });
     }
+    
+    if (!territories || territories.length === 0) {
+      return res.status(404).json({ error: 'Territory not found' });
+    }
+    
+    const territory = territories[0];
+    
+    // Get jobs for this territory to calculate statistics
+    const { data: jobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select('id, status, invoice_amount')
+      .eq('territory_id', id);
+    
+    if (jobsError) {
+      console.error('Error fetching jobs for territory:', jobsError);
+    }
+    
+    const totalJobs = jobs ? jobs.length : 0;
+    const completedJobs = jobs ? jobs.filter(job => job.status === 'completed') : [];
+    const completedJobsCount = completedJobs.length;
+    const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0);
+    const avgJobValue = completedJobsCount > 0 ? totalRevenue / completedJobsCount : 0;
+    
+    // Get territory pricing
+    const { data: pricing, error: pricingError } = await supabase
+      .from('territory_pricing')
+      .select(`
+        *,
+        services!left(name, description)
+      `)
+      .eq('territory_id', id);
+    
+    if (pricingError) {
+      console.error('Error fetching territory pricing:', pricingError);
+    }
+    
+    // Flatten the pricing data
+    const flattenedPricing = (pricing || []).map(price => ({
+      ...price,
+      service_name: price.services?.name,
+      service_description: price.services?.description,
+      services: undefined
+    }));
+    
+    const result = {
+      ...territory,
+      total_jobs: totalJobs,
+      completed_jobs: completedJobsCount,
+      total_revenue: totalRevenue,
+      avg_job_value: avgJobValue,
+      pricing: flattenedPricing
+    };
+    
+    res.json(result);
   } catch (error) {
     console.error('Get territory error:', error);
     res.status(500).json({ error: 'Failed to fetch territory' });
@@ -4238,32 +4430,33 @@ app.post('/api/territories', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    const connection = await pool.getConnection();
+    const { data: result, error } = await supabase
+      .from('territories')
+      .insert({
+        user_id: userId,
+        name: name,
+        description: description,
+        location: location,
+        zip_codes: zipCodes || [],
+        radius_miles: radiusMiles || 25.00,
+        timezone: timezone || 'America/New_York',
+        business_hours: businessHours || {},
+        team_members: teamMembers || [],
+        services: services || [],
+        pricing_multiplier: pricingMultiplier || 1.00
+      })
+      .select('id')
+      .single();
     
-    try {
-      const [result] = await connection.query(`
-        INSERT INTO territories (
-          user_id, name, description, location, zip_codes, radius_miles, 
-          timezone, business_hours, team_members, services, pricing_multiplier, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-      `, [
-        userId, name, description, location, 
-        JSON.stringify(zipCodes || []), 
-        radiusMiles || 25.00, 
-        timezone || 'America/New_York',
-        JSON.stringify(businessHours || {}),
-        JSON.stringify(teamMembers || []),
-        JSON.stringify(services || []),
-        pricingMultiplier || 1.00
-      ]);
-      
-      res.status(201).json({
-        message: 'Territory created successfully',
-        territoryId: result.insertId
-      });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Supabase insert error:', error);
+      return res.status(500).json({ error: 'Failed to create territory' });
     }
+    
+    res.status(201).json({
+      message: 'Territory created successfully',
+      territoryId: result.id
+    });
   } catch (error) {
     console.error('Create territory error:', error);
     res.status(500).json({ error: 'Failed to create territory' });
@@ -4287,26 +4480,29 @@ app.put('/api/territories/:id', async (req, res) => {
       pricingMultiplier 
     } = req.body;
     
-    const connection = await pool.getConnection();
+    const { error } = await supabase
+      .from('territories')
+      .update({
+        name: name,
+        description: description,
+        location: location,
+        zip_codes: zipCodes || [],
+        radius_miles: radiusMiles || 25.00,
+        timezone: timezone || 'America/New_York',
+        status: status,
+        business_hours: businessHours || {},
+        team_members: teamMembers || [],
+        services: services || [],
+        pricing_multiplier: pricingMultiplier || 1.00
+      })
+      .eq('id', id);
     
-    try {
-      await connection.query(`
-        UPDATE territories 
-        SET name = ?, description = ?, location = ?, zip_codes = ?, 
-            radius_miles = ?, timezone = ?, status = ?, business_hours = ?, 
-            team_members = ?, services = ?, pricing_multiplier = ?, updated_at = NOW()
-        WHERE id = ?
-      `, [
-        name, description, location, JSON.stringify(zipCodes || []),
-        radiusMiles || 25.00, timezone || 'America/New_York', status,
-        JSON.stringify(businessHours || {}), JSON.stringify(teamMembers || []),
-        JSON.stringify(services || []), pricingMultiplier || 1.00, id
-      ]);
-      
-      res.json({ message: 'Territory updated successfully' });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Supabase update error:', error);
+      return res.status(500).json({ error: 'Failed to update territory' });
     }
+    
+    res.json({ message: 'Territory updated successfully' });
   } catch (error) {
     console.error('Update territory error:', error);
     res.status(500).json({ error: 'Failed to update territory' });
@@ -4316,14 +4512,17 @@ app.put('/api/territories/:id', async (req, res) => {
 app.delete('/api/territories/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    const { error } = await supabase
+      .from('territories')
+      .delete()
+      .eq('id', id);
     
-    try {
-      await connection.query('DELETE FROM territories WHERE id = ?', [id]);
-      res.json({ message: 'Territory deleted successfully' });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Supabase delete error:', error);
+      return res.status(500).json({ error: 'Failed to delete territory' });
     }
+    
+    res.json({ message: 'Territory deleted successfully' });
   } catch (error) {
     console.error('Delete territory error:', error);
     res.status(500).json({ error: 'Failed to delete territory' });
@@ -4361,12 +4560,18 @@ app.post('/api/territories/detect', async (req, res) => {
         }
         
         // Check if customer address is within territory radius
-        if (customerAddress && territoryRadius > 0) {
+        if (customerAddress && territoryRadius > 0 && process.env.GOOGLE_MAPS_API_KEY) {
           try {
             // Get coordinates for customer address
             const customerGeocodeResponse = await fetch(
               `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(customerAddress)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
             )
+            
+            if (!customerGeocodeResponse.ok) {
+              console.warn('Google Maps API request failed for customer address');
+              continue;
+            }
+            
             const customerGeocodeData = await customerGeocodeResponse.json()
             
             if (customerGeocodeData.results && customerGeocodeData.results.length > 0) {
@@ -4376,6 +4581,12 @@ app.post('/api/territories/detect', async (req, res) => {
               const territoryGeocodeResponse = await fetch(
                 `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(territory.location)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
               )
+              
+              if (!territoryGeocodeResponse.ok) {
+                console.warn('Google Maps API request failed for territory location');
+                continue;
+              }
+              
               const territoryGeocodeData = await territoryGeocodeResponse.json()
               
               if (territoryGeocodeData.results && territoryGeocodeData.results.length > 0) {
@@ -4549,75 +4760,74 @@ app.get('/api/invoices', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const connection = await pool.getConnection();
+    const offset = (parseInt(page) - 1) * parseInt(limit);
     
-    try {
-      const offset = (parseInt(page) - 1) * parseInt(limit);
-      
-      let whereClause = 'WHERE i.user_id = ?';
-      let params = [userId];
-      
-      if (search) {
-        whereClause += ' AND (c.first_name LIKE ? OR c.last_name LIKE ? OR c.email LIKE ? OR i.invoice_number LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm, searchTerm, searchTerm);
-      }
-      
-      if (status) {
-        whereClause += ' AND i.status = ?';
-        params.push(status);
-      }
-      
-      // Handle customer filtering
-      if (customerId) {
-        whereClause += ' AND i.customer_id = ?';
-        params.push(customerId);
-      }
-      
-      // Get invoices with customer info
-      const [invoices] = await connection.query(`
-        SELECT 
-          i.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          s.name as service_name,
-          j.scheduled_date,
-          j.status as job_status
-        FROM invoices i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN jobs j ON i.job_id = j.id
-        LEFT JOIN services s ON j.service_id = s.id
-        ${whereClause}
-        ORDER BY i.${sortBy} ${sortOrder}
-        LIMIT ? OFFSET ?
-      `, [...params, parseInt(limit), offset]);
-      
-      // Get total count
-      const [countResult] = await connection.query(`
-        SELECT COUNT(*) as total
-        FROM invoices i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        ${whereClause}
-      `, params);
-      
-      const total = countResult[0].total;
-      const totalPages = Math.ceil(total / parseInt(limit));
-      
-      res.json({
-        invoices,
-        pagination: {
-          current_page: parseInt(page),
-          total_pages: totalPages,
-          total_items: total,
-          items_per_page: parseInt(limit)
-        }
-      });
-      
-    } finally {
-      connection.release();
+    // Build Supabase query
+    let query = supabase
+      .from('invoices')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        jobs!left(scheduled_date, status, services!left(name))
+      `, { count: 'exact' })
+      .eq('user_id', userId);
+    
+    // Add search filter
+    if (search) {
+      query = query.or(`
+        customers.first_name.ilike.%${search}%,
+        customers.last_name.ilike.%${search}%,
+        customers.email.ilike.%${search}%,
+        invoice_number.ilike.%${search}%
+      `);
     }
+    
+    // Add status filter
+    if (status) {
+      query = query.eq('status', status);
+    }
+    
+    // Add customer filter
+    if (customerId) {
+      query = query.eq('customer_id', customerId);
+    }
+    
+    // Add sorting
+    query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+    
+    // Add pagination
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    const { data: invoices, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching invoices:', error);
+      return res.status(500).json({ error: 'Failed to fetch invoices' });
+    }
+    
+    // Process the data to flatten the nested structure
+    const processedInvoices = (invoices || []).map(invoice => ({
+      ...invoice,
+      customer_first_name: invoice.customers?.first_name,
+      customer_last_name: invoice.customers?.last_name,
+      customer_email: invoice.customers?.email,
+      customer_phone: invoice.customers?.phone,
+      service_name: invoice.jobs?.services?.name,
+      scheduled_date: invoice.jobs?.scheduled_date,
+      job_status: invoice.jobs?.status
+    }));
+    
+    const totalPages = Math.ceil((count || 0) / parseInt(limit));
+    
+    res.json({
+      invoices: processedInvoices,
+      pagination: {
+        current_page: parseInt(page),
+        total_pages: totalPages,
+        total_items: count || 0,
+        items_per_page: parseInt(limit)
+      }
+    });
   } catch (error) {
     console.error('Get invoices error:', error);
     res.status(500).json({ error: 'Failed to fetch invoices' });
@@ -4633,35 +4843,39 @@ app.get('/api/invoices/:id', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const connection = await pool.getConnection();
+    const { data: invoices, error } = await supabase
+      .from('invoices')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        jobs!left(scheduled_date, status, services!left(name))
+      `)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      const [invoices] = await connection.query(`
-        SELECT 
-          i.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email,
-          c.phone as customer_phone,
-          s.name as service_name,
-          j.scheduled_date,
-          j.status as job_status
-        FROM invoices i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN jobs j ON i.job_id = j.id
-        LEFT JOIN services s ON j.service_id = s.id
-        WHERE i.id = ? AND i.user_id = ?
-      `, [id, userId]);
-      
-      if (invoices.length === 0) {
-        return res.status(404).json({ error: 'Invoice not found' });
-      }
-      
-      res.json(invoices[0]);
-      
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching invoice:', error);
+      return res.status(500).json({ error: 'Failed to fetch invoice' });
     }
+    
+    if (!invoices || invoices.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    // Process the data to flatten the nested structure
+    const invoice = {
+      ...invoices[0],
+      customer_first_name: invoices[0].customers?.first_name,
+      customer_last_name: invoices[0].customers?.last_name,
+      customer_email: invoices[0].customers?.email,
+      customer_phone: invoices[0].customers?.phone,
+      service_name: invoices[0].jobs?.services?.name,
+      scheduled_date: invoices[0].jobs?.scheduled_date,
+      job_status: invoices[0].jobs?.status
+    };
+    
+    res.json(invoice);
   } catch (error) {
     console.error('Get invoice error:', error);
     res.status(500).json({ error: 'Failed to fetch invoice' });
@@ -4681,67 +4895,100 @@ app.post('/api/invoices', async (req, res) => {
       return res.status(400).json({ error: 'userId, customerId, and totalAmount are required' });
     }
 
-    const connection = await pool.getConnection();
+    // Validate that the customer exists and belongs to the user
+    const { data: customerCheck, error: customerError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', customerId)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Validate that the customer exists and belongs to the user
-      const [customerCheck] = await connection.query('SELECT id FROM customers WHERE id = ? AND user_id = ?', [customerId, userId]);
-      if (customerCheck.length === 0) {
-        return res.status(400).json({ error: 'Customer not found or does not belong to user' });
-      }
+    if (customerError) {
+      console.error('Error checking customer:', customerError);
+      return res.status(500).json({ error: 'Failed to validate customer' });
+    }
+    
+    if (!customerCheck || customerCheck.length === 0) {
+      return res.status(400).json({ error: 'Customer not found or does not belong to user' });
+    }
 
-      // Validate that the job exists if jobId is provided
-      if (jobId) {
-        const [jobCheck] = await connection.query('SELECT id FROM jobs WHERE id = ? AND user_id = ?', [jobId, userId]);
-        if (jobCheck.length === 0) {
-          return res.status(400).json({ error: 'Job not found or does not belong to user' });
-        }
+    // Validate that the job exists if jobId is provided
+    if (jobId) {
+      const { data: jobCheck, error: jobError } = await supabase
+        .from('jobs')
+        .select('id')
+        .eq('id', jobId)
+        .eq('user_id', userId)
+        .limit(1);
+      
+      if (jobError) {
+        console.error('Error checking job:', jobError);
+        return res.status(500).json({ error: 'Failed to validate job' });
       }
-      const [result] = await connection.query(`
-        INSERT INTO invoices (
-          user_id, customer_id, job_id, estimate_id,
-          amount, tax_amount, total_amount,
-          status, due_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-      `, [
-        userId, customerId, jobId || null, estimateId || null,
-        totalAmount, taxAmount || 0, totalAmount,
-        status, dueDate || null
-      ]);
       
-      const invoiceId = result.insertId;
+      if (!jobCheck || jobCheck.length === 0) {
+        return res.status(400).json({ error: 'Job not found or does not belong to user' });
+      }
+    }
+    
+    const { data: result, error: insertError } = await supabase
+      .from('invoices')
+      .insert({
+        user_id: userId,
+        customer_id: customerId,
+        job_id: jobId || null,
+        estimate_id: estimateId || null,
+        amount: totalAmount,
+        tax_amount: taxAmount || 0,
+        total_amount: totalAmount,
+        status: status,
+        due_date: dueDate || null
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating invoice:', insertError);
+      return res.status(500).json({ error: 'Failed to create invoice' });
+    }
+    
+    const invoiceId = result.id;
+    
+    // Update job invoice_status if jobId is provided
+    if (jobId) {
+      const { error: updateError } = await supabase
+        .from('jobs')
+        .update({
+          invoice_status: 'invoiced',
+          invoice_id: invoiceId,
+          invoice_amount: totalAmount,
+          invoice_date: new Date().toISOString().split('T')[0]
+        })
+        .eq('id', jobId);
       
-      // Update job invoice_status if jobId is provided
-      if (jobId) {
-        await connection.query(`
-          UPDATE jobs SET 
-            invoice_status = 'invoiced',
-            invoice_id = ?,
-            invoice_amount = ?,
-            invoice_date = CURDATE(),
-            updated_at = NOW()
-          WHERE id = ?
-        `, [invoiceId, totalAmount, jobId]);
+      if (updateError) {
+        console.error('Error updating job invoice status:', updateError);
+      } else {
         console.log('Updated job invoice status for job ID:', jobId);
       }
+    }
       
       // Get the created invoice
-      const [invoices] = await connection.query(`
-        SELECT 
-          i.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email
-        FROM invoices i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        WHERE i.id = ?
-      `, [invoiceId]);
+      const { data: createdInvoice, error: fetchError } = await supabase
+        .from('invoices')
+        .select(`
+          *,
+          customers!left(first_name, last_name, email)
+        `)
+        .eq('id', invoiceId)
+        .limit(1);
       
-      res.status(201).json(invoices[0]);
+      if (fetchError) {
+        console.error('Error fetching created invoice:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch created invoice' });
+      }
       
-    } finally {
-      connection.release();
-    }
+      res.status(201).json(createdInvoice[0]);
   } catch (error) {
     console.error('Create invoice error:', error);
     console.error('Error details:', {
@@ -4767,55 +5014,52 @@ app.put('/api/invoices/:id', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const connection = await pool.getConnection();
+    // Convert string values to numbers for decimal fields
+    const amountValue = parseFloat(amount) || 0;
+    const taxAmountValue = parseFloat(taxAmount) || 0;
+    const totalAmountValue = parseFloat(totalAmount) || 0;
     
-    try {
-      // Convert string values to numbers for decimal fields
-      const amountValue = parseFloat(amount) || 0;
-      const taxAmountValue = parseFloat(taxAmount) || 0;
-      const totalAmountValue = parseFloat(totalAmount) || 0;
-      
-      console.log('Converted values:', { amountValue, taxAmountValue, totalAmountValue });
-      
-      const [result] = await connection.query(`
-        UPDATE invoices SET
-          status = ?,
-          amount = ?,
-          tax_amount = ?,
-          total_amount = ?,
-          due_date = ?,
-          notes = ?,
-          updated_at = NOW()
-        WHERE id = ? AND user_id = ?
-      `, [
-        status, amountValue, taxAmountValue,
-        totalAmountValue, dueDate || null, notes || null, id, userId
-      ]);
-      
-      console.log('Update result:', result);
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Invoice not found' });
-      }
-      
-      // Get the updated invoice
-      const [invoices] = await connection.query(`
-        SELECT 
-          i.*,
-          c.first_name as customer_first_name,
-          c.last_name as customer_last_name,
-          c.email as customer_email
-        FROM invoices i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        WHERE i.id = ?
-      `, [id]);
-      
-      console.log('Updated invoice:', invoices[0]);
-      res.json(invoices[0]);
-      
-    } finally {
-      connection.release();
+    console.log('Converted values:', { amountValue, taxAmountValue, totalAmountValue });
+    
+    const { error: updateError } = await supabase
+      .from('invoices')
+      .update({
+        status: status,
+        amount: amountValue,
+        tax_amount: taxAmountValue,
+        total_amount: totalAmountValue,
+        due_date: dueDate || null,
+        notes: notes || null
+      })
+      .eq('id', id)
+      .eq('user_id', userId);
+    
+    if (updateError) {
+      console.error('Error updating invoice:', updateError);
+      return res.status(500).json({ error: 'Failed to update invoice' });
     }
+    
+    // Get the updated invoice
+    const { data: invoices, error: fetchError } = await supabase
+      .from('invoices')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email)
+      `)
+      .eq('id', id)
+      .limit(1);
+    
+    if (fetchError) {
+      console.error('Error fetching updated invoice:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch updated invoice' });
+    }
+    
+    if (!invoices || invoices.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    console.log('Updated invoice:', invoices[0]);
+    res.json(invoices[0]);
   } catch (error) {
     console.error('Update invoice error:', error);
     console.error('Request body:', req.body);
@@ -4833,22 +5077,18 @@ app.delete('/api/invoices/:id', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const connection = await pool.getConnection();
+    const { error: deleteError } = await supabase
+      .from('invoices')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
     
-    try {
-      const [result] = await connection.query(`
-        DELETE FROM invoices WHERE id = ? AND user_id = ?
-      `, [id, userId]);
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Invoice not found' });
-      }
-      
-      res.json({ message: 'Invoice deleted successfully' });
-      
-    } finally {
-      connection.release();
+    if (deleteError) {
+      console.error('Error deleting invoice:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete invoice' });
     }
+    
+    res.json({ message: 'Invoice deleted successfully' });
   } catch (error) {
     console.error('Delete invoice error:', error);
     res.status(500).json({ error: 'Failed to delete invoice' });
@@ -5789,85 +6029,73 @@ app.get('/api/team-members', async (req, res) => {
   console.log('🔄 Team members request received:', req.query);
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
-    const connection = await pool.getConnection();
+    // Build Supabase query with joins and aggregations
+    let query = supabase
+      .from('team_members')
+      .select(`
+        *,
+        jobs!left(id, status, invoice_amount)
+      `, { count: 'exact' })
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT 
-          tm.*,
-          COUNT(j.id) as total_jobs,
-          COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed_jobs,
-          AVG(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as avg_job_value
-        FROM team_members tm
-        LEFT JOIN jobs j ON tm.id = j.team_member_id
-        WHERE tm.user_id = ?
-      `;
-      let params = [userId];
-      
-      if (status) {
-        query += ' AND tm.status = ?';
-        params.push(status);
-      }
-      
-      if (search) {
-        query += ' AND (tm.first_name LIKE ? OR tm.last_name LIKE ? OR tm.email LIKE ?)';
-        const searchTerm = `%${search}%`;
-        params.push(searchTerm, searchTerm, searchTerm);
-      }
-      
-      query += ' GROUP BY tm.id';
-      
-      // Handle sorting
-      const allowedSortFields = ['first_name', 'last_name', 'email', 'role', 'total_jobs', 'completed_jobs', 'avg_job_value'];
-      const allowedSortOrders = ['ASC', 'DESC'];
-      
-      if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
-        query += ` ORDER BY ${sortBy} ${sortOrder.toUpperCase()}`;
-      } else {
-        query += ' ORDER BY tm.first_name ASC';
-      }
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ' LIMIT ? OFFSET ?';
-      params.push(parseInt(limit), offset);
-      
-      const [teamMembers] = await connection.query(query, params);
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total 
-        FROM team_members tm
-        WHERE tm.user_id = ?
-      `;
-      let countParams = [userId];
-      
-      if (status) {
-        countQuery += ' AND tm.status = ?';
-        countParams.push(status);
-      }
-      
-      if (search) {
-        countQuery += ' AND (tm.first_name LIKE ? OR tm.last_name LIKE ? OR tm.email LIKE ?)';
-        const searchTerm = `%${search}%`;
-        countParams.push(searchTerm, searchTerm, searchTerm);
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
-      
-      res.json({
-        teamMembers,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      });
-    } finally {
-      connection.release();
+    // Add status filter
+    if (status) {
+      query = query.eq('status', status);
     }
+    
+    // Add search filter
+    if (search) {
+      query = query.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%`);
+    }
+    
+    // Add sorting
+    const allowedSortFields = ['first_name', 'last_name', 'email', 'role'];
+    const allowedSortOrders = ['ASC', 'DESC'];
+    
+    if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
+      query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+    } else {
+      query = query.order('first_name', { ascending: true });
+    }
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    const { data: teamMembers, error, count } = await query;
+    
+    if (error) {
+      console.error('Error fetching team members:', error);
+      return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+    
+    // Process team members to add job statistics
+    const processedTeamMembers = (teamMembers || []).map(member => {
+      const jobs = member.jobs || [];
+      const totalJobs = jobs.length;
+      const completedJobs = jobs.filter(job => job.status === 'completed').length;
+      const avgJobValue = completedJobs > 0 
+        ? jobs.filter(job => job.status === 'completed')
+            .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs
+        : 0;
+      
+      return {
+        ...member,
+        total_jobs: totalJobs,
+        completed_jobs: completedJobs,
+        avg_job_value: avgJobValue
+      };
+    });
+    
+    res.json({
+      teamMembers: processedTeamMembers,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
+      }
+    });
   } catch (error) {
     console.error('Get team members error:', error);
     res.status(500).json({ error: 'Failed to fetch team members' });
@@ -5878,66 +6106,69 @@ app.get('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { startDate, endDate } = req.query;
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get team member info
-      let teamMembers = [];
-      try {
-        const [teamMembersResult] = await connection.query(
-          'SELECT * FROM team_members WHERE id = ?',
-          [id]
-        );
-        teamMembers = teamMembersResult;
-      } catch (teamMemberError) {
-        console.error('Error fetching team member:', teamMemberError);
-        return res.status(500).json({ error: 'Failed to fetch team member data' });
-      }
-      
-      if (teamMembers.length === 0) {
-        return res.status(404).json({ error: 'Team member not found' });
-      }
-      
-      const teamMember = teamMembers[0];
-      
-      // Get jobs assigned to this team member
-      let jobs = [];
-      try {
-        const [jobsResult] = await connection.query(`
-          SELECT 
-            j.*,
-            c.first_name as customer_first_name,
-            c.last_name as customer_last_name,
-            c.phone as customer_phone,
-            c.address as customer_address,
-            s.name as service_name,
-            s.duration
-          FROM jobs j
-          LEFT JOIN customers c ON j.customer_id = c.id
-          LEFT JOIN services s ON j.service_id = s.id
-          WHERE j.team_member_id = ?
-          AND j.scheduled_date BETWEEN ? AND ?
-          ORDER BY j.scheduled_date ASC
-        `, [id, startDate || '2024-01-01', endDate || '2030-12-31']);
-        jobs = jobsResult;
-      } catch (jobsError) {
-        console.error('Error fetching jobs for team member:', jobsError);
-        // Return empty jobs array if query fails
-        jobs = [];
-      }
-      
-      res.json({
-        teamMember,
-        jobs
-      });
-    } finally {
-      connection.release();
+
+    // ✅ Fetch team member info
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('id', id)
+      .limit(1);
+
+    if (teamMemberError) {
+      console.error('Error fetching team member:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to fetch team member data' });
     }
+
+    if (!teamMembers || teamMembers.length === 0) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+
+    const teamMember = teamMembers[0];
+
+    // ✅ Fetch jobs assigned to this team member
+    let jobs = [];
+    try {
+      const { data: jobsResult, error: jobsError } = await supabase
+        .from('jobs')
+        .select(`
+          *,
+          customers!left(first_name, last_name, phone, address),
+          services!left(name, duration)
+        `)
+        .eq('team_member_id', id)
+        .gte('scheduled_date', startDate || '2024-01-01')
+        .lte('scheduled_date', endDate || '2030-12-31')
+        .order('scheduled_date', { ascending: true });
+
+      if (jobsError) {
+        console.error('Error fetching jobs for team member:', jobsError);
+      } else {
+        jobs = (jobsResult || []).map(job => ({
+          ...job,
+          customer_first_name: job.customers?.first_name,
+          customer_last_name: job.customers?.last_name,
+          customer_phone: job.customers?.phone,
+          customer_address: job.customers?.address,
+          service_name: job.services?.name,
+          duration: job.services?.duration
+        }));
+      }
+    } catch (jobFetchError) {
+      console.error('Unexpected error fetching jobs:', jobFetchError);
+    }
+
+    // ✅ Final response
+    res.json({
+      teamMember,
+      jobs
+    });
+
   } catch (error) {
     console.error('Get team member error:', error);
     res.status(500).json({ error: 'Failed to fetch team member' });
   }
 });
+
 
 app.post('/api/team-members', async (req, res) => {
   try {
@@ -5962,6 +6193,7 @@ app.post('/api/team-members', async (req, res) => {
       permissions
     } = req.body;
     
+    // Validate required fields
     if (!userId || !firstName || !lastName || !email || !username || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -5971,70 +6203,72 @@ app.post('/api/team-members', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
     
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if username or email already exists for this user
-      const [existing] = await connection.query(
-        'SELECT id FROM team_members WHERE user_id = ? AND (email = ? OR username = ?)',
-        [userId, email, username]
-      );
-      
-      if (existing.length > 0) {
-        return res.status(400).json({ error: 'Team member with this email or username already exists' });
-      }
-      
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, 10);
-      
-      const [result] = await connection.query(
-        `INSERT INTO team_members (
-          user_id, first_name, last_name, email, phone, username, password, role, 
-          skills, hourly_rate, availability, location, city, state, zip_code, 
-          is_service_provider, territories, permissions, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NOW())`,
-        [
-          userId, 
-          firstName, 
-          lastName, 
-          email, 
-          phone || null, 
-          username,
-          hashedPassword,
-          role || null, 
-          skills ? JSON.stringify(skills) : null,
-          hourlyRate || null,
-          availability ? JSON.stringify(availability) : null,
-          location || null,
-          city || null,
-          state || null,
-          zipCode || null,
-          isServiceProvider || false,
-          territories ? JSON.stringify(territories) : null,
-          permissions ? JSON.stringify(permissions) : null
-        ]
-      );
-      
-      // Get the created team member
-      const [teamMembers] = await connection.query(`
-        SELECT * FROM team_members WHERE id = ?
-      `, [result.insertId]);
-      
-      const teamMember = teamMembers[0];
-      delete teamMember.password; // Don't send password back
-      
-      res.status(201).json({
-        message: 'Team member created successfully',
-        teamMember
-      });
-    } finally {
-      connection.release();
+    // ✅ Check if username or email already exists for this user
+    const { data: existing, error: checkError } = await supabase
+      .from('team_members')
+      .select('id')
+      .eq('user_id', userId)
+      .or(`email.eq.${email},username.eq.${username}`)
+      .limit(1);
+
+    if (checkError) {
+      console.error('Error checking existing team member:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing team member' });
     }
+
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: 'Team member with this email or username already exists' });
+    }
+    
+    // ✅ Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // ✅ Create team member
+    const { data: newTeamMember, error: createError } = await supabase
+      .from('team_members')
+      .insert({
+        user_id: userId,
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        phone: phone || null,
+        username,
+        password: hashedPassword,
+        role: role || null,
+        skills,
+        hourly_rate: hourlyRate || null,
+        availability,
+        location: location || null,
+        city: city || null,
+        state: state || null,
+        zip_code: zipCode || null,
+        is_service_provider: isServiceProvider || false,
+        territories,
+        permissions,
+        status: 'active'
+      })
+      .select()
+      .single();
+    
+    if (createError) {
+      console.error('Error creating team member:', createError);
+      return res.status(500).json({ error: 'Failed to create team member' });
+    }
+    
+    // ✅ Don’t send password back
+    const { password: _, ...teamMemberWithoutPassword } = newTeamMember;
+    
+    res.status(201).json({
+      message: 'Team member created successfully',
+      teamMember: teamMemberWithoutPassword
+    });
+
   } catch (error) {
     console.error('Create team member error:', error);
     res.status(500).json({ error: 'Failed to create team member' });
   }
 });
+
 
 app.put('/api/team-members/:id', async (req, res) => {
   try {
@@ -6060,117 +6294,97 @@ app.put('/api/team-members/:id', async (req, res) => {
       permissions
     } = req.body;
     
-    const connection = await pool.getConnection();
+    // Build update object with only provided fields
+    const updateData = {};
     
-    try {
-      const updateFields = [];
-      const updateValues = [];
-      
-      if (firstName) {
-        updateFields.push('first_name = ?');
-        updateValues.push(firstName);
-      }
-      
-      if (lastName) {
-        updateFields.push('last_name = ?');
-        updateValues.push(lastName);
-      }
-      
-      if (email) {
-        if (!validateEmail(email)) {
-          return res.status(400).json({ error: 'Invalid email format' });
-        }
-        updateFields.push('email = ?');
-        updateValues.push(email);
-      }
-      
-      if (phone !== undefined) {
-        updateFields.push('phone = ?');
-        updateValues.push(phone);
-      }
-      
-      if (username !== undefined) {
-        updateFields.push('username = ?');
-        updateValues.push(username);
-      }
-      
-      if (password !== undefined) {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        updateFields.push('password = ?');
-        updateValues.push(hashedPassword);
-      }
-      
-      if (role !== undefined) {
-        updateFields.push('role = ?');
-        updateValues.push(role);
-      }
-      
-      if (skills !== undefined) {
-        updateFields.push('skills = ?');
-        updateValues.push(JSON.stringify(skills));
-      }
-      
-      if (hourlyRate !== undefined) {
-        updateFields.push('hourly_rate = ?');
-        updateValues.push(hourlyRate);
-      }
-      
-      if (availability !== undefined) {
-        updateFields.push('availability = ?');
-        updateValues.push(JSON.stringify(availability));
-      }
-      
-      if (status !== undefined) {
-        updateFields.push('status = ?');
-        updateValues.push(status);
-      }
-      
-      if (location !== undefined) {
-        updateFields.push('location = ?');
-        updateValues.push(location);
-      }
-      
-      if (city !== undefined) {
-        updateFields.push('city = ?');
-        updateValues.push(city);
-      }
-      
-      if (state !== undefined) {
-        updateFields.push('state = ?');
-        updateValues.push(state);
-      }
-      
-      if (zipCode !== undefined) {
-        updateFields.push('zip_code = ?');
-        updateValues.push(zipCode);
-      }
-      
-      if (isServiceProvider !== undefined) {
-        updateFields.push('is_service_provider = ?');
-        updateValues.push(isServiceProvider);
-      }
-      
-      if (territories !== undefined) {
-        updateFields.push('territories = ?');
-        updateValues.push(JSON.stringify(territories));
-      }
-      
-      if (permissions !== undefined) {
-        updateFields.push('permissions = ?');
-        updateValues.push(JSON.stringify(permissions));
-      }
-      
-      updateFields.push('updated_at = NOW()');
-      updateValues.push(id);
-      
-      const query = `UPDATE team_members SET ${updateFields.join(', ')} WHERE id = ?`;
-      
-      await connection.query(query, updateValues);
-      
-      res.json({ message: 'Team member updated successfully' });
-    } finally {
-      connection.release();
+    if (firstName) {
+      updateData.first_name = firstName;
     }
+    
+    if (lastName) {
+      updateData.last_name = lastName;
+    }
+    
+    if (email) {
+      if (!validateEmail(email)) {
+        return res.status(400).json({ error: 'Invalid email format' });
+      }
+      updateData.email = email;
+    }
+    
+    if (phone !== undefined) {
+      updateData.phone = phone;
+    }
+    
+    if (username !== undefined) {
+      updateData.username = username;
+    }
+    
+    if (password !== undefined) {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      updateData.password = hashedPassword;
+    }
+    
+    if (role !== undefined) {
+      updateData.role = role;
+    }
+    
+    if (skills !== undefined) {
+      updateData.skills = skills;
+    }
+    
+    if (hourlyRate !== undefined) {
+      updateData.hourly_rate = hourlyRate;
+    }
+    
+    if (availability !== undefined) {
+      updateData.availability = availability;
+    }
+    
+    if (status !== undefined) {
+      updateData.status = status;
+    }
+    
+    if (location !== undefined) {
+      updateData.location = location;
+    }
+    
+    if (city !== undefined) {
+      updateData.city = city;
+    }
+    
+    if (state !== undefined) {
+      updateData.state = state;
+    }
+    
+    if (zipCode !== undefined) {
+      updateData.zip_code = zipCode;
+    }
+    
+    if (isServiceProvider !== undefined) {
+      updateData.is_service_provider = isServiceProvider;
+    }
+    
+    if (territories !== undefined) {
+      updateData.territories = territories;
+    }
+    
+    if (permissions !== undefined) {
+      updateData.permissions = permissions;
+    }
+    
+    // Update team member
+    const { error } = await supabase
+      .from('team_members')
+      .update(updateData)
+      .eq('id', id);
+    
+    if (error) {
+      console.error('Error updating team member:', error);
+      return res.status(500).json({ error: 'Failed to update team member' });
+    }
+    
+    res.json({ message: 'Team member updated successfully' });
   } catch (error) {
     console.error('Update team member error:', error);
     res.status(500).json({ error: 'Failed to update team member' });
@@ -6180,31 +6394,36 @@ app.put('/api/team-members/:id', async (req, res) => {
 app.delete('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    // Check if team member has assigned jobs
+    const { data: assignedJobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select('id', { count: 'exact' })
+      .eq('team_member_id', id)
+      .in('status', ['pending', 'confirmed', 'in-progress']);
     
-    try {
-      // Check if team member has assigned jobs
-      const [assignedJobs] = await connection.query(
-        'SELECT COUNT(*) as count FROM jobs WHERE team_member_id = ? AND status IN ("pending", "confirmed", "in_progress")',
-        [id]
-      );
-      
-      if (assignedJobs[0].count > 0) {
-        return res.status(400).json({ 
-          error: 'Cannot delete team member with active job assignments. Please reassign or complete their jobs first.' 
-        });
-      }
-      
-      // Soft delete by setting status to inactive
-      await connection.query(
-        'UPDATE team_members SET status = "inactive", updated_at = NOW() WHERE id = ?',
-        [id]
-      );
-      
-      res.json({ message: 'Team member deleted successfully' });
-    } finally {
-      connection.release();
+    if (jobsError) {
+      console.error('Error checking assigned jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to delete team member' });
     }
+    
+    if (assignedJobs && assignedJobs.length > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete team member with active job assignments. Please reassign or complete their jobs first.' 
+      });
+    }
+    
+    // Soft delete by setting status to inactive
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({ status: 'inactive' })
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('Error updating team member:', updateError);
+      return res.status(500).json({ error: 'Failed to delete team member' });
+    }
+    
+    res.json({ message: 'Team member deleted successfully' });
   } catch (error) {
     console.error('Delete team member error:', error);
     res.status(500).json({ error: 'Failed to delete team member' });
@@ -6232,7 +6451,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
       let jobsQuery = `
         SELECT scheduled_date, duration 
         FROM jobs 
-        WHERE team_member_id = ? AND status IN ("pending", "confirmed", "in_progress")
+        WHERE team_member_id = ? AND status IN ("pending", "confirmed", "in-progress")
       `;
       let jobsParams = [id];
       
@@ -6378,87 +6597,87 @@ app.post('/api/team-members/register', async (req, res) => {
       permissions
     } = req.body;
     
-    const connection = await pool.getConnection();
+    // Check if email already exists for this user
+    const { data: existing, error: checkError } = await supabase
+      .from('team_members')
+      .select('id')
+      .eq('email', email)
+      .eq('user_id', userId)
+      .limit(1);
     
+    if (checkError) {
+      console.error('Error checking existing team member:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing team member' });
+    }
+    
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: 'Email already exists for this team' });
+    }
+    
+    // Generate a unique invitation token
+    const invitationToken = crypto.randomBytes(32).toString('hex');
+    
+    // Create team member with 'invited' status
+    const { data: teamMember, error: insertError } = await supabase
+      .from('team_members')
+      .insert({
+        user_id: userId,
+        first_name: sanitizeInput(firstName),
+        last_name: sanitizeInput(lastName),
+        email: sanitizeInput(email),
+        phone: phone ? sanitizeInput(phone) : null,
+        location: location ? sanitizeInput(location) : null,
+        city: city ? sanitizeInput(city) : null,
+        state: state ? sanitizeInput(state) : null,
+        zip_code: zipCode ? sanitizeInput(zipCode) : null,
+        role: role || 'worker',
+        is_service_provider: isServiceProvider || false,
+        territories: territories || [],
+        permissions: permissions || {},
+        invitation_token: invitationToken,
+        status: 'invited'
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating team member:', insertError);
+      return res.status(500).json({ error: 'Failed to create team member' });
+    }
+    
+    // Send invitation email
     try {
-      // Check if email already exists for this user
-      const [existing] = await connection.query(
-        'SELECT id FROM team_members WHERE email = ? AND user_id = ?',
-        [email, userId]
-      );
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
       
-      if (existing.length > 0) {
-        return res.status(400).json({ error: 'Email already exists for this team' });
-      }
-      
-      // Generate a unique invitation token
-      const invitationToken = crypto.randomBytes(32).toString('hex');
-      
-      // Create team member with 'invited' status
-      const [result] = await connection.query(`
-        INSERT INTO team_members (
-          user_id, first_name, last_name, email, phone, location, city, state, zip_code,
-          role, is_service_provider, territories, permissions, invitation_token, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'invited', NOW())`,
-        [
-          userId, 
-          sanitizeInput(firstName), 
-          sanitizeInput(lastName), 
-          sanitizeInput(email), 
-          phone ? sanitizeInput(phone) : null,
-          location ? sanitizeInput(location) : null,
-          city ? sanitizeInput(city) : null,
-          state ? sanitizeInput(state) : null,
-          zipCode ? sanitizeInput(zipCode) : null,
-          role || 'worker',
-          isServiceProvider ? 1 : 0,
-          territories ? JSON.stringify(territories) : JSON.stringify([]),
-          permissions ? JSON.stringify(permissions) : JSON.stringify({}),
-          invitationToken
-        ]
-      );
-      
-      // Get the created team member
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE id = ?',
-        [result.insertId]
-      );
-      
-      const teamMember = teamMembers[0];
-      
-      // Send invitation email
-      try {
-        const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
-        
-        await sendEmail({
-          to: email,
-          subject: 'You\'ve been invited to join Zenbooker',
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
-              <p>Hello ${firstName},</p>
-              <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
-              <div style="text-align: center; margin: 30px 0;">
-                <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                  Create Your Account
-                </a>
-              </div>
-              <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-              <p>Best regards,<br>The Zenbooker Team</p>
+      await sendEmail({
+        to: email,
+        subject: 'You\'ve been invited to join Zenbooker',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
+            <p>Hello ${firstName},</p>
+            <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                Create Your Account
+              </a>
             </div>
-          `,
-          text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
-        });
-      } catch (emailError) {
-        console.error('Failed to send invitation email:', emailError);
-        // Don't fail the request if email fails
-      }
-      
-      res.json({
-        message: 'Team member invited successfully',
-        teamMember: {
-          id: teamMember.id,
-          first_name: teamMember.first_name,
+            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+            <p>Best regards,<br>The Zenbooker Team</p>
+          </div>
+        `,
+        text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+      });
+    } catch (emailError) {
+      console.error('Failed to send invitation email:', emailError);
+      // Don't fail the request if email fails
+    }
+    
+    res.json({
+      message: 'Team member invited successfully',
+      teamMember: {
+        id: teamMember.id,
+        first_name: teamMember.first_name,
           last_name: teamMember.last_name,
           email: teamMember.email,
           phone: teamMember.phone,
@@ -6474,16 +6693,11 @@ app.post('/api/team-members/register', async (req, res) => {
           created_at: teamMember.created_at
         }
       });
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('Team member registration error:', error);
     console.error('Error details:', {
       message: error.message,
-      code: error.code,
-      sqlMessage: error.sqlMessage,
-      sqlState: error.sqlState
+      code: error.code
     });
     res.status(500).json({ error: 'Registration failed', details: error.message });
   }
@@ -6492,19 +6706,19 @@ app.post('/api/team-members/register', async (req, res) => {
 app.post('/api/team-members/logout', async (req, res) => {
   try {
     const { token } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      // Remove session
-      await connection.query(
-        'DELETE FROM team_member_sessions WHERE session_token = ?',
-        [token]
-      );
-      
-      res.json({ message: 'Logout successful' });
-    } finally {
-      connection.release();
+    // Remove session
+    const { error } = await supabase
+      .from('team_member_sessions')
+      .delete()
+      .eq('session_token', token);
+    
+    if (error) {
+      console.error('Error removing session:', error);
+      return res.status(500).json({ error: 'Logout failed' });
     }
+    
+    res.json({ message: 'Logout successful' });
   } catch (error) {
     console.error('Team member logout error:', error);
     res.status(500).json({ error: 'Logout failed' });
@@ -6770,7 +6984,7 @@ app.get('/api/team-analytics', async (req, res) => {
           tm.role,
           COUNT(j.id) as total_jobs,
           COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed_jobs,
-          COUNT(CASE WHEN j.status IN ('pending', 'confirmed', 'in_progress') THEN 1 END) as active_jobs,
+          COUNT(CASE WHEN j.status IN ('pending', 'confirmed', 'in-progress') THEN 1 END) as active_jobs,
           AVG(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as avg_job_value,
           SUM(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as total_revenue,
           AVG(CASE WHEN j.status = 'completed' THEN TIMESTAMPDIFF(MINUTE, j.scheduled_date, j.updated_at) END) as avg_completion_time
@@ -6961,40 +7175,51 @@ app.post('/api/coupons', authenticateToken, async (req, res) => {
       recurringApplicationType
     } = req.body;
 
-    const connection = await pool.getConnection();
+    // Check if coupon code already exists
+    const { data: existingCoupons, error: checkError } = await supabase
+      .from('coupons')
+      .select('id')
+      .eq('code', code)
+      .limit(1);
     
-    try {
-      // Check if coupon code already exists
-      const [existingCoupons] = await connection.query(
-        'SELECT id FROM coupons WHERE code = ?',
-        [code]
-      );
-      
-      if (existingCoupons.length > 0) {
-        return res.status(400).json({ error: 'Coupon code already exists' });
-      }
-
-      // Create coupon
-      const [result] = await connection.query(`
-        INSERT INTO coupons (
-          user_id, code, discount_type, discount_amount, application_type,
-          selected_services, doesnt_expire, expiration_date, restrict_before_expiration,
-          limit_total_uses, can_combine_with_recurring, recurring_application_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        userId, code, discountType, discountAmount, applicationType,
-        JSON.stringify(selectedServices), doesntExpire, 
-        doesntExpire ? null : expirationDate, restrictBeforeExpiration,
-        limitTotalUses, canCombineWithRecurring, recurringApplicationType
-      ]);
-
-      res.status(201).json({
-        message: 'Coupon created successfully',
-        couponId: result.insertId
-      });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing coupon:', checkError);
+      return res.status(500).json({ error: 'Failed to create coupon' });
     }
+    
+    if (existingCoupons && existingCoupons.length > 0) {
+      return res.status(400).json({ error: 'Coupon code already exists' });
+    }
+
+    // Create coupon
+    const { data: result, error: insertError } = await supabase
+      .from('coupons')
+      .insert({
+        user_id: userId,
+        code: code,
+        discount_type: discountType,
+        discount_amount: discountAmount,
+        application_type: applicationType,
+        selected_services: selectedServices,
+        doesnt_expire: doesntExpire,
+        expiration_date: doesntExpire ? null : expirationDate,
+        restrict_before_expiration: restrictBeforeExpiration,
+        limit_total_uses: limitTotalUses,
+        can_combine_with_recurring: canCombineWithRecurring,
+        recurring_application_type: recurringApplicationType
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Error creating coupon:', insertError);
+      return res.status(500).json({ error: 'Failed to create coupon' });
+    }
+
+    res.status(201).json({
+      message: 'Coupon created successfully',
+      couponId: result.id
+    });
   } catch (error) {
     console.error('Create coupon error:', error);
     res.status(500).json({ error: 'Failed to create coupon' });
@@ -7004,17 +7229,18 @@ app.post('/api/coupons', authenticateToken, async (req, res) => {
 app.get('/api/coupons', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
+    const { data: coupons, error } = await supabase
+      .from('coupons')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
     
-    try {
-      const [coupons] = await connection.query(`
-        SELECT * FROM coupons WHERE user_id = ? ORDER BY created_at DESC
-      `, [userId]);
-      
-      res.json({ coupons });
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching coupons:', error);
+      return res.status(500).json({ error: 'Failed to get coupons' });
     }
+    
+    res.json({ coupons: coupons || [] });
   } catch (error) {
     console.error('Get coupons error:', error);
     res.status(500).json({ error: 'Failed to get coupons' });
@@ -7027,41 +7253,48 @@ app.put('/api/coupons/:id', authenticateToken, async (req, res) => {
     const couponId = req.params.id;
     const updateData = req.body;
 
-    const connection = await pool.getConnection();
+    // Verify coupon belongs to user
+    const { data: coupons, error: checkError } = await supabase
+      .from('coupons')
+      .select('id')
+      .eq('id', couponId)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Verify coupon belongs to user
-      const [coupons] = await connection.query(
-        'SELECT id FROM coupons WHERE id = ? AND user_id = ?',
-        [couponId, userId]
-      );
-      
-      if (coupons.length === 0) {
-        return res.status(404).json({ error: 'Coupon not found' });
-      }
-
-      // Update coupon
-      await connection.query(`
-        UPDATE coupons SET 
-          code = ?, discount_type = ?, discount_amount = ?, application_type = ?,
-          selected_services = ?, doesnt_expire = ?, expiration_date = ?, 
-          restrict_before_expiration = ?, limit_total_uses = ?, 
-          can_combine_with_recurring = ?, recurring_application_type = ?,
-          is_active = ?, updated_at = NOW()
-        WHERE id = ?
-      `, [
-        updateData.code, updateData.discountType, updateData.discountAmount,
-        updateData.applicationType, JSON.stringify(updateData.selectedServices),
-        updateData.doesntExpire, updateData.doesntExpire ? null : updateData.expirationDate,
-        updateData.restrictBeforeExpiration, updateData.limitTotalUses,
-        updateData.canCombineWithRecurring, updateData.recurringApplicationType,
-        updateData.isActive, couponId
-      ]);
-
-      res.json({ message: 'Coupon updated successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking coupon:', checkError);
+      return res.status(500).json({ error: 'Failed to update coupon' });
     }
+    
+    if (!coupons || coupons.length === 0) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+
+    // Update coupon
+    const { error: updateError } = await supabase
+      .from('coupons')
+      .update({
+        code: updateData.code,
+        discount_type: updateData.discountType,
+        discount_amount: updateData.discountAmount,
+        application_type: updateData.applicationType,
+        selected_services: updateData.selectedServices,
+        doesnt_expire: updateData.doesntExpire,
+        expiration_date: updateData.doesntExpire ? null : updateData.expirationDate,
+        restrict_before_expiration: updateData.restrictBeforeExpiration,
+        limit_total_uses: updateData.limitTotalUses,
+        can_combine_with_recurring: updateData.canCombineWithRecurring,
+        recurring_application_type: updateData.recurringApplicationType,
+        is_active: updateData.isActive
+      })
+      .eq('id', couponId);
+
+    if (updateError) {
+      console.error('Error updating coupon:', updateError);
+      return res.status(500).json({ error: 'Failed to update coupon' });
+    }
+
+    res.json({ message: 'Coupon updated successfully' });
   } catch (error) {
     console.error('Update coupon error:', error);
     res.status(500).json({ error: 'Failed to update coupon' });
@@ -7073,26 +7306,35 @@ app.delete('/api/coupons/:id', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const couponId = req.params.id;
 
-    const connection = await pool.getConnection();
+    // Verify coupon belongs to user
+    const { data: coupons, error: checkError } = await supabase
+      .from('coupons')
+      .select('id')
+      .eq('id', couponId)
+      .eq('user_id', userId)
+      .limit(1);
     
-    try {
-      // Verify coupon belongs to user
-      const [coupons] = await connection.query(
-        'SELECT id FROM coupons WHERE id = ? AND user_id = ?',
-        [couponId, userId]
-      );
-      
-      if (coupons.length === 0) {
-        return res.status(404).json({ error: 'Coupon not found' });
-      }
-
-      // Delete coupon
-      await connection.query('DELETE FROM coupons WHERE id = ?', [couponId]);
-
-      res.json({ message: 'Coupon deleted successfully' });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking coupon:', checkError);
+      return res.status(500).json({ error: 'Failed to delete coupon' });
     }
+    
+    if (!coupons || coupons.length === 0) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+
+    // Delete coupon
+    const { error: deleteError } = await supabase
+      .from('coupons')
+      .delete()
+      .eq('id', couponId);
+
+    if (deleteError) {
+      console.error('Error deleting coupon:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete coupon' });
+    }
+
+    res.json({ message: 'Coupon deleted successfully' });
   } catch (error) {
     console.error('Delete coupon error:', error);
     res.status(500).json({ error: 'Failed to delete coupon' });
@@ -7282,52 +7524,60 @@ app.post('/api/payments/confirm-payment', authenticateToken, async (req, res) =>
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
     
     if (paymentIntent.status === 'succeeded') {
-      // Update invoice status
-      const connection = await pool.getConnection();
-      try {
-        await connection.query(`
-          UPDATE invoices SET 
-            status = 'paid', 
-            payment_date = NOW(),
-            stripe_payment_intent_id = ?
-          WHERE id = ?
-        `, [paymentIntentId, invoiceId]);
-        
-        // Get invoice details for email
-        const [invoices] = await connection.query(`
-          SELECT i.*, c.email, c.first_name, c.last_name
-          FROM invoices i
-          JOIN customers c ON i.customer_id = c.id
-          WHERE i.id = ?
-        `, [invoiceId]);
-        
-        if (invoices.length > 0) {
-          const invoice = invoices[0];
-          
-          // Send payment confirmation email
-          await sendEmail({
-            to: invoice.email,
-            subject: 'Payment Confirmation',
-            html: `
-              <h2>Payment Confirmation</h2>
-              <p>Hello ${invoice.first_name},</p>
-              <p>Thank you for your payment of $${invoice.total_amount}.</p>
-              <p>Invoice #: ${invoice.id}</p>
-              <p>Payment Date: ${new Date().toLocaleDateString()}</p>
-              <p>Transaction ID: ${paymentIntentId}</p>
-              <p>Thank you for your business!</p>
-            `
-          });
-        }
-        
-        res.json({ 
-          success: true, 
-          message: 'Payment confirmed successfully',
-          paymentIntent 
-        });
-      } finally {
-        connection.release();
+      // Update invoice status using Supabase
+      const { error: updateError } = await supabase
+        .from('invoices')
+        .update({
+          status: 'paid',
+          payment_date: new Date().toISOString(),
+          stripe_payment_intent_id: paymentIntentId
+        })
+        .eq('id', invoiceId);
+
+      if (updateError) {
+        console.error('Error updating invoice:', updateError);
+        return res.status(500).json({ error: 'Failed to update invoice' });
       }
+      
+      // Get invoice details for email using Supabase
+      const { data: invoices, error: fetchError } = await supabase
+        .from('invoices')
+        .select(`
+          *,
+          customers!inner(email, first_name, last_name)
+        `)
+        .eq('id', invoiceId)
+        .limit(1);
+      
+      if (fetchError) {
+        console.error('Error fetching invoice details:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch invoice details' });
+      }
+      
+      if (invoices && invoices.length > 0) {
+        const invoice = invoices[0];
+        
+        // Send payment confirmation email
+        await sendEmail({
+          to: invoice.customers.email,
+          subject: 'Payment Confirmation',
+          html: `
+            <h2>Payment Confirmation</h2>
+            <p>Hello ${invoice.customers.first_name},</p>
+            <p>Thank you for your payment of $${invoice.total_amount}.</p>
+            <p>Invoice #: ${invoice.id}</p>
+            <p>Payment Date: ${new Date().toLocaleDateString()}</p>
+            <p>Transaction ID: ${paymentIntentId}</p>
+            <p>Thank you for your business!</p>
+          `
+        });
+      }
+      
+      res.json({ 
+        success: true, 
+        message: 'Payment confirmed successfully',
+        paymentIntent 
+      });
     } else {
       res.status(400).json({ error: 'Payment not completed' });
     }
@@ -7489,83 +7739,87 @@ app.get('/api/requests', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
     
-    const connection = await pool.getConnection();
+    // Build the query
+    let query = supabase
+      .from('requests')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        services!left(name, price, duration)
+      `)
+      .eq('user_id', userId);
     
-    try {
-      let query = `
-        SELECT r.*, 
-               c.first_name as customer_first_name, 
-               c.last_name as customer_last_name,
-               c.email as customer_email,
-               c.phone as customer_phone,
-               s.name as service_name,
-               s.price as service_price,
-               s.duration as service_duration
-        FROM requests r
-        LEFT JOIN customers c ON r.customer_id = c.id
-        LEFT JOIN services s ON r.service_id = s.id
-        WHERE r.user_id = ?
-      `;
-      
-      const params = [userId];
-      
-      // Add filter conditions
-      if (filter === 'booking') {
-        query += ' AND r.type = "booking"';
-      } else if (filter === 'quote') {
-        query += ' AND r.type = "quote"';
-      }
-      
-      if (status) {
-        query += ' AND r.status = ?';
-        params.push(status);
-      }
-      
-      // Add sorting
-      query += ` ORDER BY r.${sortBy} ${sortOrder}`;
-      
-      // Add pagination
-      const offset = (page - 1) * limit;
-      query += ' LIMIT ? OFFSET ?';
-      params.push(parseInt(limit), offset);
-      
-      const [requests] = await connection.query(query, params);
-      
-      // Get total count for pagination
-      let countQuery = `
-        SELECT COUNT(*) as total
-        FROM requests r
-        WHERE r.user_id = ?
-      `;
-      
-      const countParams = [userId];
-      
-      if (filter === 'booking') {
-        countQuery += ' AND r.type = "booking"';
-      } else if (filter === 'quote') {
-        countQuery += ' AND r.type = "quote"';
-      }
-      
-      if (status) {
-        countQuery += ' AND r.status = ?';
-        countParams.push(status);
-      }
-      
-      const [countResult] = await connection.query(countQuery, countParams);
-      const total = countResult[0].total;
-      
-      res.json({
-        requests,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        }
-      });
-    } finally {
-      connection.release();
+    // Add filter conditions
+    if (filter === 'booking') {
+      query = query.eq('type', 'booking');
+    } else if (filter === 'quote') {
+      query = query.eq('type', 'quote');
     }
+    
+    if (status) {
+      query = query.eq('status', status);
+    }
+    
+    // Add sorting
+    query = query.order(sortBy, { ascending: sortOrder === 'ASC' });
+    
+    // Add pagination
+    const offset = (page - 1) * limit;
+    query = query.range(offset, offset + parseInt(limit) - 1);
+    
+    const { data: requests, error } = await query;
+    
+    if (error) {
+      console.error('Error fetching requests:', error);
+      return res.status(500).json({ error: 'Failed to fetch requests' });
+    }
+    
+    // Get total count for pagination
+    let countQuery = supabase
+      .from('requests')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+    
+    if (filter === 'booking') {
+      countQuery = countQuery.eq('type', 'booking');
+    } else if (filter === 'quote') {
+      countQuery = countQuery.eq('type', 'quote');
+    }
+    
+    if (status) {
+      countQuery = countQuery.eq('status', status);
+    }
+    
+    const { count: total, error: countError } = await countQuery;
+    
+    if (countError) {
+      console.error('Error counting requests:', countError);
+      return res.status(500).json({ error: 'Failed to count requests' });
+    }
+    
+    // Flatten the nested data for easier consumption
+    const flattenedRequests = requests.map(request => ({
+      ...request,
+      customer_first_name: request.customers?.first_name,
+      customer_last_name: request.customers?.last_name,
+      customer_email: request.customers?.email,
+      customer_phone: request.customers?.phone,
+      service_name: request.services?.name,
+      service_price: request.services?.price,
+      service_duration: request.services?.duration,
+      customers: undefined,
+      services: undefined
+    }));
+    
+    res.json({
+      requests: flattenedRequests,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: total || 0,
+        pages: Math.ceil((total || 0) / limit)
+      }
+    });
   } catch (error) {
     console.error('Get requests error:', error);
     res.status(500).json({ error: 'Failed to fetch requests' });
@@ -7575,32 +7829,43 @@ app.get('/api/requests', authenticateToken, async (req, res) => {
 app.get('/api/requests/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
     
-    try {
-      const [requests] = await connection.query(`
-        SELECT r.*, 
-               c.first_name as customer_first_name, 
-               c.last_name as customer_last_name,
-               c.email as customer_email,
-               c.phone as customer_phone,
-               s.name as service_name,
-               s.price as service_price,
-               s.duration as service_duration
-        FROM requests r
-        LEFT JOIN customers c ON r.customer_id = c.id
-        LEFT JOIN services s ON r.service_id = s.id
-        WHERE r.id = ?
-      `, [id]);
-      
-      if (requests.length === 0) {
-        return res.status(404).json({ error: 'Request not found' });
-      }
-      
-      res.json(requests[0]);
-    } finally {
-      connection.release();
+    const { data: requests, error } = await supabase
+      .from('requests')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        services!left(name, price, duration)
+      `)
+      .eq('id', id)
+      .limit(1);
+    
+    if (error) {
+      console.error('Error fetching request:', error);
+      return res.status(500).json({ error: 'Failed to fetch request' });
     }
+    
+    if (!requests || requests.length === 0) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    
+    const request = requests[0];
+    
+    // Flatten the nested data for easier consumption
+    const flattenedRequest = {
+      ...request,
+      customer_first_name: request.customers?.first_name,
+      customer_last_name: request.customers?.last_name,
+      customer_email: request.customers?.email,
+      customer_phone: request.customers?.phone,
+      service_name: request.services?.name,
+      service_price: request.services?.price,
+      service_duration: request.services?.duration,
+      customers: undefined,
+      services: undefined
+    };
+    
+    res.json(flattenedRequest);
   } catch (error) {
     console.error('Get request error:', error);
     res.status(500).json({ error: 'Failed to fetch request' });
@@ -7619,60 +7884,89 @@ app.post('/api/requests', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'User ID and type are required' });
     }
     
-    const connection = await pool.getConnection();
+    let actualCustomerId = customerId;
     
-    try {
-      let actualCustomerId = customerId;
+    // If no customerId provided, create or find customer
+    if (!customerId && customerName && customerEmail) {
+      const { data: existingCustomer, error: checkError } = await supabase
+        .from('customers')
+        .select('id')
+        .eq('email', customerEmail)
+        .eq('user_id', userId)
+        .limit(1);
       
-      // If no customerId provided, create or find customer
-      if (!customerId && customerName && customerEmail) {
-        let [existingCustomer] = await connection.query(`
-          SELECT id FROM customers WHERE email = ? AND user_id = ?
-        `, [customerEmail, userId]);
-        
-        if (existingCustomer.length > 0) {
-          actualCustomerId = existingCustomer[0].id;
-        } else {
-          const [customerResult] = await connection.query(`
-            INSERT INTO customers (user_id, first_name, last_name, email, phone, status)
-            VALUES (?, ?, ?, ?, ?, 'active')
-          `, [userId, customerName.split(' ')[0], customerName.split(' ').slice(1).join(' ') || '', customerEmail, customerPhone]);
-          actualCustomerId = customerResult.insertId;
-        }
+      if (checkError) {
+        console.error('Error checking existing customer:', checkError);
+        return res.status(500).json({ error: 'Failed to check existing customer' });
       }
       
-      const [result] = await connection.query(`
-        INSERT INTO requests (
-          user_id, customer_id, service_id, type, status, 
-          scheduled_date, scheduled_time, estimated_duration, estimated_price,
-          notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-      `, [
-        userId, actualCustomerId, serviceId, type, status,
-        scheduledDate, scheduledTime, estimatedDuration, estimatedPrice,
-        notes
-      ]);
-      
-      // Get the created request
-      const [requests] = await connection.query(`
-        SELECT r.*, 
-               c.first_name as customer_first_name, 
-               c.last_name as customer_last_name,
-               c.email as customer_email,
-               c.phone as customer_phone,
-               s.name as service_name,
-               s.price as service_price,
-               s.duration as service_duration
-        FROM requests r
-        LEFT JOIN customers c ON r.customer_id = c.id
-        LEFT JOIN services s ON r.service_id = s.id
-        WHERE r.id = ?
-      `, [result.insertId]);
-      
-      res.status(201).json(requests[0]);
-    } finally {
-      connection.release();
+      if (existingCustomer && existingCustomer.length > 0) {
+        actualCustomerId = existingCustomer[0].id;
+      } else {
+        const { data: newCustomer, error: createError } = await supabase
+          .from('customers')
+          .insert({
+            user_id: userId,
+            first_name: customerName.split(' ')[0],
+            last_name: customerName.split(' ').slice(1).join(' ') || '',
+            email: customerEmail,
+            phone: customerPhone,
+            status: 'active'
+          })
+          .select()
+          .single();
+        
+        if (createError) {
+          console.error('Error creating customer:', createError);
+          return res.status(500).json({ error: 'Failed to create customer' });
+        }
+        
+        actualCustomerId = newCustomer.id;
+      }
     }
+    
+    // Create the request
+    const { data: request, error: insertError } = await supabase
+      .from('requests')
+      .insert({
+        user_id: userId,
+        customer_id: actualCustomerId,
+        service_id: serviceId,
+        type: type,
+        status: status,
+        scheduled_date: scheduledDate,
+        scheduled_time: scheduledTime,
+        estimated_duration: estimatedDuration,
+        estimated_price: estimatedPrice,
+        notes: notes
+      })
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        services!left(name, price, duration)
+      `)
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating request:', insertError);
+      return res.status(500).json({ error: 'Failed to create request' });
+    }
+    
+    // Flatten the nested data for easier consumption
+    const flattenedRequest = {
+      ...request,
+      customer_first_name: request.customers?.first_name,
+      customer_last_name: request.customers?.last_name,
+      customer_email: request.customers?.email,
+      customer_phone: request.customers?.phone,
+      service_name: request.services?.name,
+      service_price: request.services?.price,
+      service_duration: request.services?.duration,
+      customers: undefined,
+      services: undefined
+    };
+    
+    res.status(201).json(flattenedRequest);
   } catch (error) {
     console.error('Create request error:', error);
     res.status(500).json({ error: 'Failed to create request' });
@@ -7687,40 +7981,49 @@ app.put('/api/requests/:id', authenticateToken, async (req, res) => {
       estimatedPrice, notes 
     } = req.body;
     
-    const connection = await pool.getConnection();
+    // Update the request
+    const { data: updatedRequest, error: updateError } = await supabase
+      .from('requests')
+      .update({
+        status: status,
+        scheduled_date: scheduledDate,
+        scheduled_time: scheduledTime,
+        estimated_duration: estimatedDuration,
+        estimated_price: estimatedPrice,
+        notes: notes
+      })
+      .eq('id', id)
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone),
+        services!left(name, price, duration)
+      `)
+      .single();
     
-    try {
-      await connection.query(`
-        UPDATE requests SET 
-          status = ?, scheduled_date = ?, scheduled_time = ?, 
-          estimated_duration = ?, estimated_price = ?, notes = ?, updated_at = NOW()
-        WHERE id = ?
-      `, [status, scheduledDate, scheduledTime, estimatedDuration, estimatedPrice, notes, id]);
-      
-      // Get the updated request
-      const [requests] = await connection.query(`
-        SELECT r.*, 
-               c.first_name as customer_first_name, 
-               c.last_name as customer_last_name,
-               c.email as customer_email,
-               c.phone as customer_phone,
-               s.name as service_name,
-               s.price as service_price,
-               s.duration as service_duration
-        FROM requests r
-        LEFT JOIN customers c ON r.customer_id = c.id
-        LEFT JOIN services s ON r.service_id = s.id
-        WHERE r.id = ?
-      `, [id]);
-      
-      if (requests.length === 0) {
-        return res.status(404).json({ error: 'Request not found' });
-      }
-      
-      res.json(requests[0]);
-    } finally {
-      connection.release();
+    if (updateError) {
+      console.error('Error updating request:', updateError);
+      return res.status(500).json({ error: 'Failed to update request' });
     }
+    
+    if (!updatedRequest) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    
+    // Flatten the nested data for easier consumption
+    const flattenedRequest = {
+      ...updatedRequest,
+      customer_first_name: updatedRequest.customers?.first_name,
+      customer_last_name: updatedRequest.customers?.last_name,
+      customer_email: updatedRequest.customers?.email,
+      customer_phone: updatedRequest.customers?.phone,
+      service_name: updatedRequest.services?.name,
+      service_price: updatedRequest.services?.price,
+      service_duration: updatedRequest.services?.duration,
+      customers: undefined,
+      services: undefined
+    };
+    
+    res.json(flattenedRequest);
   } catch (error) {
     console.error('Update request error:', error);
     res.status(500).json({ error: 'Failed to update request' });
@@ -7730,19 +8033,17 @@ app.put('/api/requests/:id', authenticateToken, async (req, res) => {
 app.delete('/api/requests/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const connection = await pool.getConnection();
+    const { error: deleteError } = await supabase
+      .from('requests')
+      .delete()
+      .eq('id', id);
     
-    try {
-      const [result] = await connection.query('DELETE FROM requests WHERE id = ?', [id]);
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Request not found' });
-      }
-      
-      res.json({ message: 'Request deleted successfully' });
-    } finally {
-      connection.release();
+    if (deleteError) {
+      console.error('Error deleting request:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete request' });
     }
+    
+    res.json({ message: 'Request deleted successfully' });
   } catch (error) {
     console.error('Delete request error:', error);
     res.status(500).json({ error: 'Failed to delete request' });
@@ -8093,7 +8394,7 @@ app.post('/api/upload-logo', authenticateToken, upload.single('logo'), async (re
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
   } catch (error) {
     console.error('Error uploading logo:', error);
@@ -8107,7 +8408,7 @@ app.post('/api/upload-favicon', authenticateToken, upload.single('favicon'), asy
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
   } catch (error) {
     console.error('Error uploading favicon:', error);
@@ -8121,7 +8422,7 @@ app.post('/api/upload-hero-image', authenticateToken, upload.single('heroImage')
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const fileUrl = `/uploads/${req.file.filename}`;
+    const fileUrl = `${UPLOAD_BASE_URL}/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
   } catch (error) {
     console.error('Error uploading hero image:', error);
@@ -8506,25 +8807,12 @@ app.get('/api/places/autocomplete', async (req, res) => {
     
     const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    // Use the new Places API (New) format
-    const requestBody = {
-      input: input,
-      languageCode: "en",
-      regionCode: "US"
-    };
-    
+    // Use the legacy Places API format (more widely enabled)
     const options = {
-      hostname: 'places.googleapis.com',
-      path: `/v1/places:autocomplete?key=${GOOGLE_API_KEY}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': GOOGLE_API_KEY,
-        'X-Goog-FieldMask': 'places.displayName,places.id'
-      }
+      hostname: 'maps.googleapis.com',
+      path: `/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=geocode&key=${GOOGLE_API_KEY}`,
+      method: 'GET'
     };
-    
-    const postData = JSON.stringify(requestBody);
     
     const request = https.request(options, (response) => {
       let data = '';
@@ -8539,17 +8827,10 @@ app.get('/api/places/autocomplete', async (req, res) => {
           const jsonData = JSON.parse(data);
           console.log("Parsed API response:", jsonData);
           
-          // Convert new format to legacy format for compatibility
-          const predictions = jsonData.places ? jsonData.places.map(place => ({
-            place_id: place.id,
-            description: place.displayName?.text || '',
-            structured_formatting: {
-              main_text: place.displayName?.text || '',
-              secondary_text: ''
-            }
-          })) : [];
+          // Legacy API already returns predictions in the correct format
+          const predictions = jsonData.predictions || [];
           
-          console.log("Converted predictions:", predictions);
+          console.log("Predictions:", predictions);
           res.json({ predictions });
         } catch (error) {
           console.error('Error parsing Google Places response:', error);
@@ -8563,7 +8844,6 @@ app.get('/api/places/autocomplete', async (req, res) => {
       res.status(500).json({ error: 'Failed to fetch address suggestions' });
     });
     
-    request.write(postData);
     request.end();
   } catch (error) {
     console.error('Google Places autocomplete error:', error);
@@ -8581,15 +8861,11 @@ app.get('/api/places/details', async (req, res) => {
     
     const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    // Use the new Places API (New) format
+    // Use the legacy Places API format
     const options = {
-      hostname: 'places.googleapis.com',
-      path: `/v1/places/${place_id}?key=${GOOGLE_API_KEY}`,
-      method: 'GET',
-      headers: {
-        'X-Goog-Api-Key': GOOGLE_API_KEY,
-        'X-Goog-FieldMask': 'addressComponents,formattedAddress'
-      }
+      hostname: 'maps.googleapis.com',
+      path: `/maps/api/place/details/json?place_id=${place_id}&fields=address_components,formatted_address&key=${GOOGLE_API_KEY}`,
+      method: 'GET'
     };
     
     console.log('Fetching place details for:', place_id);
@@ -8605,11 +8881,8 @@ app.get('/api/places/details', async (req, res) => {
         try {
           const jsonData = JSON.parse(data);
           
-          // Convert new format to legacy format for compatibility
-          const result = {
-            address_components: jsonData.addressComponents || [],
-            formatted_address: jsonData.formattedAddress || ''
-          };
+          // Legacy API already returns result in the correct format
+          const result = jsonData.result || {};
           
           res.json({ result });
         } catch (error) {
@@ -8647,90 +8920,88 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
     const { jobId } = req.params;
     const { teamMemberId } = req.body;
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      // Check if job exists and belongs to user
-      const [jobCheck] = await connection.query('SELECT id, user_id FROM jobs WHERE id = ?', [jobId]);
-      if (jobCheck.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
-      }
-      
-      if (jobCheck[0].user_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-      
-      // Check if team member exists (if teamMemberId is provided)
-      if (teamMemberId) {
-        const [memberCheck] = await connection.query('SELECT id FROM team_members WHERE id = ? AND user_id = ?', [teamMemberId, userId]);
-        if (memberCheck.length === 0) {
-          return res.status(404).json({ error: 'Team member not found' });
-        }
-      }
-      
-      // Remove existing assignments for this job
-      await connection.query('DELETE FROM job_team_assignments WHERE job_id = ?', [jobId]);
-      
-      // Update the job with team member assignment (for backward compatibility)
-      await connection.query(
-        'UPDATE jobs SET team_member_id = ? WHERE id = ?',
-        [teamMemberId || null, jobId]
-      );
-      
-      // Create assignment in job_team_assignments table
-      if (teamMemberId) {
-        await connection.query(`
-          INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-          VALUES (?, ?, 1, ?)
-        `, [jobId, teamMemberId, userId]);
-        
-        console.log('🔄 Created team assignment for job:', jobId, 'team member:', teamMemberId);
-      }
-      
-      // Create a notification for the team member (only if notifications table exists)
-      if (teamMemberId) {
-        try {
-          const [jobData] = await connection.query(`
-            SELECT j.*, c.first_name, c.last_name, s.name as service_name
-            FROM jobs j
-            LEFT JOIN customers c ON j.customer_id = c.id
-            LEFT JOIN services s ON j.service_id = s.id
-            WHERE j.id = ?
-          `, [jobId]);
-          
-          if (jobData.length > 0) {
-            const job = jobData[0];
-            
-            // Check if team_member_notifications table exists
-            const [tableCheck] = await connection.query(`
-              SELECT COUNT(*) as count 
-              FROM INFORMATION_SCHEMA.TABLES 
-              WHERE TABLE_SCHEMA = DATABASE() 
-              AND TABLE_NAME = 'team_member_notifications'
-            `);
-            
-            if (tableCheck[0].count > 0) {
-              await connection.query(`
-                INSERT INTO team_member_notifications 
-                (team_member_id, type, title, message, data) 
-                VALUES (?, 'job_assigned', 'New Job Assigned', ?, ?)
-              `, [
-                teamMemberId,
-                `You have been assigned a new job: ${job.service_name} for ${job.first_name} ${job.last_name}`,
-                JSON.stringify({ jobId: job.id, serviceName: job.service_name, customerName: `${job.first_name} ${job.last_name}` })
-              ]);
-            }
-          }
-        } catch (notificationError) {
-          console.error('Notification creation error (non-critical):', notificationError);
-          // Don't fail the job assignment if notification creation fails
-        }
-      }
-      
-      res.json({ message: 'Job assigned successfully' });
-    } finally {
-      connection.release();
+    // Check if job exists and belongs to user
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+    
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
     }
+    
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Check if team member exists (if teamMemberId is provided)
+    if (teamMemberId) {
+      const { data: memberCheck, error: memberError } = await supabase
+        .from('team_members')
+        .select('id')
+        .eq('id', teamMemberId)
+        .eq('user_id', userId)
+        .limit(1);
+      
+      if (memberError) {
+        console.error('Error checking team member:', memberError);
+        return res.status(500).json({ error: 'Failed to check team member' });
+      }
+      
+      if (!memberCheck || memberCheck.length === 0) {
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+    }
+    
+    // Remove existing assignments for this job
+    const { error: deleteError } = await supabase
+      .from('job_team_assignments')
+      .delete()
+      .eq('job_id', jobId);
+    
+    if (deleteError) {
+      console.error('Error removing existing assignments:', deleteError);
+      return res.status(500).json({ error: 'Failed to remove existing assignments' });
+    }
+    
+    // Update the job with team member assignment (for backward compatibility)
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({ team_member_id: teamMemberId || null })
+      .eq('id', jobId);
+    
+    if (updateError) {
+      console.error('Error updating job:', updateError);
+      return res.status(500).json({ error: 'Failed to update job' });
+    }
+    
+    // Create assignment in job_team_assignments table
+    if (teamMemberId) {
+      const { error: insertError } = await supabase
+        .from('job_team_assignments')
+        .insert({
+          job_id: jobId,
+          team_member_id: teamMemberId,
+          is_primary: true,
+          assigned_by: userId
+        });
+      
+      if (insertError) {
+        console.error('Error creating team assignment:', insertError);
+        return res.status(500).json({ error: 'Failed to create team assignment' });
+      }
+      
+      console.log('🔄 Created team assignment for job:', jobId, 'team member:', teamMemberId);
+    }
+    
+    res.json({ message: 'Job assigned successfully' });
   } catch (error) {
     console.error('Job assignment error:', error);
     res.status(500).json({ error: 'Failed to assign job' });
@@ -8753,64 +9024,113 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
   try {
     const { jobId, teamMemberId } = req.params;
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      // Check if job exists and belongs to user
-      const [jobCheck] = await connection.query('SELECT id, user_id FROM jobs WHERE id = ?', [jobId]);
-      if (jobCheck.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
+    // Check if job exists and belongs to user
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+    
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
+    }
+    
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Check if team member exists and belongs to user
+    const { data: memberCheck, error: memberError } = await supabase
+      .from('team_members')
+      .select('id')
+      .eq('id', teamMemberId)
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (memberError) {
+      console.error('Error checking team member:', memberError);
+      return res.status(500).json({ error: 'Failed to check team member' });
+    }
+    
+    if (!memberCheck || memberCheck.length === 0) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    // Remove the specific assignment
+    const { data: deleteResult, error: deleteError } = await supabase
+      .from('job_team_assignments')
+      .delete()
+      .eq('job_id', jobId)
+      .eq('team_member_id', teamMemberId)
+      .select();
+    
+    if (deleteError) {
+      console.error('Error removing assignment:', deleteError);
+      return res.status(500).json({ error: 'Failed to remove assignment' });
+    }
+    
+    if (!deleteResult || deleteResult.length === 0) {
+      return res.status(404).json({ error: 'Team member assignment not found' });
+    }
+    
+    // Check if this was the primary assignment and update jobs table accordingly
+    const { data: primaryCheck, error: primaryError } = await supabase
+      .from('job_team_assignments')
+      .select('id')
+      .eq('job_id', jobId)
+      .eq('is_primary', true);
+    
+    if (primaryError) {
+      console.error('Error checking primary assignments:', primaryError);
+      return res.status(500).json({ error: 'Failed to check primary assignments' });
+    }
+    
+    if (!primaryCheck || primaryCheck.length === 0) {
+      // No more primary assignments, clear the team_member_id in jobs table
+      const { error: updateError } = await supabase
+        .from('jobs')
+        .update({ team_member_id: null })
+        .eq('id', jobId);
+      
+      if (updateError) {
+        console.error('Error clearing team member from job:', updateError);
+        return res.status(500).json({ error: 'Failed to clear team member from job' });
+      }
+    } else {
+      // Set the first remaining assignment as primary
+      const { data: remainingAssignments, error: remainingError } = await supabase
+        .from('job_team_assignments')
+        .select('team_member_id')
+        .eq('job_id', jobId)
+        .order('assigned_at', { ascending: true })
+        .limit(1);
+      
+      if (remainingError) {
+        console.error('Error getting remaining assignments:', remainingError);
+        return res.status(500).json({ error: 'Failed to get remaining assignments' });
       }
       
-      if (jobCheck[0].user_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-      
-      // Check if team member exists and belongs to user
-      const [memberCheck] = await connection.query('SELECT id FROM team_members WHERE id = ? AND user_id = ?', [teamMemberId, userId]);
-      if (memberCheck.length === 0) {
-        return res.status(404).json({ error: 'Team member not found' });
-      }
-      
-      // Remove the specific assignment
-      const [deleteResult] = await connection.query(
-        'DELETE FROM job_team_assignments WHERE job_id = ? AND team_member_id = ?',
-        [jobId, teamMemberId]
-      );
-      
-      if (deleteResult.affectedRows === 0) {
-        return res.status(404).json({ error: 'Team member assignment not found' });
-      }
-      
-      // Check if this was the primary assignment and update jobs table accordingly
-      const [primaryCheck] = await connection.query(
-        'SELECT COUNT(*) as count FROM job_team_assignments WHERE job_id = ? AND is_primary = 1',
-        [jobId]
-      );
-      
-      if (primaryCheck[0].count === 0) {
-        // No more primary assignments, clear the team_member_id in jobs table
-        await connection.query('UPDATE jobs SET team_member_id = NULL WHERE id = ?', [jobId]);
-      } else {
-        // Set the first remaining assignment as primary
-        const [remainingAssignments] = await connection.query(
-          'SELECT team_member_id FROM job_team_assignments WHERE job_id = ? ORDER BY assigned_at ASC LIMIT 1',
-          [jobId]
-        );
+      if (remainingAssignments && remainingAssignments.length > 0) {
+        const { error: updateError } = await supabase
+          .from('jobs')
+          .update({ team_member_id: remainingAssignments[0].team_member_id })
+          .eq('id', jobId);
         
-        if (remainingAssignments.length > 0) {
-          await connection.query(
-            'UPDATE jobs SET team_member_id = ? WHERE id = ?',
-            [remainingAssignments[0].team_member_id, jobId]
-          );
+        if (updateError) {
+          console.error('Error updating job with new primary team member:', updateError);
+          return res.status(500).json({ error: 'Failed to update job with new primary team member' });
         }
       }
-      
-      console.log('🔄 Removed team assignment for job:', jobId, 'team member:', teamMemberId);
-      res.json({ message: 'Team member assignment removed successfully' });
-    } finally {
-      connection.release();
     }
+    
+    console.log('🔄 Removed team assignment for job:', jobId, 'team member:', teamMemberId);
+    res.json({ message: 'Team member assignment removed successfully' });
   } catch (error) {
     console.error('Remove team assignment error:', error);
     res.status(500).json({ error: 'Failed to remove team member assignment' });
@@ -9828,7 +10148,7 @@ app.post('/api/upload/logo', upload.single('logo'), async (req, res) => {
     // Generate unique filename
     const timestamp = Date.now();
     const filename = `logo-${userId}-${timestamp}-${req.file.originalname}`;
-    const logoUrl = `https://zenbookapi.now2code.online/uploads/${filename}`;
+    const logoUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
     
     // Move uploaded file to uploads directory with the new filename
     const fs = require('fs');
@@ -9881,12 +10201,12 @@ app.post('/api/upload/profile-picture', upload.single('profilePicture'), async (
       return res.status(400).json({ error: 'No profile picture file provided' });
     }
 
-    // Generate unique filename
+    // ✅ Generate unique filename
     const timestamp = Date.now();
     const filename = `profile-${userId}-${timestamp}-${req.file.originalname}`;
-    const profilePictureUrl = `https://zenbookapi.now2code.online/uploads/${filename}`;
+    const profilePictureUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
     
-    // Move uploaded file to uploads directory with the new filename
+    // ✅ Move uploaded file to uploads directory with the new filename
     const fs = require('fs');
     const path = require('path');
     const uploadsDir = path.join(__dirname, 'uploads');
@@ -9897,30 +10217,32 @@ app.post('/api/upload/profile-picture', upload.single('profilePicture'), async (
       fs.mkdirSync(uploadsDir, { recursive: true });
     }
     
-    // Move the uploaded file to the uploads directory
+    // Move file
     fs.renameSync(req.file.path, newFilePath);
 
-    // Save file info to database
-    const connection = await pool.getConnection();
-    
-    try {
-      // Update users table with profile picture URL
-      await connection.query(`
-        UPDATE users SET profile_picture = ? WHERE id = ?
-      `, [profilePictureUrl, userId]);
+    // ✅ Save file info to database using Supabase
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ profile_picture: profilePictureUrl })
+      .eq('id', userId);
 
-      res.json({ 
-        message: 'Profile picture uploaded successfully',
-        profilePictureUrl: profilePictureUrl
-      });
-    } finally {
-      connection.release();
+    if (updateError) {
+      console.error('❌ Error saving profile picture URL to database:', updateError);
+      return res.status(500).json({ error: 'Failed to save profile picture URL' });
     }
+
+    // ✅ Success
+    res.json({ 
+      message: 'Profile picture uploaded successfully',
+      profilePictureUrl
+    });
+
   } catch (error) {
-    console.error('Error uploading profile picture:', error);
+    console.error('🔥 Error uploading profile picture:', error);
     res.status(500).json({ error: 'Failed to upload profile picture' });
   }
 });
+
 
 // Service image upload endpoint
 app.post('/api/upload-service-image', authenticateToken, upload.single('image'), async (req, res) => {
@@ -9935,7 +10257,7 @@ app.post('/api/upload-service-image', authenticateToken, upload.single('image'),
     const extension = path.extname(req.file.originalname);
     const filename = `service-image-${timestamp}-${randomString}${extension}`;
 
-    const imageUrl = `https://zenbookapi.now2code.online/uploads/${filename}`;
+    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
 
     // Move uploaded file to uploads directory with the new filename
     const oldFilePath = req.file.path;
@@ -9979,7 +10301,7 @@ app.post('/api/upload-modifier-image', authenticateToken, upload.single('image')
     const extension = path.extname(req.file.originalname);
     const filename = `modifier-image-${timestamp}-${randomString}${extension}`;
 
-    const imageUrl = `https://zenbookapi.now2code.online/uploads/${filename}`;
+    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
 
     // Move uploaded file to uploads directory with the new filename
     const oldFilePath = req.file.path;
@@ -10024,7 +10346,7 @@ app.post('/api/upload-intake-image', authenticateToken, upload.single('image'), 
     const extension = path.extname(req.file.originalname);
     const filename = `intake-image-${timestamp}-${randomString}${extension}`;
 
-    const imageUrl = `https://zenbookapi.now2code.online/uploads/${filename}`;
+    const imageUrl = `${UPLOAD_BASE_URL}/uploads/${filename}`;
 
     // Move uploaded file to uploads directory with the new filename
     const oldFilePath = req.file.path;
@@ -10210,7 +10532,7 @@ app.get('/api/user/branding', async (req, res) => {
         const branding = brandingData[0];
         // Ensure logo URL is complete
         if (branding.logo && !branding.logo.startsWith('http')) {
-          branding.logo = `https://zenbookapi.now2code.online${branding.logo}`;
+          branding.logo = `${UPLOAD_BASE_URL}${branding.logo}`;
         }
         res.json(branding);
       } else {
@@ -10328,7 +10650,7 @@ app.get('/api/user/profile', async (req, res) => {
         const user = userData[0];
         // Ensure profile picture URL is complete
         if (user.profile_picture && !user.profile_picture.startsWith('http')) {
-          user.profile_picture = `https://zenbookapi.now2code.online${user.profile_picture}`;
+          user.profile_picture = `${UPLOAD_BASE_URL}${user.profile_picture}`;
         }
         
         // Add both business name fields for consistency
@@ -10596,48 +10918,6 @@ app.put('/api/user/notification-settings', async (req, res) => {
     res.status(500).json({ error: 'Failed to update notification setting' });
   }
 });
-// Service Categories endpoints
-app.get('/api/servi/categories', async (req, res) => {
-  const { userId } = req.query;
-  console.log('🔄 Categories request for user:', userId);
-
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
-
-  let connection;
-  try {
-    connection = await pool.getConnection();
-
-    // Directly query categories (assuming migration created table)
-    const [categories] = await connection.query(`
-      SELECT 
-        c.id,
-        c.name,
-        c.description,
-        c.color,
-        c.created_at,
-        c.updated_at,
-        COUNT(s.id) as serviceCount
-      FROM service_categories c
-      LEFT JOIN services s 
-        ON c.id = s.category_id 
-       AND s.user_id = c.user_id
-      WHERE c.user_id = ?
-      GROUP BY c.id, c.name, c.description, c.color, c.created_at, c.updated_at
-      ORDER BY c.name ASC
-    `, [userId]);
-
-    console.log('✅ Found categories:', categories.length, 'for user:', userId);
-
-    res.json({ data: categories });
-  } catch (error) {
-    console.error('❌ Get categories error for user:', userId, error);
-    res.status(500).json({ error: 'Failed to fetch categories' });
-  } finally {
-    if (connection) connection.release();
-  }
-});
 
 app.post('/api/services/categories', async (req, res) => {
   try {
@@ -10650,38 +10930,40 @@ app.post('/api/services/categories', async (req, res) => {
       return res.status(400).json({ error: 'userId and name are required' });
     }
     
-    const connection = await pool.getConnection();
+    // Check if category name already exists for this user
+    const { data: existing, error: checkError } = await supabase
+      .from('service_categories')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('name', name)
+      .limit(1);
     
-    try {
-      // Check if category name already exists for this user
-      const [existing] = await connection.query(
-        'SELECT id FROM service_categories WHERE user_id = ? AND name = ?',
-        [userId, name]
-      );
-      
-      if (existing.length > 0) {
-        return res.status(400).json({ error: 'Category name already exists' });
-      }
-      
-      const [result] = await connection.query(
-        'INSERT INTO service_categories (user_id, name, description, color, created_at) VALUES (?, ?, ?, ?, NOW())',
-        [userId, name, description || null, color || '#3B82F6']
-      );
-      
-      // Get the created category
-      const [categories] = await connection.query(
-        'SELECT * FROM service_categories WHERE id = ?',
-        [result.insertId]
-      );
-      
-      if (categories.length === 0) {
-        return res.status(500).json({ error: 'Failed to retrieve created category' });
-      }
-      
-      res.status(201).json(categories[0]);
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing category:', checkError);
+      return res.status(500).json({ error: 'Failed to create category' });
     }
+    
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: 'Category name already exists' });
+    }
+    
+    const { data: result, error: insertError } = await supabase
+      .from('service_categories')
+      .insert({
+        user_id: userId,
+        name: name,
+        description: description || null,
+        color: color || '#3B82F6'
+      })
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating category:', insertError);
+      return res.status(500).json({ error: 'Failed to create category' });
+    }
+    
+    res.status(201).json(result);
   } catch (error) {
     console.error('Create category error:', error);
     res.status(500).json({ error: 'Failed to create category' });
@@ -10696,74 +10978,70 @@ app.put('/api/services/categories/:id', async (req, res) => {
     console.log('🔄 Category update request for ID:', id);
     console.log('🔄 Request body:', req.body);
     
-    const connection = await pool.getConnection();
+    // Check if category exists
+    const { data: existing, error: checkError } = await supabase
+      .from('service_categories')
+      .select('*')
+      .eq('id', id)
+      .limit(1);
     
-    try {
-      // Check if category exists
-      const [existing] = await connection.query(
-        'SELECT * FROM service_categories WHERE id = ?',
-        [id]
-      );
-      
-      if (existing.length === 0) {
-        return res.status(404).json({ error: 'Category not found' });
-      }
-      
-      // Check if new name conflicts with existing category (excluding current category)
-      if (name && name !== existing[0].name) {
-        const [nameConflict] = await connection.query(
-          'SELECT id FROM service_categories WHERE user_id = ? AND name = ? AND id != ?',
-          [existing[0].user_id, name, id]
-        );
-        
-        if (nameConflict.length > 0) {
-          return res.status(400).json({ error: 'Category name already exists' });
-        }
-      }
-      
-      // Build dynamic update query
-      const updateFields = [];
-      const updateParams = [];
-      
-      if (name !== undefined) {
-        updateFields.push('name = ?');
-        updateParams.push(name);
-      }
-      if (description !== undefined) {
-        updateFields.push('description = ?');
-        updateParams.push(description);
-      }
-      if (color !== undefined) {
-        updateFields.push('color = ?');
-        updateParams.push(color);
-      }
-      
-      if (updateFields.length === 0) {
-        return res.status(400).json({ error: 'No fields to update' });
-      }
-      
-      updateFields.push('updated_at = NOW()');
-      updateParams.push(id);
-      
-      const [result] = await connection.query(
-        `UPDATE service_categories SET ${updateFields.join(', ')} WHERE id = ?`,
-        updateParams
-      );
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Category not found' });
-      }
-      
-      // Get the updated category
-      const [categories] = await connection.query(
-        'SELECT * FROM service_categories WHERE id = ?',
-        [id]
-      );
-      
-      res.json(categories[0]);
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing category:', checkError);
+      return res.status(500).json({ error: 'Failed to update category' });
     }
+    
+    if (!existing || existing.length === 0) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    
+    // Check if new name conflicts with existing category (excluding current category)
+    if (name && name !== existing[0].name) {
+      const { data: nameConflict, error: conflictError } = await supabase
+        .from('service_categories')
+        .select('id')
+        .eq('user_id', existing[0].user_id)
+        .eq('name', name)
+        .neq('id', id)
+        .limit(1);
+      
+      if (conflictError) {
+        console.error('Error checking name conflict:', conflictError);
+        return res.status(500).json({ error: 'Failed to update category' });
+      }
+      
+      if (nameConflict && nameConflict.length > 0) {
+        return res.status(400).json({ error: 'Category name already exists' });
+      }
+    }
+    
+    // Build update object
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (color !== undefined) updateData.color = color;
+    
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    // Update the category
+    const { data: result, error: updateError } = await supabase
+      .from('service_categories')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (updateError) {
+      console.error('Error updating category:', updateError);
+      return res.status(500).json({ error: 'Failed to update category' });
+    }
+    
+    if (!result) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    
+    res.json(result);
   } catch (error) {
     console.error('Update category error:', error);
     res.status(500).json({ error: 'Failed to update category' });
@@ -10776,54 +11054,67 @@ app.delete('/api/services/categories/:id', async (req, res) => {
     
     console.log('🔄 Category delete request for ID:', id);
     
-    const connection = await pool.getConnection();
+    // Check if category exists
+    const { data: existing, error: checkError } = await supabase
+      .from('service_categories')
+      .select('*')
+      .eq('id', id)
+      .limit(1);
     
-    try {
-      // Check if category exists
-      const [existing] = await connection.query(
-        'SELECT * FROM service_categories WHERE id = ?',
-        [id]
-      );
-      
-      if (existing.length === 0) {
-        return res.status(404).json({ error: 'Category not found' });
-      }
-      
-      // Check if any services are using this category
-      const [servicesUsingCategory] = await connection.query(
-        'SELECT COUNT(*) as count FROM services WHERE category_id = ?',
-        [id]
-      );
-      
-      if (servicesUsingCategory[0].count > 0) {
-        // Instead of preventing deletion, set services to uncategorized
-        console.log(`🔄 Setting ${servicesUsingCategory[0].count} services to uncategorized before deleting category`);
-        await connection.query(
-          'UPDATE services SET category_id = NULL WHERE category_id = ?',
-          [id]
-        );
-      }
-      
-      // Delete the category
-      const [result] = await connection.query(
-        'DELETE FROM service_categories WHERE id = ?',
-        [id]
-      );
-      
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Category not found' });
-      }
-      
-      // Create response message based on whether services were affected
-      let message = 'Category deleted successfully';
-      if (servicesUsingCategory[0].count > 0) {
-        message = `Category deleted successfully. ${servicesUsingCategory[0].count} service(s) have been set to uncategorized.`;
-      }
-      
-      res.json({ message });
-    } finally {
-      connection.release();
+    if (checkError) {
+      console.error('Error checking existing category:', checkError);
+      return res.status(500).json({ error: 'Failed to delete category' });
     }
+    
+    if (!existing || existing.length === 0) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    
+    // Check if any services are using this category
+    const { data: servicesUsingCategory, error: countError } = await supabase
+      .from('services')
+      .select('id', { count: 'exact', head: true })
+      .eq('category_id', id);
+    
+    if (countError) {
+      console.error('Error checking services using category:', countError);
+      return res.status(500).json({ error: 'Failed to delete category' });
+    }
+    
+    const serviceCount = servicesUsingCategory?.length || 0;
+    
+    if (serviceCount > 0) {
+      // Instead of preventing deletion, set services to uncategorized
+      console.log(`🔄 Setting ${serviceCount} services to uncategorized before deleting category`);
+      const { error: updateError } = await supabase
+        .from('services')
+        .update({ category_id: null })
+        .eq('category_id', id);
+      
+      if (updateError) {
+        console.error('Error updating services:', updateError);
+        return res.status(500).json({ error: 'Failed to delete category' });
+      }
+    }
+    
+    // Delete the category
+    const { error: deleteError } = await supabase
+      .from('service_categories')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      console.error('Error deleting category:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete category' });
+    }
+    
+    // Create response message based on whether services were affected
+    let message = 'Category deleted successfully';
+    if (serviceCount > 0) {
+      message = `Category deleted successfully. ${serviceCount} service(s) have been set to uncategorized.`;
+    }
+    
+    res.json({ message });
   } catch (error) {
     console.error('Delete category error:', error);
     res.status(500).json({ error: 'Failed to delete category' });
@@ -10838,38 +11129,38 @@ app.get('/api/user/business-details', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get business details from users table
-      const [userData] = await connection.query(`
-        SELECT 
-          business_name,
-          business_email,
-          phone,
-          email,
-          first_name,
-          last_name,
-          business_slug
-        FROM users 
-        WHERE id = ?
-      `, [userId]);
+    // Get business details from users table
+    const { data: userData, error } = await supabase
+      .from('users')
+      .select(`
+        business_name,
+        business_email,
+        phone,
+        email,
+        first_name,
+        last_name,
+        business_slug
+      `)
+      .eq('id', userId)
+      .limit(1);
 
-      if (userData.length > 0) {
-        res.json({
-          businessName: userData[0].business_name || '',
-          businessEmail: userData[0].business_email || '',
-          phone: userData[0].phone || '',
-          email: userData[0].email || '',
-          firstName: userData[0].first_name || '',
-          lastName: userData[0].last_name || '',
-          businessSlug: userData[0].business_slug || ''
-        });
-      } else {
-        res.status(404).json({ error: 'User not found' });
-      }
-    } finally {
-      connection.release();
+    if (error) {
+      console.error('Error fetching business details:', error);
+      return res.status(500).json({ error: 'Failed to fetch business details' });
+    }
+
+    if (userData && userData.length > 0) {
+      res.json({
+        businessName: userData[0].business_name || '',
+        businessEmail: userData[0].business_email || '',
+        phone: userData[0].phone || '',
+        email: userData[0].email || '',
+        firstName: userData[0].first_name || '',
+        lastName: userData[0].last_name || '',
+        businessSlug: userData[0].business_slug || ''
+      });
+    } else {
+      res.status(404).json({ error: 'User not found' });
     }
   } catch (error) {
     console.error('Error fetching business details:', error);
@@ -11230,84 +11521,40 @@ app.listen(PORT, async () => {
   await initializeDatabase();
 });
 
-// Fix database schema endpoint
+// Fix database schema endpoint (Supabase handles schema automatically)
 app.post('/api/fix-schema', async (req, res) => {
   try {
-    console.log('🔧 Fixing database schema...');
+    console.log('🔧 Checking Supabase schema...');
     
-    const connection = await pool.getConnection();
+    // Test connection to verify schema is working
+    const { data: jobsTest, error: jobsError } = await supabase
+      .from('jobs')
+      .select('id')
+      .limit(1);
     
-    try {
-      // Check if team_member_id column exists
-      const [columnCheck] = await connection.query(`
-        SELECT COUNT(*) as count
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = 'jobs' 
-        AND COLUMN_NAME = 'team_member_id'
-      `);
-      
-      if (columnCheck[0].count === 0) {
-        // Add team_member_id column to jobs table
-        await connection.query('ALTER TABLE jobs ADD COLUMN team_member_id INT NULL');
-        console.log('✅ Added team_member_id column to jobs table');
-      } else {
-        console.log('✅ team_member_id column already exists');
-      }
-      
-      // Check if index exists
-      const [indexCheck] = await connection.query(`
-        SELECT COUNT(*) as count
-        FROM INFORMATION_SCHEMA.STATISTICS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = 'jobs' 
-        AND INDEX_NAME = 'idx_jobs_team_member_id'
-      `);
-      
-      if (indexCheck[0].count === 0) {
-        // Add index for better performance
-        await connection.query('CREATE INDEX idx_jobs_team_member_id ON jobs(team_member_id)');
-        console.log('✅ Added index for team_member_id');
-      } else {
-        console.log('✅ Index already exists');
-      }
-      
-      // Check if intake_questions column exists in services table
-      const [servicesColumnCheck] = await connection.query(`
-        SELECT COUNT(*) as count
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = 'services' 
-        AND COLUMN_NAME = 'intake_questions'
-      `);
-      
-      if (servicesColumnCheck[0].count === 0) {
-        // Add intake_questions column to services table
-        await connection.query('ALTER TABLE services ADD COLUMN intake_questions JSON DEFAULT NULL');
-        console.log('✅ Added intake_questions column to services table');
-      } else {
-        console.log('✅ intake_questions column already exists in services table');
-      }
-      
-      // Show table structure
-      const [columns] = await connection.query('DESCRIBE jobs');
-      const [servicesColumns] = await connection.query('DESCRIBE services');
-      console.log('📋 Jobs table structure:', columns.map(c => c.Field));
-      console.log('📋 Services table structure:', servicesColumns.map(c => c.Field));
-      
-      res.json({
-        success: true,
-        message: 'Database schema updated successfully',
-        jobsColumns: columns.map(c => c.Field),
-        servicesColumns: servicesColumns.map(c => c.Field)
+    const { data: servicesTest, error: servicesError } = await supabase
+      .from('services')
+      .select('id')
+      .limit(1);
+    
+    if (jobsError || servicesError) {
+      console.error('❌ Schema check error:', { jobsError, servicesError });
+      return res.status(500).json({ 
+        error: 'Schema check failed', 
+        details: { jobsError, servicesError } 
       });
-    } finally {
-      connection.release();
     }
+    
+    console.log('✅ Supabase schema is working correctly');
+    
+    res.json({
+      success: true,
+      message: 'Supabase schema is working correctly',
+      note: 'Supabase handles schema management automatically'
+    });
   } catch (error) {
-    console.error('❌ Schema fix error:', error);
+    console.error('❌ Schema check error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Test team member endpoint
