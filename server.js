@@ -430,6 +430,8 @@ app.options('/api/team-members/:id/availability', (req, res) => res.status(204).
 app.options('/api/team-members/login', (req, res) => res.status(204).send());
 app.options('/api/team-members/register', (req, res) => res.status(204).send());
 app.options('/api/team-members/logout', (req, res) => res.status(204).send());
+app.options('/api/team-members/verify-invitation', (req, res) => res.status(204).send());
+app.options('/api/team-members/complete-signup', (req, res) => res.status(204).send());
 app.options('/api/team-members/:id/resend-invite', (req, res) => res.status(204).send());
 app.options('/api/team-members/dashboard/:teamMemberId', (req, res) => res.status(204).send());
 app.options('/api/team-members/jobs/:jobId/status', (req, res) => res.status(204).send());
@@ -6211,27 +6213,81 @@ app.post('/api/team-members', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
     
-    // ✅ Check if username or email already exists for this user
-    const { data: existing, error: checkError } = await supabase
+    // ✅ Check for specific conflicts (email, phone, username)
+    const { data: existingEmail, error: emailCheckError } = await supabase
       .from('team_members')
-      .select('id')
+      .select('id, email')
       .eq('user_id', userId)
-      .or(`email.eq.${email},username.eq.${username}`)
+      .eq('email', email)
       .limit(1);
 
-    if (checkError) {
-      console.error('Error checking existing team member:', checkError);
+    if (emailCheckError) {
+      console.error('Error checking existing email:', emailCheckError);
       return res.status(500).json({ error: 'Failed to check existing team member' });
     }
 
-    if (existing && existing.length > 0) {
-      return res.status(400).json({ error: 'Team member with this email or username already exists' });
+    if (existingEmail && existingEmail.length > 0) {
+      return res.status(400).json({ 
+        error: 'Email already exists for this team',
+        conflictType: 'email',
+        field: 'email',
+        message: `A team member with the email "${email}" already exists in your team.`
+      });
+    }
+
+    // Check for phone number conflicts if phone is provided
+    if (phone) {
+      const { data: existingPhone, error: phoneCheckError } = await supabase
+        .from('team_members')
+        .select('id, phone')
+        .eq('user_id', userId)
+        .eq('phone', phone)
+        .limit(1);
+
+      if (phoneCheckError) {
+        console.error('Error checking existing phone:', phoneCheckError);
+        return res.status(500).json({ error: 'Failed to check existing team member' });
+      }
+
+      if (existingPhone && existingPhone.length > 0) {
+        return res.status(400).json({ 
+          error: 'Phone number already exists for this team',
+          conflictType: 'phone',
+          field: 'phone',
+          message: `A team member with the phone number "${phone}" already exists in your team.`
+        });
+      }
+    }
+
+    // Check for username conflicts (for future use when username is implemented)
+    if (username) {
+      const { data: existingUsername, error: usernameCheckError } = await supabase
+        .from('team_members')
+        .select('id, username')
+        .eq('user_id', userId)
+        .eq('username', username)
+        .limit(1);
+
+      if (usernameCheckError) {
+        console.error('Error checking existing username:', usernameCheckError);
+        return res.status(500).json({ error: 'Failed to check existing team member' });
+      }
+
+      if (existingUsername && existingUsername.length > 0) {
+        return res.status(400).json({ 
+          error: 'Username already exists for this team',
+          conflictType: 'username',
+          field: 'username',
+          message: `A team member with the username "${username}" already exists in your team.`
+        });
+      }
     }
     
-    // ✅ Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // Generate invitation token
+    const invitationToken = crypto.randomBytes(32).toString('hex');
+    const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
     
-    // ✅ Create team member
+    // ✅ Create team member with invited status
     const { data: newTeamMember, error: createError } = await supabase
       .from('team_members')
       .insert({
@@ -6240,8 +6296,8 @@ app.post('/api/team-members', async (req, res) => {
         last_name: lastName,
         email,
         phone: phone || null,
-        username,
-        password: hashedPassword,
+        username: null, // Will be set during signup
+        password: null, // Will be set during signup
         role: role || null,
         skills,
         hourly_rate: hourlyRate || null,
@@ -6253,7 +6309,9 @@ app.post('/api/team-members', async (req, res) => {
         is_service_provider: isServiceProvider || false,
         territories,
         permissions,
-        status: 'active'
+        status: 'invited',
+        invitation_token: invitationToken,
+        invitation_expires: invitationExpires
       })
       .select()
       .single();
@@ -6267,7 +6325,7 @@ app.post('/api/team-members', async (req, res) => {
     const { password: _, ...teamMemberWithoutPassword } = newTeamMember;
     
     res.status(201).json({
-      message: 'Team member created successfully',
+      message: 'Team member invited successfully',
       teamMember: teamMemberWithoutPassword
     });
 
@@ -6605,21 +6663,50 @@ app.post('/api/team-members/register', async (req, res) => {
       permissions
     } = req.body;
     
-    // Check if email already exists for this user
-    const { data: existing, error: checkError } = await supabase
+    // Check for specific conflicts (email, phone)
+    const { data: existingEmail, error: emailCheckError } = await supabase
       .from('team_members')
-      .select('id')
+      .select('id, email')
       .eq('email', email)
       .eq('user_id', userId)
       .limit(1);
     
-    if (checkError) {
-      console.error('Error checking existing team member:', checkError);
+    if (emailCheckError) {
+      console.error('Error checking existing email:', emailCheckError);
       return res.status(500).json({ error: 'Failed to check existing team member' });
     }
     
-    if (existing && existing.length > 0) {
-      return res.status(400).json({ error: 'Email already exists for this team' });
+    if (existingEmail && existingEmail.length > 0) {
+      return res.status(400).json({ 
+        error: 'Email already exists for this team',
+        conflictType: 'email',
+        field: 'email',
+        message: `A team member with the email "${email}" already exists in your team.`
+      });
+    }
+
+    // Check for phone number conflicts if phone is provided
+    if (phone) {
+      const { data: existingPhone, error: phoneCheckError } = await supabase
+        .from('team_members')
+        .select('id, phone')
+        .eq('phone', phone)
+        .eq('user_id', userId)
+        .limit(1);
+
+      if (phoneCheckError) {
+        console.error('Error checking existing phone:', phoneCheckError);
+        return res.status(500).json({ error: 'Failed to check existing team member' });
+      }
+
+      if (existingPhone && existingPhone.length > 0) {
+        return res.status(400).json({ 
+          error: 'Phone number already exists for this team',
+          conflictType: 'phone',
+          field: 'phone',
+          message: `A team member with the phone number "${phone}" already exists in your team.`
+        });
+      }
     }
     
     // Generate a unique invitation token
@@ -6730,6 +6817,133 @@ app.post('/api/team-members/logout', async (req, res) => {
   } catch (error) {
     console.error('Team member logout error:', error);
     res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// Verify invitation endpoint
+app.get('/api/team-members/verify-invitation', async (req, res) => {
+  try {
+    const { token } = req.query;
+    console.log('Verifying invitation token:', token);
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+    
+    const connection = await pool.getConnection();
+    
+    try {
+      // Get team member details by invitation token
+      const [teamMembers] = await connection.query(
+        'SELECT * FROM team_members WHERE invitation_token = ? AND invitation_expires > NOW() AND status = "invited"',
+        [token]
+      );
+      
+      if (teamMembers.length === 0) {
+        return res.status(404).json({ error: 'Invalid or expired invitation token' });
+      }
+      
+      const teamMember = teamMembers[0];
+      
+      res.json({
+        firstName: teamMember.first_name,
+        lastName: teamMember.last_name,
+        email: teamMember.email,
+        role: teamMember.role,
+        teamMemberId: teamMember.id
+      });
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Verify invitation error:', error);
+    res.status(500).json({ error: 'Failed to verify invitation' });
+  }
+});
+
+// Complete team member signup endpoint
+app.post('/api/team-members/complete-signup', async (req, res) => {
+  try {
+    const { token, username, password, firstName, lastName, phone } = req.body;
+    console.log('Completing signup for token:', token);
+    
+    if (!token || !username || !password || !firstName || !lastName) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    const connection = await pool.getConnection();
+    
+    try {
+      // Verify token and get team member
+      const [teamMembers] = await connection.query(
+        'SELECT * FROM team_members WHERE invitation_token = ? AND invitation_expires > NOW() AND status = "invited"',
+        [token]
+      );
+      
+      if (teamMembers.length === 0) {
+        return res.status(404).json({ error: 'Invalid or expired invitation token' });
+      }
+      
+      const teamMember = teamMembers[0];
+      
+      // Check if username is already taken
+      const [existingUsers] = await connection.query(
+        'SELECT id, username FROM team_members WHERE username = ? AND id != ?',
+        [username, teamMember.id]
+      );
+      
+      if (existingUsers.length > 0) {
+        return res.status(400).json({ 
+          error: 'Username is already taken',
+          conflictType: 'username',
+          field: 'username',
+          message: `The username "${username}" is already taken by another team member. Please choose a different username.`
+        });
+      }
+
+      // Check if phone number is already taken (if phone is provided)
+      if (phone) {
+        const [existingPhones] = await connection.query(
+          'SELECT id, phone FROM team_members WHERE phone = ? AND id != ?',
+          [phone, teamMember.id]
+        );
+        
+        if (existingPhones.length > 0) {
+          return res.status(400).json({ 
+            error: 'Phone number is already taken',
+            conflictType: 'phone',
+            field: 'phone',
+            message: `The phone number "${phone}" is already registered by another team member. Please use a different phone number.`
+          });
+        }
+      }
+      
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+      
+      // Update team member with signup data
+      await connection.query(
+        `UPDATE team_members SET 
+          username = ?, 
+          password = ?, 
+          first_name = ?, 
+          last_name = ?, 
+          phone = ?,
+          status = 'active',
+          invitation_token = NULL,
+          invitation_expires = NULL,
+          created_at = NOW()
+        WHERE id = ?`,
+        [username, hashedPassword, firstName, lastName, phone, teamMember.id]
+      );
+      
+      res.json({ message: 'Account created successfully' });
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Complete signup error:', error);
+    res.status(500).json({ error: 'Failed to complete signup' });
   }
 });
 
@@ -11390,6 +11604,80 @@ const initializeDatabase = async () => {
     console.error('❌ Database initialization error:', error);
   }
 };
+// Customer notification preferences endpoints
+app.get('/api/customers/:customerId/notifications', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    
+    // Get customer notification preferences from database
+    const { data: customer, error } = await supabase
+      .from('customers')
+      .select('email_notifications, sms_notifications')
+      .eq('id', customerId)
+      .single();
+    
+    if (error) {
+      console.error('Error fetching customer notification preferences:', error);
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    res.json({
+      email_notifications: customer.email_notifications || false,
+      sms_notifications: customer.sms_notifications || false
+    });
+  } catch (error) {
+    console.error('Get customer notification preferences error:', error);
+    res.status(500).json({ error: 'Failed to fetch notification preferences' });
+  }
+});
+
+app.put('/api/customers/:customerId/notifications', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { email_notifications, sms_notifications } = req.body;
+    
+    // Update customer notification preferences
+    const { data: customer, error } = await supabase
+      .from('customers')
+      .update({
+        email_notifications: email_notifications || false,
+        sms_notifications: sms_notifications || false
+      })
+      .eq('id', customerId)
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Error updating customer notification preferences:', error);
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    
+    res.json({
+      email_notifications: customer.email_notifications,
+      sms_notifications: customer.sms_notifications
+    });
+  } catch (error) {
+    console.error('Update customer notification preferences error:', error);
+    res.status(500).json({ error: 'Failed to update notification preferences' });
+  }
+});
+
+app.get('/api/customers/:customerId/notifications/history', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    
+    // Get notification history for customer (placeholder implementation)
+    // In a real implementation, you would have a notifications table
+    res.json({
+      notifications: [],
+      message: 'Notification history not implemented yet'
+    });
+  } catch (error) {
+    console.error('Get customer notification history error:', error);
+    res.status(500).json({ error: 'Failed to fetch notification history' });
+  }
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
