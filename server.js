@@ -1785,11 +1785,17 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Handle empty recurring end date
       const recurringEndDateValue = recurringEndDate && recurringEndDate !== '' ? recurringEndDate : null;
 
+      // Handle multiple services
+      const serviceIds = req.body.serviceIds || [];
+      const serviceNames = req.body.serviceName ? req.body.serviceName.split(', ') : [];
+      
       // Create the job
       const jobData = {
         user_id: userId,
         customer_id: customerId,
-        service_id: serviceId,
+        service_id: serviceId, // Keep for backward compatibility
+        service_ids: serviceIds.length > 0 ? serviceIds : null, // Store multiple service IDs as JSON
+        service_names: serviceNames.length > 0 ? serviceNames : null, // Store multiple service names as JSON
         team_member_id: teamMemberIdValue,
         scheduled_date: fullScheduledDate,
         notes: notes,
