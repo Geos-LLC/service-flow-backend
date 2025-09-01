@@ -1628,6 +1628,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
 
     console.log('🔄 Creating job for user:', userId);
     console.log('🔄 Job data:', req.body);
+    console.log('🔄 DEBUG: serviceIds in req.body:', req.body.serviceIds);
+    console.log('🔄 DEBUG: serviceName in req.body:', req.body.serviceName);
     console.log('🔄 DEBUG: serviceIntakeQuestions in req.body:', req.body.serviceIntakeQuestions);
     console.log('🔄 DEBUG: intakeQuestionAnswers in req.body:', req.body.intakeQuestionAnswers);
     console.log('🔄 DEBUG: originalIntakeQuestionIds in req.body:', req.body.originalIntakeQuestionIds);
@@ -1785,7 +1787,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Handle empty recurring end date
       const recurringEndDateValue = recurringEndDate && recurringEndDate !== '' ? recurringEndDate : null;
 
-      // Handle multiple services
+      // Handle multiple services - store in existing fields for now
       const serviceIds = req.body.serviceIds || [];
       const serviceNames = req.body.serviceName ? req.body.serviceName.split(', ') : [];
       
@@ -1794,8 +1796,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         user_id: userId,
         customer_id: customerId,
         service_id: serviceId, // Keep for backward compatibility
-        service_ids: serviceIds.length > 0 ? serviceIds : null, // Store multiple service IDs as JSON
-        service_names: serviceNames.length > 0 ? serviceNames : null, // Store multiple service names as JSON
+        // Note: service_ids and service_names columns don't exist yet, storing in service_name for now
         team_member_id: teamMemberIdValue,
         scheduled_date: fullScheduledDate,
         notes: notes,
@@ -1834,9 +1835,12 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         customer_signature: customerSignature,
         photos_required: photosRequired,
         quality_check: qualityCheck,
-        service_modifiers: processedModifiers.length > 0 ? processedModifiers : null
+        service_modifiers: processedModifiers.length > 0 ? processedModifiers : null,
+        service_intake_questions: processedIntakeQuestions.length > 0 ? processedIntakeQuestions : null
       };
 
+      console.log('🔄 Attempting to insert job with data:', jobData);
+      
       const { data: result, error: insertError } = await supabase
         .from('jobs')
         .insert(jobData)
@@ -1844,10 +1848,20 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         .single();
 
       if (insertError) {
-        console.error('Error creating job:', insertError);
-        return res.status(500).json({ error: 'Failed to create job' });
+        console.error('❌ Error creating job:', insertError);
+        console.error('❌ Job data that failed:', jobData);
+        return res.status(500).json({ error: 'Failed to create job', details: insertError.message });
       }
-
+      
+            console.log('✅ Job created successfully:', result);
+      
+      // Send success response
+      res.json({
+        success: true,
+        message: 'Job created successfully',
+        job: result
+      });
+      
       // Create team member assignments in job_team_assignments table
       if (teamMemberIdValue || teamMemberIds.length > 0) {
         try {
