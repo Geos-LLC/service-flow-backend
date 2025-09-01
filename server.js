@@ -691,7 +691,7 @@ app.post('/api/auth/signin', async (req, res) => {
     // Get user with hashed password
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, email, password, first_name, last_name, business_name')
+      .select('id, email, password, first_name, last_name, business_name, profile_picture')
       .eq('email', sanitizedEmail)
       .limit(1);
     
@@ -735,7 +735,8 @@ app.post('/api/auth/signin', async (req, res) => {
         firstName: user.first_name,
         lastName: user.last_name,
         businessName: user.business_name,
-        business_name: user.business_name // Add both for compatibility
+        business_name: user.business_name, // Add both for compatibility
+        profilePicture: user.profile_picture // Include profile picture
       }
     });
   } catch (error) {
@@ -756,7 +757,7 @@ app.post('/api/auth/refresh', authenticateToken, async (req, res) => {
     // Get updated user data
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, email, first_name, last_name, business_name')
+      .select('id, email, first_name, last_name, business_name, profile_picture')
       .eq('id', req.user.userId)
       .limit(1);
       
@@ -792,7 +793,8 @@ app.post('/api/auth/refresh', authenticateToken, async (req, res) => {
         email: user.email,
         firstName: user.first_name,
         lastName: user.last_name,
-        businessName: user.business_name
+        businessName: user.business_name,
+        profilePicture: user.profile_picture
       }
     });
   } catch (error) {
@@ -818,7 +820,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   try {
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, email, first_name, last_name, business_name')
+      .select('id, email, first_name, last_name, business_name, profile_picture')
       .eq('id', req.user.userId)
       .limit(1);
     
@@ -840,7 +842,8 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         email: user.email,
         firstName: user.first_name,
         lastName: user.last_name,
-        businessName: user.business_name
+        businessName: user.business_name,
+        profilePicture: user.profile_picture
       }
     });
   } catch (error) {
