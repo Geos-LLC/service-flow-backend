@@ -6839,6 +6839,9 @@ app.post('/api/team-members/register', async (req, res) => {
     // Send invitation email (non-blocking)
     console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
     
+    // Generate invitation link
+    const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
+    
     // Send email in background without waiting
     sendEmail({
       to: email,
