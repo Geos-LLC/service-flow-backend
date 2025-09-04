@@ -6669,6 +6669,16 @@ app.post('/api/team-members/login', async (req, res) => {
 });
 
 app.post('/api/team-members/register', async (req, res) => {
+  console.log('🚀 Team member registration endpoint hit at:', new Date().toISOString());
+  
+  // Set a timeout for this request
+  const timeout = setTimeout(() => {
+    console.error('⏰ Team member registration request timed out after 30 seconds');
+    if (!res.headersSent) {
+      res.status(408).json({ error: 'Request timeout - server took too long to respond' });
+    }
+  }, 30000);
+  
   try {
     console.log('🔍 Team member registration request body:', req.body);
     
@@ -6699,6 +6709,8 @@ app.post('/api/team-members/register', async (req, res) => {
         details: 'userId, firstName, lastName, and email are required'
       });
     }
+    
+    console.log('🔍 Step 1: Checking for email conflicts...');
     
     // Check for specific conflicts (email, phone)
     const { data: existingEmail, error: emailCheckError } = await supabase
@@ -6746,10 +6758,15 @@ app.post('/api/team-members/register', async (req, res) => {
       }
     }
     
+    console.log('✅ Step 2: Phone check completed - no conflicts');
+    
     // Generate a unique invitation token
+    console.log('🔍 Step 3: Generating invitation token...');
     const invitationToken = crypto.randomBytes(32).toString('hex');
+    console.log('✅ Step 3: Invitation token generated');
     
     // Create team member with 'invited' status
+    console.log('🔍 Step 4: Inserting team member into database...');
     console.log('🔍 Inserting team member with data:', {
       user_id: userId,
       first_name: sanitizeInput(firstName),
@@ -6798,12 +6815,15 @@ app.post('/api/team-members/register', async (req, res) => {
     
     if (insertError) {
       console.error('❌ Error creating team member:', insertError);
+      clearTimeout(timeout); // Clear the timeout
       return res.status(500).json({ error: 'Failed to create team member' });
     }
     
+    console.log('✅ Step 4: Team member inserted into database successfully');
     console.log('✅ Team member created successfully:', teamMember);
     
     // Send invitation email
+    console.log('🔍 Step 5: Sending invitation email...');
     try {
       const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
       
@@ -6826,8 +6846,10 @@ app.post('/api/team-members/register', async (req, res) => {
         `,
         text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
       });
+      
+      console.log('✅ Step 5: Invitation email sent successfully');
     } catch (emailError) {
-      console.error('Failed to send invitation email:', emailError);
+      console.error('❌ Failed to send invitation email:', emailError);
       // Don't fail the request if email fails
     }
     
@@ -6855,7 +6877,9 @@ app.post('/api/team-members/register', async (req, res) => {
       }
     };
     
+    console.log('✅ Step 6: Sending success response to frontend');
     console.log('✅ Sending success response:', responseData);
+    clearTimeout(timeout); // Clear the timeout
     res.json(responseData);
   } catch (error) {
     console.error('Team member registration error:', error);
@@ -6863,6 +6887,7 @@ app.post('/api/team-members/register', async (req, res) => {
       message: error.message,
       code: error.code
     });
+    clearTimeout(timeout); // Clear the timeout
     res.status(500).json({ error: 'Registration failed', details: error.message });
   }
 });
