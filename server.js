@@ -6836,36 +6836,36 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('✅ Step 4: Team member inserted into database successfully');
     console.log('✅ Team member created successfully:', teamMember);
     
-    // Send invitation email
-    console.log('🔍 Step 5: Sending invitation email...');
-    try {
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
-      
-      await sendEmail({
-        to: email,
-        subject: 'You\'ve been invited to join Zenbooker',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
-            <p>Hello ${firstName},</p>
-            <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                Create Your Account
-              </a>
-            </div>
-            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-            <p>Best regards,<br>The Zenbooker Team</p>
+    // Send invitation email (non-blocking)
+    console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
+    
+    // Send email in background without waiting
+    sendEmail({
+      to: email,
+      subject: 'You\'ve been invited to join Zenbooker',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
+          <p>Hello ${firstName},</p>
+          <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+              Create Your Account
+            </a>
           </div>
-        `,
-        text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
-      });
-      
-      console.log('✅ Step 5: Invitation email sent successfully');
-    } catch (emailError) {
-      console.error('❌ Failed to send invitation email:', emailError);
+          <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+          <p>Best regards,<br>The Zenbooker Team</p>
+        </div>
+      `,
+      text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+    }).then(() => {
+      console.log('✅ Step 5: Invitation email sent successfully (background)');
+    }).catch((emailError) => {
+      console.error('❌ Failed to send invitation email (background):', emailError);
       // Don't fail the request if email fails
-    }
+    });
+    
+    console.log('✅ Step 5: Email sending initiated (continuing without waiting)');
     
     const responseData = {
       message: 'Team member invited successfully',
