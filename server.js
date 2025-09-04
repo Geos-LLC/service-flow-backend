@@ -6670,6 +6670,8 @@ app.post('/api/team-members/login', async (req, res) => {
 
 app.post('/api/team-members/register', async (req, res) => {
   try {
+    console.log('🔍 Team member registration request body:', req.body);
+    
     const { 
       userId, 
       firstName, 
@@ -6681,10 +6683,22 @@ app.post('/api/team-members/register', async (req, res) => {
       state,
       zipCode,
       role,
+      hourlyRate,
       isServiceProvider,
+      skills,
       territories,
+      availability,
       permissions
     } = req.body;
+    
+    // Validate required fields
+    if (!userId || !firstName || !lastName || !email) {
+      console.error('❌ Missing required fields:', { userId, firstName, lastName, email });
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        details: 'userId, firstName, lastName, and email are required'
+      });
+    }
     
     // Check for specific conflicts (email, phone)
     const { data: existingEmail, error: emailCheckError } = await supabase
@@ -6736,6 +6750,27 @@ app.post('/api/team-members/register', async (req, res) => {
     const invitationToken = crypto.randomBytes(32).toString('hex');
     
     // Create team member with 'invited' status
+    console.log('🔍 Inserting team member with data:', {
+      user_id: userId,
+      first_name: sanitizeInput(firstName),
+      last_name: sanitizeInput(lastName),
+      email: sanitizeInput(email),
+      phone: phone ? sanitizeInput(phone) : null,
+      location: location ? sanitizeInput(location) : null,
+      city: city ? sanitizeInput(city) : null,
+      state: state ? sanitizeInput(state) : null,
+      zip_code: zipCode ? sanitizeInput(zipCode) : null,
+      role: role || 'worker',
+      hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
+      is_service_provider: isServiceProvider || false,
+      skills: skills || [],
+      territories: territories || [],
+      availability: availability || {},
+      permissions: permissions || {},
+      invitation_token: invitationToken,
+      status: 'invited'
+    });
+    
     const { data: teamMember, error: insertError } = await supabase
       .from('team_members')
       .insert({
@@ -6749,8 +6784,11 @@ app.post('/api/team-members/register', async (req, res) => {
         state: state ? sanitizeInput(state) : null,
         zip_code: zipCode ? sanitizeInput(zipCode) : null,
         role: role || 'worker',
+        hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
         is_service_provider: isServiceProvider || false,
+        skills: skills || [],
         territories: territories || [],
+        availability: availability || {},
         permissions: permissions || {},
         invitation_token: invitationToken,
         status: 'invited'
@@ -6759,9 +6797,11 @@ app.post('/api/team-members/register', async (req, res) => {
       .single();
     
     if (insertError) {
-      console.error('Error creating team member:', insertError);
+      console.error('❌ Error creating team member:', insertError);
       return res.status(500).json({ error: 'Failed to create team member' });
     }
+    
+    console.log('✅ Team member created successfully:', teamMember);
     
     // Send invitation email
     try {
@@ -6791,26 +6831,32 @@ app.post('/api/team-members/register', async (req, res) => {
       // Don't fail the request if email fails
     }
     
-    res.json({
+    const responseData = {
       message: 'Team member invited successfully',
       teamMember: {
         id: teamMember.id,
         first_name: teamMember.first_name,
-          last_name: teamMember.last_name,
-          email: teamMember.email,
-          phone: teamMember.phone,
-          location: teamMember.location,
-          city: teamMember.city,
-          state: teamMember.state,
-          zip_code: teamMember.zip_code,
-          role: teamMember.role,
-          is_service_provider: teamMember.is_service_provider,
-          territories: teamMember.territories,
-          permissions: teamMember.permissions,
-          status: teamMember.status,
-          created_at: teamMember.created_at
-        }
-      });
+        last_name: teamMember.last_name,
+        email: teamMember.email,
+        phone: teamMember.phone,
+        location: teamMember.location,
+        city: teamMember.city,
+        state: teamMember.state,
+        zip_code: teamMember.zip_code,
+        role: teamMember.role,
+        hourly_rate: teamMember.hourly_rate,
+        is_service_provider: teamMember.is_service_provider,
+        skills: teamMember.skills,
+        territories: teamMember.territories,
+        availability: teamMember.availability,
+        permissions: teamMember.permissions,
+        status: teamMember.status,
+        created_at: teamMember.created_at
+      }
+    };
+    
+    console.log('✅ Sending success response:', responseData);
+    res.json(responseData);
   } catch (error) {
     console.error('Team member registration error:', error);
     console.error('Error details:', {
