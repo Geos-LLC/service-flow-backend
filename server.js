@@ -6668,6 +6668,16 @@ app.post('/api/team-members/login', async (req, res) => {
   }
 });
 
+// Test endpoint to verify backend is working
+app.get('/api/team-members/test', (req, res) => {
+  console.log('🧪 Test endpoint hit at:', new Date().toISOString());
+  res.json({ 
+    message: 'Backend is working!', 
+    timestamp: new Date().toISOString(),
+    status: 'success'
+  });
+});
+
 app.post('/api/team-members/register', async (req, res) => {
   console.log('🚀 Team member registration endpoint hit at:', new Date().toISOString());
   
@@ -6788,6 +6798,8 @@ app.post('/api/team-members/register', async (req, res) => {
       status: 'invited'
     });
     
+    console.log('🔍 Attempting database insert...');
+    
     const { data: teamMember, error: insertError } = await supabase
       .from('team_members')
       .insert({
@@ -6812,6 +6824,8 @@ app.post('/api/team-members/register', async (req, res) => {
       })
       .select()
       .single();
+    
+    console.log('🔍 Database insert completed. Result:', { teamMember, insertError });
     
     if (insertError) {
       console.error('❌ Error creating team member:', insertError);
@@ -6880,7 +6894,15 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('✅ Step 6: Sending success response to frontend');
     console.log('✅ Sending success response:', responseData);
     clearTimeout(timeout); // Clear the timeout
-    res.json(responseData);
+    
+    // Ensure response headers are set
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    // Ensure response is properly sent
+    res.status(200).json(responseData);
+    console.log('✅ Response sent successfully at:', new Date().toISOString());
+    console.log('✅ Response headers sent:', res.getHeaders());
   } catch (error) {
     console.error('Team member registration error:', error);
     console.error('Error details:', {
