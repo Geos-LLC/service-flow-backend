@@ -1793,7 +1793,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Handle multiple services - store in existing fields for now
       const serviceIds = req.body.serviceIds || [];
       const serviceNames = req.body.serviceName ? req.body.serviceName.split(', ') : [];
-      
+
       // Create the job
       const jobData = {
         user_id: userId,
@@ -1843,7 +1843,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       };
 
       console.log('🔄 Attempting to insert job with data:', jobData);
-      
+
       const { data: result, error: insertError } = await supabase
         .from('jobs')
         .insert(jobData)
@@ -1864,7 +1864,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         message: 'Job created successfully',
         job: result
       });
-      
+
       // Create team member assignments in job_team_assignments table
       if (teamMemberIdValue || teamMemberIds.length > 0) {
         try {
@@ -6840,27 +6840,27 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
     
     // Generate invitation link
-    const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
-    
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
+      
     // Send email in background without waiting
     sendEmail({
-      to: email,
-      subject: 'You\'ve been invited to join Zenbooker',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
-          <p>Hello ${firstName},</p>
-          <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-              Create Your Account
-            </a>
+        to: email,
+        subject: 'You\'ve been invited to join Zenbooker',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
+            <p>Hello ${firstName},</p>
+            <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                Create Your Account
+              </a>
+            </div>
+            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+            <p>Best regards,<br>The Zenbooker Team</p>
           </div>
-          <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-          <p>Best regards,<br>The Zenbooker Team</p>
-        </div>
-      `,
-      text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+        `,
+        text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
     }).then(() => {
       console.log('✅ Step 5: Invitation email sent successfully (background)');
     }).catch((emailError) => {
@@ -6875,23 +6875,23 @@ app.post('/api/team-members/register', async (req, res) => {
       teamMember: {
         id: teamMember.id,
         first_name: teamMember.first_name,
-        last_name: teamMember.last_name,
-        email: teamMember.email,
-        phone: teamMember.phone,
-        location: teamMember.location,
-        city: teamMember.city,
-        state: teamMember.state,
-        zip_code: teamMember.zip_code,
-        role: teamMember.role,
+          last_name: teamMember.last_name,
+          email: teamMember.email,
+          phone: teamMember.phone,
+          location: teamMember.location,
+          city: teamMember.city,
+          state: teamMember.state,
+          zip_code: teamMember.zip_code,
+          role: teamMember.role,
         hourly_rate: teamMember.hourly_rate,
-        is_service_provider: teamMember.is_service_provider,
+          is_service_provider: teamMember.is_service_provider,
         skills: teamMember.skills,
-        territories: teamMember.territories,
+          territories: teamMember.territories,
         availability: teamMember.availability,
-        permissions: teamMember.permissions,
-        status: teamMember.status,
-        created_at: teamMember.created_at
-      }
+          permissions: teamMember.permissions,
+          status: teamMember.status,
+          created_at: teamMember.created_at
+        }
     };
     
     console.log('✅ Step 6: Sending success response to frontend');
@@ -9154,17 +9154,25 @@ app.get('/api/places/autocomplete', async (req, res) => {
     
     console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...', sessiontoken });
     
-    // Build the API path with optional session token
-    let apiPath = `/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&components=country:ng`;
+    // Use the new Places API (New) endpoint
+    const requestBody = {
+      input: input,
+      includedRegionCodes: ['us'], // USA country code
+      languageCode: 'en'
+    };
+    
     if (sessiontoken) {
-      apiPath += `&sessiontoken=${sessiontoken}`;
+      requestBody.sessionToken = sessiontoken;
     }
     
-    // Use the correct Places Autocomplete API endpoint
     const options = {
-      hostname: 'maps.googleapis.com',
-      path: apiPath,
-      method: 'GET'
+      hostname: 'places.googleapis.com',
+      path: `/v1/places:autocomplete?key=${GOOGLE_API_KEY}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-FieldMask': 'suggestions.placePrediction.place,suggestions.placePrediction.text'
+      }
     };
     
     const request = https.request(options, (response) => {
@@ -9176,25 +9184,33 @@ app.get('/api/places/autocomplete', async (req, res) => {
       
       response.on('end', () => {
         try {
-          console.log("Google API raw response:", data);
+          console.log("Google Places API (New) raw response:", data);
           const jsonData = JSON.parse(data);
           console.log("Parsed API response:", jsonData);
           
           // Check for API errors
-          if (jsonData.error_message) {
-            console.error('Google Places API error:', jsonData.error_message);
-            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error_message });
+          if (jsonData.error) {
+            console.error('Google Places API error:', jsonData.error);
+            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error.message });
           }
           
-          if (jsonData.status !== 'OK' && jsonData.status !== 'ZERO_RESULTS') {
-            console.error('Google Places API status:', jsonData.status);
-            return res.status(500).json({ error: 'Google Places API status: ' + jsonData.status });
-          }
+          // Convert new API format to legacy format for compatibility
+          const suggestions = jsonData.suggestions || [];
+          const predictions = suggestions.map(suggestion => {
+            if (suggestion.placePrediction) {
+              return {
+                description: suggestion.placePrediction.text?.text || '',
+                place_id: suggestion.placePrediction.place?.id || '',
+                structured_formatting: {
+                  main_text: suggestion.placePrediction.text?.text || '',
+                  secondary_text: ''
+                }
+              };
+            }
+            return null;
+          }).filter(Boolean);
           
-          // Legacy API already returns predictions in the correct format
-          const predictions = jsonData.predictions || [];
-          
-          console.log("Predictions:", predictions);
+          console.log("Converted predictions:", predictions);
           res.json({ predictions });
         } catch (error) {
           console.error('Error parsing Google Places response:', error);
@@ -9208,6 +9224,8 @@ app.get('/api/places/autocomplete', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch address suggestions' });
     });
     
+    // Send the POST body
+    request.write(JSON.stringify(requestBody));
     request.end();
   } catch (error) {
     console.error('Google Places autocomplete error:', error);
@@ -9227,11 +9245,15 @@ app.get('/api/places/details', async (req, res) => {
     // Try using the same key that works for geocoding
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    // Use the legacy Places API format
+    // Use the new Places API (New) endpoint
     const options = {
-      hostname: 'maps.googleapis.com',
-      path: `/maps/api/place/details/json?place_id=${place_id}&fields=address_components,formatted_address&key=${GOOGLE_API_KEY}`,
-      method: 'GET'
+      hostname: 'places.googleapis.com',
+      path: `/v1/places/${place_id}?key=${GOOGLE_API_KEY}`,
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-FieldMask': 'addressComponents,formattedAddress'
+      }
     };
     
     console.log('Fetching place details for:', place_id);
@@ -9245,11 +9267,22 @@ app.get('/api/places/details', async (req, res) => {
       
       response.on('end', () => {
         try {
+          console.log("Google Places API (New) details response:", data);
           const jsonData = JSON.parse(data);
           
-          // Legacy API already returns result in the correct format
-          const result = jsonData.result || {};
+          // Check for API errors
+          if (jsonData.error) {
+            console.error('Google Places API error:', jsonData.error);
+            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error.message });
+          }
           
+          // Convert new API format to legacy format for compatibility
+          const result = {
+            formatted_address: jsonData.formattedAddress || '',
+            address_components: jsonData.addressComponents || []
+          };
+          
+          console.log("Converted place details:", result);
           res.json({ result });
         } catch (error) {
           console.error('Error parsing Google Places response:', error);
