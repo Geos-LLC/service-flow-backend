@@ -9140,49 +9140,10 @@ app.put('/api/invoices/:id/status', async (req, res) => {
     res.status(500).json({ error: 'Failed to update invoice status' });
   }
 });
-// Fallback function to use geocoding API when Places API fails
-const fallbackToGeocoding = async (input, res) => {
-  try {
-    console.log('Falling back to geocoding API for:', input);
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
-    
-    const geocodeResponse = await fetch(
-      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}`
-    );
-    
-    if (!geocodeResponse.ok) {
-      throw new Error('Geocoding API request failed');
-    }
-    
-    const geocodeData = await geocodeResponse.json();
-    
-    if (geocodeData.status === 'OK' && geocodeData.results && geocodeData.results.length > 0) {
-      // Convert geocoding results to Places API format
-      const predictions = geocodeData.results.map((result, index) => ({
-        description: result.formatted_address,
-        place_id: `geocode_${index}_${Date.now()}`, // Generate a temporary place_id
-        structured_formatting: {
-          main_text: result.formatted_address,
-          secondary_text: ''
-        }
-      }));
-      
-      console.log("Geocoding fallback predictions:", predictions);
-      return res.json({ predictions });
-    } else {
-      console.log("No geocoding results found");
-      return res.json({ predictions: [] });
-    }
-  } catch (error) {
-    console.error('Geocoding fallback error:', error);
-    return res.json({ predictions: [] });
-  }
-};
-
 // Google Places API endpoints (New)
 app.get('/api/places/autocomplete', async (req, res) => {
   try {
-    const { input } = req.query;
+    const { input, sessiontoken } = req.query;
     
     if (!input || input.length < 3) {
       return res.json({ predictions: [] });
@@ -9191,12 +9152,18 @@ app.get('/api/places/autocomplete', async (req, res) => {
     // Try using the same key that works for geocoding
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...' });
+    console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...', sessiontoken });
     
-    // Try using the newer Places API (New) first, fallback to legacy
+    // Build the API path with optional session token
+    let apiPath = `/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&components=country:ng`;
+    if (sessiontoken) {
+      apiPath += `&sessiontoken=${sessiontoken}`;
+    }
+    
+    // Use the correct Places Autocomplete API endpoint
     const options = {
       hostname: 'maps.googleapis.com',
-      path: `/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=geocode&key=${GOOGLE_API_KEY}`,
+      path: apiPath,
       method: 'GET'
     };
     
@@ -9216,14 +9183,12 @@ app.get('/api/places/autocomplete', async (req, res) => {
           // Check for API errors
           if (jsonData.error_message) {
             console.error('Google Places API error:', jsonData.error_message);
-            // Fallback to geocoding API if Places API fails
-            return fallbackToGeocoding(input, res);
+            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error_message });
           }
           
           if (jsonData.status !== 'OK' && jsonData.status !== 'ZERO_RESULTS') {
             console.error('Google Places API status:', jsonData.status);
-            // Fallback to geocoding API if Places API fails
-            return fallbackToGeocoding(input, res);
+            return res.status(500).json({ error: 'Google Places API status: ' + jsonData.status });
           }
           
           // Legacy API already returns predictions in the correct format
@@ -9233,16 +9198,14 @@ app.get('/api/places/autocomplete', async (req, res) => {
           res.json({ predictions });
         } catch (error) {
           console.error('Error parsing Google Places response:', error);
-          // Fallback to geocoding API if Places API fails
-          return fallbackToGeocoding(input, res);
+          return res.status(500).json({ error: 'Failed to parse address suggestions' });
         }
       });
     });
     
     request.on('error', (error) => {
       console.error('Google Places autocomplete error:', error);
-      // Fallback to geocoding API if Places API fails
-      return fallbackToGeocoding(input, res);
+      return res.status(500).json({ error: 'Failed to fetch address suggestions' });
     });
     
     request.end();
@@ -9260,17 +9223,6 @@ app.get('/api/places/details', async (req, res) => {
       return res.status(400).json({ error: 'place_id is required' });
     }
     
-    // Check if this is a fallback geocoding result
-    if (place_id.startsWith('geocode_')) {
-      // For fallback results, we don't have detailed place info
-      // Return a basic structure
-      return res.json({
-        result: {
-          formatted_address: 'Address details not available',
-          address_components: []
-        }
-      });
-    }
     
     // Try using the same key that works for geocoding
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
