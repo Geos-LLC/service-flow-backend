@@ -287,9 +287,11 @@ app.use(cors(corsOptions));
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
-// Additional CORS middleware for all requests
+// Additional CORS middleware for all requests - ALLOW ALL ORIGINS
 app.use((req, res, next) => {
-  // Set CORS headers for all requests
+  console.log('🌐 CORS: Processing request:', req.method, req.url, 'from origin:', req.headers.origin);
+  
+  // Set CORS headers for all requests - ALLOW ALL ORIGINS
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
@@ -298,37 +300,35 @@ app.use((req, res, next) => {
   
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
-    console.log('🔄 Handling OPTIONS preflight request for:', req.path);
-    res.status(204).end();
+    console.log('🔍 Preflight request received for:', req.url, 'from origin:', req.headers.origin);
+    console.log('🔍 Sending preflight response with headers:', {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override'
+    });
+    res.status(200).end();
     return;
   }
   
+  console.log('🌐 CORS: Headers set for:', req.method, req.url);
   next();
 });
 
-// Add CORS headers to all responses - Allow all origins
+// Comprehensive CORS headers for all responses - ALLOW ALL ORIGINS
 app.use((req, res, next) => {
-  // Set CORS headers for all responses
-  const origin = req.headers.origin;
+  console.log('🌐 CORS-2: Processing request:', req.method, req.url);
   
-  // Allow all origins
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    // If no origin header, allow all (for non-browser requests)
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  
-  // Set standard CORS headers
+  // Set CORS headers for all responses - FORCE ALLOW ALL ORIGINS
+  res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+  res.header('Access-Control-Max-Age', '86400');
   
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
-    console.log('🔄 Handling OPTIONS preflight request for:', req.path);
-    res.status(204).send();
+    console.log('🔍 CORS-2: Preflight request for:', req.path, 'from origin:', req.headers.origin);
+    res.status(200).json({ message: 'CORS preflight OK' });
     return;
   }
   
@@ -3620,6 +3620,60 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
+// Service settings endpoints
+app.get('/api/user/service-settings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('service_settings')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('Error fetching service settings:', error);
+      return res.status(500).json({ error: 'Failed to fetch service settings' });
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Return default settings if none exist
+    const serviceSettings = user.service_settings || { categoriesEnabled: false };
+    
+    res.json(serviceSettings);
+  } catch (error) {
+    console.error('Get service settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch service settings' });
+  }
+});
+
+app.put('/api/user/service-settings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const serviceSettings = req.body;
+    
+    const { error } = await supabase
+      .from('users')
+      .update({
+        service_settings: serviceSettings
+      })
+      .eq('id', userId);
+    
+    if (error) {
+      console.error('Error updating service settings:', error);
+      return res.status(500).json({ error: 'Failed to update service settings' });
+    }
+    
+    res.json({ message: 'Service settings updated successfully', settings: serviceSettings });
+  } catch (error) {
+    console.error('Update service settings error:', error);
+    res.status(500).json({ error: 'Failed to update service settings' });
+  }
+});
+
 app.put('/api/user/password', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -4303,17 +4357,17 @@ app.put('/api/user/availability', async (req, res) => {
 });
 
 // Territory Management API endpoints
-app.get('/api/territories', async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
+app.get('/api/territories', authenticateToken, async (req, res) => {
+  console.log('🏔️ Territories endpoint hit from origin:', req.headers.origin);
+  console.log('🏔️ Query params:', req.query);
+  
+  // Set CORS headers explicitly - ALLOW ALL ORIGINS
+  res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
+  
+  console.log('🏔️ CORS headers set for territories endpoint');
   
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
@@ -6091,17 +6145,17 @@ app.delete('/api/job-templates/:id', async (req, res) => {
 });
 
 // Team Management endpoints
-app.get('/api/team-members', async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
+app.get('/api/team-members', authenticateToken, async (req, res) => {
+  console.log('🏃‍♂️ Team members endpoint hit from origin:', req.headers.origin);
+  console.log('🏃‍♂️ Query params:', req.query);
+  
+  // Set CORS headers explicitly - ALLOW ALL ORIGINS
+  res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
+  
+  console.log('🏃‍♂️ CORS headers set for team-members endpoint');
   
   console.log('🔄 Team members request received:', req.query);
   try {
