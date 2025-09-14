@@ -4441,6 +4441,109 @@ app.post('/api/user/payment-processor/setup', authenticateToken, async (req, res
   }
 });
 
+// Billing endpoints
+app.get('/api/user/billing', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+    
+    // For now, return default billing info since we don't have Stripe integration set up
+    // In a real implementation, you'd fetch this from your billing provider (Stripe)
+    const billingData = {
+      currentPlan: "Standard",
+      isTrial: true,
+      trialDaysLeft: 14,
+      trialEndDate: "July 4",
+      monthlyPrice: 29,
+      subscriptionStatus: 'trialing'
+    };
+    
+    res.json(billingData);
+  } catch (error) {
+    console.error('Get billing error:', error);
+    res.status(500).json({ error: 'Failed to fetch billing information' });
+  }
+});
+
+app.post('/api/user/billing/setup-intent', async (req, res) => {
+  try {
+    const { userId, email, name } = req.body;
+    
+    if (!userId || !email) {
+      return res.status(400).json({ error: 'User ID and email are required' });
+    }
+    
+    // For now, return a mock setup intent
+    // In a real implementation, you'd create this with Stripe
+    const mockSetupIntent = {
+      setup_intent: 'seti_mock_setup_intent_12345',
+      client_secret: 'seti_mock_client_secret_12345'
+    };
+    
+    res.json(mockSetupIntent);
+  } catch (error) {
+    console.error('Create setup intent error:', error);
+    res.status(500).json({ error: 'Failed to create setup intent' });
+  }
+});
+
+app.post('/api/user/billing/subscription', async (req, res) => {
+  try {
+    const { userId, plan, paymentMethodId } = req.body;
+    
+    if (!userId || !plan || !paymentMethodId) {
+      return res.status(400).json({ error: 'User ID, plan, and payment method are required' });
+    }
+    
+    // For now, return success
+    // In a real implementation, you'd create the subscription with Stripe
+    res.json({ 
+      message: 'Subscription created successfully',
+      subscription_id: 'sub_mock_12345'
+    });
+  } catch (error) {
+    console.error('Create subscription error:', error);
+    res.status(500).json({ error: 'Failed to create subscription' });
+  }
+});
+
+app.get('/api/user/billing/payment-methods', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+    
+    // For now, return empty payment methods
+    // In a real implementation, you'd fetch this from Stripe
+    res.json({ payment_methods: [] });
+  } catch (error) {
+    console.error('Get payment methods error:', error);
+    res.status(500).json({ error: 'Failed to fetch payment methods' });
+  }
+});
+
+app.post('/api/user/billing/cancel-subscription', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+    
+    // For now, return success
+    // In a real implementation, you'd cancel the subscription with Stripe
+    res.json({ message: 'Subscription cancelled successfully' });
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
 // Availability endpoints
 app.get('/api/user/availability', async (req, res) => {
   try {
