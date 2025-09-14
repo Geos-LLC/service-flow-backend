@@ -3881,68 +3881,247 @@ app.get('/api/user/billing', async (req, res) => {
   }
 });
 
-app.post('/api/user/billing/subscription', async (req, res) => {
+// Create Stripe customer and setup intent
+app.post('/api/user/billing/setup-intent', async (req, res) => {
   try {
-    const { userId, plan, cardNumber, expiryMonth, expiryYear, cvc } = req.body;
+    const { userId, email, name } = req.body;
     
-    // In a real application, you would integrate with a payment processor here
-    // For now, we'll just store the subscription info
-    
-    const cardLast4 = cardNumber.slice(-4);
-    const trialEndDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
-    
-    // Check if billing record exists
-    const { data: existingBilling, error: checkError } = await supabase
+    // Create or retrieve Stripe customer
+    let customer;
+    const { data: existingBilling } = await supabase
       .from('user_billing')
-      .select('id')
+      .select('stripe_customer_id')
       .eq('user_id', userId)
       .limit(1);
     
-    if (checkError) {
-      console.error('Error checking existing billing:', checkError);
-      return res.status(500).json({ error: 'Failed to check existing subscription' });
-    }
-    
-    if (existingBilling && existingBilling.length > 0) {
-      // Update existing billing record
-      const { error: updateError } = await supabase
-        .from('user_billing')
-        .update({
-          subscription_plan: plan,
-          monthly_price: 29,
-          card_last4: cardLast4,
-          trial_end_date: trialEndDate,
-          is_trial: false
-        })
-        .eq('user_id', userId);
-      
-      if (updateError) {
-        console.error('Error updating subscription:', updateError);
-        return res.status(500).json({ error: 'Failed to update subscription' });
-      }
+    if (existingBilling?.[0]?.stripe_customer_id) {
+      customer = await stripe.customers.retrieve(existingBilling[0].stripe_customer_id);
     } else {
-      // Create new billing record
-      const { error: insertError } = await supabase
-        .from('user_billing')
-        .insert({
-          user_id: userId,
-          subscription_plan: plan,
-          monthly_price: 29,
-          card_last4: cardLast4,
-          trial_end_date: trialEndDate,
-          is_trial: true
-        });
+      customer = await stripe.customers.create({
+        email: email,
+        name: name,
+        metadata: { user_id: userId }
+      });
       
-      if (insertError) {
-        console.error('Error creating subscription:', insertError);
-        return res.status(500).json({ error: 'Failed to create subscription' });
-      }
+      // Save customer ID to database
+      await supabase
+        .from('user_billing')
+        .upsert({
+          user_id: userId,
+          stripe_customer_id: customer.id,
+          subscription_plan: 'Standard',
+          monthly_price: 29,
+          is_trial: true,
+          trial_end_date: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+        });
     }
     
-    res.json({ message: 'Subscription created successfully' });
+    // Create setup intent for future payments
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customer.id,
+      usage: 'off_session'
+    });
+    
+    res.json({
+      setup_intent: setupIntent.client_secret,
+      customer_id: customer.id
+    });
+  } catch (error) {
+    console.error('Setup intent error:', error);
+    res.status(500).json({ error: 'Failed to create setup intent' });
+  }
+});
+
+// Create Stripe subscription
+app.post('/api/user/billing/subscription', async (req, res) => {
+  try {
+    const { userId, plan, paymentMethodId } = req.body;
+    
+    // Get user's Stripe customer ID
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (billingError || !billingData?.[0]?.stripe_customer_id) {
+      return res.status(400).json({ error: 'No customer found. Please refresh and try again.' });
+    }
+    
+    const customerId = billingData[0].stripe_customer_id;
+    
+    // Attach payment method to customer
+    await stripe.paymentMethods.attach(paymentMethodId, {
+      customer: customerId,
+    });
+    
+    // Set as default payment method
+    await stripe.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: paymentMethodId,
+      },
+    });
+    
+    // Create price based on plan
+    const planPrices = {
+      'Starter': 1900, // $19.00 in cents
+      'Standard': 2900, // $29.00 in cents
+      'Professional': 4900 // $49.00 in cents
+    };
+    
+    // Create subscription
+    const subscription = await stripe.subscriptions.create({
+      customer: customerId,
+      items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `Zenbooker ${plan} Plan`,
+          },
+          unit_amount: planPrices[plan] || 2900,
+          recurring: {
+            interval: 'month',
+          },
+        },
+      }],
+      trial_period_days: 14,
+      expand: ['latest_invoice.payment_intent'],
+    });
+    
+    // Update billing record
+    await supabase
+      .from('user_billing')
+      .update({
+        stripe_subscription_id: subscription.id,
+        subscription_plan: plan,
+        monthly_price: planPrices[plan] / 100,
+        is_trial: subscription.status === 'trialing',
+        subscription_status: subscription.status
+      })
+      .eq('user_id', userId);
+    
+    res.json({
+      subscription_id: subscription.id,
+      status: subscription.status,
+      message: 'Subscription created successfully'
+    });
+    
   } catch (error) {
     console.error('Create subscription error:', error);
-    res.status(500).json({ error: 'Failed to create subscription' });
+    res.status(500).json({ error: error.message || 'Failed to create subscription' });
+  }
+});
+
+// Get payment methods for a customer
+app.get('/api/user/billing/payment-methods', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    
+    const { data: billingData } = await supabase
+      .from('user_billing')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (!billingData?.[0]?.stripe_customer_id) {
+      return res.json({ payment_methods: [] });
+    }
+    
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: billingData[0].stripe_customer_id,
+      type: 'card',
+    });
+    
+    res.json({
+      payment_methods: paymentMethods.data.map(pm => ({
+        id: pm.id,
+        brand: pm.card.brand,
+        last4: pm.card.last4,
+        exp_month: pm.card.exp_month,
+        exp_year: pm.card.exp_year
+      }))
+    });
+  } catch (error) {
+    console.error('Get payment methods error:', error);
+    res.status(500).json({ error: 'Failed to fetch payment methods' });
+  }
+});
+
+// Cancel subscription
+app.post('/api/user/billing/cancel-subscription', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    const { data: billingData } = await supabase
+      .from('user_billing')
+      .select('stripe_subscription_id')
+      .eq('user_id', userId)
+      .limit(1);
+    
+    if (!billingData?.[0]?.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+    
+    await stripe.subscriptions.update(billingData[0].stripe_subscription_id, {
+      cancel_at_period_end: true
+    });
+    
+    await supabase
+      .from('user_billing')
+      .update({ subscription_status: 'canceled' })
+      .eq('user_id', userId);
+    
+    res.json({ message: 'Subscription cancelled successfully' });
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+});
+
+// Stripe webhook handler
+app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted':
+        const subscription = event.data.object;
+        await supabase
+          .from('user_billing')
+          .update({
+            subscription_status: subscription.status,
+            is_trial: subscription.status === 'trialing'
+          })
+          .eq('stripe_subscription_id', subscription.id);
+        break;
+
+      case 'invoice.payment_succeeded':
+        const invoice = event.data.object;
+        console.log('Payment succeeded for subscription:', invoice.subscription);
+        break;
+
+      case 'invoice.payment_failed':
+        const failedInvoice = event.data.object;
+        console.log('Payment failed for subscription:', failedInvoice.subscription);
+        break;
+
+      default:
+        console.log(`Unhandled event type ${event.type}`);
+    }
+
+    res.json({received: true});
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
