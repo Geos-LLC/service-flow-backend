@@ -1360,7 +1360,16 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add search filter
     if (search) {
-      query = query.or(`customers.first_name.ilike.%${search}%,customers.last_name.ilike.%${search}%,services.name.ilike.%${search}%`);
+      console.log('🔄 Backend: Search term:', search);
+      try {
+        // Escape special characters in search term
+        const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
+        console.log('🔄 Backend: Escaped search term:', escapedSearch);
+        query = query.or(`customers.first_name.ilike.%${escapedSearch}%,customers.last_name.ilike.%${escapedSearch}%,services.name.ilike.%${escapedSearch}%`);
+      } catch (searchError) {
+        console.error('🔄 Backend: Search query error:', searchError);
+        // Continue without search filter if there's an error
+      }
     }
     
     // Add customer filter
@@ -1434,11 +1443,41 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     console.log('🔄 Backend: Supabase query built');
     
-    const { data: jobs, error, count } = await query;
+    let jobs, error, count;
+    try {
+      const result = await query;
+      jobs = result.data;
+      error = result.error;
+      count = result.count;
+    } catch (queryError) {
+      console.error('🔄 Backend: Query execution error:', queryError);
+      return res.status(500).json({ 
+        error: 'Failed to execute jobs query',
+        details: queryError.message 
+      });
+    }
     
     if (error) {
-      console.error('Error fetching jobs:', error);
-      return res.status(500).json({ error: 'Failed to fetch jobs' });
+      console.error('🔄 Backend: Supabase query error:', error);
+      console.error('🔄 Backend: Error details:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      console.error('🔄 Backend: Query parameters:', {
+        userId,
+        search,
+        status,
+        sortBy,
+        sortOrder,
+        page,
+        limit
+      });
+      return res.status(500).json({ 
+        error: 'Failed to fetch jobs',
+        details: error.message 
+      });
     }
       
       console.log('🔄 Backend: Jobs query executed');
@@ -7486,79 +7525,87 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
 app.post('/api/team-members/:id/resend-invite', async (req, res) => {
   try {
     const { id } = req.params;
-    console.log('Resending invite for team member ID:', id);
+    console.log('🔄 Resending invite for team member ID:', id);
     
-    const connection = await pool.getConnection();
+    // Get team member details from Supabase
+    const { data: teamMember, error: fetchError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('id', id)
+      .single();
     
-    try {
-      // Get team member details
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE id = ?',
-        [id]
-      );
-      
-      if (teamMembers.length === 0) {
-        return res.status(404).json({ error: 'Team member not found' });
-      }
-      
-      const teamMember = teamMembers[0];
-      
-      if (teamMember.status !== 'invited') {
-        return res.status(400).json({ error: 'Team member is not in invited status' });
-      }
-      
-      // Generate new invitation token
-      const invitationToken = crypto.randomBytes(32).toString('hex');
-      const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-      
-      // Update invitation token
-      await connection.query(
-        'UPDATE team_members SET invitation_token = ?, invitation_expires = ? WHERE id = ?',
-        [invitationToken, invitationExpires, id]
-      );
-      
-      // Send new invitation email
-      try {
-        const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
-        
-        await sendTeamMemberEmail({
-          to: teamMember.email,
-          subject: 'You\'ve been invited to join Service Flow',
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
-              <p>Hello ${teamMember.first_name},</p>
-              <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
-              <div style="text-align: center; margin: 30px 0;">
-                <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                  Create Your Account
-                </a>
-              </div>
-              <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-              <p>Best regards,<br>The Service Flow Team</p>
-            </div>
-          `,
-          text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
-        });
-      } catch (emailError) {
-        console.error('Failed to send invitation email:', emailError);
-        console.error('Email error details:', {
-          message: emailError.message,
-          code: emailError.code,
-          command: emailError.command
-        });
-        return res.status(500).json({ 
-          error: 'Failed to send invitation email',
-          details: emailError.message 
-        });
-      }
-      
-      res.json({ message: 'Invitation resent successfully' });
-    } finally {
-      connection.release();
+    if (fetchError) {
+      console.error('🔄 Error fetching team member:', fetchError);
+      return res.status(404).json({ error: 'Team member not found' });
     }
+    
+    if (!teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    if (teamMember.status !== 'invited') {
+      return res.status(400).json({ error: 'Team member is not in invited status' });
+    }
+    
+    // Generate new invitation token
+    const invitationToken = crypto.randomBytes(32).toString('hex');
+    const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+    
+    // Update invitation token in Supabase
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({
+        invitation_token: invitationToken,
+        invitation_expires: invitationExpires.toISOString()
+      })
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('🔄 Error updating invitation token:', updateError);
+      return res.status(500).json({ error: 'Failed to update invitation token' });
+    }
+    
+    // Send new invitation email
+    try {
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
+      
+      await sendTeamMemberEmail({
+        to: teamMember.email,
+        subject: 'You\'ve been invited to join Service Flow',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
+            <p>Hello ${teamMember.first_name},</p>
+            <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                Create Your Account
+              </a>
+            </div>
+            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+            <p>Best regards,<br>The Service Flow Team</p>
+          </div>
+        `,
+        text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+      });
+      
+      console.log('✅ Invitation email sent successfully via SendGrid');
+    } catch (emailError) {
+      console.error('❌ Failed to send invitation email:', emailError);
+      console.error('❌ Email error details:', {
+        message: emailError.message,
+        code: emailError.code,
+        command: emailError.command
+      });
+      return res.status(500).json({ 
+        error: 'Failed to send invitation email',
+        details: emailError.message 
+      });
+    }
+    
+    res.json({ message: 'Invitation resent successfully' });
   } catch (error) {
-    console.error('Resend invitation error:', error);
+    console.error('❌ Resend invitation error:', error);
     res.status(500).json({ error: 'Failed to resend invitation' });
   }
 });
