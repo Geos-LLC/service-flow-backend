@@ -12288,6 +12288,15 @@ app.use((err, req, res, next) => {
   });
 });
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    message: 'Server is running'
+  });
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
@@ -12300,7 +12309,12 @@ app.listen(PORT, async () => {
   console.log('🔍 Test endpoint available: /api/test-branding');
   
   // Initialize database schema
-  await initializeDatabase();
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    console.log('⚠️ Server will continue without database initialization');
+  }
 });
 
 // Fix database schema endpoint (Supabase handles schema automatically)
