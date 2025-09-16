@@ -7727,118 +7727,126 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
     
     console.log('🔍 Team member dashboard request:', { teamMemberId, startDate, endDate });
     
-    const connection = await pool.getConnection();
+    // Get team member info using Supabase
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('id', teamMemberId);
     
-    try {
-      // Get team member info
-      let teamMembers = [];
-      try {
-        console.log('📋 Fetching team member with ID:', teamMemberId);
-        const [teamMembersResult] = await connection.query(
-          'SELECT * FROM team_members WHERE id = ?',
-          [teamMemberId]
-        );
-        teamMembers = teamMembersResult;
-        console.log('✅ Team member found:', teamMembers.length > 0);
-      } catch (teamMemberError) {
-        console.error('❌ Error fetching team member:', teamMemberError);
-        return res.status(500).json({ error: 'Failed to fetch team member data' });
-      }
-      
-      if (teamMembers.length === 0) {
-        console.log('❌ Team member not found with ID:', teamMemberId);
-        return res.status(404).json({ error: 'Team member not found' });
-      }
-      
-      const teamMember = teamMembers[0];
-      console.log('✅ Team member data:', { id: teamMember.id, name: `${teamMember.first_name} ${teamMember.last_name}` });
-      
-      // Get jobs assigned to this team member
-      let jobs = [];
-      try {
-        console.log('📋 Fetching jobs for team member:', teamMemberId);
-        const [jobsResult] = await connection.query(`
-          SELECT 
-            j.*,
-            c.first_name as customer_first_name,
-            c.last_name as customer_last_name,
-            c.phone as customer_phone,
-            c.address as customer_address,
-            s.name as service_name,
-            s.duration
-          FROM jobs j
-          LEFT JOIN customers c ON j.customer_id = c.id
-          LEFT JOIN services s ON j.service_id = s.id
-          WHERE j.team_member_id = ?
-          AND j.scheduled_date BETWEEN ? AND ?
-          ORDER BY j.scheduled_date ASC
-        `, [teamMemberId, startDate || '2024-01-01', endDate || '2030-12-31']);
-        jobs = jobsResult;
-        console.log('✅ Jobs found:', jobs.length);
-      } catch (jobsError) {
-        console.error('❌ Error fetching jobs for team member:', jobsError);
-        console.error('❌ Jobs query failed with error:', jobsError.message);
-        // Return empty jobs array if query fails
-        jobs = [];
-      }
-      
-      // Calculate stats
-      const today = new Date().toISOString().split('T')[0];
-      const todayJobs = jobs.filter(job => job.scheduled_date.split('T')[0] === today);
-      const completedJobs = jobs.filter(job => job.status === 'completed');
-      
-      const stats = {
-        totalJobs: jobs.length,
-        todayJobs: todayJobs.length,
-        completedJobs: completedJobs.length,
-        avgJobValue: completedJobs.length > 0 
-          ? completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs.length 
-          : 0
-      };
-      
-      console.log('📊 Stats calculated:', stats);
-      
-      // Get notifications (with error handling for missing table)
-      let notifications = [];
-      try {
-        console.log('📋 Fetching notifications for team member:', teamMemberId);
-        const [notificationsResult] = await connection.query(`
-          SELECT * FROM team_member_notifications 
-          WHERE team_member_id = ? 
-          ORDER BY created_at DESC 
-          LIMIT 10
-        `, [teamMemberId]);
-        notifications = notificationsResult;
-        console.log('✅ Notifications found:', notifications.length);
-      } catch (notificationError) {
-        console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
-        // Continue without notifications
-      }
-      
-      const response = {
-        teamMember: {
-          id: teamMember.id,
-          first_name: teamMember.first_name,
-          last_name: teamMember.last_name,
-          email: teamMember.email,
-          phone: teamMember.phone,
-          role: teamMember.role,
-          username: teamMember.username,
-          status: teamMember.status,
-          hourly_rate: teamMember.hourly_rate,
-          skills: teamMember.skills,
-          availability: teamMember.availability
-        },
-        jobs: jobs,
-        stats: stats,
-        notifications: notifications
-      };
-      
-      console.log('✅ Dashboard response prepared successfully');
-      res.json(response);
-    } finally {
-      connection.release();
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to fetch team member data' });
     }
+    
+    if (!teamMembers || teamMembers.length === 0) {
+      console.log('❌ Team member not found with ID:', teamMemberId);
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    const teamMember = teamMembers[0];
+    console.log('✅ Team member data:', { id: teamMember.id, name: `${teamMember.first_name} ${teamMember.last_name}` });
+    
+    // Get jobs assigned to this team member using Supabase
+    let jobs = [];
+    try {
+      console.log('📋 Fetching jobs for team member:', teamMemberId);
+      
+      // Build the date filter
+      const startDateFilter = startDate || '2024-01-01';
+      const endDateFilter = endDate || '2030-12-31';
+      
+      const { data: jobsData, error: jobsError } = await supabase
+        .from('jobs')
+        .select(`
+          *,
+          customers:customer_id (
+            first_name,
+            last_name,
+            phone,
+            address
+          ),
+          services:service_id (
+            name,
+            duration
+          )
+        `)
+        .eq('team_member_id', teamMemberId)
+        .gte('scheduled_date', startDateFilter)
+        .lte('scheduled_date', endDateFilter)
+        .order('scheduled_date', { ascending: true });
+      
+      if (jobsError) {
+        console.error('❌ Error fetching jobs for team member:', jobsError);
+        jobs = [];
+      } else {
+        jobs = jobsData || [];
+        console.log('✅ Jobs found:', jobs.length);
+      }
+    } catch (jobsError) {
+      console.error('❌ Error fetching jobs for team member:', jobsError);
+      jobs = [];
+    }
+    
+    // Calculate stats
+    const today = new Date().toISOString().split('T')[0];
+    const todayJobs = jobs.filter(job => job.scheduled_date?.split('T')[0] === today);
+    const completedJobs = jobs.filter(job => job.status === 'completed');
+    
+    const stats = {
+      totalJobs: jobs.length,
+      todayJobs: todayJobs.length,
+      completedJobs: completedJobs.length,
+      avgJobValue: completedJobs.length > 0 
+        ? completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs.length 
+        : 0
+    };
+    
+    console.log('📊 Stats calculated:', stats);
+    
+    // Get notifications using Supabase (optional - continue if table doesn't exist)
+    let notifications = [];
+    try {
+      console.log('📋 Fetching notifications for team member:', teamMemberId);
+      const { data: notificationsData, error: notificationError } = await supabase
+        .from('team_member_notifications')
+        .select('*')
+        .eq('team_member_id', teamMemberId)
+        .order('created_at', { ascending: false })
+        .limit(10);
+      
+      if (notificationError) {
+        console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
+        notifications = [];
+      } else {
+        notifications = notificationsData || [];
+        console.log('✅ Notifications found:', notifications.length);
+      }
+    } catch (notificationError) {
+      console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
+      notifications = [];
+    }
+    
+    const response = {
+      teamMember: {
+        id: teamMember.id,
+        first_name: teamMember.first_name,
+        last_name: teamMember.last_name,
+        email: teamMember.email,
+        phone: teamMember.phone,
+        role: teamMember.role,
+        username: teamMember.username,
+        status: teamMember.status,
+        hourly_rate: teamMember.hourly_rate,
+        skills: teamMember.skills,
+        availability: teamMember.availability
+      },
+      jobs: jobs,
+      stats: stats,
+      notifications: notifications
+    };
+    
+    console.log('✅ Dashboard response prepared successfully');
+    res.json(response);
   } catch (error) {
     console.error('❌ Team member dashboard error:', error);
     console.error('❌ Error details:', {
