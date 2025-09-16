@@ -6640,6 +6640,55 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
   }
 });
 
+// Verify invitation endpoint - MUST be before /:id route
+app.get('/api/team-members/verify-invitation', async (req, res) => {
+  try {
+    const { token } = req.query;
+    console.log('🔍 Verifying invitation token:', token);
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+    
+    // Get team member details by invitation token using Supabase
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('invitation_token', token)
+      .eq('status', 'invited')
+      .gt('invitation_expires', new Date().toISOString());
+    
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member by token:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to verify invitation' });
+    }
+    
+    if (!teamMembers || teamMembers.length === 0) {
+      console.log('❌ No valid team member found for token:', token);
+      return res.status(404).json({ error: 'Invalid or expired invitation token' });
+    }
+    
+    const teamMember = teamMembers[0];
+    console.log('✅ Valid team member found:', {
+      id: teamMember.id,
+      email: teamMember.email,
+      status: teamMember.status,
+      expires: teamMember.invitation_expires
+    });
+    
+    res.json({
+      firstName: teamMember.first_name,
+      lastName: teamMember.last_name,
+      email: teamMember.email,
+      role: teamMember.role,
+      teamMemberId: teamMember.id
+    });
+  } catch (error) {
+    console.error('❌ Verify invitation error:', error);
+    res.status(500).json({ error: 'Failed to verify invitation' });
+  }
+});
+
 app.get('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -7444,54 +7493,6 @@ app.post('/api/team-members/logout', async (req, res) => {
   }
 });
 
-// Verify invitation endpoint
-app.get('/api/team-members/verify-invitation', async (req, res) => {
-  try {
-    const { token } = req.query;
-    console.log('🔍 Verifying invitation token:', token);
-    
-    if (!token) {
-      return res.status(400).json({ error: 'Token is required' });
-    }
-    
-    // Get team member details by invitation token using Supabase
-    const { data: teamMembers, error: teamMemberError } = await supabase
-      .from('team_members')
-      .select('*')
-      .eq('invitation_token', token)
-      .eq('status', 'invited')
-      .gt('invitation_expires', new Date().toISOString());
-    
-    if (teamMemberError) {
-      console.error('❌ Error fetching team member by token:', teamMemberError);
-      return res.status(500).json({ error: 'Failed to verify invitation' });
-    }
-    
-    if (!teamMembers || teamMembers.length === 0) {
-      console.log('❌ No valid team member found for token:', token);
-      return res.status(404).json({ error: 'Invalid or expired invitation token' });
-    }
-    
-    const teamMember = teamMembers[0];
-    console.log('✅ Valid team member found:', {
-      id: teamMember.id,
-      email: teamMember.email,
-      status: teamMember.status,
-      expires: teamMember.invitation_expires
-    });
-    
-    res.json({
-      firstName: teamMember.first_name,
-      lastName: teamMember.last_name,
-      email: teamMember.email,
-      role: teamMember.role,
-      teamMemberId: teamMember.id
-    });
-  } catch (error) {
-    console.error('❌ Verify invitation error:', error);
-    res.status(500).json({ error: 'Failed to verify invitation' });
-  }
-});
 
 // Complete team member signup endpoint
 app.post('/api/team-members/complete-signup', async (req, res) => {
