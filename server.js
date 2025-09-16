@@ -78,8 +78,8 @@ async function testEmailConnection() {
     // Test SendGrid configuration
     await testSendGridConfig();
     
-    await transporter.verify();
-    console.log('Email connection verified successfully');
+    // SendGrid doesn't need transporter verification
+    console.log('✅ Email connection verified successfully');
     return true;
   } catch (error) {
     console.error('Email connection test failed:', error);
@@ -12150,180 +12150,20 @@ app.put('/api/user/business-details', async (req, res) => {
 // Initialize database schema on startup
 const initializeDatabase = async () => {
   try {
-    console.log('🔧 Initializing database schema...');
-    const connection = await pool.getConnection();
+    console.log('🔧 Checking Supabase connection...');
     
-    try {
-      // Ensure the service_categories table exists
-      await connection.query(`
-        CREATE TABLE IF NOT EXISTS service_categories (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          user_id INT NOT NULL,
-          name VARCHAR(100) NOT NULL,
-          description TEXT,
-          color VARCHAR(16) DEFAULT '#3B82F6',
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          UNIQUE KEY unique_name (user_id, name)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;`
-      );
-      console.log('✅ service_categories table created/verified');
-      
-      // Add intake_questions column to services table if it doesn't exist
-      const [servicesColumnCheck] = await connection.query(`
-        SELECT COUNT(*) as count
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = 'services' 
-        AND COLUMN_NAME = 'intake_questions'
-      `);
-      
-      if (servicesColumnCheck[0].count === 0) {
-        await connection.query('ALTER TABLE services ADD COLUMN intake_questions JSON DEFAULT NULL');
-        console.log('✅ Added intake_questions column to services table');
-      } else {
-        console.log('✅ intake_questions column already exists in services table');
-      }
-
-      // Add business_email column to users table if it doesn't exist
-      const [businessEmailColumnCheck] = await connection.query(`
-        SELECT COUNT(*) as count
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() 
-        AND TABLE_NAME = 'users' 
-        AND COLUMN_NAME = 'business_email'
-      `);
-      
-      if (businessEmailColumnCheck[0].count === 0) {
-        await connection.query('ALTER TABLE users ADD COLUMN business_email VARCHAR(255) DEFAULT NULL AFTER business_name');
-        console.log('✅ Added business_email column to users table');
-      } else {
-        console.log('✅ business_email column already exists in users table');
-      }
-      
-          // Create job_answers table if it doesn't exist
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS job_answers (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        job_id int(11) NOT NULL,
-        question_id varchar(255) NOT NULL COMMENT 'ID of the intake question',
-        question_text text NOT NULL COMMENT 'The actual question text',
-        question_type varchar(50) NOT NULL COMMENT 'Type of question (dropdown, multiple_choice, text, etc.)',
-        answer text DEFAULT NULL COMMENT 'Customer answer to the question',
-        created_at timestamp NOT NULL DEFAULT current_timestamp(),
-        updated_at timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-        PRIMARY KEY (id),
-        KEY idx_job_answers_job_id (job_id),
-        KEY idx_job_answers_question_id (question_id),
-        CONSTRAINT job_answers_ibfk_1 FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-    `);
-
-    // Create notification_templates table if it doesn't exist
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS notification_templates (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        user_id int(11) NOT NULL,
-        template_type enum('email','sms') NOT NULL,
-        notification_name varchar(100) NOT NULL,
-        subject varchar(255) DEFAULT NULL,
-        content text NOT NULL,
-        is_enabled tinyint(1) DEFAULT 1,
-        created_at timestamp NOT NULL DEFAULT current_timestamp(),
-        updated_at timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-        PRIMARY KEY (id),
-        UNIQUE KEY user_template_type_name (user_id, template_type, notification_name),
-        KEY idx_notification_templates_user_id (user_id),
-        CONSTRAINT notification_templates_ibfk_1 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-    `);
-
-    // Create job_team_assignments table if it doesn't exist
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS job_team_assignments (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        job_id int(11) NOT NULL,
-        team_member_id int(11) NOT NULL,
-        is_primary tinyint(1) DEFAULT 0,
-        assigned_at timestamp NOT NULL DEFAULT current_timestamp(),
-        assigned_by int(11) NOT NULL,
-        PRIMARY KEY (id),
-        KEY idx_job_team_assignments_job_id (job_id),
-        KEY idx_job_team_assignments_team_member_id (team_member_id),
-        KEY idx_job_team_assignments_lookup (job_id, is_primary),
-        CONSTRAINT job_team_assignments_ibfk_1 FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE,
-        CONSTRAINT job_team_assignments_ibfk_2 FOREIGN KEY (team_member_id) REFERENCES team_members (id) ON DELETE CASCADE,
-        CONSTRAINT job_team_assignments_ibfk_3 FOREIGN KEY (assigned_by) REFERENCES users (id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-    `);
-    console.log('✅ job_team_assignments table created/verified');
-
-    // Create team_member_notifications table if it doesn't exist
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS team_member_notifications (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        team_member_id int(11) NOT NULL,
-        type enum('job_assigned','job_reminder','job_completed','system','payment') NOT NULL,
-        title varchar(255) NOT NULL,
-        message text NOT NULL,
-        data longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(data)),
-        is_read tinyint(1) DEFAULT 0,
-        created_at timestamp NOT NULL DEFAULT current_timestamp(),
-        PRIMARY KEY (id),
-        KEY idx_team_member_notifications_team_member_id (team_member_id),
-        CONSTRAINT team_member_notifications_ibfk_1 FOREIGN KEY (team_member_id) REFERENCES team_members (id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-    `);
-    console.log('✅ team_member_notifications table created/verified');
-
-    // Migrate existing team member assignments to job_team_assignments table
-    try {
-      const [existingAssignments] = await connection.query(`
-        SELECT COUNT(*) as count FROM job_team_assignments
-      `);
-      
-      if (existingAssignments[0].count === 0) {
-        // Only migrate if the table is empty
-        const [jobsWithTeamMembers] = await connection.query(`
-          SELECT id, team_member_id, user_id 
-          FROM jobs 
-          WHERE team_member_id IS NOT NULL AND team_member_id != ''
-        `);
-        
-        if (jobsWithTeamMembers.length > 0) {
-          for (const job of jobsWithTeamMembers) {
-            await connection.query(`
-              INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-              VALUES (?, ?, 1, ?)
-            `, [job.id, job.team_member_id, job.user_id]);
-          }
-          console.log(`✅ Migrated ${jobsWithTeamMembers.length} existing team member assignments`);
-        }
-      }
-    } catch (migrationError) {
-      console.log('⚠️ Team member assignment migration failed:', migrationError.message);
+    // Test Supabase connection
+    const { data, error } = await supabase
+      .from('users')
+      .select('id')
+      .limit(1);
+    
+    if (error) {
+      console.error('❌ Supabase connection error:', error);
+      return;
     }
-
-    // Create user_notification_settings table if it doesn't exist
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS user_notification_settings (
-        id int(11) NOT NULL AUTO_INCREMENT,
-        user_id int(11) NOT NULL,
-        notification_type varchar(50) NOT NULL,
-        email_enabled tinyint(1) DEFAULT 1,
-        sms_enabled tinyint(1) DEFAULT 0,
-        push_enabled tinyint(1) DEFAULT 0,
-        created_at timestamp NOT NULL DEFAULT current_timestamp(),
-        updated_at timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
-        PRIMARY KEY (id),
-        UNIQUE KEY user_notification_type (user_id, notification_type),
-        KEY idx_user_notification_settings_user_id (user_id),
-        CONSTRAINT user_notification_settings_ibfk_1 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-    `);
-      console.log('✅ job_answers table created/verified');
-      console.log('✅ notification_templates table created/verified');
-      console.log('✅ user_notification_settings table created/verified');
+    
+    console.log('✅ Supabase database connection verified');
       
       // Insert default notification templates if they don't exist
       const defaultTemplates = [
@@ -12386,10 +12226,6 @@ const initializeDatabase = async () => {
         `, [notificationType, emailEnabled, smsEnabled, pushEnabled]);
       }
       
-      console.log('✅ Database schema initialization complete');
-    } finally {
-      connection.release();
-    }
   } catch (error) {
     console.error('❌ Database initialization error:', error);
   }
