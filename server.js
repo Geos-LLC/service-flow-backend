@@ -12,6 +12,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const validator = require('validator');
 const nodemailer = require('nodemailer');
+const sgMail = require('@sendgrid/mail');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cron = require('node-cron');
 const https = require('https');
@@ -42,7 +43,13 @@ function createTransporter() {
 
 transporter = createTransporter();
 
-
+// SendGrid configuration
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  console.log('SendGrid configured for team member emails');
+} else {
+  console.log('SendGrid API key not found, using fallback email service');
+}
 
 // Test email configuration
 async function testEmailConnection() {
@@ -191,6 +198,43 @@ async function sendEmail({ to, subject, html, text }) {
       response: error.response
     });
     throw error;
+  }
+}
+
+// SendGrid email function for team member emails
+async function sendTeamMemberEmail({ to, subject, html, text }) {
+  try {
+    console.log('Attempting to send team member email via SendGrid to:', to);
+    
+    if (!process.env.SENDGRID_API_KEY) {
+      console.log('SendGrid API key not found, falling back to regular email');
+      return await sendEmail({ to, subject, html, text });
+    }
+    
+    const msg = {
+      to,
+      from: process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com',
+      subject,
+      html,
+      text
+    };
+    
+    console.log('SendGrid email options:', { to, subject, from: msg.from });
+    
+    const response = await sgMail.send(msg);
+    console.log('SendGrid email sent successfully:', response[0].statusCode);
+    return response;
+  } catch (error) {
+    console.error('SendGrid email sending error:', error);
+    console.error('SendGrid error details:', {
+      message: error.message,
+      code: error.code,
+      response: error.response?.body
+    });
+    
+    // Fallback to regular email if SendGrid fails
+    console.log('Falling back to regular email service...');
+    return await sendEmail({ to, subject, html, text });
   }
 }
 
@@ -7214,29 +7258,29 @@ app.post('/api/team-members/register', async (req, res) => {
     // Generate invitation link
       const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
       
-    // Send email in background without waiting
-    sendEmail({
+    // Send email in background without waiting using SendGrid
+    sendTeamMemberEmail({
         to: email,
-        subject: 'You\'ve been invited to join Zenbooker',
+        subject: 'You\'ve been invited to join Service Flow',
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
+            <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
             <p>Hello ${firstName},</p>
-            <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
+            <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
             <div style="text-align: center; margin: 30px 0;">
               <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
                 Create Your Account
               </a>
             </div>
             <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-            <p>Best regards,<br>The Zenbooker Team</p>
+            <p>Best regards,<br>The Service Flow Team</p>
           </div>
         `,
-        text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+        text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
     }).then(() => {
-      console.log('✅ Step 5: Invitation email sent successfully (background)');
+      console.log('✅ Step 5: Team member invitation email sent successfully via SendGrid (background)');
     }).catch((emailError) => {
-      console.error('❌ Failed to send invitation email (background):', emailError);
+      console.error('❌ Failed to send team member invitation email:', emailError);
       // Don't fail the request if email fails
     });
     
@@ -7477,24 +7521,24 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       try {
         const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
         
-        await sendEmail({
+        await sendTeamMemberEmail({
           to: teamMember.email,
-          subject: 'You\'ve been invited to join Zenbooker',
+          subject: 'You\'ve been invited to join Service Flow',
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #2563eb;">Welcome to Zenbooker!</h2>
+              <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
               <p>Hello ${teamMember.first_name},</p>
-              <p>You've been invited to join your team on Zenbooker. To get started, please click the link below to create your account:</p>
+              <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
               <div style="text-align: center; margin: 30px 0;">
                 <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
                   Create Your Account
                 </a>
               </div>
               <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
-              <p>Best regards,<br>The Zenbooker Team</p>
+              <p>Best regards,<br>The Service Flow Team</p>
             </div>
           `,
-          text: `Welcome to Zenbooker! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
+          text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
         });
       } catch (emailError) {
         console.error('Failed to send invitation email:', emailError);
