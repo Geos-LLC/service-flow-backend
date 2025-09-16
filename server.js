@@ -7779,7 +7779,18 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         console.error('❌ Error fetching jobs for team member:', jobsError);
         jobs = [];
       } else {
-        jobs = jobsData || [];
+        // Transform the data to match frontend expectations
+        jobs = (jobsData || []).map(job => ({
+          ...job,
+          // Flatten customer data
+          customer_first_name: job.customers?.first_name || '',
+          customer_last_name: job.customers?.last_name || '',
+          customer_phone: job.customers?.phone || '',
+          customer_address: job.customers?.address || '',
+          // Flatten service data
+          service_name: job.services?.name || '',
+          duration: job.services?.duration || 60
+        }));
         console.log('✅ Jobs found:', jobs.length);
       }
     } catch (jobsError) {
@@ -7864,27 +7875,54 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
   try {
     const { jobId } = req.params;
     const { teamMemberId, status, notes } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      // Update job status
-      await connection.query(
-        'UPDATE jobs SET status = ?, notes = CONCAT(IFNULL(notes, ""), "\n", ?), updated_at = NOW() WHERE id = ? AND team_member_id = ?',
-        [status, notes || '', jobId, teamMemberId]
-      );
-      
-      // Create notification for business owner
-      await connection.query(`
-        INSERT INTO team_member_notifications (team_member_id, type, title, message, data)
-        VALUES (?, 'job_completed', 'Job Status Updated', ?, ?)
-      `, [teamMemberId, `Job #${jobId} status updated to ${status}`, JSON.stringify({ jobId, status })]);
-      
-      res.json({ message: 'Job status updated successfully' });
-    } finally {
-      connection.release();
+    console.log('🔍 Updating job status:', { jobId, teamMemberId, status, notes });
+    
+    // Update job status using Supabase
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({
+        status: status,
+        notes: notes || '',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId)
+      .eq('team_member_id', teamMemberId);
+    
+    if (updateError) {
+      console.error('❌ Error updating job status:', updateError);
+      return res.status(500).json({ error: 'Failed to update job status' });
     }
+    
+    console.log('✅ Job status updated successfully');
+    
+    // Create notification for business owner using Supabase (optional)
+    try {
+      const { error: notificationError } = await supabase
+        .from('team_member_notifications')
+        .insert({
+          team_member_id: teamMemberId,
+          type: 'job_completed',
+          title: 'Job Status Updated',
+          message: `Job #${jobId} status updated to ${status}`,
+          data: JSON.stringify({ jobId, status }),
+          created_at: new Date().toISOString()
+        });
+      
+      if (notificationError) {
+        console.warn('⚠️ Failed to create notification:', notificationError);
+        // Continue without notification
+      } else {
+        console.log('✅ Notification created successfully');
+      }
+    } catch (notificationError) {
+      console.warn('⚠️ Notification creation failed:', notificationError);
+      // Continue without notification
+    }
+    
+    res.json({ message: 'Job status updated successfully' });
   } catch (error) {
-    console.error('Update job status error:', error);
+    console.error('❌ Update job status error:', error);
     res.status(500).json({ error: 'Failed to update job status' });
   }
 });
