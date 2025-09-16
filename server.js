@@ -43,14 +43,22 @@ function createTransporter() {
 
 transporter = createTransporter();
 
-// SendGrid configuration - Hardcoded API key
-const SENDGRID_API_KEY = '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';
-sgMail.setApiKey(SENDGRID_API_KEY);
+// SendGrid configuration - Use environment variable for security
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+if (SENDGRID_API_KEY) {
+  sgMail.setApiKey(SENDGRID_API_KEY);
+} else {
+  console.log('⚠️ SENDGRID_API_KEY environment variable not set');
+}
 console.log('✅ SendGrid configured for team member emails');
-console.log('✅ SendGrid API key present: Yes (hardcoded)');
-console.log('✅ SendGrid API key length:', SENDGRID_API_KEY.length);
-console.log('✅ SendGrid API key starts with:', SENDGRID_API_KEY.substring(0, 10) + '...');
-console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
+console.log('✅ SendGrid API key present:', SENDGRID_API_KEY ? 'Yes' : 'No');
+if (SENDGRID_API_KEY) {
+  console.log('✅ SendGrid API key length:', SENDGRID_API_KEY.length);
+  console.log('✅ SendGrid API key starts with:', SENDGRID_API_KEY.substring(0, 10) + '...');
+} else {
+  console.log('⚠️ SendGrid API key not configured - using fallback email service');
+}
+console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
 
 // Test SendGrid configuration
 async function testSendGridConfig() {
@@ -58,7 +66,7 @@ async function testSendGridConfig() {
     console.log('📧 Testing SendGrid configuration...');
     console.log('📧 API Key present: Yes (hardcoded)');
     console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
-    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
     
     // Test with a simple API call to verify the key
     const testMsg = {
@@ -236,7 +244,7 @@ async function testSendGridConfig() {
     console.log('🧪 Testing SendGrid configuration...');
     console.log('📧 API Key present: Yes (hardcoded)');
     console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
-    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
     
     // Test the API key by making a simple request
     const testMsg = {
@@ -260,9 +268,17 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
   try {
     console.log('📧 Attempting to send team member email via SendGrid to:', to);
     
+    // Check if SendGrid is configured
+    if (!SENDGRID_API_KEY) {
+      console.log('⚠️ SendGrid API key not configured, using fallback email service');
+      const result = await sendEmail({ to, subject, html, text });
+      console.log('✅ Fallback email sent successfully');
+      return result;
+    }
+    
     const msg = {
       to,
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
       subject,
       html,
       text
