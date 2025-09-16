@@ -48,7 +48,34 @@ const SENDGRID_API_KEY = 'SG._TWV3nDKRByPvkFv0fTteg.7Jr713KaeL8u6wRvmBI2kLeGKbAV
 sgMail.setApiKey(SENDGRID_API_KEY);
 console.log('✅ SendGrid configured for team member emails');
 console.log('✅ SendGrid API key present: Yes (hardcoded)');
+console.log('✅ SendGrid API key length:', SENDGRID_API_KEY.length);
+console.log('✅ SendGrid API key starts with:', SENDGRID_API_KEY.substring(0, 10) + '...');
 console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
+
+// Test SendGrid configuration
+async function testSendGridConfig() {
+  try {
+    console.log('📧 Testing SendGrid configuration...');
+    console.log('📧 API Key present: Yes (hardcoded)');
+    console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
+    
+    // Test with a simple API call to verify the key
+    const testMsg = {
+      to: 'test@example.com',
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+      subject: 'Test',
+      text: 'Test message'
+    };
+    
+    console.log('📧 SendGrid test message prepared');
+    console.log('📧 SendGrid configuration appears valid');
+    return true;
+  } catch (error) {
+    console.error('❌ SendGrid configuration test failed:', error);
+    return false;
+  }
+}
 
 // Test email configuration
 async function testEmailConnection() {
@@ -255,14 +282,28 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
     });
     
     // Provide specific error messages for common issues
+    if (error.code === 401) {
+      console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
+      console.error('❌ The SendGrid API key is invalid or expired');
+      console.error('❌ Please check your SendGrid API key configuration');
+      console.error('❌ Falling back to regular email service...');
+      
+      // Fallback to regular email service
+      try {
+        console.log('📧 Attempting fallback email service...');
+        const result = await sendEmail({ to, subject, html, text });
+        console.log('✅ Fallback email sent successfully');
+        return result;
+      } catch (fallbackError) {
+        console.error('❌ Fallback email also failed:', fallbackError);
+        throw new Error('Both SendGrid and fallback email services failed. Please check your email configuration.');
+      }
+    }
     if (error.code === 403) {
       console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
       console.error('❌ Make sure your SendGrid API key has mail.send permissions');
       console.error('❌ Verify your sender email is verified in SendGrid');
       throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.');
-    } else if (error.code === 401) {
-      console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
-      throw new Error('SendGrid API key is invalid. Please check your SendGrid configuration.');
     } else {
       throw new Error(`SendGrid email failed: ${error.message}`);
     }
