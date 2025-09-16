@@ -7448,39 +7448,47 @@ app.post('/api/team-members/logout', async (req, res) => {
 app.get('/api/team-members/verify-invitation', async (req, res) => {
   try {
     const { token } = req.query;
-    console.log('Verifying invitation token:', token);
+    console.log('🔍 Verifying invitation token:', token);
     
     if (!token) {
       return res.status(400).json({ error: 'Token is required' });
     }
     
-    const connection = await pool.getConnection();
+    // Get team member details by invitation token using Supabase
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('invitation_token', token)
+      .eq('status', 'invited')
+      .gt('invitation_expires', new Date().toISOString());
     
-    try {
-      // Get team member details by invitation token
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE invitation_token = ? AND invitation_expires > NOW() AND status = "invited"',
-        [token]
-      );
-      
-      if (teamMembers.length === 0) {
-        return res.status(404).json({ error: 'Invalid or expired invitation token' });
-      }
-      
-      const teamMember = teamMembers[0];
-      
-      res.json({
-        firstName: teamMember.first_name,
-        lastName: teamMember.last_name,
-        email: teamMember.email,
-        role: teamMember.role,
-        teamMemberId: teamMember.id
-      });
-    } finally {
-      connection.release();
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member by token:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to verify invitation' });
     }
+    
+    if (!teamMembers || teamMembers.length === 0) {
+      console.log('❌ No valid team member found for token:', token);
+      return res.status(404).json({ error: 'Invalid or expired invitation token' });
+    }
+    
+    const teamMember = teamMembers[0];
+    console.log('✅ Valid team member found:', {
+      id: teamMember.id,
+      email: teamMember.email,
+      status: teamMember.status,
+      expires: teamMember.invitation_expires
+    });
+    
+    res.json({
+      firstName: teamMember.first_name,
+      lastName: teamMember.last_name,
+      email: teamMember.email,
+      role: teamMember.role,
+      teamMemberId: teamMember.id
+    });
   } catch (error) {
-    console.error('Verify invitation error:', error);
+    console.error('❌ Verify invitation error:', error);
     res.status(500).json({ error: 'Failed to verify invitation' });
   }
 });
@@ -7489,84 +7497,105 @@ app.get('/api/team-members/verify-invitation', async (req, res) => {
 app.post('/api/team-members/complete-signup', async (req, res) => {
   try {
     const { token, username, password, firstName, lastName, phone } = req.body;
-    console.log('Completing signup for token:', token);
+    console.log('🔍 Completing signup for token:', token);
     
     if (!token || !username || !password || !firstName || !lastName) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    const connection = await pool.getConnection();
+    // Verify token and get team member using Supabase
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('invitation_token', token)
+      .eq('status', 'invited')
+      .gt('invitation_expires', new Date().toISOString());
     
-    try {
-      // Verify token and get team member
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE invitation_token = ? AND invitation_expires > NOW() AND status = "invited"',
-        [token]
-      );
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member by token:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to verify invitation' });
+    }
+    
+    if (!teamMembers || teamMembers.length === 0) {
+      console.log('❌ No valid team member found for token:', token);
+      return res.status(404).json({ error: 'Invalid or expired invitation token' });
+    }
+    
+    const teamMember = teamMembers[0];
+    console.log('✅ Valid team member found for signup:', teamMember.id);
+    
+    // Check if username is already taken
+    const { data: existingUsers, error: usernameError } = await supabase
+      .from('team_members')
+      .select('id, username')
+      .eq('username', username)
+      .neq('id', teamMember.id);
+    
+    if (usernameError) {
+      console.error('❌ Error checking username:', usernameError);
+      return res.status(500).json({ error: 'Failed to check username availability' });
+    }
+    
+    if (existingUsers && existingUsers.length > 0) {
+      return res.status(400).json({ 
+        error: 'Username is already taken',
+        conflictType: 'username',
+        field: 'username',
+        message: `The username "${username}" is already taken by another team member. Please choose a different username.`
+      });
+    }
+
+    // Check if phone number is already taken (if phone is provided)
+    if (phone) {
+      const { data: existingPhones, error: phoneError } = await supabase
+        .from('team_members')
+        .select('id, phone')
+        .eq('phone', phone)
+        .neq('id', teamMember.id);
       
-      if (teamMembers.length === 0) {
-        return res.status(404).json({ error: 'Invalid or expired invitation token' });
+      if (phoneError) {
+        console.error('❌ Error checking phone:', phoneError);
+        return res.status(500).json({ error: 'Failed to check phone availability' });
       }
       
-      const teamMember = teamMembers[0];
-      
-      // Check if username is already taken
-      const [existingUsers] = await connection.query(
-        'SELECT id, username FROM team_members WHERE username = ? AND id != ?',
-        [username, teamMember.id]
-      );
-      
-      if (existingUsers.length > 0) {
+      if (existingPhones && existingPhones.length > 0) {
         return res.status(400).json({ 
-          error: 'Username is already taken',
-          conflictType: 'username',
-          field: 'username',
-          message: `The username "${username}" is already taken by another team member. Please choose a different username.`
+          error: 'Phone number is already taken',
+          conflictType: 'phone',
+          field: 'phone',
+          message: `The phone number "${phone}" is already registered by another team member. Please use a different phone number.`
         });
       }
-
-      // Check if phone number is already taken (if phone is provided)
-      if (phone) {
-        const [existingPhones] = await connection.query(
-          'SELECT id, phone FROM team_members WHERE phone = ? AND id != ?',
-          [phone, teamMember.id]
-        );
-        
-        if (existingPhones.length > 0) {
-          return res.status(400).json({ 
-            error: 'Phone number is already taken',
-            conflictType: 'phone',
-            field: 'phone',
-            message: `The phone number "${phone}" is already registered by another team member. Please use a different phone number.`
-          });
-        }
-      }
-      
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, 10);
-      
-      // Update team member with signup data
-      await connection.query(
-        `UPDATE team_members SET 
-          username = ?, 
-          password = ?, 
-          first_name = ?, 
-          last_name = ?, 
-          phone = ?,
-          status = 'active',
-          invitation_token = NULL,
-          invitation_expires = NULL,
-          created_at = NOW()
-        WHERE id = ?`,
-        [username, hashedPassword, firstName, lastName, phone, teamMember.id]
-      );
-      
-      res.json({ message: 'Account created successfully' });
-    } finally {
-      connection.release();
     }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Update team member with signup data using Supabase
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({
+        username: username,
+        password: hashedPassword,
+        first_name: firstName,
+        last_name: lastName,
+        phone: phone,
+        status: 'active',
+        invitation_token: null,
+        invitation_expires: null,
+        created_at: new Date().toISOString()
+      })
+      .eq('id', teamMember.id);
+    
+    if (updateError) {
+      console.error('❌ Error updating team member:', updateError);
+      return res.status(500).json({ error: 'Failed to complete signup' });
+    }
+    
+    console.log('✅ Team member signup completed successfully');
+    res.json({ message: 'Account created successfully' });
   } catch (error) {
-    console.error('Complete signup error:', error);
+    console.error('❌ Complete signup error:', error);
     res.status(500).json({ error: 'Failed to complete signup' });
   }
 });
