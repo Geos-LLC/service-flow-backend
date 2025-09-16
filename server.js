@@ -3970,20 +3970,40 @@ app.post('/api/user/billing/subscription', async (req, res) => {
       'Professional': 4900 // $49.00 in cents
     };
     
+    // Create or get product first
+    let product;
+    try {
+      // Try to find existing product
+      const products = await stripe.products.list({ limit: 100 });
+      product = products.data.find(p => p.name === `Service Flow ${plan} Plan`);
+      
+      if (!product) {
+        // Create new product if it doesn't exist
+        product = await stripe.products.create({
+          name: `Service Flow ${plan} Plan`,
+          type: 'service',
+        });
+      }
+    } catch (error) {
+      console.error('Error creating/finding product:', error);
+      return res.status(500).json({ error: 'Failed to create product' });
+    }
+
+    // Create price for the product
+    const price = await stripe.prices.create({
+      product: product.id,
+      unit_amount: planPrices[plan] || 2900,
+      currency: 'usd',
+      recurring: {
+        interval: 'month',
+      },
+    });
+
     // Create subscription
     const subscription = await stripe.subscriptions.create({
       customer: customerId,
       items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: `Zenbooker ${plan} Plan`,
-          },
-          unit_amount: planPrices[plan] || 2900,
-          recurring: {
-            interval: 'month',
-          },
-        },
+        price: price.id,
       }],
       trial_period_days: 14,
       expand: ['latest_invoice.payment_intent'],
