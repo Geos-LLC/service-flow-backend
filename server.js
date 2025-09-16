@@ -7144,81 +7144,95 @@ app.put('/api/team-members/:id/availability', async (req, res) => {
 app.post('/api/team-members/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const connection = await pool.getConnection();
+    console.log('🔍 Team member login attempt for username:', username);
     
+    // Find team member by username or email using Supabase
+    const { data: teamMembers, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .or(`username.eq.${username},email.eq.${username}`)
+      .eq('status', 'active');
+    
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member:', teamMemberError);
+      return res.status(500).json({ error: 'Database error. Please try again.' });
+    }
+    
+    if (!teamMembers || teamMembers.length === 0) {
+      console.log('❌ No team member found for username:', username);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const teamMember = teamMembers[0];
+    console.log('✅ Team member found:', teamMember.id);
+    
+    // Check password (handle case where password might not be set for existing team members)
+    if (!teamMember.password) {
+      console.log('❌ No password set for team member:', teamMember.id);
+      return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
+    }
+    
+    const isValidPassword = await bcrypt.compare(password, teamMember.password);
+    if (!isValidPassword) {
+      console.log('❌ Invalid password for team member:', teamMember.id);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Update last login using Supabase
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({ last_login: new Date().toISOString() })
+      .eq('id', teamMember.id);
+    
+    if (updateError) {
+      console.warn('⚠️ Failed to update last login:', updateError);
+      // Continue without updating last login
+    }
+    
+    // Generate session token
+    const sessionToken = jwt.sign(
+      { 
+        teamMemberId: teamMember.id, 
+        userId: teamMember.user_id,
+        type: 'team_member'
+      },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    // Store session using Supabase (optional - continue if it fails)
     try {
-      // Find team member by username or email
-      const [teamMembers] = await connection.query(
-        'SELECT * FROM team_members WHERE (username = ? OR email = ?) AND is_active = 1',
-        [username, username]
-      );
+      const { error: sessionError } = await supabase
+        .from('team_member_sessions')
+        .insert({
+          team_member_id: teamMember.id,
+          session_token: sessionToken,
+          device_info: req.headers['user-agent'],
+          ip_address: req.ip,
+          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+        });
       
-      if (teamMembers.length === 0) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+      if (sessionError) {
+        console.warn('⚠️ Session storage failed:', sessionError.message);
+        // Continue without session storage
       }
-      
-      const teamMember = teamMembers[0];
-      
-      // Check password (handle case where password might not be set for existing team members)
-      if (!teamMember.password) {
-        return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
-      }
-      
-      const isValidPassword = await bcrypt.compare(password, teamMember.password);
-      if (!isValidPassword) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-      
-      // Update last login
-      await connection.query(
-        'UPDATE team_members SET last_login = NOW() WHERE id = ?',
-        [teamMember.id]
-      );
-      
-      // Generate session token
-      const sessionToken = jwt.sign(
-        { 
-          teamMemberId: teamMember.id, 
-          userId: teamMember.user_id,
-          type: 'team_member'
-        },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-      );
-      
-      // Store session (with error handling in case table doesn't exist yet)
-      try {
-        await connection.query(
-          'INSERT INTO team_member_sessions (team_member_id, session_token, device_info, ip_address, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))',
-          [teamMember.id, sessionToken, req.headers['user-agent'], req.ip]
-        );
-      } catch (sessionError) {
-        console.warn('Session storage failed (table may not exist):', sessionError.message);
-        // Continue without session storage for now
-      }
-      
-      // Remove password from response
-      delete teamMember.password;
-      
-      res.json({
-        message: 'Login successful',
-        teamMember,
-        token: sessionToken
-      });
-    } finally {
-      connection.release();
+    } catch (sessionError) {
+      console.warn('⚠️ Session storage failed (table may not exist):', sessionError.message);
+      // Continue without session storage for now
     }
-  } catch (error) {
-    console.error('Team member login error:', error);
     
-    // Provide more specific error messages
-    if (error.code === 'ER_NO_SUCH_TABLE') {
-      res.status(500).json({ error: 'Database tables not set up. Please contact administrator.' });
-    } else if (error.code === 'ECONNREFUSED') {
-      res.status(500).json({ error: 'Database connection failed. Please try again.' });
-    } else {
-      res.status(500).json({ error: 'Login failed. Please try again.' });
-    }
+    // Remove password from response
+    delete teamMember.password;
+    
+    console.log('✅ Team member login successful:', teamMember.id);
+    res.json({
+      message: 'Login successful',
+      teamMember,
+      token: sessionToken
+    });
+  } catch (error) {
+    console.error('❌ Team member login error:', error);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
