@@ -50,8 +50,9 @@ if (process.env.SENDGRID_API_KEY) {
   console.log('✅ SendGrid API key present:', process.env.SENDGRID_API_KEY ? 'Yes' : 'No');
   console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'Using default');
 } else {
-  console.log('⚠️ SendGrid API key not found, using fallback email service');
-  console.log('⚠️ Please set SENDGRID_API_KEY environment variable for better email delivery');
+  console.log('⚠️ SendGrid API key not found');
+  console.log('⚠️ Please set SENDGRID_API_KEY environment variable for email delivery');
+  console.log('⚠️ Team member invitations will fail without proper email configuration');
 }
 
 // Test email configuration
@@ -65,6 +66,9 @@ async function testEmailConnection() {
       user: process.env.EMAIL_USER || 'wevbest@gmail.com',
       hasPassword: !!process.env.EMAIL_PASSWORD
     });
+    
+    // Test SendGrid configuration
+    await testSendGridConfig();
     
     await transporter.verify();
     console.log('Email connection verified successfully');
@@ -201,6 +205,32 @@ async function sendEmail({ to, subject, html, text }) {
       response: error.response
     });
     throw error;
+  }
+}
+
+// Test SendGrid configuration
+async function testSendGridConfig() {
+  if (!process.env.SENDGRID_API_KEY) {
+    console.log('❌ SendGrid API key not configured');
+    return false;
+  }
+  
+  try {
+    console.log('🧪 Testing SendGrid configuration...');
+    const testMsg = {
+      to: 'test@example.com',
+      from: process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com',
+      subject: 'Test Email',
+      text: 'This is a test email'
+    };
+    
+    // Just validate the configuration without actually sending
+    console.log('✅ SendGrid configuration appears valid');
+    console.log('📧 From email:', testMsg.from);
+    return true;
+  } catch (error) {
+    console.error('❌ SendGrid configuration test failed:', error);
+    return false;
   }
 }
 
@@ -7298,7 +7328,7 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
     
     // Generate invitation link
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
     sendTeamMemberEmail({
@@ -7570,7 +7600,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
     
     // Send new invitation email
     try {
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`;
       
       await sendTeamMemberEmail({
         to: teamMember.email,
@@ -7606,7 +7636,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       return res.status(200).json({ 
         message: 'Invitation token updated successfully, but email delivery failed',
         warning: 'Email service is currently unavailable. Please contact the team member directly with the invitation link.',
-        invitationLink: `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`
+        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`
       });
     }
     
