@@ -43,17 +43,12 @@ function createTransporter() {
 
 transporter = createTransporter();
 
-// SendGrid configuration
-if (process.env.SENDGRID_API_KEY) {
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-  console.log('✅ SendGrid configured for team member emails');
-  console.log('✅ SendGrid API key present:', process.env.SENDGRID_API_KEY ? 'Yes' : 'No');
-  console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'Using default');
-} else {
-  console.log('⚠️ SendGrid API key not found');
-  console.log('⚠️ Please set SENDGRID_API_KEY environment variable for email delivery');
-  console.log('⚠️ Team member invitations will fail without proper email configuration');
-}
+// SendGrid configuration - Hardcoded API key
+const SENDGRID_API_KEY = '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';
+sgMail.setApiKey(SENDGRID_API_KEY);
+console.log('✅ SendGrid configured for team member emails');
+console.log('✅ SendGrid API key present: Yes (hardcoded)');
+console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
 
 // Test email configuration
 async function testEmailConnection() {
@@ -210,22 +205,16 @@ async function sendEmail({ to, subject, html, text }) {
 
 // Test SendGrid configuration
 async function testSendGridConfig() {
-  if (!process.env.SENDGRID_API_KEY) {
-    console.log('❌ SendGrid API key not configured');
-    console.log('❌ Please set SENDGRID_API_KEY environment variable');
-    return false;
-  }
-  
   try {
     console.log('🧪 Testing SendGrid configuration...');
-    console.log('📧 API Key present:', process.env.SENDGRID_API_KEY ? 'Yes' : 'No');
-    console.log('📧 API Key length:', process.env.SENDGRID_API_KEY?.length || 0);
-    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com');
+    console.log('📧 API Key present: Yes (hardcoded)');
+    console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro');
     
     // Test the API key by making a simple request
     const testMsg = {
       to: 'test@example.com',
-      from: process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com',
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
       subject: 'Test Email',
       text: 'This is a test email'
     };
@@ -244,14 +233,9 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
   try {
     console.log('📧 Attempting to send team member email via SendGrid to:', to);
     
-    if (!process.env.SENDGRID_API_KEY) {
-      console.log('⚠️ SendGrid API key not found, skipping email send');
-      throw new Error('SendGrid API key not configured');
-    }
-    
     const msg = {
       to,
-      from: process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com',
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
       subject,
       html,
       text
@@ -278,7 +262,7 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
       throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.');
     } else if (error.code === 401) {
       console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
-      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
+      throw new Error('SendGrid API key is invalid. Please check your SendGrid configuration.');
     } else {
       throw new Error(`SendGrid email failed: ${error.message}`);
     }
