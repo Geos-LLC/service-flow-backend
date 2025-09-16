@@ -21,13 +21,10 @@ SUPABASE_ANON_KEY=your_supabase_anon_key_here
 JWT_SECRET=your_jwt_secret_here
 ```
 
-### Email Configuration (Fallback)
+### Email Configuration (SendGrid Only)
 ```
-EMAIL_SERVICE=gmail
-EMAIL_HOST=smtp.gmail.com
-EMAIL_PORT=587
-EMAIL_USER=your_gmail_username
-EMAIL_PASS=your_gmail_app_password
+# SendGrid is the only email service used
+# No SMTP/Gmail configuration needed
 ```
 
 ## How to Set Up SendGrid

@@ -19,29 +19,7 @@ const https = require('https');
 const crypto = require('crypto');
 require('dotenv').config();
 
-// Email configuration with fallback
-let transporter;
-
-function createTransporter() {
-  return nodemailer.createTransport({
-    service: process.env.EMAIL_SERVICE || 'gmail',
-    host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-    port: process.env.EMAIL_PORT || 587,
-    secure: false, // use TLS with STARTTLS
-    auth: {
-      user: process.env.EMAIL_USER || 'wevbest@gmail.com',
-      pass: process.env.EMAIL_PASSWORD || 'qqsf nruc uosc twwc'
-    },
-    tls: {
-      rejectUnauthorized: false
-    },
-    connectionTimeout: 60000, // 60 seconds
-    greetingTimeout: 30000, // 30 seconds
-    socketTimeout: 60000 // 60 seconds
-  });
-}
-
-transporter = createTransporter();
+// Email configuration - SendGrid only
 
 // SendGrid configuration - Use environment variable for security
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
@@ -202,41 +180,7 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
-// Email sending function
-async function sendEmail({ to, subject, html, text }) {
-  try {
-    console.log('Attempting to send email to:', to);
-    console.log('Email configuration:', {
-      service: process.env.EMAIL_SERVICE || 'gmail',
-      user: process.env.EMAIL_USER || 'wevbest@gmail.com',
-      from: process.env.EMAIL_USER || 'wevbest@gmail.com'
-    });
-    
-    const mailOptions = {
-      from: process.env.EMAIL_USER || 'wevbest@gmail.com',
-      to,
-      subject,
-      html,
-      text
-    };
-    
-    console.log('Mail options:', { to, subject, from: mailOptions.from });
-    
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Email sent successfully:', info.messageId);
-    return info;
-  } catch (error) {
-    console.error('Email sending error:', error);
-    console.error('Email error details:', {
-      message: error.message,
-      code: error.code,
-      command: error.command,
-      responseCode: error.responseCode,
-      response: error.response
-    });
-    throw error;
-  }
-}
+// Removed sendEmail function - using SendGrid only
 
 // Test SendGrid configuration
 async function testSendGridConfig() {
@@ -263,19 +207,17 @@ async function testSendGridConfig() {
   }
 }
 
-// SendGrid email function for team member emails
+// SendGrid email service only
 async function sendTeamMemberEmail({ to, subject, html, text }) {
+  console.log('📧 Attempting to send team member email via SendGrid to:', to);
+  
+  // Check if SendGrid is configured
+  if (!SENDGRID_API_KEY) {
+    console.error('❌ SendGrid API key not configured');
+    throw new Error('SendGrid API key not configured. Please set SENDGRID_API_KEY environment variable.');
+  }
+  
   try {
-    console.log('📧 Attempting to send team member email via SendGrid to:', to);
-    
-    // Check if SendGrid is configured
-    if (!SENDGRID_API_KEY) {
-      console.log('⚠️ SendGrid API key not configured, using fallback email service');
-      const result = await sendEmail({ to, subject, html, text });
-      console.log('✅ Fallback email sent successfully');
-      return result;
-    }
-    
     const msg = {
       to,
       from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
@@ -302,18 +244,7 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
       console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
       console.error('❌ The SendGrid API key is invalid or expired');
       console.error('❌ Please check your SendGrid API key configuration');
-      console.error('❌ Falling back to regular email service...');
-      
-      // Fallback to regular email service
-      try {
-        console.log('📧 Attempting fallback email service...');
-        const result = await sendEmail({ to, subject, html, text });
-        console.log('✅ Fallback email sent successfully');
-        return result;
-      } catch (fallbackError) {
-        console.error('❌ Fallback email also failed:', fallbackError);
-        throw new Error('Both SendGrid and fallback email services failed. Please check your email configuration.');
-      }
+      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
     }
     if (error.code === 403) {
       console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
@@ -7201,24 +7132,24 @@ app.post('/api/team-members/login', async (req, res) => {
     
     if (!teamMembers || teamMembers.length === 0) {
       console.log('❌ No team member found for username:', username);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    const teamMember = teamMembers[0];
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const teamMember = teamMembers[0];
     console.log('✅ Team member found:', teamMember.id);
-    
-    // Check password (handle case where password might not be set for existing team members)
-    if (!teamMember.password) {
+      
+      // Check password (handle case where password might not be set for existing team members)
+      if (!teamMember.password) {
       console.log('❌ No password set for team member:', teamMember.id);
-      return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
-    }
-    
-    const isValidPassword = await bcrypt.compare(password, teamMember.password);
-    if (!isValidPassword) {
+        return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
+      }
+      
+      const isValidPassword = await bcrypt.compare(password, teamMember.password);
+      if (!isValidPassword) {
       console.log('❌ Invalid password for team member:', teamMember.id);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
     // Update last login using Supabase
     const { error: updateError } = await supabase
       .from('team_members')
@@ -7229,18 +7160,18 @@ app.post('/api/team-members/login', async (req, res) => {
       console.warn('⚠️ Failed to update last login:', updateError);
       // Continue without updating last login
     }
-    
-    // Generate session token
-    const sessionToken = jwt.sign(
-      { 
-        teamMemberId: teamMember.id, 
-        userId: teamMember.user_id,
-        type: 'team_member'
-      },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    
+      
+      // Generate session token
+      const sessionToken = jwt.sign(
+        { 
+          teamMemberId: teamMember.id, 
+          userId: teamMember.user_id,
+          type: 'team_member'
+        },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+      
     // Store session using Supabase (optional - continue if it fails)
     try {
       const { error: sessionError } = await supabase
@@ -7257,23 +7188,23 @@ app.post('/api/team-members/login', async (req, res) => {
         console.warn('⚠️ Session storage failed:', sessionError.message);
         // Continue without session storage
       }
-    } catch (sessionError) {
+      } catch (sessionError) {
       console.warn('⚠️ Session storage failed (table may not exist):', sessionError.message);
-      // Continue without session storage for now
-    }
-    
-    // Remove password from response
-    delete teamMember.password;
-    
+        // Continue without session storage for now
+      }
+      
+      // Remove password from response
+      delete teamMember.password;
+      
     console.log('✅ Team member login successful:', teamMember.id);
-    res.json({
-      message: 'Login successful',
-      teamMember,
-      token: sessionToken
-    });
+      res.json({
+        message: 'Login successful',
+        teamMember,
+        token: sessionToken
+      });
   } catch (error) {
     console.error('❌ Team member login error:', error);
-    res.status(500).json({ error: 'Login failed. Please try again.' });
+      res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
@@ -7574,13 +7505,13 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
     
     if (!teamMembers || teamMembers.length === 0) {
       console.log('❌ No valid team member found for token:', token);
-      return res.status(404).json({ error: 'Invalid or expired invitation token' });
-    }
-    
-    const teamMember = teamMembers[0];
+        return res.status(404).json({ error: 'Invalid or expired invitation token' });
+      }
+      
+      const teamMember = teamMembers[0];
     console.log('✅ Valid team member found for signup:', teamMember.id);
-    
-    // Check if username is already taken
+      
+      // Check if username is already taken
     const { data: existingUsers, error: usernameError } = await supabase
       .from('team_members')
       .select('id, username')
@@ -7593,16 +7524,16 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
     }
     
     if (existingUsers && existingUsers.length > 0) {
-      return res.status(400).json({ 
-        error: 'Username is already taken',
-        conflictType: 'username',
-        field: 'username',
-        message: `The username "${username}" is already taken by another team member. Please choose a different username.`
-      });
-    }
+        return res.status(400).json({ 
+          error: 'Username is already taken',
+          conflictType: 'username',
+          field: 'username',
+          message: `The username "${username}" is already taken by another team member. Please choose a different username.`
+        });
+      }
 
-    // Check if phone number is already taken (if phone is provided)
-    if (phone) {
+      // Check if phone number is already taken (if phone is provided)
+      if (phone) {
       const { data: existingPhones, error: phoneError } = await supabase
         .from('team_members')
         .select('id, phone')
@@ -7615,18 +7546,18 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
       }
       
       if (existingPhones && existingPhones.length > 0) {
-        return res.status(400).json({ 
-          error: 'Phone number is already taken',
-          conflictType: 'phone',
-          field: 'phone',
-          message: `The phone number "${phone}" is already registered by another team member. Please use a different phone number.`
-        });
+          return res.status(400).json({ 
+            error: 'Phone number is already taken',
+            conflictType: 'phone',
+            field: 'phone',
+            message: `The phone number "${phone}" is already registered by another team member. Please use a different phone number.`
+          });
+        }
       }
-    }
-    
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
+      
+      // Hash password
+      const hashedPassword = await bcrypt.hash(password, 10);
+      
     // Update team member with signup data using Supabase
     const { error: updateError } = await supabase
       .from('team_members')
@@ -7775,22 +7706,22 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       .eq('id', teamMemberId);
     
     if (teamMemberError) {
-      console.error('❌ Error fetching team member:', teamMemberError);
-      return res.status(500).json({ error: 'Failed to fetch team member data' });
-    }
-    
+        console.error('❌ Error fetching team member:', teamMemberError);
+        return res.status(500).json({ error: 'Failed to fetch team member data' });
+      }
+      
     if (!teamMembers || teamMembers.length === 0) {
-      console.log('❌ Team member not found with ID:', teamMemberId);
-      return res.status(404).json({ error: 'Team member not found' });
-    }
-    
-    const teamMember = teamMembers[0];
-    console.log('✅ Team member data:', { id: teamMember.id, name: `${teamMember.first_name} ${teamMember.last_name}` });
-    
+        console.log('❌ Team member not found with ID:', teamMemberId);
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+      
+      const teamMember = teamMembers[0];
+      console.log('✅ Team member data:', { id: teamMember.id, name: `${teamMember.first_name} ${teamMember.last_name}` });
+      
     // Get jobs assigned to this team member using Supabase
-    let jobs = [];
-    try {
-      console.log('📋 Fetching jobs for team member:', teamMemberId);
+      let jobs = [];
+      try {
+        console.log('📋 Fetching jobs for team member:', teamMemberId);
       
       // Build the date filter
       const startDateFilter = startDate || '2024-01-01';
@@ -7834,31 +7765,31 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         }));
         console.log('✅ Jobs found:', jobs.length);
       }
-    } catch (jobsError) {
-      console.error('❌ Error fetching jobs for team member:', jobsError);
-      jobs = [];
-    }
-    
-    // Calculate stats
-    const today = new Date().toISOString().split('T')[0];
+      } catch (jobsError) {
+        console.error('❌ Error fetching jobs for team member:', jobsError);
+        jobs = [];
+      }
+      
+      // Calculate stats
+      const today = new Date().toISOString().split('T')[0];
     const todayJobs = jobs.filter(job => job.scheduled_date?.split('T')[0] === today);
-    const completedJobs = jobs.filter(job => job.status === 'completed');
-    
-    const stats = {
-      totalJobs: jobs.length,
-      todayJobs: todayJobs.length,
-      completedJobs: completedJobs.length,
-      avgJobValue: completedJobs.length > 0 
-        ? completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs.length 
-        : 0
-    };
-    
-    console.log('📊 Stats calculated:', stats);
-    
+      const completedJobs = jobs.filter(job => job.status === 'completed');
+      
+      const stats = {
+        totalJobs: jobs.length,
+        todayJobs: todayJobs.length,
+        completedJobs: completedJobs.length,
+        avgJobValue: completedJobs.length > 0 
+          ? completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs.length 
+          : 0
+      };
+      
+      console.log('📊 Stats calculated:', stats);
+      
     // Get notifications using Supabase (optional - continue if table doesn't exist)
-    let notifications = [];
-    try {
-      console.log('📋 Fetching notifications for team member:', teamMemberId);
+      let notifications = [];
+      try {
+        console.log('📋 Fetching notifications for team member:', teamMemberId);
       const { data: notificationsData, error: notificationError } = await supabase
         .from('team_member_notifications')
         .select('*')
@@ -7873,32 +7804,32 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         notifications = notificationsData || [];
         console.log('✅ Notifications found:', notifications.length);
       }
-    } catch (notificationError) {
-      console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
+      } catch (notificationError) {
+        console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
       notifications = [];
-    }
-    
-    const response = {
-      teamMember: {
-        id: teamMember.id,
-        first_name: teamMember.first_name,
-        last_name: teamMember.last_name,
-        email: teamMember.email,
-        phone: teamMember.phone,
-        role: teamMember.role,
-        username: teamMember.username,
-        status: teamMember.status,
-        hourly_rate: teamMember.hourly_rate,
-        skills: teamMember.skills,
-        availability: teamMember.availability
-      },
-      jobs: jobs,
-      stats: stats,
-      notifications: notifications
-    };
-    
-    console.log('✅ Dashboard response prepared successfully');
-    res.json(response);
+      }
+      
+      const response = {
+        teamMember: {
+          id: teamMember.id,
+          first_name: teamMember.first_name,
+          last_name: teamMember.last_name,
+          email: teamMember.email,
+          phone: teamMember.phone,
+          role: teamMember.role,
+          username: teamMember.username,
+          status: teamMember.status,
+          hourly_rate: teamMember.hourly_rate,
+          skills: teamMember.skills,
+          availability: teamMember.availability
+        },
+        jobs: jobs,
+        stats: stats,
+        notifications: notifications
+      };
+      
+      console.log('✅ Dashboard response prepared successfully');
+      res.json(response);
   } catch (error) {
     console.error('❌ Team member dashboard error:', error);
     console.error('❌ Error details:', {
@@ -7960,8 +7891,8 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
       console.warn('⚠️ Notification creation failed:', notificationError);
       // Continue without notification
     }
-    
-    res.json({ message: 'Job status updated successfully' });
+      
+      res.json({ message: 'Job status updated successfully' });
   } catch (error) {
     console.error('❌ Update job status error:', error);
     res.status(500).json({ error: 'Failed to update job status' });
