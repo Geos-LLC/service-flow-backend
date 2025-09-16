@@ -4125,11 +4125,11 @@ app.post('/api/user/billing/subscription', async (req, res) => {
     // Create price for the product
     const price = await stripe.prices.create({
       product: product.id,
-      unit_amount: planPrices[plan] || 2900,
+          unit_amount: planPrices[plan] || 2900,
       currency: 'usd',
-      recurring: {
-        interval: 'month',
-      },
+          recurring: {
+            interval: 'month',
+          },
     });
 
     // Create subscription
@@ -7345,7 +7345,7 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
     
     // Generate invitation link
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
     sendTeamMemberEmail({
@@ -7590,17 +7590,17 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
     }
     
     if (!teamMember) {
-      return res.status(404).json({ error: 'Team member not found' });
-    }
-    
-    if (teamMember.status !== 'invited') {
-      return res.status(400).json({ error: 'Team member is not in invited status' });
-    }
-    
-    // Generate new invitation token
-    const invitationToken = crypto.randomBytes(32).toString('hex');
-    const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+      
+      if (teamMember.status !== 'invited') {
+        return res.status(400).json({ error: 'Team member is not in invited status' });
+      }
+      
+      // Generate new invitation token
+      const invitationToken = crypto.randomBytes(32).toString('hex');
+      const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+      
     // Update invitation token in Supabase
     const { error: updateError } = await supabase
       .from('team_members')
@@ -7614,39 +7614,39 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       console.error('🔄 Error updating invitation token:', updateError);
       return res.status(500).json({ error: 'Failed to update invitation token' });
     }
-    
-    // Send new invitation email
-    try {
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`;
       
+      // Send new invitation email
+      try {
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
+        
       await sendTeamMemberEmail({
-        to: teamMember.email,
+          to: teamMember.email,
         subject: 'You\'ve been invited to join Service Flow',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
-            <p>Hello ${teamMember.first_name},</p>
+              <p>Hello ${teamMember.first_name},</p>
             <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                Create Your Account
-              </a>
-            </div>
-            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                  Create Your Account
+                </a>
+              </div>
+              <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
             <p>Best regards,<br>The Service Flow Team</p>
-          </div>
-        `,
+            </div>
+          `,
         text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
-      });
+        });
       
       console.log('✅ Invitation email sent successfully via SendGrid');
-    } catch (emailError) {
+      } catch (emailError) {
       console.error('❌ Failed to send invitation email:', emailError);
       console.error('❌ Email error details:', {
-        message: emailError.message,
-        code: emailError.code,
-        command: emailError.command
-      });
+          message: emailError.message,
+          code: emailError.code,
+          command: emailError.command
+        });
       
       // Provide specific error messages based on the error type
       let errorMessage = 'Email service is currently unavailable. Please contact the team member directly with the invitation link.';
@@ -7664,11 +7664,11 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       return res.status(200).json({ 
         message: 'Invitation token updated successfully, but email delivery failed',
         warning: errorMessage,
-        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`
-      });
-    }
-    
-    res.json({ message: 'Invitation resent successfully' });
+        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`
+        });
+      }
+      
+      res.json({ message: 'Invitation resent successfully' });
   } catch (error) {
     console.error('❌ Resend invitation error:', error);
     res.status(500).json({ error: 'Failed to resend invitation' });
