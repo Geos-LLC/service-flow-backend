@@ -12164,68 +12164,6 @@ const initializeDatabase = async () => {
     }
     
     console.log('✅ Supabase database connection verified');
-      
-      // Insert default notification templates if they don't exist
-      const defaultTemplates = [
-        ['email', 'appointment_confirmation', 'Appointment Confirmed - {business_name}', 'Hi {customer_name},\n\nYour appointment has been confirmed for {appointment_date} at {appointment_time}.\n\nService: {service_name}\nLocation: {location}\n\nWe look forward to serving you!\n\nBest regards,\n{business_name}'],
-        ['sms', 'appointment_confirmation', null, 'Hi {customer_name}, your appointment is confirmed for {appointment_date} at {appointment_time}. Service: {service_name}. Location: {location}. - {business_name}'],
-        ['email', 'appointment_reminder', 'Appointment Reminder - {business_name}', 'Hi {customer_name},\n\nThis is a friendly reminder about your upcoming appointment:\n\nDate: {appointment_date}\nTime: {appointment_time}\nService: {service_name}\nLocation: {location}\n\nPlease let us know if you need to reschedule.\n\nBest regards,\n{business_name}'],
-        ['sms', 'appointment_reminder', null, 'Reminder: Your appointment is tomorrow at {appointment_time}. Service: {service_name}. Location: {location}. - {business_name}'],
-        ['email', 'appointment_cancelled', 'Appointment Cancelled - {business_name}', 'Hi {customer_name},\n\nYour appointment scheduled for {appointment_date} at {appointment_time} has been cancelled.\n\nService: {service_name}\n\nIf you have any questions, please contact us.\n\nBest regards,\n{business_name}'],
-        ['sms', 'appointment_cancelled', null, 'Your appointment for {appointment_date} at {appointment_time} has been cancelled. Service: {service_name}. - {business_name}'],
-        ['email', 'appointment_rescheduled', 'Appointment Rescheduled - {business_name}', 'Hi {customer_name},\n\nYour appointment has been rescheduled:\n\nNew Date: {new_appointment_date}\nNew Time: {new_appointment_time}\nService: {service_name}\nLocation: {location}\n\nWe apologize for any inconvenience.\n\nBest regards,\n{business_name}'],
-        ['sms', 'appointment_rescheduled', null, 'Your appointment has been rescheduled to {new_appointment_date} at {new_appointment_time}. Service: {service_name}. - {business_name}'],
-        ['email', 'enroute', 'We\'re On Our Way - {business_name}', 'Hi {customer_name},\n\nWe\'re on our way to your appointment!\n\nEstimated arrival: {eta}\nService: {service_name}\nLocation: {location}\n\nWe\'ll see you soon!\n\nBest regards,\n{business_name}'],
-        ['sms', 'enroute', null, 'We\'re on our way! ETA: {eta}. Service: {service_name}. Location: {location}. - {business_name}'],
-        ['email', 'job_follow_up', 'How Was Your Service? - {business_name}', 'Hi {customer_name},\n\nThank you for choosing {business_name} for your recent service.\n\nWe hope you were satisfied with our work. Please take a moment to rate your experience and provide feedback.\n\nService: {service_name}\nDate: {service_date}\n\nYour feedback helps us improve our services.\n\nBest regards,\n{business_name}'],
-        ['email', 'payment_receipt', 'Payment Receipt - {business_name}', 'Hi {customer_name},\n\nThank you for your payment. Here is your receipt:\n\nService: {service_name}\nDate: {service_date}\nAmount: {amount}\nPayment Method: {payment_method}\n\nThank you for choosing {business_name}!\n\nBest regards,\n{business_name}'],
-        ['email', 'invoice', 'Invoice - {business_name}', 'Hi {customer_name},\n\nPlease find attached your invoice for the following service:\n\nService: {service_name}\nDate: {service_date}\nAmount: {amount}\n\nPlease pay by {due_date}.\n\nThank you,\n{business_name}'],
-        ['email', 'estimate', 'Your Estimate is Ready - {business_name}', 'Hi {customer_name},\n\nYour estimate is ready!\n\nService: {service_name}\nEstimated Amount: {estimated_amount}\n\nPlease review the details and let us know if you\'d like to proceed with the booking.\n\nBest regards,\n{business_name}'],
-        ['sms', 'estimate', null, 'Your estimate is ready! Service: {service_name}. Amount: {estimated_amount}. - {business_name}'],
-        ['email', 'quote_request_processing', 'Quote Request Received - {business_name}', 'Hi {customer_name},\n\nThank you for your quote request. We have received your inquiry and will review it carefully.\n\nWe\'ll get back to you within 24 hours with a detailed quote.\n\nBest regards,\n{business_name}'],
-        ['email', 'booking_request_acknowledgment', 'Booking Request Received - {business_name}', 'Hi {customer_name},\n\nThank you for your booking request. We have received your inquiry and will confirm your appointment shortly.\n\nWe\'ll contact you within 2 hours to confirm the details.\n\nBest regards,\n{business_name}'],
-        ['email', 'recurring_booking_cancelled', 'Recurring Booking Cancelled - {business_name}', 'Hi {customer_name},\n\nYour recurring booking has been cancelled as requested.\n\nService: {service_name}\n\nIf you need to reschedule or have any questions, please contact us.\n\nBest regards,\n{business_name}'],
-        ['sms', 'recurring_booking_cancelled', null, 'Your recurring booking has been cancelled. Service: {service_name}. - {business_name}'],
-        ['email', 'contact_customer', 'Message from {business_name}', 'Hi {customer_name},\n\n{message_content}\n\nBest regards,\n{business_name}'],
-        ['email', 'team_member_invite', 'Welcome to {business_name} Team', 'Hi {team_member_name},\n\nWelcome to the {business_name} team!\n\nYour account has been created. Please click the link below to set up your password and complete your profile:\n\n{invite_link}\n\nIf you have any questions, please contact us.\n\nBest regards,\n{business_name}'],
-        ['email', 'assigned_job_cancelled', 'Job Assignment Cancelled - {business_name}', 'Hi {team_member_name},\n\nThe job you were assigned to has been cancelled:\n\nJob: {job_title}\nCustomer: {customer_name}\nDate: {job_date}\nTime: {job_time}\n\nYou are no longer assigned to this job.\n\nBest regards,\n{business_name}'],
-        ['email', 'assigned_job_rescheduled', 'Job Assignment Rescheduled - {business_name}', 'Hi {team_member_name},\n\nThe job you were assigned to has been rescheduled:\n\nJob: {job_title}\nCustomer: {customer_name}\nNew Date: {new_job_date}\nNew Time: {new_job_time}\n\nPlease update your schedule accordingly.\n\nBest regards,\n{business_name}']
-      ];
-
-      for (const [templateType, notificationName, subject, content] of defaultTemplates) {
-        await connection.query(`
-          INSERT IGNORE INTO notification_templates (user_id, template_type, notification_name, subject, content, is_enabled)
-          VALUES (1, ?, ?, ?, ?, 1)
-        `, [templateType, notificationName, subject, content]);
-      }
-
-      // Insert default notification settings if they don't exist
-      const defaultSettings = [
-        ['appointment_confirmation', 1, 1, 0],
-        ['appointment_reminder', 1, 1, 0],
-        ['appointment_cancelled', 1, 1, 0],
-        ['appointment_rescheduled', 1, 1, 0],
-        ['enroute', 0, 1, 0],
-        ['job_follow_up', 1, 0, 0],
-        ['payment_receipt', 1, 0, 0],
-        ['invoice', 1, 0, 0],
-        ['estimate', 1, 1, 0],
-        ['quote_request_processing', 1, 0, 0],
-        ['booking_request_acknowledgment', 1, 0, 0],
-        ['recurring_booking_cancelled', 1, 1, 0],
-        ['contact_customer', 1, 0, 0],
-        ['team_member_invite', 1, 0, 0],
-        ['assigned_job_cancelled', 1, 1, 1],
-        ['assigned_job_rescheduled', 1, 1, 1]
-      ];
-
-      for (const [notificationType, emailEnabled, smsEnabled, pushEnabled] of defaultSettings) {
-        await connection.query(`
-          INSERT IGNORE INTO user_notification_settings (user_id, notification_type, email_enabled, sms_enabled, push_enabled)
-          VALUES (1, ?, ?, ?, ?)
-        `, [notificationType, emailEnabled, smsEnabled, pushEnabled]);
-      }
-      
   } catch (error) {
     console.error('❌ Database initialization error:', error);
   }
