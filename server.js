@@ -46,9 +46,12 @@ transporter = createTransporter();
 // SendGrid configuration
 if (process.env.SENDGRID_API_KEY) {
   sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-  console.log('SendGrid configured for team member emails');
+  console.log('✅ SendGrid configured for team member emails');
+  console.log('✅ SendGrid API key present:', process.env.SENDGRID_API_KEY ? 'Yes' : 'No');
+  console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'Using default');
 } else {
-  console.log('SendGrid API key not found, using fallback email service');
+  console.log('⚠️ SendGrid API key not found, using fallback email service');
+  console.log('⚠️ Please set SENDGRID_API_KEY environment variable for better email delivery');
 }
 
 // Test email configuration
@@ -204,11 +207,11 @@ async function sendEmail({ to, subject, html, text }) {
 // SendGrid email function for team member emails
 async function sendTeamMemberEmail({ to, subject, html, text }) {
   try {
-    console.log('Attempting to send team member email via SendGrid to:', to);
+    console.log('📧 Attempting to send team member email via SendGrid to:', to);
     
     if (!process.env.SENDGRID_API_KEY) {
-      console.log('SendGrid API key not found, falling back to regular email');
-      return await sendEmail({ to, subject, html, text });
+      console.log('⚠️ SendGrid API key not found, skipping email send');
+      throw new Error('SendGrid API key not configured');
     }
     
     const msg = {
@@ -219,22 +222,22 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
       text
     };
     
-    console.log('SendGrid email options:', { to, subject, from: msg.from });
+    console.log('📧 SendGrid email options:', { to, subject, from: msg.from });
     
     const response = await sgMail.send(msg);
-    console.log('SendGrid email sent successfully:', response[0].statusCode);
+    console.log('✅ SendGrid email sent successfully:', response[0].statusCode);
     return response;
   } catch (error) {
-    console.error('SendGrid email sending error:', error);
-    console.error('SendGrid error details:', {
+    console.error('❌ SendGrid email sending error:', error);
+    console.error('❌ SendGrid error details:', {
       message: error.message,
       code: error.code,
       response: error.response?.body
     });
     
-    // Fallback to regular email if SendGrid fails
-    console.log('Falling back to regular email service...');
-    return await sendEmail({ to, subject, html, text });
+    // Don't fallback to regular email if it's also having issues
+    // Instead, throw the error so the calling function can handle it
+    throw new Error(`SendGrid email failed: ${error.message}`);
   }
 }
 
@@ -7597,9 +7600,13 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
         code: emailError.code,
         command: emailError.command
       });
-      return res.status(500).json({ 
-        error: 'Failed to send invitation email',
-        details: emailError.message 
+      
+      // Return success but with a warning about email delivery
+      console.log('⚠️ Continuing with invitation token update despite email failure');
+      return res.status(200).json({ 
+        message: 'Invitation token updated successfully, but email delivery failed',
+        warning: 'Email service is currently unavailable. Please contact the team member directly with the invitation link.',
+        invitationLink: `${process.env.FRONTEND_URL || 'https://zenbooker.com'}/team-member-signup?token=${invitationToken}`
       });
     }
     
