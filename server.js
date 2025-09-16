@@ -3842,7 +3842,7 @@ app.get('/api/user/billing', async (req, res) => {
     
     const { data: billingInfo, error } = await supabase
       .from('user_billing')
-      .select('subscription_plan, trial_end_date, is_trial, monthly_price, card_last4')
+      .select('plan_type, billing_cycle, next_billing_date')
       .eq('user_id', userId);
     
     if (error) {
@@ -3858,22 +3858,24 @@ app.get('/api/user/billing', async (req, res) => {
         trialDaysLeft: 14,
         trialEndDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
         monthlyPrice: 29,
-        cardNumber: ''
+        cardNumber: '',
+        subscriptionStatus: 'trialing'
       });
     }
     
     const billing = billingInfo[0];
-    const trialEnd = new Date(billing.trial_end_date);
+    const nextBillingDate = billing.next_billing_date ? new Date(billing.next_billing_date) : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
     const now = new Date();
-    const daysLeft = Math.max(0, Math.ceil((trialEnd - now) / (1000 * 60 * 60 * 24)));
+    const daysLeft = Math.max(0, Math.ceil((nextBillingDate - now) / (1000 * 60 * 60 * 24)));
     
     res.json({
-      currentPlan: billing.subscription_plan || 'Standard',
-      isTrial: billing.is_trial === true,
+      currentPlan: billing.plan_type || 'Standard',
+      isTrial: billing.billing_cycle === 'trial' || !billing.plan_type,
       trialDaysLeft: daysLeft,
-      trialEndDate: trialEnd.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
-      monthlyPrice: billing.monthly_price || 29,
-      cardNumber: billing.card_last4 ? `****${billing.card_last4}` : ''
+      trialEndDate: nextBillingDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
+      monthlyPrice: 29, // Default price since we don't have this in the current schema
+      cardNumber: '', // No card info in current schema
+      subscriptionStatus: billing.billing_cycle || 'trialing'
     });
   } catch (error) {
     console.error('Get billing error:', error);
@@ -3909,10 +3911,9 @@ app.post('/api/user/billing/setup-intent', async (req, res) => {
         .upsert({
           user_id: userId,
           stripe_customer_id: customer.id,
-          subscription_plan: 'Standard',
-          monthly_price: 29,
-          is_trial: true,
-          trial_end_date: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+          plan_type: 'Standard',
+          billing_cycle: 'trial',
+          next_billing_date: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
         });
     }
     
@@ -3993,10 +3994,8 @@ app.post('/api/user/billing/subscription', async (req, res) => {
       .from('user_billing')
       .update({
         stripe_subscription_id: subscription.id,
-        subscription_plan: plan,
-        monthly_price: planPrices[plan] / 100,
-        is_trial: subscription.status === 'trialing',
-        subscription_status: subscription.status
+        plan_type: plan,
+        billing_cycle: subscription.status === 'trialing' ? 'trial' : 'monthly'
       })
       .eq('user_id', userId);
     
@@ -4098,8 +4097,7 @@ app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (
         await supabase
           .from('user_billing')
           .update({
-            subscription_status: subscription.status,
-            is_trial: subscription.status === 'trialing'
+            billing_cycle: subscription.status === 'trialing' ? 'trial' : 'monthly'
           })
           .eq('stripe_subscription_id', subscription.id);
         break;
@@ -4441,32 +4439,6 @@ app.post('/api/user/payment-processor/setup', authenticateToken, async (req, res
   }
 });
 
-// Billing endpoints
-app.get('/api/user/billing', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-    
-    // For now, return default billing info since we don't have Stripe integration set up
-    // In a real implementation, you'd fetch this from your billing provider (Stripe)
-    const billingData = {
-      currentPlan: "Standard",
-      isTrial: true,
-      trialDaysLeft: 14,
-      trialEndDate: "July 4",
-      monthlyPrice: 29,
-      subscriptionStatus: 'trialing'
-    };
-    
-    res.json(billingData);
-  } catch (error) {
-    console.error('Get billing error:', error);
-    res.status(500).json({ error: 'Failed to fetch billing information' });
-  }
-});
 
 app.post('/api/user/billing/setup-intent', async (req, res) => {
   try {
