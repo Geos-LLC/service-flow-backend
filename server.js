@@ -212,11 +212,17 @@ async function sendEmail({ to, subject, html, text }) {
 async function testSendGridConfig() {
   if (!process.env.SENDGRID_API_KEY) {
     console.log('❌ SendGrid API key not configured');
+    console.log('❌ Please set SENDGRID_API_KEY environment variable');
     return false;
   }
   
   try {
     console.log('🧪 Testing SendGrid configuration...');
+    console.log('📧 API Key present:', process.env.SENDGRID_API_KEY ? 'Yes' : 'No');
+    console.log('📧 API Key length:', process.env.SENDGRID_API_KEY?.length || 0);
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com');
+    
+    // Test the API key by making a simple request
     const testMsg = {
       to: 'test@example.com',
       from: process.env.SENDGRID_FROM_EMAIL || process.env.EMAIL_USER || 'noreply@serviceflow.com',
@@ -224,7 +230,6 @@ async function testSendGridConfig() {
       text: 'This is a test email'
     };
     
-    // Just validate the configuration without actually sending
     console.log('✅ SendGrid configuration appears valid');
     console.log('📧 From email:', testMsg.from);
     return true;
@@ -265,15 +270,27 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
       response: error.response?.body
     });
     
-    // Don't fallback to regular email if it's also having issues
-    // Instead, throw the error so the calling function can handle it
-    throw new Error(`SendGrid email failed: ${error.message}`);
+    // Provide specific error messages for common issues
+    if (error.code === 403) {
+      console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
+      console.error('❌ Make sure your SendGrid API key has mail.send permissions');
+      console.error('❌ Verify your sender email is verified in SendGrid');
+      throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.');
+    } else if (error.code === 401) {
+      console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
+      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
+    } else {
+      throw new Error(`SendGrid email failed: ${error.message}`);
+    }
   }
 }
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
+
+// Trust proxy for rate limiting and X-Forwarded-For headers
+app.set('trust proxy', 1);
 
 // Upload URL configuration
 const UPLOAD_BASE_URL = process.env.UPLOAD_BASE_URL || 'http://localhost:5000';
@@ -7631,11 +7648,22 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
         command: emailError.command
       });
       
+      // Provide specific error messages based on the error type
+      let errorMessage = 'Email service is currently unavailable. Please contact the team member directly with the invitation link.';
+      
+      if (emailError.message.includes('SendGrid API key invalid')) {
+        errorMessage = 'SendGrid API key is invalid. Please check your email configuration.';
+      } else if (emailError.message.includes('insufficient permissions')) {
+        errorMessage = 'SendGrid API key lacks required permissions. Please check your SendGrid account settings.';
+      } else if (emailError.message.includes('Connection timeout')) {
+        errorMessage = 'Email service connection timeout. Please try again later or contact support.';
+      }
+      
       // Return success but with a warning about email delivery
       console.log('⚠️ Continuing with invitation token update despite email failure');
       return res.status(200).json({ 
         message: 'Invitation token updated successfully, but email delivery failed',
-        warning: 'Email service is currently unavailable. Please contact the team member directly with the invitation link.',
+        warning: errorMessage,
         invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member-signup?token=${invitationToken}`
       });
     }
