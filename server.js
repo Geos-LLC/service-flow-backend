@@ -7219,6 +7219,7 @@ app.post('/api/team-members/register', async (req, res) => {
     // Generate a unique invitation token
     console.log('🔍 Step 3: Generating invitation token...');
     const invitationToken = crypto.randomBytes(32).toString('hex');
+    const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
     console.log('✅ Step 3: Invitation token generated');
     
     // Create team member with 'invited' status
@@ -7241,6 +7242,7 @@ app.post('/api/team-members/register', async (req, res) => {
       availability: availability || {},
       permissions: permissions || {},
       invitation_token: invitationToken,
+      invitation_expires: invitationExpires.toISOString(),
       status: 'invited'
     });
     
@@ -7266,6 +7268,7 @@ app.post('/api/team-members/register', async (req, res) => {
         availability: availability || {},
         permissions: permissions || {},
         invitation_token: invitationToken,
+        invitation_expires: invitationExpires.toISOString(),
         status: 'invited'
       })
       .select()
