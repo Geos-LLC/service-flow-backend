@@ -6915,23 +6915,46 @@ app.put('/api/team-members/:id', async (req, res) => {
 app.delete('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    // Check if team member has assigned jobs
+    
+    // First, get the team member's current status
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, status, first_name, last_name')
+      .eq('id', id)
+      .single();
+    
+    if (memberError) {
+      console.error('Error fetching team member:', memberError);
+      return res.status(500).json({ error: 'Failed to fetch team member' });
+    }
+    
+    if (!teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    // Check if team member has active job assignments
     const { data: assignedJobs, error: jobsError } = await supabase
       .from('jobs')
-      .select('id', { count: 'exact' })
+      .select('id, status', { count: 'exact' })
       .eq('team_member_id', id)
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
     if (jobsError) {
       console.error('Error checking assigned jobs:', jobsError);
-      return res.status(500).json({ error: 'Failed to delete team member' });
+      return res.status(500).json({ error: 'Failed to check job assignments' });
     }
     
-    if (assignedJobs && assignedJobs.length > 0) {
+    // Only prevent deletion if team member is ACTIVE and has active job assignments
+    if (teamMember.status === 'active' && assignedJobs && assignedJobs.length > 0) {
       return res.status(400).json({ 
-        error: 'Cannot delete team member with active job assignments. Please reassign or complete their jobs first.' 
+        error: 'Cannot delete active team member with active job assignments. Please reassign or complete their jobs first, or deactivate the team member first.' 
       });
     }
+    
+    // Allow deletion for:
+    // 1. Inactive team members (regardless of job assignments)
+    // 2. Active team members with no active job assignments
+    // 3. Invited team members (never activated)
     
     // Soft delete by setting status to inactive
     const { error: updateError } = await supabase
@@ -6944,6 +6967,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
       return res.status(500).json({ error: 'Failed to delete team member' });
     }
     
+    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} deleted successfully`);
     res.json({ message: 'Team member deleted successfully' });
   } catch (error) {
     console.error('Delete team member error:', error);
@@ -7489,6 +7513,90 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
     }
     
     console.log('✅ Team member signup completed successfully');
+    
+    // Send activation confirmation email to team member
+    try {
+      await sendTeamMemberEmail({
+        to: teamMember.email,
+        subject: 'Welcome to Service Flow - Account Activated!',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #10b981;">🎉 Welcome to Service Flow!</h2>
+            <p>Hello ${firstName},</p>
+            <p>Your account has been successfully activated! You can now access your team dashboard and start managing your work.</p>
+            <div style="background-color: #f0f9ff; border: 1px solid #0ea5e9; border-radius: 8px; padding: 20px; margin: 20px 0;">
+              <h3 style="color: #0c4a6e; margin-top: 0;">What's Next?</h3>
+              <ul style="color: #0c4a6e;">
+                <li>Access your team dashboard</li>
+                <li>Update your availability and preferences</li>
+                <li>Start receiving job assignments</li>
+                <li>Connect with your team members</li>
+              </ul>
+            </div>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                Access Your Dashboard
+              </a>
+            </div>
+            <p>If you have any questions, please contact your team administrator or our support team.</p>
+            <p>Best regards,<br>The Service Flow Team</p>
+          </div>
+        `,
+        text: `Welcome to Service Flow! Your account has been activated. Visit ${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard to access your dashboard.`
+      });
+      console.log('✅ Activation confirmation email sent to team member');
+    } catch (emailError) {
+      console.error('❌ Failed to send activation confirmation email:', emailError);
+      // Don't fail the signup process if email fails
+    }
+    
+    // Send notification email to admin/team owner
+    try {
+      // Get team owner/admin email
+      const { data: adminData, error: adminError } = await supabase
+        .from('team_members')
+        .select('email, first_name, last_name')
+        .eq('user_id', teamMember.user_id)
+        .eq('role', 'admin')
+        .single();
+      
+      if (!adminError && adminData) {
+        await sendTeamMemberEmail({
+          to: adminData.email,
+          subject: 'Team Member Activated - Service Flow',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #2563eb;">Team Member Activated</h2>
+              <p>Hello ${adminData.first_name},</p>
+              <p><strong>${firstName} ${lastName}</strong> has successfully activated their account and joined your team.</p>
+              <div style="background-color: #f0fdf4; border: 1px solid #22c55e; border-radius: 8px; padding: 20px; margin: 20px 0;">
+                <h3 style="color: #166534; margin-top: 0;">Team Member Details:</h3>
+                <ul style="color: #166534;">
+                  <li><strong>Name:</strong> ${firstName} ${lastName}</li>
+                  <li><strong>Email:</strong> ${teamMember.email}</li>
+                  <li><strong>Phone:</strong> ${phone || 'Not provided'}</li>
+                  <li><strong>Role:</strong> ${teamMember.role || 'Team Member'}</li>
+                  <li><strong>Status:</strong> Active</li>
+                </ul>
+              </div>
+              <p>You can manage this team member's permissions and settings from your team dashboard.</p>
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                  Manage Team
+                </a>
+              </div>
+              <p>Best regards,<br>The Service Flow Team</p>
+            </div>
+          `,
+          text: `Team member ${firstName} ${lastName} has activated their account and joined your team. You can manage them from your team dashboard.`
+        });
+        console.log('✅ Admin notification email sent');
+      }
+    } catch (adminEmailError) {
+      console.error('❌ Failed to send admin notification email:', adminEmailError);
+      // Don't fail the signup process if admin email fails
+    }
+    
     res.json({ message: 'Account created successfully' });
   } catch (error) {
     console.error('❌ Complete signup error:', error);
