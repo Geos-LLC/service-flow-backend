@@ -6956,22 +6956,66 @@ app.delete('/api/team-members/:id', async (req, res) => {
     // 2. Active team members with no active job assignments
     // 3. Invited team members (never activated)
     
-    // Soft delete by setting status to inactive
+    // Actually DELETE the team member from the database
+    const { error: deleteError } = await supabase
+      .from('team_members')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      console.error('Error deleting team member:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete team member' });
+    }
+    
+    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} permanently deleted from database`);
+    res.json({ message: 'Team member permanently deleted successfully' });
+  } catch (error) {
+    console.error('Delete team member error:', error);
+    res.status(500).json({ error: 'Failed to delete team member' });
+  }
+});
+
+// Deactivate team member (soft delete - keeps record but sets status to inactive)
+app.put('/api/team-members/:id/deactivate', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get the team member
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, status, first_name, last_name')
+      .eq('id', id)
+      .single();
+    
+    if (memberError) {
+      console.error('Error fetching team member:', memberError);
+      return res.status(500).json({ error: 'Failed to fetch team member' });
+    }
+    
+    if (!teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    if (teamMember.status === 'inactive') {
+      return res.status(400).json({ error: 'Team member is already deactivated' });
+    }
+    
+    // Deactivate team member (soft delete)
     const { error: updateError } = await supabase
       .from('team_members')
       .update({ status: 'inactive' })
       .eq('id', id);
     
     if (updateError) {
-      console.error('Error updating team member:', updateError);
-      return res.status(500).json({ error: 'Failed to delete team member' });
+      console.error('Error deactivating team member:', updateError);
+      return res.status(500).json({ error: 'Failed to deactivate team member' });
     }
     
-    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} deleted successfully`);
-    res.json({ message: 'Team member deleted successfully' });
+    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} deactivated successfully`);
+    res.json({ message: 'Team member deactivated successfully' });
   } catch (error) {
-    console.error('Delete team member error:', error);
-    res.status(500).json({ error: 'Failed to delete team member' });
+    console.error('Deactivate team member error:', error);
+    res.status(500).json({ error: 'Failed to deactivate team member' });
   }
 });
 
@@ -7135,6 +7179,40 @@ app.post('/api/team-members/login', async (req, res) => {
   } catch (error) {
     console.error('❌ Team member login error:', error);
       res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
+});
+
+// Get current team member profile (for authentication validation)
+app.get('/api/team-members/me', authenticateToken, async (req, res) => {
+  try {
+    const teamMemberId = req.user.userId;
+    console.log('🔍 Getting current team member profile for ID:', teamMemberId);
+    
+    // Get team member from Supabase
+    const { data: teamMember, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('*')
+      .eq('id', teamMemberId)
+      .eq('status', 'active')
+      .single();
+    
+    if (teamMemberError) {
+      console.error('❌ Error fetching team member:', teamMemberError);
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    if (!teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    // Remove password from response
+    delete teamMember.password;
+    
+    console.log('✅ Team member profile retrieved successfully');
+    res.json(teamMember);
+  } catch (error) {
+    console.error('❌ Get team member profile error:', error);
+    res.status(500).json({ error: 'Failed to get team member profile' });
   }
 });
 
