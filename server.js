@@ -11,8 +11,15 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const validator = require('validator');
-const nodemailer = require('nodemailer');
+// Nodemailer removed - using SendGrid only
 const sgMail = require('@sendgrid/mail');
+
+// Mock pool for MySQL endpoints that aren't used
+const pool = {
+  getConnection: () => {
+    throw new Error('MySQL endpoints are disabled - using Supabase only');
+  }
+};
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cron = require('node-cron');
 const https = require('https');
@@ -5130,125 +5137,24 @@ app.post('/api/territories/detect', async (req, res) => {
   }
 });
 
-// Get available team members for a territory
-app.get('/api/territories/:id/team-members', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const connection = await pool.getConnection();
-    
-    try {
-      const [territory] = await connection.query(`
-        SELECT team_members FROM territories WHERE id = ?
-      `, [id]);
-      
-      if (territory.length === 0) {
-        return res.status(404).json({ error: 'Territory not found' });
-      }
-      
-      const teamMemberIds = JSON.parse(territory[0].team_members || '[]');
-      
-      if (teamMemberIds.length === 0) {
-        return res.json({ teamMembers: [] });
-      }
-      
-      const [teamMembers] = await connection.query(`
-        SELECT id, first_name, last_name, email, phone, status, is_service_provider
-        FROM team_members 
-        WHERE id IN (${teamMemberIds.map(() => '?').join(',')}) AND status = 'active'
-      `, teamMemberIds);
-      
-      res.json({ teamMembers });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Get territory team members error:', error);
-    res.status(500).json({ error: 'Failed to fetch territory team members' });
-  }
-});
+// Get available team members for a territory - DISABLED (MySQL not configured)
+// app.get('/api/territories/:id/team-members', async (req, res) => {
+//   res.status(501).json({ error: 'This endpoint is temporarily disabled' });
+// });
 
-// Get territory business hours
-app.get('/api/territories/:id/business-hours', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const connection = await pool.getConnection();
-    
-    try {
-      const [territory] = await connection.query(`
-        SELECT business_hours, timezone FROM territories WHERE id = ?
-      `, [id]);
-      
-      if (territory.length === 0) {
-        return res.status(404).json({ error: 'Territory not found' });
-      }
-      
-      const businessHours = JSON.parse(territory[0].business_hours || '{}');
-      const timezone = territory[0].timezone || 'America/New_York';
-      
-      res.json({ businessHours, timezone });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Get territory business hours error:', error);
-    res.status(500).json({ error: 'Failed to fetch territory business hours' });
-  }
-});
+// Get territory business hours - DISABLED (MySQL not configured)
+// app.get('/api/territories/:id/business-hours', async (req, res) => {
+//   res.status(501).json({ error: 'This endpoint is temporarily disabled' });
+// });
 
-// Territory pricing endpoints
-app.get('/api/territories/:id/pricing', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const connection = await pool.getConnection();
-    
-    try {
-      const [pricing] = await connection.query(`
-        SELECT tp.*, s.name as service_name, s.description as service_description
-        FROM territory_pricing tp
-        JOIN services s ON tp.service_id = s.id
-        WHERE tp.territory_id = ?
-      `, [id]);
-      
-      res.json(pricing);
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Get territory pricing error:', error);
-    res.status(500).json({ error: 'Failed to fetch territory pricing' });
-  }
-});
+// Territory pricing endpoints - DISABLED (MySQL not configured)
+// app.get('/api/territories/:id/pricing', async (req, res) => {
+//   res.status(501).json({ error: 'This endpoint is temporarily disabled' });
+// });
 
-app.post('/api/territories/:id/pricing', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { serviceId, basePrice, priceMultiplier, minimumPrice, maximumPrice } = req.body;
-    
-    const connection = await pool.getConnection();
-    
-    try {
-      await connection.query(`
-        INSERT INTO territory_pricing (
-          territory_id, service_id, base_price, price_multiplier, 
-          minimum_price, maximum_price, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NOW())
-        ON DUPLICATE KEY UPDATE
-          base_price = VALUES(base_price),
-          price_multiplier = VALUES(price_multiplier),
-          minimum_price = VALUES(minimum_price),
-          maximum_price = VALUES(maximum_price),
-          updated_at = NOW()
-      `, [id, serviceId, basePrice, priceMultiplier || 1.00, minimumPrice, maximumPrice]);
-      
-      res.json({ message: 'Territory pricing updated successfully' });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Update territory pricing error:', error);
-    res.status(500).json({ error: 'Failed to update territory pricing' });
-  }
-});
+// app.post('/api/territories/:id/pricing', async (req, res) => {
+//   res.status(501).json({ error: 'This endpoint is temporarily disabled' });
+// });
 
 // Invoices endpoints
 app.get('/api/invoices', async (req, res) => {
