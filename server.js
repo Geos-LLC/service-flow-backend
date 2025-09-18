@@ -6802,7 +6802,6 @@ app.put('/api/team-members/:id', async (req, res) => {
       username,
       password,
       role, 
-      skills, 
       hourlyRate,
       availability,
       status,
@@ -6848,10 +6847,6 @@ app.put('/api/team-members/:id', async (req, res) => {
     
     if (role !== undefined) {
       updateData.role = role;
-    }
-    
-    if (skills !== undefined) {
-      updateData.skills = skills;
     }
     
     if (hourlyRate !== undefined) {
@@ -7253,7 +7248,6 @@ app.post('/api/team-members/register', async (req, res) => {
       role,
       hourlyRate,
       isServiceProvider,
-      skills,
       territories,
       availability,
       permissions
@@ -7339,7 +7333,6 @@ app.post('/api/team-members/register', async (req, res) => {
       role: role || 'worker',
       hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
       is_service_provider: isServiceProvider || false,
-      skills: skills || [],
       territories: territories || [],
       availability: availability || {},
       permissions: permissions || {},
@@ -7365,7 +7358,6 @@ app.post('/api/team-members/register', async (req, res) => {
         role: role || 'worker',
         hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
         is_service_provider: isServiceProvider || false,
-        skills: skills || [],
         territories: territories || [],
         availability: availability || {},
         permissions: permissions || {},
@@ -7436,7 +7428,6 @@ app.post('/api/team-members/register', async (req, res) => {
           role: teamMember.role,
         hourly_rate: teamMember.hourly_rate,
           is_service_provider: teamMember.is_service_provider,
-        skills: teamMember.skills,
           territories: teamMember.territories,
         availability: teamMember.availability,
           permissions: teamMember.permissions,
@@ -7915,7 +7906,6 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
           username: teamMember.username,
           status: teamMember.status,
           hourly_rate: teamMember.hourly_rate,
-          skills: teamMember.skills,
           availability: teamMember.availability
         },
         jobs: jobs,
