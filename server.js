@@ -6653,7 +6653,6 @@ app.post('/api/team-members', async (req, res) => {
       city,
       state,
       zipCode,
-      isServiceProvider,
       territories,
       permissions
     } = req.body;
@@ -6761,7 +6760,6 @@ app.post('/api/team-members', async (req, res) => {
         city: city || null,
         state: state || null,
         zip_code: zipCode || null,
-        is_service_provider: isServiceProvider || false,
         territories,
         permissions,
         status: 'invited',
@@ -6809,7 +6807,6 @@ app.put('/api/team-members/:id', async (req, res) => {
       city,
       state,
       zipCode,
-      isServiceProvider,
       territories,
       permissions
     } = req.body;
@@ -6877,9 +6874,6 @@ app.put('/api/team-members/:id', async (req, res) => {
       updateData.zip_code = zipCode;
     }
     
-    if (isServiceProvider !== undefined) {
-      updateData.is_service_provider = isServiceProvider;
-    }
     
     if (territories !== undefined) {
       updateData.territories = territories;
@@ -7247,7 +7241,6 @@ app.post('/api/team-members/register', async (req, res) => {
       zipCode,
       role,
       hourlyRate,
-      isServiceProvider,
       territories,
       availability,
       permissions
@@ -7357,7 +7350,6 @@ app.post('/api/team-members/register', async (req, res) => {
         zip_code: zipCode ? sanitizeInput(zipCode) : null,
         role: role || 'worker',
         hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
-        is_service_provider: isServiceProvider || false,
         territories: territories || [],
         availability: availability || {},
         permissions: permissions || {},
@@ -7427,7 +7419,6 @@ app.post('/api/team-members/register', async (req, res) => {
           zip_code: teamMember.zip_code,
           role: teamMember.role,
         hourly_rate: teamMember.hourly_rate,
-          is_service_provider: teamMember.is_service_provider,
           territories: teamMember.territories,
         availability: teamMember.availability,
           permissions: teamMember.permissions,
@@ -10808,7 +10799,6 @@ app.post('/api/migrate/team-member-settings', async (req, res) => {
         // Update existing team members with default settings
         await connection.query(`
           UPDATE team_members SET settings = JSON_OBJECT(
-            'isServiceProvider', true,
             'emailNotifications', true,
             'smsNotifications', false,
             'role', 'service_provider',
