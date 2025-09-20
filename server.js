@@ -6846,7 +6846,34 @@ app.put('/api/team-members/:id', async (req, res) => {
     
     if (error) {
       console.error('Error updating team member:', error);
-      return res.status(500).json({ error: 'Failed to update team member' });
+      console.error('Error details:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint
+      });
+      
+      // Provide specific error messages based on the database error
+      let errorMessage = 'Failed to update team member';
+      let errorType = 'database_error';
+      
+      if (error.code === '42703') { // Column does not exist
+        errorMessage = 'Database schema error. The color column may not exist. Please contact support.';
+        errorType = 'schema_error';
+      } else if (error.code === '23505') { // Unique constraint violation
+        errorMessage = 'A team member with this information already exists.';
+        errorType = 'duplicate_entry';
+      } else if (error.code === '23502') { // Not null constraint violation
+        errorMessage = 'Required fields are missing.';
+        errorType = 'missing_fields';
+      }
+      
+      return res.status(500).json({ 
+        error: errorMessage,
+        errorType: errorType,
+        details: error.message,
+        code: error.code
+      });
     }
     
     res.json({ message: 'Team member updated successfully' });
@@ -7302,12 +7329,33 @@ app.post('/api/team-members/register', async (req, res) => {
       isServiceProvider = false
     } = req.body;
     
-    // Validate required fields
-    if (!userId || !firstName || !lastName || !email) {
-      console.error('❌ Missing required fields:', { userId, firstName, lastName, email });
+    // Validate required fields with specific messages
+    if (!userId) {
+      console.error('❌ Missing userId');
       return res.status(400).json({ 
-        error: 'Missing required fields',
-        details: 'userId, firstName, lastName, and email are required'
+        error: 'User session expired. Please refresh the page and try again.',
+        errorType: 'session_expired',
+        field: 'userId'
+      });
+    }
+    
+    if (!firstName || !lastName) {
+      console.error('❌ Missing name fields:', { firstName, lastName });
+      return res.status(400).json({ 
+        error: 'First name and last name are required.',
+        errorType: 'missing_name',
+        field: firstName ? 'lastName' : 'firstName',
+        message: `Please enter a ${!firstName ? 'first' : 'last'} name.`
+      });
+    }
+    
+    if (!email) {
+      console.error('❌ Missing email');
+      return res.status(400).json({ 
+        error: 'Email address is required.',
+        errorType: 'missing_email',
+        field: 'email',
+        message: 'Please enter an email address for the team member.'
       });
     }
     
@@ -7323,15 +7371,20 @@ app.post('/api/team-members/register', async (req, res) => {
     
     if (emailCheckError) {
       console.error('Error checking existing email:', emailCheckError);
-      return res.status(500).json({ error: 'Failed to check existing team member' });
+      return res.status(500).json({ 
+        error: 'Failed to check existing team member',
+        errorType: 'database_error',
+        details: 'Unable to verify if email already exists'
+      });
     }
     
     if (existingEmail && existingEmail.length > 0) {
       return res.status(400).json({ 
-        error: 'Email already exists for this team',
+        error: `A team member with the email "${email}" already exists in your team.`,
+        errorType: 'email_conflict',
         conflictType: 'email',
         field: 'email',
-        message: `A team member with the email "${email}" already exists in your team.`
+        message: `Please use a different email address or check if this team member already exists.`
       });
     }
 
@@ -7346,15 +7399,20 @@ app.post('/api/team-members/register', async (req, res) => {
 
       if (phoneCheckError) {
         console.error('Error checking existing phone:', phoneCheckError);
-        return res.status(500).json({ error: 'Failed to check existing team member' });
+        return res.status(500).json({ 
+          error: 'Failed to check existing team member',
+          errorType: 'database_error',
+          details: 'Unable to verify if phone number already exists'
+        });
       }
 
       if (existingPhone && existingPhone.length > 0) {
         return res.status(400).json({ 
-          error: 'Phone number already exists for this team',
+          error: `A team member with the phone number "${phone}" already exists in your team.`,
+          errorType: 'phone_conflict',
           conflictType: 'phone',
           field: 'phone',
-          message: `A team member with the phone number "${phone}" already exists in your team.`
+          message: `Please use a different phone number or check if this team member already exists.`
         });
       }
     }
@@ -7426,7 +7484,39 @@ app.post('/api/team-members/register', async (req, res) => {
     if (insertError) {
       console.error('❌ Error creating team member:', insertError);
       clearTimeout(timeout); // Clear the timeout
-      return res.status(500).json({ error: 'Failed to create team member' });
+      
+      // Provide specific error messages based on the database error
+      let errorMessage = 'Failed to create team member';
+      let errorType = 'database_error';
+      
+      if (insertError.code === '23505') { // Unique constraint violation
+        if (insertError.message.includes('email')) {
+          errorMessage = `A team member with the email "${email}" already exists in your team.`;
+          errorType = 'email_conflict';
+        } else if (insertError.message.includes('phone')) {
+          errorMessage = `A team member with the phone number "${phone}" already exists in your team.`;
+          errorType = 'phone_conflict';
+        } else {
+          errorMessage = 'A team member with this information already exists.';
+          errorType = 'duplicate_entry';
+        }
+      } else if (insertError.code === '23502') { // Not null constraint violation
+        errorMessage = 'Required fields are missing. Please check all required fields.';
+        errorType = 'missing_fields';
+      } else if (insertError.code === '23503') { // Foreign key constraint violation
+        errorMessage = 'Invalid user or territory reference. Please refresh and try again.';
+        errorType = 'invalid_reference';
+      } else if (insertError.message.includes('duplicate key')) {
+        errorMessage = 'A team member with this information already exists.';
+        errorType = 'duplicate_entry';
+      }
+      
+      return res.status(400).json({ 
+        error: errorMessage,
+        errorType: errorType,
+        details: insertError.message,
+        code: insertError.code
+      });
     }
     
     console.log('✅ Step 4: Team member inserted into database successfully');
@@ -7504,10 +7594,36 @@ app.post('/api/team-members/register', async (req, res) => {
     console.error('Team member registration error:', error);
     console.error('Error details:', {
       message: error.message,
-      code: error.code
+      code: error.code,
+      stack: error.stack
     });
     clearTimeout(timeout); // Clear the timeout
-    res.status(500).json({ error: 'Registration failed', details: error.message });
+    
+    // Provide specific error messages based on the error type
+    let errorMessage = 'Registration failed';
+    let errorType = 'server_error';
+    let details = error.message;
+    
+    if (error.message.includes('timeout')) {
+      errorMessage = 'Request timed out. Please try again.';
+      errorType = 'timeout_error';
+    } else if (error.message.includes('network') || error.message.includes('ECONNREFUSED')) {
+      errorMessage = 'Network error. Please check your connection and try again.';
+      errorType = 'network_error';
+    } else if (error.message.includes('validation')) {
+      errorMessage = 'Invalid data provided. Please check your input and try again.';
+      errorType = 'validation_error';
+    } else if (error.message.includes('database') || error.message.includes('connection')) {
+      errorMessage = 'Database error. Please try again in a few moments.';
+      errorType = 'database_error';
+    }
+    
+    res.status(500).json({ 
+      error: errorMessage,
+      errorType: errorType,
+      details: details,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
