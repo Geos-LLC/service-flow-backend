@@ -6743,6 +6743,10 @@ app.post('/api/team-members', async (req, res) => {
     const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
     
     // ✅ Create team member with invited status
+    // Generate a random color for the team member
+    const colors = ['#2563EB', '#DC2626', '#059669', '#D97706', '#7C3AED', '#DB2777', '#6B7280'];
+    const randomColor = colors[Math.floor(Math.random() * colors.length)];
+    
     const { data: newTeamMember, error: createError } = await supabase
       .from('team_members')
       .insert({
@@ -6763,6 +6767,7 @@ app.post('/api/team-members', async (req, res) => {
         zip_code: zipCode || null,
         territories,
         permissions,
+        color: randomColor,
         status: 'invited',
         invitation_token: invitationToken,
         invitation_expires: invitationExpires
@@ -6809,7 +6814,8 @@ app.put('/api/team-members/:id', async (req, res) => {
       state,
       zipCode,
       territories,
-      permissions
+      permissions,
+      color
     } = req.body;
     
     // Build update object with only provided fields
@@ -6884,6 +6890,10 @@ app.put('/api/team-members/:id', async (req, res) => {
       updateData.permissions = permissions;
     }
     
+    if (color !== undefined) {
+      updateData.color = color;
+    }
+    
     // Update team member
     const { error } = await supabase
       .from('team_members')
@@ -6906,38 +6916,109 @@ app.delete('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
+    // Validate team member ID
+    if (!id || isNaN(parseInt(id))) {
+      return res.status(400).json({ 
+        error: 'Invalid team member ID',
+        errorType: 'VALIDATION_ERROR',
+        userMessage: 'Please provide a valid team member ID.'
+      });
+    }
+    
     // First, get the team member's current status
     const { data: teamMember, error: memberError } = await supabase
       .from('team_members')
-      .select('id, status, first_name, last_name')
+      .select('id, status, first_name, last_name, user_id')
       .eq('id', id)
       .single();
     
     if (memberError) {
       console.error('Error fetching team member:', memberError);
-      return res.status(500).json({ error: 'Failed to fetch team member' });
+      
+      // Handle specific Supabase errors
+      if (memberError.code === 'PGRST116') {
+        return res.status(404).json({ 
+          error: 'Team member not found',
+          errorType: 'NOT_FOUND',
+          userMessage: 'The team member you are trying to delete does not exist.'
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Database error while fetching team member',
+        errorType: 'DATABASE_ERROR',
+        userMessage: 'Unable to retrieve team member information. Please try again later.'
+      });
     }
     
     if (!teamMember) {
-      return res.status(404).json({ error: 'Team member not found' });
+      return res.status(404).json({ 
+        error: 'Team member not found',
+        errorType: 'NOT_FOUND',
+        userMessage: 'The team member you are trying to delete does not exist.'
+      });
     }
     
     // Check if team member has active job assignments
     const { data: assignedJobs, error: jobsError } = await supabase
       .from('jobs')
-      .select('id, status', { count: 'exact' })
+      .select('id, status, title', { count: 'exact' })
       .eq('team_member_id', id)
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
     if (jobsError) {
       console.error('Error checking assigned jobs:', jobsError);
-      return res.status(500).json({ error: 'Failed to check job assignments' });
+      return res.status(500).json({ 
+        error: 'Database error while checking job assignments',
+        errorType: 'DATABASE_ERROR',
+        userMessage: 'Unable to check for active job assignments. Please try again later.'
+      });
     }
     
-    // Only prevent deletion if team member is ACTIVE and has active job assignments
+    // Enhanced validation for active team members with job assignments
     if (teamMember.status === 'active' && assignedJobs && assignedJobs.length > 0) {
+      const jobTitles = assignedJobs.slice(0, 3).map(job => job.title || 'Untitled Job').join(', ');
+      const additionalJobs = assignedJobs.length > 3 ? ` and ${assignedJobs.length - 3} more` : '';
+      
       return res.status(400).json({ 
-        error: 'Cannot delete active team member with active job assignments. Please reassign or complete their jobs first, or deactivate the team member first.' 
+        error: 'Cannot delete active team member with active job assignments',
+        errorType: 'BUSINESS_RULE_VIOLATION',
+        userMessage: `Cannot delete ${teamMember.first_name} ${teamMember.last_name} because they have ${assignedJobs.length} active job assignment(s): ${jobTitles}${additionalJobs}. Please reassign or complete these jobs first, or deactivate the team member instead.`,
+        details: {
+          teamMemberName: `${teamMember.first_name} ${teamMember.last_name}`,
+          activeJobsCount: assignedJobs.length,
+          activeJobs: assignedJobs.slice(0, 5).map(job => ({
+            id: job.id,
+            title: job.title || 'Untitled Job',
+            status: job.status
+          }))
+        }
+      });
+    }
+    
+    // Check for any other constraints (e.g., team member is the only admin)
+    const { data: adminCount, error: adminError } = await supabase
+      .from('team_members')
+      .select('id', { count: 'exact' })
+      .eq('user_id', teamMember.user_id)
+      .eq('status', 'active')
+      .eq('role', 'admin');
+    
+    if (adminError) {
+      console.error('Error checking admin count:', adminError);
+      return res.status(500).json({ 
+        error: 'Database error while checking admin status',
+        errorType: 'DATABASE_ERROR',
+        userMessage: 'Unable to verify admin status. Please try again later.'
+      });
+    }
+    
+    // Check if this is the last admin
+    if (teamMember.role === 'admin' && adminCount && adminCount.length <= 1) {
+      return res.status(400).json({ 
+        error: 'Cannot delete the last admin team member',
+        errorType: 'BUSINESS_RULE_VIOLATION',
+        userMessage: `Cannot delete ${teamMember.first_name} ${teamMember.last_name} because they are the only admin team member. Please assign another admin before deleting this team member.`
       });
     }
     
@@ -6945,6 +7026,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
     // 1. Inactive team members (regardless of job assignments)
     // 2. Active team members with no active job assignments
     // 3. Invited team members (never activated)
+    // 4. Non-admin team members
     
     // Actually DELETE the team member from the database
     const { error: deleteError } = await supabase
@@ -6954,14 +7036,57 @@ app.delete('/api/team-members/:id', async (req, res) => {
     
     if (deleteError) {
       console.error('Error deleting team member:', deleteError);
-      return res.status(500).json({ error: 'Failed to delete team member' });
+      
+      // Handle specific deletion errors
+      if (deleteError.code === '23503') { // Foreign key constraint violation
+        return res.status(400).json({ 
+          error: 'Cannot delete team member due to related records',
+          errorType: 'CONSTRAINT_VIOLATION',
+          userMessage: 'Cannot delete this team member because they have related records in the system. Please contact support if you need assistance.'
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Database error while deleting team member',
+        errorType: 'DATABASE_ERROR',
+        userMessage: 'Unable to delete team member. Please try again later or contact support if the problem persists.'
+      });
     }
     
     console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} permanently deleted from database`);
-    res.json({ message: 'Team member permanently deleted successfully' });
+    res.json({ 
+      message: 'Team member permanently deleted successfully',
+      success: true,
+      deletedMember: {
+        id: teamMember.id,
+        name: `${teamMember.first_name} ${teamMember.last_name}`
+      }
+    });
   } catch (error) {
     console.error('Delete team member error:', error);
-    res.status(500).json({ error: 'Failed to delete team member' });
+    
+    // Handle specific error types
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ 
+        error: 'Invalid request data',
+        errorType: 'VALIDATION_ERROR',
+        userMessage: 'The request data is invalid. Please check your input and try again.'
+      });
+    }
+    
+    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      return res.status(503).json({ 
+        error: 'Service temporarily unavailable',
+        errorType: 'SERVICE_UNAVAILABLE',
+        userMessage: 'The service is temporarily unavailable. Please try again in a few moments.'
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Internal server error',
+      errorType: 'INTERNAL_ERROR',
+      userMessage: 'An unexpected error occurred. Please try again later or contact support if the problem persists.'
+    });
   }
 });
 
@@ -7338,6 +7463,10 @@ app.post('/api/team-members/register', async (req, res) => {
     
     console.log('🔍 Attempting database insert...');
     
+    // Generate a random color for the team member
+    const colors = ['#2563EB', '#DC2626', '#059669', '#D97706', '#7C3AED', '#DB2777', '#6B7280'];
+    const randomColor = colors[Math.floor(Math.random() * colors.length)];
+    
     const { data: teamMember, error: insertError } = await supabase
       .from('team_members')
       .insert({
@@ -7355,6 +7484,7 @@ app.post('/api/team-members/register', async (req, res) => {
         territories: territories || [],
         availability: availability || {},
         permissions: permissions || {},
+        color: randomColor,
         invitation_token: invitationToken,
         invitation_expires: invitationExpires.toISOString(),
         status: 'invited'
