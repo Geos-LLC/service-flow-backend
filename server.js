@@ -361,6 +361,25 @@ app.use(cors(corsOptions));
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
+// Additional catch-all OPTIONS handler for debugging
+app.options('*', (req, res) => {
+  console.log('🔍 Catch-all OPTIONS request for:', req.path, 'from origin:', req.headers.origin);
+  
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400');
+  
+  console.log('🔍 Catch-all OPTIONS response sent');
+  res.status(200).end();
+});
+
 // Additional CORS middleware for all requests - ALLOW ALL ORIGINS
 app.use((req, res, next) => {
   console.log('🌐 CORS: Processing request:', req.method, req.url, 'from origin:', req.headers.origin);
@@ -418,6 +437,12 @@ app.use((req, res, next) => {
   
   // Log all requests for debugging
   console.log('📡 Request received:', req.method, req.path, req.query);
+  console.log('📡 Request headers:', {
+    origin: req.headers.origin,
+    'content-type': req.headers['content-type'],
+    'authorization': req.headers.authorization ? 'Present' : 'Missing',
+    'user-agent': req.headers['user-agent']?.substring(0, 50)
+  });
   
   next();
 });
