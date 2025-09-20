@@ -1,5 +1,5 @@
 const express = require('express');
-
+const axios = require('axios');
 const cors = require('cors');
 const { supabase, db } = require('./supabase');
 const { BUCKETS, ensureBuckets, uploadToStorage, deleteFromStorage, getFileUrl } = require('./supabase-storage');
@@ -9808,100 +9808,36 @@ app.put('/api/invoices/:id/status', async (req, res) => {
     res.status(500).json({ error: 'Failed to update invoice status' });
   }
 });
-// Google Places API endpoints (New)
+// Google Places API endpoints (Simple approach)
 app.get('/api/places/autocomplete', async (req, res) => {
   try {
-    const { input, sessiontoken } = req.query;
+    const { input } = req.query;
     
     if (!input || input.length < 3) {
       return res.json({ predictions: [] });
     }
     
-    // Try using the same key that works for geocoding
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...', sessiontoken });
+    console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...' });
     
-    // Use the new Places API (New) with proper implementation
-    const requestBody = {
-      input: input,
-      includedRegionCodes: ['US'], // USA country code
-      languageCode: 'en',
-      inputType: 'TEXT_QUERY'
-    };
-    
-    if (sessiontoken) {
-      requestBody.sessionToken = sessiontoken;
-    }
-    
-    const options = {
-      hostname: 'places.googleapis.com',
-      path: `/v1/places:autocomplete?key=${GOOGLE_API_KEY}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-FieldMask': 'suggestions.placePrediction.place,suggestions.placePrediction.text'
+    const response = await axios.get(
+      "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+      {
+        params: {
+          input,
+          key: GOOGLE_API_KEY,
+          types: "geocode",
+          components: "country:us",
+        },
       }
-    };
+    );
     
-    console.log('Making request to:', options.hostname + options.path);
-    console.log('Request body:', requestBody);
-    
-    const request = https.request(options, (response) => {
-      let data = '';
-      
-      response.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      response.on('end', () => {
-        try {
-          console.log("Google Places API (New) raw response:", data);
-          const jsonData = JSON.parse(data);
-          console.log("Parsed API response:", jsonData);
-          
-          // Check for API errors
-          if (jsonData.error) {
-            console.error('Google Places API error:', jsonData.error);
-            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error.message });
-          }
-          
-          // Convert new API format to legacy format for compatibility
-          const suggestions = jsonData.suggestions || [];
-          const predictions = suggestions.map(suggestion => {
-            if (suggestion.placePrediction) {
-              return {
-                description: suggestion.placePrediction.text?.text || '',
-                place_id: suggestion.placePrediction.place?.id || '',
-                structured_formatting: {
-                  main_text: suggestion.placePrediction.text?.text || '',
-                  secondary_text: ''
-                }
-              };
-            }
-            return null;
-          }).filter(Boolean);
-          
-          console.log("Converted predictions:", predictions);
-          res.json({ predictions });
-        } catch (error) {
-          console.error('Error parsing Google Places response:', error);
-          return res.status(500).json({ error: 'Failed to parse address suggestions' });
-        }
-      });
-    });
-    
-    request.on('error', (error) => {
-      console.error('Google Places autocomplete error:', error);
-      return res.status(500).json({ error: 'Failed to fetch address suggestions' });
-    });
-    
-    // Send the POST body
-    request.write(JSON.stringify(requestBody));
-    request.end();
+    console.log("Google Places API response:", response.data);
+    res.json(response.data.predictions);
   } catch (error) {
     console.error('Google Places autocomplete error:', error);
-    res.status(500).json({ error: 'Failed to fetch address suggestions' });
+    res.status(500).json({ error: "Autocomplete failed" });
   }
 });
 
@@ -9913,65 +9849,26 @@ app.get('/api/places/details', async (req, res) => {
       return res.status(400).json({ error: 'place_id is required' });
     }
     
-    // Try using the same key that works for geocoding
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
     
-    // Use the new Places API (New) with proper implementation
-    const options = {
-      hostname: 'places.googleapis.com',
-      path: `/v1/places/${place_id}?key=${GOOGLE_API_KEY}`,
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-FieldMask': 'addressComponents,formattedAddress'
-      }
-    };
-    
     console.log('Fetching place details for:', place_id);
-    console.log('Making request to:', options.hostname + options.path);
     
-    const request = https.request(options, (response) => {
-      let data = '';
-      
-      response.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      response.on('end', () => {
-        try {
-          console.log("Google Places API (New) details response:", data);
-          const jsonData = JSON.parse(data);
-          
-          // Check for API errors
-          if (jsonData.error) {
-            console.error('Google Places API error:', jsonData.error);
-            return res.status(500).json({ error: 'Google Places API error: ' + jsonData.error.message });
-          }
-          
-          // Convert new API format to legacy format for compatibility
-          const result = {
-            formatted_address: jsonData.formattedAddress || '',
-            address_components: jsonData.addressComponents || []
-          };
-          
-          console.log("Converted place details:", result);
-          res.json({ result });
-        } catch (error) {
-          console.error('Error parsing Google Places response:', error);
-          res.status(500).json({ error: 'Failed to parse place details' });
-        }
-      });
-    });
+    const response = await axios.get(
+      "https://maps.googleapis.com/maps/api/place/details/json",
+      {
+        params: {
+          place_id: place_id,
+          key: GOOGLE_API_KEY,
+          fields: "formatted_address,geometry,name,address_components",
+        },
+      }
+    );
     
-    request.on('error', (error) => {
-      console.error('Google Places details error:', error);
-      res.status(500).json({ error: 'Failed to fetch place details' });
-    });
-    
-    request.end();
+    console.log("Google Places API details response:", response.data);
+    res.json(response.data.result);
   } catch (error) {
     console.error('Google Places details error:', error);
-    res.status(500).json({ error: 'Failed to fetch place details' });
+    res.status(500).json({ error: "Place details failed" });
   }
 });
 // Assign job to team member
