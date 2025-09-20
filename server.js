@@ -358,12 +358,9 @@ const corsOptions = {
 // Middleware
 app.use(cors(corsOptions));
 
-// Handle preflight requests
-app.options('*', cors(corsOptions));
-
-// Additional catch-all OPTIONS handler for debugging
+// Handle preflight requests - single OPTIONS handler
 app.options('*', (req, res) => {
-  console.log('🔍 Catch-all OPTIONS request for:', req.path, 'from origin:', req.headers.origin);
+  console.log('🔍 OPTIONS request for:', req.path, 'from origin:', req.headers.origin);
   
   const origin = req.headers.origin;
   if (origin) {
@@ -376,7 +373,7 @@ app.options('*', (req, res) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Max-Age', '86400');
   
-  console.log('🔍 Catch-all OPTIONS response sent');
+  console.log('🔍 OPTIONS response sent successfully');
   res.status(200).end();
 });
 
@@ -1626,19 +1623,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   }
 });
 
-// Handle OPTIONS requests for jobs
-app.options('/api/jobs/:id', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.status(200).end();
-});
+// OPTIONS handled by catch-all above
 
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
   // Set CORS headers explicitly
@@ -4814,19 +4799,7 @@ app.put('/api/user/availability', async (req, res) => {
 });
 
 // Territory Management API endpoints
-// Handle OPTIONS requests for territories
-app.options('/api/territories', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.status(200).end();
-});
+// OPTIONS handled by catch-all above
 
 app.get('/api/territories', authenticateToken, async (req, res) => {
   console.log('🏔️ Territories endpoint hit from origin:', req.headers.origin);
@@ -6520,19 +6493,7 @@ app.delete('/api/job-templates/:id', async (req, res) => {
 });
 
 // Team Management endpoints
-// Handle OPTIONS requests for team-members
-app.options('/api/team-members', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.status(200).end();
-});
+// OPTIONS handled by catch-all above
 
 app.get('/api/team-members', authenticateToken, async (req, res) => {
   console.log('🏃‍♂️ Team members endpoint hit from origin:', req.headers.origin);
