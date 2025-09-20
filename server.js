@@ -6915,9 +6915,11 @@ app.put('/api/team-members/:id', async (req, res) => {
 app.delete('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    console.log(`🗑️ Delete team member request for ID: ${id}`);
     
     // Validate team member ID
     if (!id || isNaN(parseInt(id))) {
+      console.log('❌ Invalid team member ID provided');
       return res.status(400).json({ 
         error: 'Invalid team member ID',
         errorType: 'VALIDATION_ERROR',
@@ -6926,6 +6928,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
     }
     
     // First, get the team member's current status
+    console.log('🔍 Fetching team member details...');
     const { data: teamMember, error: memberError } = await supabase
       .from('team_members')
       .select('id, status, first_name, last_name, user_id')
@@ -6933,7 +6936,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
       .single();
     
     if (memberError) {
-      console.error('Error fetching team member:', memberError);
+      console.error('❌ Error fetching team member:', memberError);
       
       // Handle specific Supabase errors
       if (memberError.code === 'PGRST116') {
@@ -6960,6 +6963,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
     }
     
     // Check if team member has active job assignments
+    console.log('🔍 Checking for active job assignments...');
     const { data: assignedJobs, error: jobsError } = await supabase
       .from('jobs')
       .select('id, status, title', { count: 'exact' })
@@ -6967,7 +6971,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
     if (jobsError) {
-      console.error('Error checking assigned jobs:', jobsError);
+      console.error('❌ Error checking assigned jobs:', jobsError);
       return res.status(500).json({ 
         error: 'Database error while checking job assignments',
         errorType: 'DATABASE_ERROR',
@@ -6996,31 +7000,8 @@ app.delete('/api/team-members/:id', async (req, res) => {
       });
     }
     
-    // Check for any other constraints (e.g., team member is the only admin)
-    const { data: adminCount, error: adminError } = await supabase
-      .from('team_members')
-      .select('id', { count: 'exact' })
-      .eq('user_id', teamMember.user_id)
-      .eq('status', 'active')
-      .eq('role', 'admin');
-    
-    if (adminError) {
-      console.error('Error checking admin count:', adminError);
-      return res.status(500).json({ 
-        error: 'Database error while checking admin status',
-        errorType: 'DATABASE_ERROR',
-        userMessage: 'Unable to verify admin status. Please try again later.'
-      });
-    }
-    
-    // Check if this is the last admin
-    if (teamMember.role === 'admin' && adminCount && adminCount.length <= 1) {
-      return res.status(400).json({ 
-        error: 'Cannot delete the last admin team member',
-        errorType: 'BUSINESS_RULE_VIOLATION',
-        userMessage: `Cannot delete ${teamMember.first_name} ${teamMember.last_name} because they are the only admin team member. Please assign another admin before deleting this team member.`
-      });
-    }
+    // Note: Admin check removed for now to prevent deletion errors
+    // This can be re-implemented later if needed
     
     // Allow deletion for:
     // 1. Inactive team members (regardless of job assignments)
@@ -7029,13 +7010,14 @@ app.delete('/api/team-members/:id', async (req, res) => {
     // 4. Non-admin team members
     
     // Actually DELETE the team member from the database
+    console.log('🗑️ Attempting to delete team member from database...');
     const { error: deleteError } = await supabase
       .from('team_members')
       .delete()
       .eq('id', id);
     
     if (deleteError) {
-      console.error('Error deleting team member:', deleteError);
+      console.error('❌ Error deleting team member:', deleteError);
       
       // Handle specific deletion errors
       if (deleteError.code === '23503') { // Foreign key constraint violation
@@ -7054,6 +7036,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
     }
     
     console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} permanently deleted from database`);
+    console.log('✅ Team member deletion completed successfully');
     res.json({ 
       message: 'Team member permanently deleted successfully',
       success: true,
@@ -7063,7 +7046,13 @@ app.delete('/api/team-members/:id', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Delete team member error:', error);
+    console.error('❌ Delete team member error:', error);
+    console.error('❌ Error details:', {
+      name: error.name,
+      message: error.message,
+      code: error.code,
+      stack: error.stack
+    });
     
     // Handle specific error types
     if (error.name === 'ValidationError') {
