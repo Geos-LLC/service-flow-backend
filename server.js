@@ -6834,8 +6834,23 @@ app.put('/api/team-members/:id', async (req, res) => {
       updateData.permissions = permissions;
     }
     
+    // Only include color if the column exists (handle gracefully)
     if (color !== undefined) {
-      updateData.color = color;
+      // Check if color column exists by trying a test query first
+      try {
+        const { error: testError } = await supabase
+          .from('team_members')
+          .select('color')
+          .limit(1);
+        
+        if (!testError) {
+          updateData.color = color;
+        } else {
+          console.log('Color column does not exist, skipping color update');
+        }
+      } catch (err) {
+        console.log('Color column does not exist, skipping color update');
+      }
     }
     
     // Update team member
