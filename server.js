@@ -341,108 +341,35 @@ const upload = multer({
   }
 });
 
-// CORS configuration - Allow all origins
+// CORS configuration - Specific origins for production
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow all origins for development
-    callback(null, true);
-  },
+  origin: [
+    'https://www.service-flow.pro', 
+    'https://service-flow.pro',
+    'http://localhost:3000', // for development
+    'http://localhost:3001'   // for development
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control', 'X-HTTP-Method-Override'],
   exposedHeaders: ['Content-Length', 'X-Requested-With'],
   preflightContinue: false,
-  optionsSuccessStatus: 204
+  optionsSuccessStatus: 200
 };
 
 // Middleware
 app.use(cors(corsOptions));
 
-// Handle preflight requests - single OPTIONS handler
-app.options('*', (req, res) => {
-  console.log('🔍 OPTIONS request for:', req.path, 'from origin:', req.headers.origin);
-  
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400');
-  
-  console.log('🔍 OPTIONS response sent successfully');
-  res.status(200).end();
-});
+// Handle preflight requests using cors middleware
+app.options('*', cors(corsOptions));
 
-// Additional CORS middleware for all requests - ALLOW ALL ORIGINS
+// Log all requests for debugging
 app.use((req, res, next) => {
-  console.log('🌐 CORS: Processing request:', req.method, req.url, 'from origin:', req.headers.origin);
-  
-  // Set CORS headers for all requests - ALLOW ALL ORIGINS
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400');
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    console.log('🔍 Preflight request received for:', req.url, 'from origin:', req.headers.origin);
-    console.log('🔍 Sending preflight response with headers:', {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override'
-    });
-    res.status(200).end();
-    return;
-  }
-  
-  console.log('🌐 CORS: Headers set for:', req.method, req.url);
+  console.log('📡 Request received:', req.method, req.path, 'from origin:', req.headers.origin);
   next();
 });
 
-// Comprehensive CORS headers for all responses - ALLOW ALL ORIGINS
-app.use((req, res, next) => {
-  console.log('🌐 CORS-2: Processing request:', req.method, req.url);
-  
-  // Set CORS headers for all responses - FORCE ALLOW ALL ORIGINS
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400');
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    console.log('🔍 CORS-2: Preflight request for:', req.path, 'from origin:', req.headers.origin);
-    res.status(200).json({ message: 'CORS preflight OK' });
-    return;
-  }
-  
-  // Log all requests for debugging
-  console.log('📡 Request received:', req.method, req.path, req.query);
-  console.log('📡 Request headers:', {
-    origin: req.headers.origin,
-    'content-type': req.headers['content-type'],
-    'authorization': req.headers.authorization ? 'Present' : 'Missing',
-    'user-agent': req.headers['user-agent']?.substring(0, 50)
-  });
-  
-  next();
-});
+// CORS is now handled by the cors middleware above
 
 // CORS test endpoint
 app.get('/api/test-cors', (req, res) => {
