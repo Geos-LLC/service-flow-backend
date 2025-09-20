@@ -366,7 +366,12 @@ app.use((req, res, next) => {
   console.log('🌐 CORS: Processing request:', req.method, req.url, 'from origin:', req.headers.origin);
   
   // Set CORS headers for all requests - ALLOW ALL ORIGINS
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -393,7 +398,12 @@ app.use((req, res, next) => {
   console.log('🌐 CORS-2: Processing request:', req.method, req.url);
   
   // Set CORS headers for all responses - FORCE ALLOW ALL ORIGINS
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -410,6 +420,27 @@ app.use((req, res, next) => {
   console.log('📡 Request received:', req.method, req.path, req.query);
   
   next();
+});
+
+// CORS test endpoint
+app.get('/api/test-cors', (req, res) => {
+  console.log('🧪 CORS test endpoint hit from origin:', req.headers.origin);
+  
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  res.json({ 
+    message: 'CORS test successful', 
+    origin: origin,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Define public routes that don't require authentication
@@ -1568,6 +1599,20 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     console.error('Get jobs error:', error);
     res.status(500).json({ error: 'Failed to fetch jobs' });
   }
+});
+
+// Handle OPTIONS requests for jobs
+app.options('/api/jobs/:id', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.status(200).end();
 });
 
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
@@ -4744,12 +4789,31 @@ app.put('/api/user/availability', async (req, res) => {
 });
 
 // Territory Management API endpoints
+// Handle OPTIONS requests for territories
+app.options('/api/territories', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.status(200).end();
+});
+
 app.get('/api/territories', authenticateToken, async (req, res) => {
   console.log('🏔️ Territories endpoint hit from origin:', req.headers.origin);
   console.log('🏔️ Query params:', req.query);
   
   // Set CORS headers explicitly - ALLOW ALL ORIGINS
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
@@ -6431,12 +6495,31 @@ app.delete('/api/job-templates/:id', async (req, res) => {
 });
 
 // Team Management endpoints
+// Handle OPTIONS requests for team-members
+app.options('/api/team-members', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.status(200).end();
+});
+
 app.get('/api/team-members', authenticateToken, async (req, res) => {
   console.log('🏃‍♂️ Team members endpoint hit from origin:', req.headers.origin);
   console.log('🏃‍♂️ Query params:', req.query);
   
   // Set CORS headers explicitly - ALLOW ALL ORIGINS
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
   res.header('Access-Control-Allow-Credentials', 'true');
