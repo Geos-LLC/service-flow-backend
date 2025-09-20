@@ -11,6 +11,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const validator = require('validator');
+
 // Nodemailer removed - using SendGrid only
 const sgMail = require('@sendgrid/mail');
 
@@ -7243,7 +7244,8 @@ app.post('/api/team-members/register', async (req, res) => {
       hourlyRate,
       territories,
       availability,
-      permissions
+      permissions,
+      isServiceProvider = false
     } = req.body;
     
     // Validate required fields
