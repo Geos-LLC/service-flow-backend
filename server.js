@@ -366,6 +366,11 @@ app.options('*', cors(corsOptions));
 // Log all requests for debugging
 app.use((req, res, next) => {
   console.log('📡 Request received:', req.method, req.path, 'from origin:', req.headers.origin);
+  console.log('📡 Request headers:', {
+    'content-type': req.headers['content-type'],
+    'authorization': req.headers.authorization ? 'Present' : 'Missing',
+    'user-agent': req.headers['user-agent']?.substring(0, 50)
+  });
   next();
 });
 
@@ -1553,16 +1558,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
 // OPTIONS handled by catch-all above
 
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const userId = req.user.userId;
@@ -4732,16 +4728,7 @@ app.get('/api/territories', authenticateToken, async (req, res) => {
   console.log('🏔️ Territories endpoint hit from origin:', req.headers.origin);
   console.log('🏔️ Query params:', req.query);
   
-  // Set CORS headers explicitly - ALLOW ALL ORIGINS
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   console.log('🏔️ CORS headers set for territories endpoint');
   
@@ -6426,16 +6413,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
   console.log('🏃‍♂️ Team members endpoint hit from origin:', req.headers.origin);
   console.log('🏃‍♂️ Query params:', req.query);
   
-  // Set CORS headers explicitly - ALLOW ALL ORIGINS
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   console.log('🏃‍♂️ CORS headers set for team-members endpoint');
   
