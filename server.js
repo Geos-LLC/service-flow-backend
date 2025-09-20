@@ -2093,7 +2093,19 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { status } = req.body;
+    let { status } = req.body;
+
+    // Map frontend status values to database enum values
+    const statusMapping = {
+      'in_progress': 'in-progress',
+      'in-progress': 'in-progress',
+      'pending': 'pending',
+      'confirmed': 'confirmed',
+      'completed': 'completed',
+      'cancelled': 'cancelled'
+    };
+
+    status = statusMapping[status] || status;
 
     console.log('🔄 Updating job status:', { id, status });
 
@@ -12350,20 +12362,20 @@ app.get('/api/customers/:customerId/notifications', async (req, res) => {
     const { customerId } = req.params;
     
     // Get customer notification preferences from database
-    const { data: customer, error } = await supabase
-      .from('customers')
+    const { data: preferences, error } = await supabase
+      .from('customer_notification_preferences')
       .select('email_notifications, sms_notifications')
-      .eq('id', customerId)
+      .eq('customer_id', customerId)
       .single();
     
     if (error) {
       console.error('Error fetching customer notification preferences:', error);
-      return res.status(404).json({ error: 'Customer not found' });
+      return res.status(404).json({ error: 'Customer notification preferences not found' });
     }
     
     res.json({
-      email_notifications: customer.email_notifications || false,
-      sms_notifications: customer.sms_notifications || false
+      email_notifications: preferences.email_notifications || false,
+      sms_notifications: preferences.sms_notifications || false
     });
   } catch (error) {
     console.error('Get customer notification preferences error:', error);
@@ -12377,24 +12389,24 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
     const { email_notifications, sms_notifications } = req.body;
     
     // Update customer notification preferences
-    const { data: customer, error } = await supabase
-      .from('customers')
-      .update({
+    const { data: preferences, error } = await supabase
+      .from('customer_notification_preferences')
+      .upsert({
+        customer_id: customerId,
         email_notifications: email_notifications || false,
         sms_notifications: sms_notifications || false
       })
-      .eq('id', customerId)
       .select()
       .single();
     
     if (error) {
       console.error('Error updating customer notification preferences:', error);
-      return res.status(404).json({ error: 'Customer not found' });
+      return res.status(404).json({ error: 'Customer notification preferences not found' });
     }
     
     res.json({
-      email_notifications: customer.email_notifications,
-      sms_notifications: customer.sms_notifications
+      email_notifications: preferences.email_notifications,
+      sms_notifications: preferences.sms_notifications
     });
   } catch (error) {
     console.error('Update customer notification preferences error:', error);
