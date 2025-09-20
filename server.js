@@ -6966,7 +6966,7 @@ app.delete('/api/team-members/:id', async (req, res) => {
     console.log('🔍 Checking for active job assignments...');
     const { data: assignedJobs, error: jobsError } = await supabase
       .from('jobs')
-      .select('id, status, title', { count: 'exact' })
+      .select('id, status', { count: 'exact' })
       .eq('team_member_id', id)
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
@@ -6981,19 +6981,15 @@ app.delete('/api/team-members/:id', async (req, res) => {
     
     // Enhanced validation for active team members with job assignments
     if (teamMember.status === 'active' && assignedJobs && assignedJobs.length > 0) {
-      const jobTitles = assignedJobs.slice(0, 3).map(job => job.title || 'Untitled Job').join(', ');
-      const additionalJobs = assignedJobs.length > 3 ? ` and ${assignedJobs.length - 3} more` : '';
-      
       return res.status(400).json({ 
         error: 'Cannot delete active team member with active job assignments',
         errorType: 'BUSINESS_RULE_VIOLATION',
-        userMessage: `Cannot delete ${teamMember.first_name} ${teamMember.last_name} because they have ${assignedJobs.length} active job assignment(s): ${jobTitles}${additionalJobs}. Please reassign or complete these jobs first, or deactivate the team member instead.`,
+        userMessage: `Cannot delete ${teamMember.first_name} ${teamMember.last_name} because they have ${assignedJobs.length} active job assignment(s). Please reassign or complete these jobs first, or deactivate the team member instead.`,
         details: {
           teamMemberName: `${teamMember.first_name} ${teamMember.last_name}`,
           activeJobsCount: assignedJobs.length,
           activeJobs: assignedJobs.slice(0, 5).map(job => ({
             id: job.id,
-            title: job.title || 'Untitled Job',
             status: job.status
           }))
         }
