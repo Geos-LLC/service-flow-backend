@@ -569,6 +569,12 @@ testSupabaseConnection();
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
+  // Skip authentication for OPTIONS requests (CORS preflight)
+  if (req.method === 'OPTIONS') {
+    console.log('🔓 Skipping auth for OPTIONS request');
+    return next();
+  }
+
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
@@ -1328,16 +1334,7 @@ app.delete('/api/services/:id', authenticateToken, async (req, res) => {
 
 // Jobs endpoints
 app.get('/api/jobs', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId } = req.query;
@@ -1682,16 +1679,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
 
 // Create job endpoint
 app.post('/api/jobs', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const userId = req.user.userId;
@@ -2101,16 +2089,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
 
 // Update job endpoint
 app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const userId = req.user.userId;
@@ -2318,16 +2297,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
 // Delete job endpoint
 app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const userId = req.user.userId;
@@ -9962,16 +9932,7 @@ app.get('/api/places/details', async (req, res) => {
 });
 // Assign job to team member
 app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const { jobId } = req.params;
@@ -10067,16 +10028,7 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
 
 // Remove team member assignment from job
 app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const { jobId, teamMemberId } = req.params;
@@ -10196,16 +10148,7 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
 
 // Get team assignments for a job
 app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const { jobId } = req.params;
@@ -10250,16 +10193,7 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
 
 // Assign multiple team members to a job
 app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res) => {
-  // Set CORS headers explicitly
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   try {
     const { jobId } = req.params;
@@ -11190,11 +11124,7 @@ app.get('/api/test-branding', (req, res) => {
 
 // Test endpoint to verify CORS is working
 app.get('/api/test-cors', (req, res) => {
-  // Set CORS headers explicitly
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
+  // CORS handled by middleware
   
   console.log('🧪 CORS test endpoint hit at:', new Date().toISOString());
   res.json({ 
@@ -11206,13 +11136,7 @@ app.get('/api/test-cors', (req, res) => {
 });
 
 // Add OPTIONS handler for test endpoint
-app.options('/api/test-cors', (req, res) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.status(204).end();
-});
+// OPTIONS handled by catch-all above
 
 // Logo upload endpoint
 app.post('/api/upload/logo', upload.single('logo'), async (req, res) => {
