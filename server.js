@@ -501,6 +501,7 @@ app.options('/api/user/service-areas', (req, res) => res.status(204).send());
 // Add OPTIONS handlers for jobs endpoints
 app.options('/api/jobs', (req, res) => res.status(204).send());
 app.options('/api/jobs/:id', (req, res) => res.status(204).send());
+app.options('/api/jobs/:id/status', (req, res) => res.status(204).send());
 app.options('/api/jobs/:jobId/assign', (req, res) => res.status(204).send());
 app.options('/api/jobs/:jobId/assign/:teamMemberId', (req, res) => res.status(204).send());
 app.options('/api/jobs/:jobId/assignments', (req, res) => res.status(204).send());
@@ -2084,6 +2085,59 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Create job error:', error);
     res.status(500).json({ error: 'Failed to create job' });
+  }
+});
+
+// Update job status endpoint
+app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { status } = req.body;
+
+    console.log('🔄 Updating job status:', { id, status });
+
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (checkError) {
+      console.error('Error checking job existence:', checkError);
+      return res.status(500).json({ error: 'Failed to update job status' });
+    }
+
+    if (!existingJob || existingJob.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Update job status
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({ 
+        status: status,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (updateError) {
+      console.error('Error updating job status:', updateError);
+      return res.status(500).json({ error: 'Failed to update job status' });
+    }
+
+    console.log('🔄 Job status updated successfully');
+    
+    res.json({
+      message: 'Job status updated successfully',
+      status: status
+    });
+  } catch (error) {
+    console.error('Update job status error:', error);
+    res.status(500).json({ error: 'Failed to update job status' });
   }
 });
 
