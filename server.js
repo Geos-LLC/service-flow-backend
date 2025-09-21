@@ -12655,7 +12655,95 @@ app.get('/api/customers/:customerId/notifications/history', async (req, res) => 
     res.status(500).json({ error: 'Failed to fetch notification history' });
   }
 });
+// Google Places API Autocomplete endpoint
+app.get('/api/places/autocomplete', async (req, res) => {
+  try {
+    const { input } = req.query;
+    
+    if (!input) {
+      return res.status(400).json({ error: 'Input is required' });
+    }
 
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
+      console.warn('Using fallback Google API key - this may have limited functionality');
+    }
+
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&types=address`
+    );
+
+    if (response.data.status === 'OK') {
+      res.json({ predictions: response.data.predictions });
+    } else {
+      console.error('Google Places API error:', response.data.status, response.data.error_message);
+      res.status(400).json({ 
+        error: `Google Places API error: ${response.data.status}`, 
+        details: response.data.error_message 
+      });
+    }
+
+  } catch (error) {
+    console.error('Places autocomplete error:', error);
+    
+    if (error.response) {
+      console.error('Google API error response:', error.response.data);
+      res.status(400).json({ 
+        error: 'Places autocomplete failed', 
+        details: error.response.data?.error?.message || 'Unknown API error'
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Places autocomplete service unavailable',
+        details: error.message
+      });
+    }
+  }
+});
+
+// Google Place Details API endpoint
+app.get('/api/places/details', async (req, res) => {
+  try {
+    const { place_id } = req.query;
+    
+    if (!place_id) {
+      return res.status(400).json({ error: 'Place ID is required' });
+    }
+
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&key=${GOOGLE_API_KEY}&fields=formatted_address,address_components,geometry`
+    );
+
+    if (response.data.status === 'OK') {
+      res.json({ result: response.data.result });
+    } else {
+      console.error('Google Place Details API error:', response.data.status, response.data.error_message);
+      res.status(400).json({ 
+        error: `Google Place Details API error: ${response.data.status}`, 
+        details: response.data.error_message 
+      });
+    }
+
+  } catch (error) {
+    console.error('Place details error:', error);
+    
+    if (error.response) {
+      console.error('Google API error response:', error.response.data);
+      res.status(400).json({ 
+        error: 'Place details failed', 
+        details: error.response.data?.error?.message || 'Unknown API error'
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Place details service unavailable',
+        details: error.message
+      });
+    }
+  }
+});
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
@@ -12767,6 +12855,8 @@ app.post('/api/fix-schema', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
 
 // Google Geocoding API proxy endpoint for address validation fallback
 
