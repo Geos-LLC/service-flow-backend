@@ -12525,6 +12525,75 @@ app.post('/api/address/validate', async (req, res) => {
     }
   }
 });
+
+app.post('/api/address/geocode', async (req, res) => {
+  try {
+    const { address } = req.body;
+    
+    if (!address) {
+      return res.status(400).json({ error: 'Address is required' });
+    }
+
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`
+    );
+
+    if (response.data.status === 'OK' && response.data.results && response.data.results.length > 0) {
+      const result = response.data.results[0];
+      const formattedAddress = result.formatted_address;
+      
+      // Process the geocoding result into validation format
+      const validationResult = {
+        isValid: true,
+        confidence: 'MEDIUM',
+        formattedAddress: formattedAddress,
+        components: {
+          streetNumber: result.address_components?.find(c => c.types.includes('street_number'))?.long_name,
+          route: result.address_components?.find(c => c.types.includes('route'))?.long_name,
+          locality: result.address_components?.find(c => c.types.includes('locality'))?.long_name,
+          administrativeArea: result.address_components?.find(c => c.types.includes('administrative_area_level_1'))?.long_name,
+          postalCode: result.address_components?.find(c => c.types.includes('postal_code'))?.long_name,
+          country: result.address_components?.find(c => c.types.includes('country'))?.long_name
+        },
+        geocode: result.geometry?.location,
+        suggestions: result.address_components?.map(comp => ({
+          type: comp.types[0],
+          name: comp.short_name,
+          longName: comp.long_name
+        })) || [],
+        issues: []
+      };
+
+      res.json({
+        success: true,
+        result: validationResult
+      });
+    } else {
+      res.json({
+        success: false,
+        result: {
+          isValid: false,
+          confidence: 'LOW',
+          formattedAddress: null,
+          components: {},
+          geocode: null,
+          suggestions: [],
+          issues: ['Address not found']
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Geocoding API error:', error);
+    res.status(500).json({ 
+      error: 'Geocoding service unavailable',
+      details: error.message
+    });
+  }
+});
+
 app.get('/api/customers/:customerId/notifications/history', async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -12652,5 +12721,8 @@ app.post('/api/fix-schema', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Google Geocoding API proxy endpoint for address validation fallback
+
 
 
