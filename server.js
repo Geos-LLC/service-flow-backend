@@ -12465,7 +12465,8 @@ app.post('/api/address/validate', async (req, res) => {
       },
       {
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'X-Goog-User-Project': 'serviceflow-backend'
         }
       }
     );
@@ -12513,6 +12514,51 @@ app.post('/api/address/validate', async (req, res) => {
     
     if (error.response) {
       console.error('Google API error response:', error.response.data);
+      console.error('Google API error status:', error.response.status);
+      console.error('Google API error headers:', error.response.headers);
+      
+      // If Google API fails, fall back to geocoding
+      try {
+        console.log('Falling back to geocoding API...');
+        const geocodeResponse = await axios.get(
+          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`
+        );
+        
+        if (geocodeResponse.data.status === 'OK' && geocodeResponse.data.results && geocodeResponse.data.results.length > 0) {
+          const result = geocodeResponse.data.results[0];
+          const formattedAddress = result.formatted_address;
+          
+          const fallbackResult = {
+            isValid: true,
+            confidence: 'MEDIUM',
+            formattedAddress: formattedAddress,
+            components: {
+              streetNumber: result.address_components?.find(c => c.types.includes('street_number'))?.long_name,
+              route: result.address_components?.find(c => c.types.includes('route'))?.long_name,
+              locality: result.address_components?.find(c => c.types.includes('locality'))?.long_name,
+              administrativeArea: result.address_components?.find(c => c.types.includes('administrative_area_level_1'))?.long_name,
+              postalCode: result.address_components?.find(c => c.types.includes('postal_code'))?.long_name,
+              country: result.address_components?.find(c => c.types.includes('country'))?.long_name
+            },
+            geocode: result.geometry?.location,
+            suggestions: result.address_components?.map(comp => ({
+              type: comp.types[0],
+              name: comp.short_name,
+              longName: comp.long_name
+            })) || [],
+            issues: []
+          };
+
+          res.json({
+            success: true,
+            result: fallbackResult
+          });
+          return;
+        }
+      } catch (fallbackError) {
+        console.error('Geocoding fallback also failed:', fallbackError);
+      }
+      
       res.status(400).json({ 
         error: 'Address validation failed', 
         details: error.response.data?.error?.message || 'Unknown API error'
