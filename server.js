@@ -1378,7 +1378,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         // Escape special characters in search term
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
         console.log('🔄 Backend: Escaped search term:', escapedSearch);
-        query = query.or(`customers.first_name.ilike.%${escapedSearch}%,customers.last_name.ilike.%${escapedSearch}%,services.name.ilike.%${escapedSearch}%`);
+        // Use a simpler search approach that's more reliable
+        query = query.or(`service_name.ilike.%${escapedSearch}%,customer_first_name.ilike.%${escapedSearch}%,customer_last_name.ilike.%${escapedSearch}%`);
       } catch (searchError) {
         console.error('🔄 Backend: Search query error:', searchError);
         // Continue without search filter if there's an error
@@ -1430,12 +1431,17 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add date filter
     if (dateFilter === 'future') {
-      query = query.gte('scheduled_date', new Date().toISOString().split('T')[0]);
+      const today = new Date().toISOString().split('T')[0];
+      console.log('🔄 Backend: Filtering for future jobs from:', today);
+      query = query.gte('scheduled_date', today);
     } else if (dateFilter === 'past') {
-      query = query.lt('scheduled_date', new Date().toISOString().split('T')[0]);
+      const today = new Date().toISOString().split('T')[0];
+      console.log('🔄 Backend: Filtering for past jobs before:', today);
+      query = query.lt('scheduled_date', today);
     } else if (dateRange) {
       const [startDate, endDate] = dateRange.split(':');
       if (startDate && endDate) {
+        console.log('🔄 Backend: Filtering for date range:', startDate, 'to', endDate);
         query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
       }
     }
@@ -1458,12 +1464,19 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     let jobs, error, count;
     try {
+      console.log('🔄 Backend: Executing Supabase query...');
       const result = await query;
       jobs = result.data;
       error = result.error;
       count = result.count;
+      console.log('🔄 Backend: Query executed successfully');
     } catch (queryError) {
       console.error('🔄 Backend: Query execution error:', queryError);
+      console.error('🔄 Backend: Query error details:', {
+        message: queryError.message,
+        stack: queryError.stack,
+        name: queryError.name
+      });
       return res.status(500).json({ 
         error: 'Failed to execute jobs query',
         details: queryError.message 
@@ -1485,12 +1498,72 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         sortBy,
         sortOrder,
         page,
-        limit
+        limit,
+        dateFilter
       });
-      return res.status(500).json({ 
-        error: 'Failed to fetch jobs',
-        details: error.message 
-      });
+      
+      // If it's a search-related error, try without search
+      if (search && (error.message.includes('ilike') || error.message.includes('search'))) {
+        console.log('🔄 Backend: Retrying without search filter...');
+        try {
+          // Rebuild query without search
+          let retryQuery = supabase
+            .from('jobs')
+            .select(`
+              *,
+              customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+              services!left(name, price, duration),
+              team_members!left(first_name, last_name, email)
+            `, { count: 'exact' })
+            .eq('user_id', userId);
+          
+          // Reapply other filters except search
+          if (status) {
+            const statusArray = status.split(',');
+            const mappedStatusArray = statusArray.map(s => {
+              switch (s) {
+                case 'in_progress':
+                  return 'in-progress';
+                default:
+                  return s;
+              }
+            });
+            retryQuery = retryQuery.in('status', mappedStatusArray);
+          }
+          
+          // Reapply date filter
+          if (dateFilter === 'future') {
+            const today = new Date().toISOString().split('T')[0];
+            retryQuery = retryQuery.gte('scheduled_date', today);
+          } else if (dateFilter === 'past') {
+            const today = new Date().toISOString().split('T')[0];
+            retryQuery = retryQuery.lt('scheduled_date', today);
+          }
+          
+          // Reapply sorting and pagination
+          retryQuery = retryQuery.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+          const offset = (page - 1) * limit;
+          retryQuery = retryQuery.range(offset, offset + parseInt(limit) - 1);
+          
+          const retryResult = await retryQuery;
+          jobs = retryResult.data;
+          error = retryResult.error;
+          count = retryResult.count;
+          
+          if (!error) {
+            console.log('🔄 Backend: Retry successful, returning jobs without search filter');
+          }
+        } catch (retryError) {
+          console.error('🔄 Backend: Retry also failed:', retryError);
+        }
+      }
+      
+      if (error) {
+        return res.status(500).json({ 
+          error: 'Failed to fetch jobs',
+          details: error.message 
+        });
+      }
     }
       
       console.log('🔄 Backend: Jobs query executed');
@@ -4995,11 +5068,11 @@ app.post('/api/territories', async (req, res) => {
       console.error('Supabase insert error:', error);
       return res.status(500).json({ error: 'Failed to create territory' });
     }
-      
-      res.status(201).json({
-        message: 'Territory created successfully',
+    
+    res.status(201).json({
+      message: 'Territory created successfully',
       territoryId: result.id
-      });
+    });
   } catch (error) {
     console.error('Create territory error:', error);
     res.status(500).json({ error: 'Failed to create territory' });
@@ -5044,8 +5117,8 @@ app.put('/api/territories/:id', async (req, res) => {
       console.error('Supabase update error:', error);
       return res.status(500).json({ error: 'Failed to update territory' });
     }
-      
-      res.json({ message: 'Territory updated successfully' });
+    
+    res.json({ message: 'Territory updated successfully' });
   } catch (error) {
     console.error('Update territory error:', error);
     res.status(500).json({ error: 'Failed to update territory' });
