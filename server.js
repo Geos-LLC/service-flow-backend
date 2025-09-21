@@ -1496,6 +1496,12 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       console.log('🔄 Backend: Jobs query executed');
       console.log('🔄 Backend: Jobs found:', jobs ? jobs.length : 0);
       console.log('🔄 Backend: First job:', jobs ? jobs[0] : null);
+      console.log('🔄 Backend: Jobs with customer data:', jobs ? jobs.map(job => ({
+        id: job.id,
+        customer_id: job.customer_id,
+        customer_data: job.customers,
+        has_customer_data: !!job.customers
+      })) : []);
       
       // Process jobs to add team assignments and format data
       const processedJobs = (jobs || []).map(job => {
@@ -1945,6 +1951,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       };
 
       console.log('🔄 Attempting to insert job with data:', jobData);
+      console.log('🔄 Customer ID being used:', customerId);
+      console.log('🔄 Customer ID type:', typeof customerId);
 
       const { data: result, error: insertError } = await supabase
         .from('jobs')
@@ -1959,6 +1967,22 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       }
       
             console.log('✅ Job created successfully:', result);
+            console.log('🔄 Created job customer_id:', result.customer_id);
+            
+            // Verify customer exists and get customer data
+            if (result.customer_id) {
+              const { data: customerData, error: customerError } = await supabase
+                .from('customers')
+                .select('id, first_name, last_name, email, phone')
+                .eq('id', result.customer_id)
+                .single();
+              
+              if (customerError) {
+                console.error('🔄 Error fetching customer data:', customerError);
+              } else {
+                console.log('🔄 Customer data found:', customerData);
+              }
+            }
       
       // Send success response
       res.json({
@@ -10077,6 +10101,10 @@ app.get('/api/places/autocomplete', async (req, res) => {
     
     console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...' });
     
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
+      console.warn('Using fallback Google API key - this may have limited functionality');
+    }
+    
     const response = await axios.get(
       "https://maps.googleapis.com/maps/api/place/autocomplete/json",
       {
@@ -10090,7 +10118,13 @@ app.get('/api/places/autocomplete', async (req, res) => {
     );
     
     console.log("Google Places API response:", response.data);
-    res.json(response.data.predictions);
+    
+    if (response.data.status === 'OK') {
+      res.json({ predictions: response.data.predictions });
+    } else {
+      console.error('Google Places API error:', response.data.status, response.data.error_message);
+      res.status(400).json({ error: `Google Places API error: ${response.data.status}`, details: response.data.error_message });
+    }
   } catch (error) {
     console.error('Google Places autocomplete error:', error);
     res.status(500).json({ error: "Autocomplete failed" });
@@ -10121,7 +10155,13 @@ app.get('/api/places/details', async (req, res) => {
     );
     
     console.log("Google Places API details response:", response.data);
-    res.json(response.data.result);
+    
+    if (response.data.status === 'OK') {
+      res.json({ result: response.data.result });
+    } else {
+      console.error('Google Places API details error:', response.data.status, response.data.error_message);
+      res.status(400).json({ error: `Google Places API error: ${response.data.status}`, details: response.data.error_message });
+    }
   } catch (error) {
     console.error('Google Places details error:', error);
     res.status(500).json({ error: "Place details failed" });

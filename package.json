@@ -1,7 +1,7 @@
 {
-    "name": "zenbooker-backend",
+    "name": "serviceflow-backend",
     "version": "1.0.0",
-    "description": "Backend API for zenbooker",
+    "description": "Backend API for serviceflow",
     "main": "server.js",
     "scripts": {
         "start": "node server.js",
@@ -13,9 +13,9 @@
         "express",
         "mysql",
         "api",
-        "zenbooker"
+        "serviceflow"
     ],
-    "author": "zenbooker Development Team",
+    "author": "serviceflow Development Team",
     "license": "MIT",
     "dependencies": {
         "@sendgrid/mail": "^8.1.5",
