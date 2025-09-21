@@ -10098,12 +10098,12 @@ app.get('/api/places/autocomplete', async (req, res) => {
       return res.json({ predictions: [] });
     }
     
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
     
     console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...' });
     
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
-      console.warn('Using fallback Google API key - this may have limited functionality');
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ') {
+      console.warn('Using provided Google API key - ensure it has Places API enabled');
     }
     
     const response = await axios.get(
@@ -10112,8 +10112,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
         params: {
           input,
           key: GOOGLE_API_KEY,
-          types: "geocode",
-          components: "country:us",
+          types: "address",
         },
       }
     );
@@ -10140,7 +10139,7 @@ app.get('/api/places/details', async (req, res) => {
       return res.status(400).json({ error: 'place_id is required' });
     }
     
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.GOOGLE_API_KEY || "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8";
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
     
     console.log('Fetching place details for:', place_id);
     
@@ -12466,8 +12465,8 @@ app.post('/api/address/validate', async (req, res) => {
 
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
     
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
-      console.warn('Using fallback Google API key - this may have limited functionality');
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ') {
+      console.warn('Using provided Google API key - ensure it has Places API enabled');
     }
 
     const response = await axios.post(
@@ -12682,95 +12681,55 @@ async function checkColorColumn() {
   }
 }
 
-// Google Places API Autocomplete endpoint
-app.get('/api/places/autocomplete', async (req, res) => {
+// Migration endpoint to add color column
+app.post('/api/migrate/add-color-column', async (req, res) => {
   try {
-    const { input } = req.query;
+    console.log('Starting color column migration...');
     
-    if (!input) {
-      return res.status(400).json({ error: 'Input is required' });
-    }
-
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    // Add color column
+    const { error: alterError } = await supabase.rpc('exec_sql', {
+      sql: "ALTER TABLE team_members ADD COLUMN IF NOT EXISTS color VARCHAR(7) DEFAULT '#2563EB'"
+    });
     
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
-      console.warn('Using fallback Google API key - this may have limited functionality');
+    if (alterError) {
+      console.error('Error adding color column:', alterError);
+      return res.status(500).json({ error: 'Failed to add color column', details: alterError.message });
     }
-
-    const response = await axios.get(
-      `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&key=${GOOGLE_API_KEY}&types=address`
-    );
-
-    if (response.data.status === 'OK') {
-      res.json({ predictions: response.data.predictions });
-    } else {
-      console.error('Google Places API error:', response.data.status, response.data.error_message);
-      res.status(400).json({ 
-        error: `Google Places API error: ${response.data.status}`, 
-        details: response.data.error_message 
-      });
+    
+    // Update existing team members with default colors
+    const { error: updateError } = await supabase.rpc('exec_sql', {
+      sql: `
+        UPDATE team_members 
+        SET color = CASE 
+          WHEN id % 7 = 1 THEN '#2563EB'
+          WHEN id % 7 = 2 THEN '#DC2626'
+          WHEN id % 7 = 3 THEN '#059669'
+          WHEN id % 7 = 4 THEN '#D97706'
+          WHEN id % 7 = 5 THEN '#7C3AED'
+          WHEN id % 7 = 6 THEN '#DB2777'
+          ELSE '#6B7280'
+        END
+        WHERE color IS NULL OR color = '#2563EB'
+      `
+    });
+    
+    if (updateError) {
+      console.error('Error updating colors:', updateError);
+      return res.status(500).json({ error: 'Failed to update colors', details: updateError.message });
     }
-
+    
+    console.log('Color column migration completed successfully');
+    res.json({ 
+      success: true, 
+      message: 'Color column added and existing team members updated with default colors' 
+    });
+    
   } catch (error) {
-    console.error('Places autocomplete error:', error);
-    
-    if (error.response) {
-      console.error('Google API error response:', error.response.data);
-      res.status(400).json({ 
-        error: 'Places autocomplete failed', 
-        details: error.response.data?.error?.message || 'Unknown API error'
-      });
-    } else {
-      res.status(500).json({ 
-        error: 'Places autocomplete service unavailable',
-        details: error.message
-      });
-    }
+    console.error('Migration error:', error);
+    res.status(500).json({ error: 'Migration failed', details: error.message });
   }
 });
 
-// Google Place Details API endpoint
-app.get('/api/places/details', async (req, res) => {
-  try {
-    const { place_id } = req.query;
-    
-    if (!place_id) {
-      return res.status(400).json({ error: 'Place ID is required' });
-    }
-
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
-    
-    const response = await axios.get(
-      `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&key=${GOOGLE_API_KEY}&fields=formatted_address,address_components,geometry`
-    );
-
-    if (response.data.status === 'OK') {
-      res.json({ result: response.data.result });
-    } else {
-      console.error('Google Place Details API error:', response.data.status, response.data.error_message);
-      res.status(400).json({ 
-        error: `Google Place Details API error: ${response.data.status}`, 
-        details: response.data.error_message 
-      });
-    }
-
-  } catch (error) {
-    console.error('Place details error:', error);
-    
-    if (error.response) {
-      console.error('Google API error response:', error.response.data);
-      res.status(400).json({ 
-        error: 'Place details failed', 
-        details: error.response.data?.error?.message || 'Unknown API error'
-      });
-    } else {
-      res.status(500).json({ 
-        error: 'Place details service unavailable',
-        details: error.message
-      });
-    }
-  }
-});
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
