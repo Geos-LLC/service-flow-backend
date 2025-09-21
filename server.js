@@ -6801,7 +6801,7 @@ app.post('/api/team-members', async (req, res) => {
         zip_code: zipCode || null,
         territories,
         permissions,
-        color: randomColor,
+        ...(await checkColorColumn() ? { color: randomColor } : {}),
         status: 'invited',
         invitation_token: invitationToken,
         invitation_expires: invitationExpires
@@ -6924,10 +6924,24 @@ app.put('/api/team-members/:id', async (req, res) => {
       updateData.permissions = permissions;
     }
     
-    // Include color if provided
+    // Include color if provided (only if column exists)
     if (color !== undefined) {
-      updateData.color = color;
-      console.log('Setting team member color:', color);
+      // Check if color column exists by trying a test query first
+      try {
+        const { error: testError } = await supabase
+          .from('team_members')
+          .select('color')
+          .limit(1);
+        
+        if (!testError) {
+          updateData.color = color;
+          console.log('Setting team member color:', color);
+        } else {
+          console.log('Color column does not exist, skipping color update');
+        }
+      } catch (err) {
+        console.log('Color column does not exist, skipping color update');
+      }
     }
     
     // Update team member
@@ -7563,7 +7577,7 @@ app.post('/api/team-members/register', async (req, res) => {
         territories: territories || [],
         availability: availability || {},
         permissions: permissions || {},
-        color: randomColor,
+        ...(await checkColorColumn() ? { color: randomColor } : {}),
         invitation_token: invitationToken,
         invitation_expires: invitationExpires.toISOString(),
         status: 'invited'
@@ -12655,6 +12669,19 @@ app.get('/api/customers/:customerId/notifications/history', async (req, res) => 
     res.status(500).json({ error: 'Failed to fetch notification history' });
   }
 });
+// Helper function to check if color column exists
+async function checkColorColumn() {
+  try {
+    const { error } = await supabase
+      .from('team_members')
+      .select('color')
+      .limit(1);
+    return !error;
+  } catch (err) {
+    return false;
+  }
+}
+
 // Google Places API Autocomplete endpoint
 app.get('/api/places/autocomplete', async (req, res) => {
   try {
