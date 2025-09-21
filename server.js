@@ -12441,6 +12441,90 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
   }
 });
 
+// Address Validation API endpoint
+app.post('/api/address/validate', async (req, res) => {
+  try {
+    const { address } = req.body;
+    
+    if (!address) {
+      return res.status(400).json({ error: 'Address is required' });
+    }
+
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
+      console.warn('Using fallback Google API key - this may have limited functionality');
+    }
+
+    const response = await axios.post(
+      `https://addressvalidation.googleapis.com/v1:validateAddress?key=${GOOGLE_API_KEY}`,
+      {
+        address: {
+          addressLines: [address]
+        }
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    if (response.data && response.data.result) {
+      const validationResult = response.data.result;
+      
+      // Extract useful information from the validation result
+      const processedResult = {
+        isValid: validationResult.verdict?.inputGranularity === 'PREMISE' || 
+                validationResult.verdict?.inputGranularity === 'SUB_PREMISE' ||
+                validationResult.verdict?.inputGranularity === 'ROUTE',
+        confidence: validationResult.verdict?.addressComplete ? 'HIGH' : 'MEDIUM',
+        formattedAddress: validationResult.address?.formattedAddress,
+        components: {
+          streetNumber: validationResult.address?.addressComponents?.find(c => c.componentType === 'street_number')?.componentName,
+          route: validationResult.address?.addressComponents?.find(c => c.componentType === 'route')?.componentName,
+          locality: validationResult.address?.addressComponents?.find(c => c.componentType === 'locality')?.componentName,
+          administrativeArea: validationResult.address?.addressComponents?.find(c => c.componentType === 'administrative_area_level_1')?.componentName,
+          postalCode: validationResult.address?.addressComponents?.find(c => c.componentType === 'postal_code')?.componentName,
+          country: validationResult.address?.addressComponents?.find(c => c.componentType === 'country')?.componentName
+        },
+        geocode: validationResult.geocode,
+        suggestions: validationResult.address?.addressComponents?.map(comp => ({
+          type: comp.componentType,
+          name: comp.componentName,
+          longName: comp.longName
+        })) || [],
+        issues: validationResult.verdict?.issues || []
+      };
+
+      res.json({
+        success: true,
+        result: processedResult
+      });
+    } else {
+      res.json({
+        success: false,
+        error: 'No validation result returned'
+      });
+    }
+
+  } catch (error) {
+    console.error('Address validation error:', error);
+    
+    if (error.response) {
+      console.error('Google API error response:', error.response.data);
+      res.status(400).json({ 
+        error: 'Address validation failed', 
+        details: error.response.data?.error?.message || 'Unknown API error'
+      });
+    } else {
+      res.status(500).json({ 
+        error: 'Address validation service unavailable',
+        details: error.message
+      });
+    }
+  }
+});
 app.get('/api/customers/:customerId/notifications/history', async (req, res) => {
   try {
     const { customerId } = req.params;
@@ -12569,88 +12653,4 @@ app.post('/api/fix-schema', async (req, res) => {
   }
 });
 
-// Address Validation API endpoint
-app.post('/api/address/validate', async (req, res) => {
-  try {
-    const { address } = req.body;
-    
-    if (!address) {
-      return res.status(400).json({ error: 'Address is required' });
-    }
-
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
-    
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === "AIzaSyBFw0Qbyq9zTFTd-tUY6dZWTgaQzuU17R8") {
-      console.warn('Using fallback Google API key - this may have limited functionality');
-    }
-
-    const response = await axios.post(
-      `https://addressvalidation.googleapis.com/v1:validateAddress?key=${GOOGLE_API_KEY}`,
-      {
-        address: {
-          addressLines: [address]
-        }
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    if (response.data && response.data.result) {
-      const validationResult = response.data.result;
-      
-      // Extract useful information from the validation result
-      const processedResult = {
-        isValid: validationResult.verdict?.inputGranularity === 'PREMISE' || 
-                validationResult.verdict?.inputGranularity === 'SUB_PREMISE' ||
-                validationResult.verdict?.inputGranularity === 'ROUTE',
-        confidence: validationResult.verdict?.addressComplete ? 'HIGH' : 'MEDIUM',
-        formattedAddress: validationResult.address?.formattedAddress,
-        components: {
-          streetNumber: validationResult.address?.addressComponents?.find(c => c.componentType === 'street_number')?.componentName,
-          route: validationResult.address?.addressComponents?.find(c => c.componentType === 'route')?.componentName,
-          locality: validationResult.address?.addressComponents?.find(c => c.componentType === 'locality')?.componentName,
-          administrativeArea: validationResult.address?.addressComponents?.find(c => c.componentType === 'administrative_area_level_1')?.componentName,
-          postalCode: validationResult.address?.addressComponents?.find(c => c.componentType === 'postal_code')?.componentName,
-          country: validationResult.address?.addressComponents?.find(c => c.componentType === 'country')?.componentName
-        },
-        geocode: validationResult.geocode,
-        suggestions: validationResult.address?.addressComponents?.map(comp => ({
-          type: comp.componentType,
-          name: comp.componentName,
-          longName: comp.longName
-        })) || [],
-        issues: validationResult.verdict?.issues || []
-      };
-
-      res.json({
-        success: true,
-        result: processedResult
-      });
-    } else {
-      res.json({
-        success: false,
-        error: 'No validation result returned'
-      });
-    }
-
-  } catch (error) {
-    console.error('Address validation error:', error);
-    
-    if (error.response) {
-      console.error('Google API error response:', error.response.data);
-      res.status(400).json({ 
-        error: 'Address validation failed', 
-        details: error.response.data?.error?.message || 'Unknown API error'
-      });
-    } else {
-      res.status(500).json({ 
-        error: 'Address validation service unavailable',
-        details: error.message
-      });
-    }
-  }
-});
 
