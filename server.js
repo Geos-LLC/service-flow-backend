@@ -1378,8 +1378,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         // Escape special characters in search term
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
         console.log('🔄 Backend: Escaped search term:', escapedSearch);
-        // Use a simpler search approach that's more reliable
-        query = query.or(`service_name.ilike.%${escapedSearch}%,customer_first_name.ilike.%${escapedSearch}%,customer_last_name.ilike.%${escapedSearch}%`);
+        // Search in joined tables using the correct syntax
+        query = query.or(`service_name.ilike.%${escapedSearch}%,customers.first_name.ilike.%${escapedSearch}%,customers.last_name.ilike.%${escapedSearch}%`);
       } catch (searchError) {
         console.error('🔄 Backend: Search query error:', searchError);
         // Continue without search filter if there's an error
@@ -1503,7 +1503,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       });
       
       // If it's a search-related error, try without search
-      if (search && (error.message.includes('ilike') || error.message.includes('search'))) {
+      if (search && (error.message.includes('ilike') || error.message.includes('search') || error.message.includes('column') || error.message.includes('does not exist'))) {
         console.log('🔄 Backend: Retrying without search filter...');
         try {
           // Rebuild query without search
