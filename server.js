@@ -2331,7 +2331,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     Object.keys(updateData).forEach(key => {
       console.log(`🔄 Processing field: ${key}, value: ${updateData[key]}, mapped: ${fieldMappings[key]}`);
-      if (fieldMappings[key] && updateData[key] !== undefined) {
+      if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
         // Handle special cases
         if (key === 'scheduledDate' && updateData.scheduledTime) {
           // Simply combine date and time as-is, no timezone conversion
@@ -2341,11 +2341,18 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
           updateDataToSend[fieldMappings[key]] = updateData[key];
         } else if (key === 'serviceAddress') {
           // Handle nested service address
+          console.log(`🔄 Processing serviceAddress:`, updateData[key]);
           if (updateData[key]) {
             updateDataToSend.service_address_street = updateData[key].street || null;
             updateDataToSend.service_address_city = updateData[key].city || null;
             updateDataToSend.service_address_state = updateData[key].state || null;
             updateDataToSend.service_address_zip = updateData[key].zipCode || null;
+            console.log(`🔄 Mapped service address fields:`, {
+              service_address_street: updateDataToSend.service_address_street,
+              service_address_city: updateDataToSend.service_address_city,
+              service_address_state: updateDataToSend.service_address_state,
+              service_address_zip: updateDataToSend.service_address_zip
+            });
           }
         } else {
           updateDataToSend[fieldMappings[key]] = updateData[key];
@@ -7705,7 +7712,7 @@ app.post('/api/team-members/register', async (req, res) => {
     console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
     
     // Generate invitation link
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
     sendTeamMemberEmail({
@@ -7950,7 +7957,7 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
               </ul>
             </div>
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/dashboard" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+              <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
                 Access Your Dashboard
               </a>
             </div>
@@ -7958,7 +7965,7 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
             <p>Best regards,<br>The Service Flow Team</p>
           </div>
         `,
-        text: `Welcome to Service Flow! Your account has been activated. Visit ${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/dashboard to access your dashboard.`
+        text: `Welcome to Service Flow! Your account has been activated. Visit ${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard to access your dashboard.`
       });
       console.log('✅ Activation confirmation email sent to team member');
     } catch (emailError) {
@@ -8066,7 +8073,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       
       // Send new invitation email
       try {
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
         
       await sendTeamMemberEmail({
           to: teamMember.email,
@@ -8113,7 +8120,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       return res.status(200).json({ 
         message: 'Invitation token updated successfully, but email delivery failed',
         warning: errorMessage,
-        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`
+        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`
         });
       }
       
