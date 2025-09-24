@@ -1664,6 +1664,10 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     
     const job = jobs[0];
     
+    console.log('🔧 Backend: Job retrieved from database:', job);
+    console.log('🔧 Backend: service_modifiers field:', job.service_modifiers);
+    console.log('🔧 Backend: service_modifiers type:', typeof job.service_modifiers);
+    
     // Get intake answers from job_answers table
     const { data: intakeAnswers, error: answersError } = await supabase
       .from('job_answers')
@@ -1834,6 +1838,10 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
     let processedModifiers = [];
     let processedIntakeQuestions = [];
 
+    console.log('🔧 Backend: Processing modifiers for job creation');
+    console.log('🔧 Backend: serviceModifiers:', serviceModifiers);
+    console.log('🔧 Backend: selectedModifiers:', req.body.selectedModifiers);
+
     // Process selected modifiers to calculate price and duration
     if (serviceModifiers && Array.isArray(serviceModifiers)) {
       processedModifiers = serviceModifiers.map(modifier => {
@@ -1890,6 +1898,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         };
       });
     }
+
+    console.log('🔧 Backend: Final processedModifiers:', processedModifiers);
+    console.log('🔧 Backend: processedModifiers length:', processedModifiers.length);
 
     // Process intake questions with answers
     console.log('🔄 DEBUG: serviceIntakeQuestions type:', typeof serviceIntakeQuestions);
@@ -2026,6 +2037,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       console.log('🔄 Attempting to insert job with data:', jobData);
       console.log('🔄 Customer ID being used:', customerId);
       console.log('🔄 Customer ID type:', typeof customerId);
+      console.log('🔧 Backend: service_modifiers being stored:', jobData.service_modifiers);
+      console.log('🔧 Backend: service_modifiers type:', typeof jobData.service_modifiers);
 
       const { data: result, error: insertError } = await supabase
         .from('jobs')
