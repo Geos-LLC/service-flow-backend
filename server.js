@@ -1559,10 +1559,10 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       }
       
       if (error) {
-        return res.status(500).json({ 
-          error: 'Failed to fetch jobs',
-          details: error.message 
-        });
+      return res.status(500).json({ 
+        error: 'Failed to fetch jobs',
+        details: error.message 
+      });
       }
     }
       
@@ -5075,11 +5075,11 @@ app.post('/api/territories', async (req, res) => {
       console.error('Supabase insert error:', error);
       return res.status(500).json({ error: 'Failed to create territory' });
     }
-    
-    res.status(201).json({
-      message: 'Territory created successfully',
+      
+      res.status(201).json({
+        message: 'Territory created successfully',
       territoryId: result.id
-    });
+      });
   } catch (error) {
     console.error('Create territory error:', error);
     res.status(500).json({ error: 'Failed to create territory' });
@@ -5124,8 +5124,8 @@ app.put('/api/territories/:id', async (req, res) => {
       console.error('Supabase update error:', error);
       return res.status(500).json({ error: 'Failed to update territory' });
     }
-    
-    res.json({ message: 'Territory updated successfully' });
+      
+      res.json({ message: 'Territory updated successfully' });
   } catch (error) {
     console.error('Update territory error:', error);
     res.status(500).json({ error: 'Failed to update territory' });
