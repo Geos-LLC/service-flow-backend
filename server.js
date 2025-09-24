@@ -1232,31 +1232,56 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
     
     // Prepare modifiers for storage
     let modifiersToStore = null;
+    console.log('🔧 Service Update: Received modifiers:', modifiers);
+    console.log('🔧 Service Update: Modifiers type:', typeof modifiers);
+    
     if (modifiers) {
       try {
         // If modifiers is already a string, use it; otherwise stringify it
         modifiersToStore = typeof modifiers === 'string' ? modifiers : JSON.stringify(modifiers);
+        console.log('🔧 Service Update: Prepared modifiers for storage:', modifiersToStore);
       } catch (error) {
         console.error('Error preparing modifiers for storage:', error);
         modifiersToStore = null;
       }
+    } else {
+      console.log('🔧 Service Update: No modifiers provided, keeping existing ones');
     }
+    
+    // Build update object with only provided fields
+    const updateData = {
+      name: sanitizedName,
+      description: sanitizedDescription,
+      price: price || 0,
+      duration: duration || 60,
+      category: sanitizedCategory,
+      require_payment_method: require_payment_method || false,
+      image: image,
+      updated_at: new Date().toISOString()
+    };
+    
+    // Only update modifiers if provided
+    if (modifiers !== undefined) {
+      updateData.modifiers = modifiersToStore;
+      console.log('🔧 Service Update: Updating modifiers field');
+    } else {
+      console.log('🔧 Service Update: Preserving existing modifiers');
+    }
+    
+    // Only update intake_questions if provided
+    if (intake_questions !== undefined) {
+      updateData.intake_questions = intake_questions;
+      console.log('🔧 Service Update: Updating intake_questions field');
+    } else {
+      console.log('🔧 Service Update: Preserving existing intake_questions');
+    }
+    
+    console.log('🔧 Service Update: Final update data:', updateData);
     
     // Update service
     const { data: updatedService, error: updateError } = await supabase
       .from('services')
-      .update({
-        name: sanitizedName,
-        description: sanitizedDescription,
-        price: price || 0,
-        duration: duration || 60,
-        category: sanitizedCategory,
-        modifiers: modifiersToStore,
-        intake_questions: intake_questions,
-        require_payment_method: require_payment_method || false,
-        image: image,
-        updated_at: new Date().toISOString()
-      })
+      .update(updateData)
       .eq('id', id)
       .eq('user_id', userId)
       .select()
