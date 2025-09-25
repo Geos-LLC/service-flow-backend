@@ -1869,15 +1869,24 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
 
     // Process selected modifiers to calculate price and duration
     if (serviceModifiers && Array.isArray(serviceModifiers)) {
+      console.log('🔧 Backend: Processing modifiers with selectedModifiers:', req.body.selectedModifiers);
+      console.log('🔧 Backend: serviceModifiers count:', serviceModifiers.length);
+      
       processedModifiers = serviceModifiers.map(modifier => {
-        const selectedOptions = req.body.selectedModifiers?.[modifier.id] || [];
+        console.log('🔧 Backend: Processing modifier:', modifier.id, modifier.title);
+        const selectedModifierData = req.body.selectedModifiers?.[modifier.id];
+        console.log('🔧 Backend: selectedModifierData for modifier', modifier.id, ':', selectedModifierData);
+        
         let modifierPrice = 0;
         let modifierDuration = 0;
         let selectedOptionsData = [];
 
         if (modifier.selectionType === 'quantity') {
-          // Handle quantity selection
-          Object.entries(selectedOptions).forEach(([optionId, quantity]) => {
+          // Handle quantity selection - selectedModifierData.quantities contains {optionId: quantity}
+          const quantities = selectedModifierData?.quantities || {};
+          console.log('🔧 Backend: Processing quantities for modifier', modifier.id, ':', quantities);
+          
+          Object.entries(quantities).forEach(([optionId, quantity]) => {
             const option = modifier.options?.find(o => o.id == optionId);
             if (option && quantity > 0) {
               const optionPrice = parseFloat(option.price) || 0;
@@ -1892,10 +1901,12 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               });
             }
           });
-        } else {
-          // Handle single/multi selection
-          const selectedOptionIds = Array.isArray(selectedOptions) ? selectedOptions : [selectedOptions];
-          selectedOptionIds.forEach(optionId => {
+        } else if (modifier.selectionType === 'multi') {
+          // Handle multi-selection - selectedModifierData.selections contains [optionId1, optionId2]
+          const selections = selectedModifierData?.selections || [];
+          console.log('🔧 Backend: Processing multi-selections for modifier', modifier.id, ':', selections);
+          
+          selections.forEach(optionId => {
             const option = modifier.options?.find(o => o.id == optionId);
             if (option) {
               const optionPrice = parseFloat(option.price) || 0;
@@ -1910,10 +1921,77 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               });
             }
           });
+        } else {
+          // Handle single selection - selectedModifierData.selection contains optionId
+          const selection = selectedModifierData?.selection;
+          console.log('🔧 Backend: Processing single selection for modifier', modifier.id, ':', selection);
+          
+          if (selection) {
+            const option = modifier.options?.find(o => o.id == selection);
+            if (option) {
+              const optionPrice = parseFloat(option.price) || 0;
+              const optionDuration = parseFloat(option.duration) || 0;
+              modifierPrice += optionPrice;
+              modifierDuration += optionDuration;
+              selectedOptionsData.push({
+                ...option,
+                selected: true,
+                totalPrice: optionPrice,
+                totalDuration: optionDuration
+              });
+            }
+          }
+        }
+        
+        // Fallback: If no selections were found with the new format, try the old format
+        if (selectedOptionsData.length === 0 && selectedModifierData) {
+          console.log('🔧 Backend: No selections found with new format, trying old format for modifier', modifier.id);
+          
+          // Try old format where selectedModifierData is directly an array or object
+          if (Array.isArray(selectedModifierData)) {
+            selectedModifierData.forEach(optionId => {
+              const option = modifier.options?.find(o => o.id == optionId);
+              if (option) {
+                const optionPrice = parseFloat(option.price) || 0;
+                const optionDuration = parseFloat(option.duration) || 0;
+                modifierPrice += optionPrice;
+                modifierDuration += optionDuration;
+                selectedOptionsData.push({
+                  ...option,
+                  selected: true,
+                  totalPrice: optionPrice,
+                  totalDuration: optionDuration
+                });
+              }
+            });
+          } else if (typeof selectedModifierData === 'object' && !selectedModifierData.quantities && !selectedModifierData.selections && !selectedModifierData.selection) {
+            // Try old format where it's {optionId: quantity}
+            Object.entries(selectedModifierData).forEach(([optionId, quantity]) => {
+              const option = modifier.options?.find(o => o.id == optionId);
+              if (option && quantity > 0) {
+                const optionPrice = parseFloat(option.price) || 0;
+                const optionDuration = parseFloat(option.duration) || 0;
+                modifierPrice += optionPrice * quantity;
+                modifierDuration += optionDuration * quantity;
+                selectedOptionsData.push({
+                  ...option,
+                  selectedQuantity: quantity,
+                  totalPrice: optionPrice * quantity,
+                  totalDuration: optionDuration * quantity
+                });
+              }
+            });
+          }
         }
 
         finalPrice += modifierPrice;
         finalDuration += modifierDuration;
+
+        console.log('🔧 Backend: Final modifier data for', modifier.id, ':', {
+          selectedOptions: selectedOptionsData,
+          totalModifierPrice: modifierPrice,
+          totalModifierDuration: modifierDuration
+        });
 
         return {
           ...modifier,
@@ -1922,10 +2000,33 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           totalModifierDuration: modifierDuration
         };
       });
+    } else {
+      console.log('🔧 Backend: No serviceModifiers found or not an array:', serviceModifiers);
     }
 
     console.log('🔧 Backend: Final processedModifiers:', processedModifiers);
     console.log('🔧 Backend: processedModifiers length:', processedModifiers.length);
+    
+    // If we have modifiers but no processed modifiers, log a warning
+    if (serviceModifiers && Array.isArray(serviceModifiers) && serviceModifiers.length > 0 && processedModifiers.length === 0) {
+      console.log('⚠️ WARNING: Service has modifiers but none were processed. This might indicate a scope issue.');
+      console.log('⚠️ serviceModifiers:', serviceModifiers);
+      console.log('⚠️ selectedModifiers:', req.body.selectedModifiers);
+      
+      // Check if selectedModifiers has any data at all
+      const hasSelectedModifiers = req.body.selectedModifiers && Object.keys(req.body.selectedModifiers).length > 0;
+      console.log('⚠️ hasSelectedModifiers:', hasSelectedModifiers);
+      
+      if (!hasSelectedModifiers) {
+        console.log('⚠️ No selectedModifiers found in request body. This suggests the frontend is not sending modifier selections.');
+      } else {
+        console.log('⚠️ selectedModifiers found but no matches with serviceModifiers. Checking for ID mismatches...');
+        serviceModifiers.forEach(modifier => {
+          const hasMatch = req.body.selectedModifiers[modifier.id];
+          console.log(`⚠️ Modifier ${modifier.id} (${modifier.title}) has match:`, !!hasMatch);
+        });
+      }
+    }
 
     // Process intake questions with answers
     console.log('🔄 DEBUG: serviceIntakeQuestions type:', typeof serviceIntakeQuestions);
