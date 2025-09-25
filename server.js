@@ -2004,8 +2004,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       console.log('🔧 Backend: No serviceModifiers found or not an array:', serviceModifiers);
     }
 
-    console.log('🔧 Backend: Final processedModifiers:', processedModifiers);
-    console.log('🔧 Backend: processedModifiers length:', processedModifiers.length);
+      console.log('🔧 Backend: Final processedModifiers:', processedModifiers);
+      console.log('🔧 Backend: processedModifiers length:', processedModifiers.length);
+      console.log('🔧 Backend: processedModifiers details:', processedModifiers.map(m => ({
+        id: m.id,
+        title: m.title,
+        selectedOptions: m.selectedOptions,
+        selectedOptionsLength: m.selectedOptions?.length
+      })));
     
     // If we have modifiers but no processed modifiers, log a warning
     if (serviceModifiers && Array.isArray(serviceModifiers) && serviceModifiers.length > 0 && processedModifiers.length === 0) {
@@ -2165,6 +2171,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       console.log('🔄 Customer ID type:', typeof customerId);
       console.log('🔧 Backend: service_modifiers being stored:', jobData.service_modifiers);
       console.log('🔧 Backend: service_modifiers type:', typeof jobData.service_modifiers);
+      console.log('🔧 Backend: service_modifiers stringified:', JSON.stringify(jobData.service_modifiers, null, 2));
 
       const { data: result, error: insertError } = await supabase
         .from('jobs')
