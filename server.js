@@ -1862,6 +1862,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
     let finalDuration = parseFloat(duration) || 0;
     let processedModifiers = [];
     let processedIntakeQuestions = [];
+    
+    // Use the total from frontend if provided (it already includes modifiers)
+    let finalTotal = parseFloat(total) || finalPrice;
+    
+    console.log('🔧 Backend: Price calculation:');
+    console.log('🔧 - Base price (finalPrice):', finalPrice);
+    console.log('🔧 - Frontend total:', total);
+    console.log('🔧 - Final total to use:', finalTotal);
 
     console.log('🔧 Backend: Processing modifiers for job creation');
     console.log('🔧 Backend: serviceModifiers:', serviceModifiers);
@@ -1984,7 +1992,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           }
         }
 
-        finalPrice += modifierPrice;
+        // Don't add modifier price to finalPrice since it's already included in finalTotal
+        // finalPrice += modifierPrice;
         finalDuration += modifierDuration;
 
         console.log('🔧 Backend: Final modifier data for', modifier.id, ':', {
@@ -2012,6 +2021,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         selectedOptions: m.selectedOptions,
         selectedOptionsLength: m.selectedOptions?.length
       })));
+      
+      console.log('🔧 Backend: Final calculation values:');
+      console.log('🔧 - finalPrice (base):', finalPrice);
+      console.log('🔧 - finalTotal (with modifiers):', finalTotal);
+      console.log('🔧 - finalDuration:', finalDuration);
     
     // If we have modifiers but no processed modifiers, log a warning
     if (serviceModifiers && Array.isArray(serviceModifiers) && serviceModifiers.length > 0 && processedModifiers.length === 0) {
@@ -2135,7 +2149,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         discount: discount,
         additional_fees: additionalFees,
         taxes: taxes,
-        total: finalPrice,
+        total: finalTotal,
         payment_method: paymentMethod,
         territory: territory,
         is_recurring: recurringJob,
@@ -10170,7 +10184,7 @@ app.post('/api/public/business/:businessSlug/book', async (req, res) => {
     
     // Create invoice record
     const [serviceResult] = await pool.query('SELECT price FROM services WHERE id = ?', [bookingData.service]);
-    const price = serviceResult[0]?.price || 0;
+    const price = serviceResult[0]?.price || 0;               
     
     await pool.query(
       'INSERT INTO invoices (user_id, customer_id, job_id, amount, total_amount, status, due_date) VALUES (?, ?, ?, ?, ?, ?, ?)',
