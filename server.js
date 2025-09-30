@@ -25,6 +25,11 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cron = require('node-cron');
 const https = require('https');
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
+const { google } = require('googleapis');
+const twilio = require('twilio');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
 require('dotenv').config();
 
 // Email configuration - SendGrid only
@@ -45,6 +50,36 @@ if (SENDGRID_API_KEY) {
   console.log('⚠️ SendGrid API key not configured - using fallback email service');
 }
 console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
+
+// Google OAuth Configuration
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/api/auth/google/callback';
+
+// Google Calendar and Sheets Configuration
+const GOOGLE_CALENDAR_SCOPES = [
+  'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/calendar.events'
+];
+
+const GOOGLE_SHEETS_SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/drive.file'
+];
+
+// Twilio Configuration
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
+
+// Initialize Twilio client
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// Initialize Google OAuth client
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+console.log('✅ Google OAuth configured:', GOOGLE_CLIENT_ID ? 'Yes' : 'No');
+console.log('✅ Twilio configured:', TWILIO_ACCOUNT_SID ? 'Yes' : 'No');
 
 // Test SendGrid configuration
 async function testSendGridConfig() {
@@ -900,6 +935,113 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Logout error:', error);
     res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// Google OAuth endpoints
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    
+    if (!idToken) {
+      return res.status(400).json({ error: 'Google ID token is required' });
+    }
+    
+    // Verify the Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: idToken,
+      audience: GOOGLE_CLIENT_ID
+    });
+    
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name, picture } = payload;
+    
+    console.log('🔍 Google OAuth payload:', { googleId, email, name });
+    
+    // Check if user already exists
+    const { data: existingUsers, error: fetchError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, business_name, profile_picture, google_id')
+      .eq('email', email)
+      .limit(1);
+    
+    if (fetchError) {
+      console.error('Error fetching user:', fetchError);
+      return res.status(500).json({ error: 'Authentication failed' });
+    }
+    
+    let user;
+    
+    if (existingUsers && existingUsers.length > 0) {
+      // User exists, update Google ID if not set
+      user = existingUsers[0];
+      if (!user.google_id) {
+        const { error: updateError } = await supabase
+          .from('users')
+          .update({ google_id: googleId })
+          .eq('id', user.id);
+        
+        if (updateError) {
+          console.error('Error updating Google ID:', updateError);
+        }
+      }
+    } else {
+      // Create new user
+      const nameParts = name.split(' ');
+      const firstName = nameParts[0] || '';
+      const lastName = nameParts.slice(1).join(' ') || '';
+      
+      const { data: newUser, error: createError } = await supabase
+        .from('users')
+        .insert({
+          email: email,
+          first_name: firstName,
+          last_name: lastName,
+          business_name: `${firstName}'s Business`,
+          profile_picture: picture,
+          google_id: googleId,
+          password: null // No password for OAuth users
+        })
+        .select('id, email, first_name, last_name, business_name, profile_picture')
+        .single();
+      
+      if (createError) {
+        console.error('Error creating user:', createError);
+        return res.status(500).json({ error: 'Failed to create account' });
+      }
+      
+      user = newUser;
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name
+      },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    
+    res.json({ 
+      message: 'Google authentication successful',
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name,
+        profilePicture: user.profile_picture
+      }
+    });
+    
+  } catch (error) {
+    console.error('Google OAuth error:', error);
+    res.status(500).json({ error: 'Google authentication failed' });
   }
 });
 
@@ -13014,6 +13156,406 @@ app.use((err, req, res, next) => {
     message: 'Something went wrong on the server',
     ...(process.env.NODE_ENV === 'development' && { details: err.message })
   });
+});
+
+// Twilio SMS endpoints
+app.post('/api/sms/send', authenticateToken, async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    
+    if (!to || !message) {
+      return res.status(400).json({ error: 'Phone number and message are required' });
+    }
+    
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
+      return res.status(500).json({ error: 'Twilio not configured' });
+    }
+    
+    // Send SMS using Twilio
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: TWILIO_PHONE_NUMBER,
+      to: to
+    });
+    
+    console.log('📱 SMS sent successfully:', result.sid);
+    
+    res.json({ 
+      success: true, 
+      message: 'SMS sent successfully',
+      sid: result.sid
+    });
+    
+  } catch (error) {
+    console.error('SMS sending error:', error);
+    res.status(500).json({ error: 'Failed to send SMS' });
+  }
+});
+
+// Send job confirmation SMS
+app.post('/api/sms/job-confirmation', authenticateToken, async (req, res) => {
+  try {
+    const { customerPhone, jobDetails, customerName } = req.body;
+    
+    if (!customerPhone || !jobDetails) {
+      return res.status(400).json({ error: 'Customer phone and job details are required' });
+    }
+    
+    const message = `Hi ${customerName || 'there'}! Your booking is confirmed for ${jobDetails.service_name} on ${jobDetails.scheduled_date} at ${jobDetails.scheduled_time}. We'll see you soon! - ${req.user.businessName || 'Your Service Team'}`;
+    
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: TWILIO_PHONE_NUMBER,
+      to: customerPhone
+    });
+    
+    console.log('📱 Job confirmation SMS sent:', result.sid);
+    
+    res.json({ 
+      success: true, 
+      message: 'Job confirmation SMS sent successfully',
+      sid: result.sid
+    });
+    
+  } catch (error) {
+    console.error('Job confirmation SMS error:', error);
+    res.status(500).json({ error: 'Failed to send job confirmation SMS' });
+  }
+});
+
+// Send payment reminder SMS
+app.post('/api/sms/payment-reminder', authenticateToken, async (req, res) => {
+  try {
+    const { customerPhone, invoiceDetails, customerName } = req.body;
+    
+    if (!customerPhone || !invoiceDetails) {
+      return res.status(400).json({ error: 'Customer phone and invoice details are required' });
+    }
+    
+    const message = `Hi ${customerName || 'there'}! This is a friendly reminder that your invoice #${invoiceDetails.invoice_number} for $${invoiceDetails.total_amount} is due. Please pay at your earliest convenience. - ${req.user.businessName || 'Your Service Team'}`;
+    
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: TWILIO_PHONE_NUMBER,
+      to: customerPhone
+    });
+    
+    console.log('📱 Payment reminder SMS sent:', result.sid);
+    
+    res.json({ 
+      success: true, 
+      message: 'Payment reminder SMS sent successfully',
+      sid: result.sid
+    });
+    
+  } catch (error) {
+    console.error('Payment reminder SMS error:', error);
+    res.status(500).json({ error: 'Failed to send payment reminder SMS' });
+  }
+});
+
+// Google Calendar endpoints
+app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, customerName, serviceName, scheduledDate, scheduledTime, duration, address } = req.body;
+    
+    if (!jobId || !customerName || !serviceName || !scheduledDate || !scheduledTime) {
+      return res.status(400).json({ error: 'Missing required job details' });
+    }
+
+    // Get user's Google access token (you'll need to store this when they authenticate)
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('google_access_token, google_refresh_token')
+      .eq('id', req.user.userId)
+      .single();
+
+    if (userError || !userData?.google_access_token) {
+      return res.status(400).json({ error: 'Google Calendar not connected. Please connect your Google account.' });
+    }
+
+    // Create OAuth2 client with user's tokens
+    const oauth2Client = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: userData.google_access_token,
+      refresh_token: userData.google_refresh_token
+    });
+
+    // Create calendar event
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    const event = {
+      summary: `${serviceName} - ${customerName}`,
+      description: `Job ID: ${jobId}\nCustomer: ${customerName}\nService: ${serviceName}\nAddress: ${address || 'Not specified'}`,
+      start: {
+        dateTime: new Date(`${scheduledDate}T${scheduledTime}:00`).toISOString(),
+        timeZone: 'America/New_York', // You can make this configurable
+      },
+      end: {
+        dateTime: new Date(new Date(`${scheduledDate}T${scheduledTime}:00`).getTime() + (duration || 60) * 60000).toISOString(),
+        timeZone: 'America/New_York',
+      },
+      attendees: [
+        { email: req.user.email, responseStatus: 'accepted' }
+      ],
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 }, // 1 day before
+          { method: 'popup', minutes: 30 }, // 30 minutes before
+        ],
+      },
+    };
+
+    const response = await calendar.events.insert({
+      calendarId: 'primary',
+      resource: event,
+    });
+
+    console.log('📅 Calendar event created:', response.data.id);
+
+    res.json({ 
+      success: true, 
+      message: 'Job synced to Google Calendar',
+      eventId: response.data.id,
+      eventLink: response.data.htmlLink
+    });
+
+  } catch (error) {
+    console.error('Calendar sync error:', error);
+    res.status(500).json({ error: 'Failed to sync to Google Calendar' });
+  }
+});
+
+// Google Sheets export endpoints
+app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Get user's Google access token
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('google_access_token, google_refresh_token')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData?.google_access_token) {
+      return res.status(400).json({ error: 'Google Sheets not connected. Please connect your Google account.' });
+    }
+
+    // Get customers data
+    const { data: customers, error: customersError } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (customersError) {
+      return res.status(500).json({ error: 'Failed to fetch customers' });
+    }
+
+    // Create OAuth2 client
+    const oauth2Client = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: userData.google_access_token,
+      refresh_token: userData.google_refresh_token
+    });
+
+    // Create new spreadsheet
+    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+
+    const spreadsheet = await sheets.spreadsheets.create({
+      resource: {
+        properties: {
+          title: `ZenBooker Customers - ${new Date().toLocaleDateString()}`
+        }
+      }
+    });
+
+    const spreadsheetId = spreadsheet.data.spreadsheetId;
+
+    // Prepare data for export
+    const headers = ['Name', 'Email', 'Phone', 'Address', 'City', 'State', 'Zip Code', 'Created Date', 'Last Contact'];
+    const values = customers.map(customer => [
+      customer.name || '',
+      customer.email || '',
+      customer.phone || '',
+      customer.address || '',
+      customer.city || '',
+      customer.state || '',
+      customer.zip_code || '',
+      new Date(customer.created_at).toLocaleDateString(),
+      customer.last_contact ? new Date(customer.last_contact).toLocaleDateString() : ''
+    ]);
+
+    // Add data to spreadsheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: spreadsheetId,
+      range: 'A1',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [headers, ...values]
+      }
+    });
+
+    // Format the header row
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: spreadsheetId,
+      resource: {
+        requests: [{
+          repeatCell: {
+            range: {
+              sheetId: 0,
+              startRowIndex: 0,
+              endRowIndex: 1
+            },
+            cell: {
+              userEnteredFormat: {
+                backgroundColor: { red: 0.2, green: 0.4, blue: 0.8 },
+                textFormat: { foregroundColor: { red: 1, green: 1, blue: 1 }, bold: true }
+              }
+            },
+            fields: 'userEnteredFormat(backgroundColor,textFormat)'
+          }
+        }]
+      }
+    });
+
+    console.log('📊 Customers exported to Google Sheets:', spreadsheetId);
+
+    res.json({ 
+      success: true, 
+      message: 'Customers exported to Google Sheets',
+      spreadsheetId: spreadsheetId,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`
+    });
+
+  } catch (error) {
+    console.error('Sheets export error:', error);
+    res.status(500).json({ error: 'Failed to export to Google Sheets' });
+  }
+});
+
+// Export jobs to Google Sheets
+app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
+  try {
+    const { userId, dateRange } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Get user's Google access token
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('google_access_token, google_refresh_token')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData?.google_access_token) {
+      return res.status(400).json({ error: 'Google Sheets not connected. Please connect your Google account.' });
+    }
+
+    // Get jobs data
+    let jobsQuery = supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers(name, email, phone),
+        services(name, price)
+      `)
+      .eq('user_id', userId)
+      .order('scheduled_date', { ascending: false });
+
+    if (dateRange && dateRange.start && dateRange.end) {
+      jobsQuery = jobsQuery
+        .gte('scheduled_date', dateRange.start)
+        .lte('scheduled_date', dateRange.end);
+    }
+
+    const { data: jobs, error: jobsError } = await jobsQuery;
+
+    if (jobsError) {
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Create OAuth2 client
+    const oauth2Client = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: userData.google_access_token,
+      refresh_token: userData.google_refresh_token
+    });
+
+    // Create new spreadsheet
+    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+
+    const spreadsheet = await sheets.spreadsheets.create({
+      resource: {
+        properties: {
+          title: `ZenBooker Jobs - ${new Date().toLocaleDateString()}`
+        }
+      }
+    });
+
+    const spreadsheetId = spreadsheet.data.spreadsheetId;
+
+    // Prepare data for export
+    const headers = ['Job ID', 'Customer', 'Service', 'Date', 'Time', 'Status', 'Total Amount', 'Address', 'Notes'];
+    const values = jobs.map(job => [
+      job.id,
+      job.customers?.name || '',
+      job.services?.name || '',
+      new Date(job.scheduled_date).toLocaleDateString(),
+      job.scheduled_time || '',
+      job.status || '',
+      `$${job.total || 0}`,
+      job.address || '',
+      job.notes || ''
+    ]);
+
+    // Add data to spreadsheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: spreadsheetId,
+      range: 'A1',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [headers, ...values]
+      }
+    });
+
+    console.log('📊 Jobs exported to Google Sheets:', spreadsheetId);
+
+    res.json({ 
+      success: true, 
+      message: 'Jobs exported to Google Sheets',
+      spreadsheetId: spreadsheetId,
+      spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`
+    });
+
+  } catch (error) {
+    console.error('Jobs export error:', error);
+    res.status(500).json({ error: 'Failed to export jobs to Google Sheets' });
+  }
 });
 
 // Health check endpoint
