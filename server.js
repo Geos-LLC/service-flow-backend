@@ -382,14 +382,45 @@ const upload = multer({
   }
 });
 
-// CORS configuration - Specific origins for production
+// CORS configuration - Enhanced for development and production
 const corsOptions = {
-  origin: [
-    'https://www.service-flow.pro', 
-    'https://service-flow.pro',
-    'http://localhost:3000', // for development
-    'http://localhost:3001'   // for development
-  ],
+  origin: function (origin, callback) {
+    console.log('🌐 CORS: Checking origin:', origin);
+    
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) {
+      console.log('✅ CORS: Allowing request with no origin');
+      return callback(null, true);
+    }
+    
+    const allowedOrigins = [
+      'https://www.service-flow.pro', 
+      'https://service-flow.pro',
+      'https://service-flow-frontend.vercel.app', // Vercel deployment
+      'https://service-flow.vercel.app', // Alternative Vercel URL
+      'http://localhost:3000', // for development
+      'http://localhost:3001',   // for development
+      'http://127.0.0.1:3000',   // alternative localhost
+      'http://127.0.0.1:3001'    // alternative localhost
+    ];
+    
+    // Check if origin matches any allowed origin
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      if (allowedOrigin.includes('*')) {
+        return origin.includes(allowedOrigin.replace('*', ''));
+      }
+      return origin === allowedOrigin;
+    });
+    
+    if (isAllowed) {
+      console.log('✅ CORS: Origin allowed:', origin);
+      callback(null, true);
+    } else {
+      console.log('🚫 CORS: Origin not allowed:', origin);
+      console.log('🚫 CORS: Allowed origins:', allowedOrigins);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control', 'X-HTTP-Method-Override'],
@@ -403,6 +434,60 @@ app.use(cors(corsOptions));
 
 // Handle preflight requests using cors middleware
 app.options('*', cors(corsOptions));
+
+// Additional explicit OPTIONS handler for better CORS support
+app.options('*', (req, res) => {
+  console.log('🔧 OPTIONS request received for:', req.path);
+  console.log('🔧 Origin:', req.headers.origin);
+  
+  // Set CORS headers explicitly - more permissive for production
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else {
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '86400'); // 24 hours
+  
+  console.log('✅ OPTIONS: CORS headers set for origin:', origin);
+  res.status(200).end();
+});
+
+// Enhanced CORS bypass for development and production
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  console.log('🔧 CORS Bypass: Checking origin:', origin);
+  
+  // Allow localhost in development
+  if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
+    console.log('✅ CORS Bypass: Allowing localhost origin:', origin);
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  }
+  
+  // Allow Vercel deployments and common production domains
+  if (origin && (
+    origin.includes('vercel.app') || 
+    origin.includes('netlify.app') || 
+    origin.includes('service-flow') ||
+    origin.includes('serviceflow')
+  )) {
+    console.log('✅ CORS Bypass: Allowing production origin:', origin);
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  }
+  
+  next();
+});
 
 // Log all requests for debugging
 app.use((req, res, next) => {
