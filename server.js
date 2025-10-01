@@ -51,6 +51,12 @@ if (SENDGRID_API_KEY) {
 }
 console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
 
+// Helper function to get today's date in local timezone
+const getTodayString = () => {
+  const today = new Date();
+  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+};
+
 // Google OAuth Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -1598,13 +1604,13 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add date filter
     if (dateFilter === 'future') {
-      const today = new Date().toISOString().split('T')[0];
-      console.log('🔄 Backend: Filtering for future jobs from:', today);
-      query = query.gte('scheduled_date', today);
+      const todayString = getTodayString();
+      console.log('🔄 Backend: Filtering for future jobs from:', todayString);
+      query = query.gte('scheduled_date', todayString);
     } else if (dateFilter === 'past') {
-      const today = new Date().toISOString().split('T')[0];
-      console.log('🔄 Backend: Filtering for past jobs before:', today);
-      query = query.lt('scheduled_date', today);
+      const todayString = getTodayString();
+      console.log('🔄 Backend: Filtering for past jobs before:', todayString);
+      query = query.lt('scheduled_date', todayString);
     } else if (dateRange) {
       const [startDate, endDate] = dateRange.split(':');
       if (startDate && endDate) {
@@ -1700,11 +1706,11 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           
           // Reapply date filter
           if (dateFilter === 'future') {
-            const today = new Date().toISOString().split('T')[0];
-            retryQuery = retryQuery.gte('scheduled_date', today);
+            const todayString = getTodayString();
+            retryQuery = retryQuery.gte('scheduled_date', todayString);
           } else if (dateFilter === 'past') {
-            const today = new Date().toISOString().split('T')[0];
-            retryQuery = retryQuery.lt('scheduled_date', today);
+            const todayString = getTodayString();
+            retryQuery = retryQuery.lt('scheduled_date', todayString);
           }
           
           // Reapply sorting and pagination
@@ -2600,6 +2606,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       additionalFees: 'additional_fees',
       taxes: 'taxes',
       total: 'total',
+      total_amount: 'total_amount',
       paymentMethod: 'payment_method',
       territory: 'territory',
       territoryId: 'territory_id',
@@ -2630,6 +2637,14 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     console.log('🔄 Received update data:', updateData);
     console.log('🔄 Available field mappings:', Object.keys(fieldMappings));
+    console.log('🔄 Pricing fields received:', {
+      price: updateData.price,
+      discount: updateData.discount,
+      additionalFees: updateData.additionalFees,
+      taxes: updateData.taxes,
+      total: updateData.total,
+      total_amount: updateData.total_amount
+    });
 
     Object.keys(updateData).forEach(key => {
       console.log(`🔄 Processing field: ${key}, value: ${updateData[key]}, mapped: ${fieldMappings[key]}`);
@@ -2728,6 +2743,16 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     }
 
     // Update the job
+    console.log('🔄 Final update data to send to database:', updateDataToSend);
+    console.log('🔄 Pricing fields in final update:', {
+      price: updateDataToSend.price,
+      discount: updateDataToSend.discount,
+      additional_fees: updateDataToSend.additional_fees,
+      taxes: updateDataToSend.taxes,
+      total: updateDataToSend.total,
+      total_amount: updateDataToSend.total_amount
+    });
+    
     const { error: updateError } = await supabase
       .from('jobs')
       .update(updateDataToSend)
@@ -8513,8 +8538,8 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       }
       
       // Calculate stats
-      const today = new Date().toISOString().split('T')[0];
-    const todayJobs = jobs.filter(job => job.scheduled_date?.split('T')[0] === today);
+      const todayString = getTodayString();
+    const todayJobs = jobs.filter(job => job.scheduled_date?.split('T')[0] === todayString);
       const completedJobs = jobs.filter(job => job.status === 'completed');
       
       const stats = {
