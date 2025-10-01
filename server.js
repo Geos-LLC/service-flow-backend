@@ -3739,7 +3739,7 @@ app.post('/api/estimates/:id/send', async (req, res) => {
 
         await sendEmail({
           to: estimate.customers.email,
-          subject: `Your Estimate #${estimate.id} is Ready - ${estimate.users?.business_name || 'ZenBooker'}`,
+          subject: `Your Estimate #${estimate.id} is Ready - ${estimate.users?.business_name || 'Service-flow'}`,
           html: emailHtml,
           text: `
             Hi ${estimate.customers.first_name},
@@ -8756,7 +8756,7 @@ app.get('/api/public/user/:slug', async (req, res) => {
         return res.status(404).json({ 
           error: 'Business not found',
           message: `No business found with slug: ${decodedSlug}`,
-          availableSlugs: ['now2code-academy', 'zenbooker-cleaning-services', 'test-business']
+          availableSlugs: ['now2code-academy', 'Service-flow-cleaning-services', 'test-business']
         });
       }
       
@@ -10013,7 +10013,7 @@ app.get('/api/booking-settings/:userId', authenticateToken, async (req, res) => 
           primaryColor: "#4CAF50",
           headerBackground: "#ffffff",
           headerIcons: "#4CAF50",
-          hideZenbookerBranding: false,
+          hideServiceflowBranding: false,
           logo: null,
           favicon: null,
           heroImage: null
@@ -10159,7 +10159,7 @@ app.get('/api/public/business/:businessSlug/settings', async (req, res) => {
           primaryColor: "#4CAF50",
           headerBackground: "#ffffff",
           headerIcons: "#4CAF50",
-          hideZenbookerBranding: false,
+          hideServiceflowBranding: false,
           logo: null,
           favicon: null,
           heroImage: null
@@ -13407,7 +13407,7 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
     const spreadsheet = await sheets.spreadsheets.create({
       resource: {
         properties: {
-          title: `ZenBooker Customers - ${new Date().toLocaleDateString()}`
+          title: `Serviceflow Customers - ${new Date().toLocaleDateString()}`
         }
       }
     });
@@ -13537,7 +13537,7 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
     const spreadsheet = await sheets.spreadsheets.create({
       resource: {
         properties: {
-          title: `ZenBooker Jobs - ${new Date().toLocaleDateString()}`
+          title: `Serviceflow Jobs - ${new Date().toLocaleDateString()}`
         }
       }
     });
@@ -13598,7 +13598,7 @@ app.use((req, res) => {
 });
 // Start server
 app.listen(PORT, async () => {
-  console.log(`ZenBooker API server running on port ${PORT}`);
+  console.log(`Serviceflow API server running on port ${PORT}`);
   console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
   console.log('🔍 Branding endpoints registered: /api/user/branding (GET, PUT)');
   console.log('🔍 Test endpoint available: /api/test-branding');
