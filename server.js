@@ -2507,7 +2507,6 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       skillsRequired: 'skills_required',
       price: 'price',
       service_price: 'service_price',
-      modifier_price: 'modifier_price',
       discount: 'discount',
       additionalFees: 'additional_fees',
       taxes: 'taxes',
@@ -2543,9 +2542,6 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     
 
-    console.log('🔧 Job Update Debug - Received updateData:', updateData);
-    console.log('🔧 Job Update Debug - Field mappings:', fieldMappings);
-    
     Object.keys(updateData).forEach(key => {
      if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
         // Handle special cases
@@ -2631,8 +2627,6 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    console.log('🔧 Job Update Debug - Sending to database:', updateDataToSend);
-    
     const { error: updateError } = await supabase
       .from('jobs')
       .update(updateDataToSend)
