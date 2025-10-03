@@ -385,11 +385,9 @@ const upload = multer({
 // CORS configuration - Enhanced for development and production
 const corsOptions = {
   origin: function (origin, callback) {
-    console.log('🌐 CORS: Checking origin:', origin);
     
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
-      console.log('✅ CORS: Allowing request with no origin');
       return callback(null, true);
     }
     
@@ -413,11 +411,8 @@ const corsOptions = {
     });
     
     if (isAllowed) {
-      console.log('✅ CORS: Origin allowed:', origin);
       callback(null, true);
     } else {
-      console.log('🚫 CORS: Origin not allowed:', origin);
-      console.log('🚫 CORS: Allowed origins:', allowedOrigins);
       callback(new Error('Not allowed by CORS'));
     }
   },
@@ -437,8 +432,6 @@ app.options('*', cors(corsOptions));
 
 // Additional explicit OPTIONS handler for better CORS support
 app.options('*', (req, res) => {
-  console.log('🔧 OPTIONS request received for:', req.path);
-  console.log('🔧 Origin:', req.headers.origin);
   
   // Set CORS headers explicitly - more permissive for production
   const origin = req.headers.origin;
@@ -453,37 +446,21 @@ app.options('*', (req, res) => {
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Max-Age', '86400'); // 24 hours
   
-  console.log('✅ OPTIONS: CORS headers set for origin:', origin);
   res.status(200).end();
 });
 
-// Enhanced CORS bypass for development and production
+// Aggressive CORS bypass for all origins
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   
-  console.log('🔧 CORS Bypass: Checking origin:', origin);
   
-  // Allow localhost in development
-  if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
-    console.log('✅ CORS Bypass: Allowing localhost origin:', origin);
+  // Set CORS headers for ALL requests to fix production issues
+  if (origin) {
     res.header('Access-Control-Allow-Origin', origin);
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  }
-  
-  // Allow Vercel deployments and common production domains
-  if (origin && (
-    origin.includes('vercel.app') || 
-    origin.includes('netlify.app') || 
-    origin.includes('service-flow') ||
-    origin.includes('serviceflow')
-  )) {
-    console.log('✅ CORS Bypass: Allowing production origin:', origin);
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+    res.header('Access-Control-Max-Age', '86400');
   }
   
   next();
@@ -491,12 +468,7 @@ app.use((req, res, next) => {
 
 // Log all requests for debugging
 app.use((req, res, next) => {
-  console.log('📡 Request received:', req.method, req.path, 'from origin:', req.headers.origin);
-  console.log('📡 Request headers:', {
-    'content-type': req.headers['content-type'],
-    'authorization': req.headers.authorization ? 'Present' : 'Missing',
-    'user-agent': req.headers['user-agent']?.substring(0, 50)
-  });
+ 
   next();
 });
 
@@ -504,7 +476,6 @@ app.use((req, res, next) => {
 
 // CORS test endpoint
 app.get('/api/test-cors', (req, res) => {
-  console.log('🧪 CORS test endpoint hit from origin:', req.headers.origin);
   
   const origin = req.headers.origin;
   if (origin) {
@@ -649,7 +620,6 @@ app.options('/api/team-members/:id/settings', (req, res) => res.status(204).send
 
 // Add a more specific OPTIONS handler for team-members endpoint
 app.options('/api/team-members', (req, res) => {
-  console.log('🔄 Handling OPTIONS request for /api/team-members');
   res.status(204).send();
 });
 
@@ -668,7 +638,6 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Test Supabase connection
 async function testSupabaseConnection() {
   try {
-    console.log('Testing Supabase connection...');
     const { data, error } = await supabase
       .from('users')
       .select('count')
@@ -679,11 +648,6 @@ async function testSupabaseConnection() {
       return false;
     }
     
-    console.log('Supabase connected successfully');
-    console.log('Supabase config:', {
-      url: process.env.SUPABASE_URL,
-      hasServiceKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY
-    });
     return true;
   } catch (error) {
     console.error('Supabase connection test failed:', error);
@@ -698,20 +662,14 @@ testSupabaseConnection();
 const authenticateToken = (req, res, next) => {
   // Skip authentication for OPTIONS requests (CORS preflight)
   if (req.method === 'OPTIONS') {
-    console.log('🔓 Skipping auth for OPTIONS request');
     return next();
   }
 
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
-  console.log('Auth check - Header:', authHeader ? 'Present' : 'Missing');
-  console.log('Auth check - Token:', token ? 'Present' : 'Missing');
-  console.log('Auth check - Origin:', req.headers.origin);
-  console.log('Auth check - User-Agent:', req.headers['user-agent']);
 
   if (!token) {
-    console.log('Auth failed - No token provided');
     return res.status(401).json({ 
       error: 'Access token required',
       message: 'Please log in to access this resource'
@@ -720,7 +678,6 @@ const authenticateToken = (req, res, next) => {
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      console.log('Auth failed - Token verification error:', err.message);
       if (err.name === 'TokenExpiredError') {
         return res.status(401).json({ 
           error: 'Token expired',
@@ -738,7 +695,6 @@ const authenticateToken = (req, res, next) => {
         });
       }
     }
-    console.log('Auth successful - User ID:', user.userId);
     req.user = user;
     next();
   });
@@ -1047,7 +1003,6 @@ app.post('/api/auth/google', async (req, res) => {
     const payload = ticket.getPayload();
     const { sub: googleId, email, name, picture } = payload;
     
-    console.log('🔍 Google OAuth payload:', { googleId, email, name });
     
     // Check if user already exists
     const { data: existingUsers, error: fetchError } = await supabase
@@ -1178,9 +1133,6 @@ app.get('/api/services', async (req, res) => {
   try {
     const { userId, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
     
-    console.log('🔄 Backend: Services request received');
-    console.log('🔄 Backend: User ID:', userId);
-    console.log('🔄 Backend: All query params:', req.query);
     
     // Build Supabase query
     let query = supabase
@@ -1258,7 +1210,6 @@ app.get('/api/services', async (req, res) => {
 // Service Categories endpoints
 app.get('/api/services/categories', async (req, res) => {
   const { userId } = req.query;
-  console.log('🔄 Categories request for user:', userId);
 
   if (!userId) {
     return res.status(400).json({ error: 'userId is required' });
@@ -1296,8 +1247,7 @@ app.get('/api/services/categories', async (req, res) => {
       serviceCount: category.services ? category.services.length : 0
     }));
 
-    console.log('✅ Found categories:', processedCategories.length, 'for user:', userId);
-
+  
     res.json({ data: processedCategories });
 
   } catch (error) {
@@ -1465,21 +1415,17 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
     
     // Prepare modifiers for storage
     let modifiersToStore = null;
-    console.log('🔧 Service Update: Received modifiers:', modifiers);
-    console.log('🔧 Service Update: Modifiers type:', typeof modifiers);
     
     if (modifiers) {
       try {
         // If modifiers is already a string, use it; otherwise stringify it
         modifiersToStore = typeof modifiers === 'string' ? modifiers : JSON.stringify(modifiers);
-        console.log('🔧 Service Update: Prepared modifiers for storage:', modifiersToStore);
-      } catch (error) {
+        } catch (error) {
         console.error('Error preparing modifiers for storage:', error);
         modifiersToStore = null;
       }
     } else {
-      console.log('🔧 Service Update: No modifiers provided, keeping existing ones');
-    }
+       }
     
     // Build update object with only provided fields
     const updateData = {
@@ -1496,20 +1442,15 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
     // Only update modifiers if provided
     if (modifiers !== undefined) {
       updateData.modifiers = modifiersToStore;
-      console.log('🔧 Service Update: Updating modifiers field');
     } else {
-      console.log('🔧 Service Update: Preserving existing modifiers');
     }
     
     // Only update intake_questions if provided
     if (intake_questions !== undefined) {
       updateData.intake_questions = intake_questions;
-      console.log('🔧 Service Update: Updating intake_questions field');
     } else {
-      console.log('🔧 Service Update: Preserving existing intake_questions');
     }
     
-    console.log('🔧 Service Update: Final update data:', updateData);
     
     // Update service
     const { data: updatedService, error: updateError } = await supabase
@@ -1598,11 +1539,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   try {
     const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId } = req.query;
     
-    console.log('🔄 Backend: Jobs request received');
-    console.log('🔄 Backend: User ID:', userId);
-    console.log('🔄 Backend: Status filter:', status);
-    console.log('🔄 Backend: Date filter:', dateFilter);
-    console.log('🔄 Backend: All query params:', req.query);
+  
     // Build Supabase query with joins
     let query = supabase
       .from('jobs')
@@ -1631,11 +1568,9 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add search filter
     if (search) {
-      console.log('🔄 Backend: Search term:', search);
       try {
         // Escape special characters in search term
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
-        console.log('🔄 Backend: Escaped search term:', escapedSearch);
         // Search in joined tables using the correct syntax
         query = query.or(`service_name.ilike.%${escapedSearch}%,customers.first_name.ilike.%${escapedSearch}%,customers.last_name.ilike.%${escapedSearch}%`);
       } catch (searchError) {
@@ -1690,17 +1625,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     // Add date filter
     if (dateFilter === 'future') {
       const todayString = getTodayString();
-      console.log('🔄 Backend: Filtering for future jobs from:', todayString);
       query = query.gte('scheduled_date', todayString);
     } else if (dateFilter === 'past') {
       const todayString = getTodayString();
-      console.log('🔄 Backend: Filtering for past jobs before:', todayString);
       query = query.lt('scheduled_date', todayString);
     } else if (dateRange) {
       const [startDate, endDate] = dateRange.split(':');
       if (startDate && endDate) {
-        console.log('🔄 Backend: Filtering for date range:', startDate, 'to', endDate);
-        query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
+         query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
       }
     }
     
@@ -1718,16 +1650,13 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     const offset = (page - 1) * limit;
     query = query.range(offset, offset + parseInt(limit) - 1);
     
-    console.log('🔄 Backend: Supabase query built');
     
     let jobs, error, count;
     try {
-      console.log('🔄 Backend: Executing Supabase query...');
       const result = await query;
       jobs = result.data;
       error = result.error;
       count = result.count;
-      console.log('🔄 Backend: Query executed successfully');
     } catch (queryError) {
       console.error('🔄 Backend: Query execution error:', queryError);
       console.error('🔄 Backend: Query error details:', {
@@ -1762,7 +1691,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       
       // If it's a search-related error, try without search
       if (search && (error.message.includes('ilike') || error.message.includes('search') || error.message.includes('column') || error.message.includes('does not exist'))) {
-        console.log('🔄 Backend: Retrying without search filter...');
+       
         try {
           // Rebuild query without search
           let retryQuery = supabase
@@ -1809,8 +1738,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           count = retryResult.count;
           
           if (!error) {
-            console.log('🔄 Backend: Retry successful, returning jobs without search filter');
-          }
+             }
         } catch (retryError) {
           console.error('🔄 Backend: Retry also failed:', retryError);
         }
@@ -1824,15 +1752,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       }
     }
       
-      console.log('🔄 Backend: Jobs query executed');
-      console.log('🔄 Backend: Jobs found:', jobs ? jobs.length : 0);
-      console.log('🔄 Backend: First job:', jobs ? jobs[0] : null);
-      console.log('🔄 Backend: Jobs with customer data:', jobs ? jobs.map(job => ({
-        id: job.id,
-        customer_id: job.customer_id,
-        customer_data: job.customers,
-        has_customer_data: !!job.customers
-      })) : []);
+     
       
       // Process jobs to add team assignments and format data
       const processedJobs = (jobs || []).map(job => {
@@ -1880,9 +1800,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         }
       };
       
-      console.log('🔄 Backend: Sending response with', processedJobs.length, 'jobs');
-      console.log('🔄 Backend: Response structure:', response);
-      
+     
       res.json(response);
   } catch (error) {
     console.error('Get jobs error:', error);
@@ -1922,10 +1840,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     
     const job = jobs[0];
     
-    console.log('🔧 Backend: Job retrieved from database:', job);
-    console.log('🔧 Backend: service_modifiers field:', job.service_modifiers);
-    console.log('🔧 Backend: service_modifiers type:', typeof job.service_modifiers);
-    
+   
     // Get intake answers from job_answers table
     const { data: intakeAnswers, error: answersError } = await supabase
       .from('job_answers')
@@ -2072,21 +1987,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       intakeQuestionIdMapping
     } = req.body;
 
-    console.log('🔄 Creating job for user:', userId);
-    console.log('🔄 Job data:', req.body);
-    console.log('🔄 DEBUG: serviceIds in req.body:', req.body.serviceIds);
-    console.log('🔄 DEBUG: serviceName in req.body:', req.body.serviceName);
-    console.log('🔄 DEBUG: serviceIntakeQuestions in req.body:', req.body.serviceIntakeQuestions);
-    console.log('🔄 DEBUG: intakeQuestionAnswers in req.body:', req.body.intakeQuestionAnswers);
-    console.log('🔄 DEBUG: originalIntakeQuestionIds in req.body:', req.body.originalIntakeQuestionIds);
-
+    
     // Combine scheduled date and time - save exactly as user chose
     let fullScheduledDate;
     if (scheduledDate && scheduledTime) {
       // Simply combine date and time as-is, no timezone conversion
       fullScheduledDate = `${scheduledDate} ${scheduledTime}:00`;
-      console.log(`🕐 Saving time as chosen: ${scheduledDate} ${scheduledTime}`);
-    } else {
+   } else {
       fullScheduledDate = scheduledDate;
     }
 
@@ -2098,26 +2005,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
     
     // Use the total from frontend if provided (it already includes modifiers)
     let finalTotal = parseFloat(total) || finalPrice;
-    
-    console.log('🔧 Backend: Price calculation:');
-    console.log('🔧 - Base price (finalPrice):', finalPrice);
-    console.log('🔧 - Frontend total:', total);
-    console.log('🔧 - Final total to use:', finalTotal);
-
-    console.log('🔧 Backend: Processing modifiers for job creation');
-    console.log('🔧 Backend: serviceModifiers:', serviceModifiers);
-    console.log('🔧 Backend: selectedModifiers:', req.body.selectedModifiers);
-
+  
     // Process selected modifiers to calculate price and duration
     if (serviceModifiers && Array.isArray(serviceModifiers)) {
-      console.log('🔧 Backend: Processing modifiers with selectedModifiers:', req.body.selectedModifiers);
-      console.log('🔧 Backend: serviceModifiers count:', serviceModifiers.length);
-      
+    
       processedModifiers = serviceModifiers.map(modifier => {
-        console.log('🔧 Backend: Processing modifier:', modifier.id, modifier.title);
-        const selectedModifierData = req.body.selectedModifiers?.[modifier.id];
-        console.log('🔧 Backend: selectedModifierData for modifier', modifier.id, ':', selectedModifierData);
-        
+     const selectedModifierData = req.body.selectedModifiers?.[modifier.id];
+       
         let modifierPrice = 0;
         let modifierDuration = 0;
         let selectedOptionsData = [];
@@ -2125,8 +2019,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         if (modifier.selectionType === 'quantity') {
           // Handle quantity selection - selectedModifierData.quantities contains {optionId: quantity}
           const quantities = selectedModifierData?.quantities || {};
-          console.log('🔧 Backend: Processing quantities for modifier', modifier.id, ':', quantities);
-          
+         
           Object.entries(quantities).forEach(([optionId, quantity]) => {
             const option = modifier.options?.find(o => o.id == optionId);
             if (option && quantity > 0) {
@@ -2145,8 +2038,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         } else if (modifier.selectionType === 'multi') {
           // Handle multi-selection - selectedModifierData.selections contains [optionId1, optionId2]
           const selections = selectedModifierData?.selections || [];
-          console.log('🔧 Backend: Processing multi-selections for modifier', modifier.id, ':', selections);
-          
+        
           selections.forEach(optionId => {
             const option = modifier.options?.find(o => o.id == optionId);
             if (option) {
@@ -2165,8 +2057,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         } else {
           // Handle single selection - selectedModifierData.selection contains optionId
           const selection = selectedModifierData?.selection;
-          console.log('🔧 Backend: Processing single selection for modifier', modifier.id, ':', selection);
-          
+         
           if (selection) {
             const option = modifier.options?.find(o => o.id == selection);
             if (option) {
@@ -2186,8 +2077,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         
         // Fallback: If no selections were found with the new format, try the old format
         if (selectedOptionsData.length === 0 && selectedModifierData) {
-          console.log('🔧 Backend: No selections found with new format, trying old format for modifier', modifier.id);
-          
+         
           // Try old format where selectedModifierData is directly an array or object
           if (Array.isArray(selectedModifierData)) {
             selectedModifierData.forEach(optionId => {
@@ -2229,11 +2119,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         // finalPrice += modifierPrice;
         finalDuration += modifierDuration;
 
-        console.log('🔧 Backend: Final modifier data for', modifier.id, ':', {
-          selectedOptions: selectedOptionsData,
-          totalModifierPrice: modifierPrice,
-          totalModifierDuration: modifierDuration
-        });
+       
 
         return {
           ...modifier,
@@ -2243,48 +2129,24 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         };
       });
     } else {
-      console.log('🔧 Backend: No serviceModifiers found or not an array:', serviceModifiers);
-    }
+   }
 
-      console.log('🔧 Backend: Final processedModifiers:', processedModifiers);
-      console.log('🔧 Backend: processedModifiers length:', processedModifiers.length);
-      console.log('🔧 Backend: processedModifiers details:', processedModifiers.map(m => ({
-        id: m.id,
-        title: m.title,
-        selectedOptions: m.selectedOptions,
-        selectedOptionsLength: m.selectedOptions?.length
-      })));
-      
-      console.log('🔧 Backend: Final calculation values:');
-      console.log('🔧 - finalPrice (base):', finalPrice);
-      console.log('🔧 - finalTotal (with modifiers):', finalTotal);
-      console.log('🔧 - finalDuration:', finalDuration);
     
     // If we have modifiers but no processed modifiers, log a warning
     if (serviceModifiers && Array.isArray(serviceModifiers) && serviceModifiers.length > 0 && processedModifiers.length === 0) {
-      console.log('⚠️ WARNING: Service has modifiers but none were processed. This might indicate a scope issue.');
-      console.log('⚠️ serviceModifiers:', serviceModifiers);
-      console.log('⚠️ selectedModifiers:', req.body.selectedModifiers);
-      
+     
       // Check if selectedModifiers has any data at all
       const hasSelectedModifiers = req.body.selectedModifiers && Object.keys(req.body.selectedModifiers).length > 0;
-      console.log('⚠️ hasSelectedModifiers:', hasSelectedModifiers);
-      
+     
       if (!hasSelectedModifiers) {
-        console.log('⚠️ No selectedModifiers found in request body. This suggests the frontend is not sending modifier selections.');
-      } else {
-        console.log('⚠️ selectedModifiers found but no matches with serviceModifiers. Checking for ID mismatches...');
-        serviceModifiers.forEach(modifier => {
+     } else {
+       serviceModifiers.forEach(modifier => {
           const hasMatch = req.body.selectedModifiers[modifier.id];
-          console.log(`⚠️ Modifier ${modifier.id} (${modifier.title}) has match:`, !!hasMatch);
         });
       }
     }
 
     // Process intake questions with answers
-    console.log('🔄 DEBUG: serviceIntakeQuestions type:', typeof serviceIntakeQuestions);
-    console.log('🔄 DEBUG: serviceIntakeQuestions value:', serviceIntakeQuestions);
-    console.log('🔄 DEBUG: Array.isArray(serviceIntakeQuestions):', Array.isArray(serviceIntakeQuestions));
     
     // If serviceIntakeQuestions is not provided, try to get it from the service
     if (!serviceIntakeQuestions && serviceId) {
@@ -2305,7 +2167,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             } else if (Array.isArray(serviceData[0].intake_questions)) {
               serviceIntakeQuestions = serviceData[0].intake_questions;
             }
-            console.log('🔄 DEBUG: Retrieved serviceIntakeQuestions from service:', serviceIntakeQuestions);
           } catch (parseError) {
             console.error('Error parsing service intake questions:', parseError);
             serviceIntakeQuestions = [];
@@ -2321,24 +2182,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         const originalQuestionIds = req.body.originalIntakeQuestionIds || [];
       
       if (serviceIntakeQuestions && Array.isArray(serviceIntakeQuestions)) {
-        console.log('🔄 Processing intake questions with answers:');
-        console.log('🔄 Service intake questions:', serviceIntakeQuestions);
-        console.log('🔄 Intake answers from frontend:', intakeAnswers);
-        console.log('🔄 Original question IDs:', originalQuestionIds);
-        
+       
         processedIntakeQuestions = serviceIntakeQuestions.map((question, index) => {
           // The frontend sends answers using the normalized question IDs (1, 2, 3)
           // So we should use the question.id directly, not the originalQuestionIds
           const answer = intakeAnswers[question.id];
           
-          console.log(`🔄 Question ${question.id} (${question.question}):`, {
-            questionId: question.id,
-            questionIdType: typeof question.id,
-            availableAnswerIds: Object.keys(intakeAnswers),
-            answer: answer,
-            answerType: typeof answer,
-            isArray: Array.isArray(answer)
-          });
+        
           
           return {
             ...question,
@@ -2346,11 +2196,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           };
         });
       }
-
-      console.log('🔄 Processed modifiers:', processedModifiers);
-      console.log('🔄 Processed intake questions:', processedIntakeQuestions);
-      console.log('🔄 Final price:', finalPrice);
-      console.log('🔄 Final duration:', finalDuration);
 
       // Handle empty team member ID
       const teamMemberIdValue = teamMemberId && teamMemberId !== '' ? teamMemberId : null;
@@ -2413,13 +2258,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         service_intake_questions: processedIntakeQuestions.length > 0 ? processedIntakeQuestions : null
       };
 
-      console.log('🔄 Attempting to insert job with data:', jobData);
-      console.log('🔄 Customer ID being used:', customerId);
-      console.log('🔄 Customer ID type:', typeof customerId);
-      console.log('🔧 Backend: service_modifiers being stored:', jobData.service_modifiers);
-      console.log('🔧 Backend: service_modifiers type:', typeof jobData.service_modifiers);
-      console.log('🔧 Backend: service_modifiers stringified:', JSON.stringify(jobData.service_modifiers, null, 2));
-
+    
       const { data: result, error: insertError } = await supabase
         .from('jobs')
         .insert(jobData)
@@ -2432,9 +2271,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to create job', details: insertError.message });
       }
       
-            console.log('✅ Job created successfully:', result);
-            console.log('🔄 Created job customer_id:', result.customer_id);
-            
             // Verify customer exists and get customer data
             if (result.customer_id) {
               const { data: customerData, error: customerError } = await supabase
@@ -2446,8 +2282,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               if (customerError) {
                 console.error('🔄 Error fetching customer data:', customerError);
               } else {
-                console.log('🔄 Customer data found:', customerData);
-              }
+               }
             }
       
       // Send success response
@@ -2474,8 +2309,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             if (assignmentError) {
               console.error('Error creating primary team assignment:', assignmentError);
             } else {
-              console.log('🔄 DEBUG: Created primary team assignment for job:', result.id);
-            }
+             }
           }
           
           // Add additional team members from the array
@@ -2493,8 +2327,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               if (assignmentError) {
                 console.error('Error creating additional team assignment:', assignmentError);
               } else {
-                console.log('🔄 DEBUG: Created additional team assignment for job:', result.id);
-              }
+               }
             }
           }
         } catch (assignmentError) {
@@ -2503,20 +2336,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         }
       }
 
-      // Save intake question answers to job_answers table if provided
-      console.log('🔄 DEBUG: processedIntakeQuestions length:', processedIntakeQuestions ? processedIntakeQuestions.length : 0);
-      console.log('🔄 DEBUG: processedIntakeQuestions:', processedIntakeQuestions);
-      
       if (processedIntakeQuestions && processedIntakeQuestions.length > 0) {
-        console.log('🔄 DEBUG: Attempting to save intake questions to job_answers table');
         try {
           for (let index = 0; index < processedIntakeQuestions.length; index++) {
             const question = processedIntakeQuestions[index];
-            console.log('🔄 DEBUG: Processing question:', question);
-            if (question.answer !== undefined && question.answer !== null && question.answer !== '') {
+             if (question.answer !== undefined && question.answer !== null && question.answer !== '') {
               const answerToSave = (Array.isArray(question.answer) || typeof question.answer === 'object') ? JSON.stringify(question.answer) : question.answer;
-              console.log('🔄 DEBUG: Saving answer:', answerToSave);
-              try {
+               try {
                 // Use the original question ID for consistency in the database
                 const originalQuestionId = originalQuestionIds[index] || question.id;
                 const { error: answerError } = await supabase
@@ -2532,23 +2358,20 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 if (answerError) {
                   console.error('Error inserting job answer:', answerError);
                 } else {
-                  console.log('🔄 DEBUG: Successfully saved job answer for question:', question.id, 'with original ID:', originalQuestionId);
-                }
+                 }
               } catch (insertError) {
                 console.error('Error inserting job answer:', insertError);
                 // Continue processing other answers even if one fails
               }
             } else {
-              console.log('🔄 DEBUG: Skipping question with no answer:', question.id);
-            }
+             }
           }
         } catch (error) {
           console.error('Error processing intake questions for job_answers:', error);
           // Don't fail the entire operation if intake questions processing fails
         }
       } else {
-        console.log('🔄 DEBUG: No processedIntakeQuestions to save');
-      }
+        }
 
       // Get the created job
       const { data: createdJob, error: fetchError } = await supabase
@@ -2566,7 +2389,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to fetch created job' });
       }
 
-      console.log('🔄 Job created successfully:', result.id);
       
       res.status(201).json({
         message: 'Job created successfully',
@@ -2597,8 +2419,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
 
     status = statusMapping[status] || status;
 
-    console.log('🔄 Updating job status:', { id, status });
-
+    
     // Check if job exists and belongs to user
     const { data: existingJob, error: checkError } = await supabase
       .from('jobs')
@@ -2631,8 +2452,6 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to update job status' });
     }
 
-    console.log('🔄 Job status updated successfully');
-    
     res.json({
       message: 'Job status updated successfully',
       status: status
@@ -2652,9 +2471,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const updateData = req.body;
 
-    console.log('🔄 Updating job:', id);
-    console.log('🔄 Update data:', updateData);
-
+  
     // Check if job exists and belongs to user
     const { data: existingJob, error: checkError } = await supabase
       .from('jobs')
@@ -2720,41 +2537,24 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       serviceIntakeQuestions: 'service_intake_questions'
     };
 
-    console.log('🔄 Received update data:', updateData);
-    console.log('🔄 Available field mappings:', Object.keys(fieldMappings));
-    console.log('🔄 Pricing fields received:', {
-      price: updateData.price,
-      discount: updateData.discount,
-      additionalFees: updateData.additionalFees,
-      taxes: updateData.taxes,
-      total: updateData.total,
-      total_amount: updateData.total_amount
-    });
+    
 
     Object.keys(updateData).forEach(key => {
-      console.log(`🔄 Processing field: ${key}, value: ${updateData[key]}, mapped: ${fieldMappings[key]}`);
-      if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
+     if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
         // Handle special cases
         if (key === 'scheduledDate' && updateData.scheduledTime) {
           // Simply combine date and time as-is, no timezone conversion
           updateDataToSend[fieldMappings[key]] = `${updateData[key]} ${updateData.scheduledTime}:00`;
-          console.log(`🕐 Update saving time as chosen: ${updateData[key]} ${updateData.scheduledTime}`);
         } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
           updateDataToSend[fieldMappings[key]] = updateData[key];
         } else if (key === 'serviceAddress') {
           // Handle nested service address
-          console.log(`🔄 Processing serviceAddress:`, updateData[key]);
           if (updateData[key]) {
             updateDataToSend.service_address_street = updateData[key].street || null;
             updateDataToSend.service_address_city = updateData[key].city || null;
             updateDataToSend.service_address_state = updateData[key].state || null;
             updateDataToSend.service_address_zip = updateData[key].zipCode || null;
-            console.log(`🔄 Mapped service address fields:`, {
-              service_address_street: updateDataToSend.service_address_street,
-              service_address_city: updateDataToSend.service_address_city,
-              service_address_state: updateDataToSend.service_address_state,
-              service_address_zip: updateDataToSend.service_address_zip
-            });
+          
           }
         } else {
           updateDataToSend[fieldMappings[key]] = updateData[key];
@@ -2762,11 +2562,9 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       }
     });
 
-    console.log('🔄 Final update data to send:', updateDataToSend);
-
+   
     if (Object.keys(updateDataToSend).length === 0) {
-      console.log('🔄 No valid fields to update - all fields were filtered out');
-      return res.status(400).json({ error: 'No valid fields to update' });
+     return res.status(400).json({ error: 'No valid fields to update' });
     }
 
     // Handle team member assignments update
@@ -2820,23 +2618,12 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
           }
         }
         
-        console.log('🔄 Updated team assignments for job:', id);
       } catch (assignmentError) {
         console.error('Error updating team assignments:', assignmentError);
         // Don't fail the job update if team assignment fails
       }
     }
 
-    // Update the job
-    console.log('🔄 Final update data to send to database:', updateDataToSend);
-    console.log('🔄 Pricing fields in final update:', {
-      price: updateDataToSend.price,
-      discount: updateDataToSend.discount,
-      additional_fees: updateDataToSend.additional_fees,
-      taxes: updateDataToSend.taxes,
-      total: updateDataToSend.total,
-      total_amount: updateDataToSend.total_amount
-    });
     
     const { error: updateError } = await supabase
       .from('jobs')
@@ -2865,8 +2652,6 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch updated job' });
     }
 
-    console.log('🔄 Job updated successfully');
-    
     res.json({
       message: 'Job updated successfully',
       job: updatedJob[0]
@@ -2884,8 +2669,6 @@ app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-
-    console.log('🔄 Deleting job:', id);
 
     // Check if job exists and belongs to user
     const { data: existingJob, error: checkError } = await supabase
@@ -2931,10 +2714,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { search, page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'DESC', status } = req.query;
     
-    console.log('🔄 Backend: Customers request received');
-    console.log('🔄 Backend: User ID:', userId);
-    console.log('🔄 Backend: All query params:', req.query);
-    
+
     // Build Supabase query
     let query = supabase
       .from('customers')
@@ -2964,9 +2744,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
     // Add pagination
     const offset = (page - 1) * limit;
     query = query.range(offset, offset + parseInt(limit) - 1);
-    
-    console.log('🔄 Backend: Supabase query built');
-    
+  
     const { data: customers, error, count } = await query;
     
     if (error) {
@@ -2974,9 +2752,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch customers' });
     }
     
-    console.log('🔄 Backend: Customers query executed');
-    console.log('🔄 Backend: Customers found:', customers ? customers.length : 0);
-    
+  
     res.json({
       customers: customers || [],
       pagination: {
@@ -3436,8 +3212,7 @@ app.get('/api/estimates', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
     
-    console.log('Fetching estimates for user:', userId, 'with filters:', { status, customerId, page, limit, sortBy, sortOrder });
-    
+   
     // Build Supabase query
     let query = supabase
       .from('estimates')
@@ -3470,8 +3245,7 @@ app.get('/api/estimates', async (req, res) => {
     const offset = (page - 1) * limit;
     query = query.range(offset, offset + parseInt(limit) - 1);
     
-    console.log('Executing Supabase query for estimates');
-    
+
     const { data: estimates, error, count } = await query;
     
     if (error) {
@@ -3479,8 +3253,7 @@ app.get('/api/estimates', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch estimates' });
     }
     
-    console.log('Found estimates:', estimates ? estimates.length : 0);
-    
+   
     const response = {
       estimates: estimates || [],
       pagination: {
@@ -3490,9 +3263,7 @@ app.get('/api/estimates', async (req, res) => {
         pages: Math.ceil((count || 0) / limit)
       }
     };
-    
-    console.log('Sending response with', estimates ? estimates.length : 0, 'estimates');
-    res.json(response);
+   res.json(response);
   } catch (error) {
     console.error('Get estimates error:', error);
     res.status(500).json({ 
@@ -3834,16 +3605,13 @@ app.post('/api/estimates/:id/send', async (req, res) => {
         });
 
         emailSent = true;
-        console.log(`✅ Estimate email sent to ${estimate.customers.email}`);
       } catch (err) {
         console.error('Email sending failed:', err);
         emailErrorMsg = err.message;
       }
     } else if (estimate.customers?.email) {
-      console.log('⚠️ Email not configured - estimate status updated but no email sent');
-    } else {
-      console.log('⚠️ No customer email available - estimate status updated but no email sent');
-    }
+   } else {
+   }
 
     res.json({
       message: 'Estimate sent successfully',
@@ -4767,16 +4535,13 @@ app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (
 
       case 'invoice.payment_succeeded':
         const invoice = event.data.object;
-        console.log('Payment succeeded for subscription:', invoice.subscription);
-        break;
+       break;
 
       case 'invoice.payment_failed':
         const failedInvoice = event.data.object;
-        console.log('Payment failed for subscription:', failedInvoice.subscription);
-        break;
+      break;
 
       default:
-        console.log(`Unhandled event type ${event.type}`);
     }
 
     res.json({received: true});
@@ -5277,12 +5042,7 @@ app.put('/api/user/availability', async (req, res) => {
 // OPTIONS handled by catch-all above
 
 app.get('/api/territories', authenticateToken, async (req, res) => {
-  console.log('🏔️ Territories endpoint hit from origin:', req.headers.origin);
-  console.log('🏔️ Query params:', req.query);
-  
-  // CORS handled by middleware
-  
-  console.log('🏔️ CORS headers set for territories endpoint');
+
   
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
@@ -5457,12 +5217,9 @@ app.post('/api/territories', async (req, res) => {
       pricingMultiplier 
     } = req.body;
     
-    console.log('Received territory data:', req.body)
-    console.log('Required fields check:', { userId, name, location })
-    
+  
         if (!userId || !name || !location) {
-      console.log('Missing required fields:', { userId: !!userId, name: !!name, location: !!location })
-      return res.status(400).json({ error: 'Missing required fields' });
+        return res.status(400).json({ error: 'Missing required fields' });
     }
     
     const { data: result, error } = await supabase
@@ -5818,7 +5575,6 @@ app.get('/api/invoices/:id', async (req, res) => {
 
 app.post('/api/invoices', async (req, res) => {
   try {
-    console.log('Invoice creation request:', req.body);
     const { 
       userId, customerId, jobId, estimateId, invoiceNumber, 
       subtotal, taxAmount, discountAmount, totalAmount, 
@@ -5903,7 +5659,6 @@ app.post('/api/invoices', async (req, res) => {
       if (updateError) {
         console.error('Error updating job invoice status:', updateError);
       } else {
-        console.log('Updated job invoice status for job ID:', jobId);
       }
     }
       
@@ -5942,8 +5697,7 @@ app.put('/api/invoices/:id', async (req, res) => {
       totalAmount, dueDate, notes 
     } = req.body;
     
-    console.log('Invoice update request:', { id, userId, status, amount, taxAmount, totalAmount });
-    
+  
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
     }
@@ -5952,9 +5706,7 @@ app.put('/api/invoices/:id', async (req, res) => {
     const amountValue = parseFloat(amount) || 0;
     const taxAmountValue = parseFloat(taxAmount) || 0;
     const totalAmountValue = parseFloat(totalAmount) || 0;
-    
-    console.log('Converted values:', { amountValue, taxAmountValue, totalAmountValue });
-    
+
     const { error: updateError } = await supabase
       .from('invoices')
       .update({
@@ -5992,7 +5744,6 @@ app.put('/api/invoices/:id', async (req, res) => {
       return res.status(404).json({ error: 'Invoice not found' });
     }
     
-    console.log('Updated invoice:', invoices[0]);
     res.json(invoices[0]);
   } catch (error) {
     console.error('Update invoice error:', error);
@@ -6962,14 +6713,9 @@ app.delete('/api/job-templates/:id', async (req, res) => {
 // OPTIONS handled by catch-all above
 
 app.get('/api/team-members', authenticateToken, async (req, res) => {
-  console.log('🏃‍♂️ Team members endpoint hit from origin:', req.headers.origin);
-  console.log('🏃‍♂️ Query params:', req.query);
-  
+
   // CORS handled by middleware
-  
-  console.log('🏃‍♂️ CORS headers set for team-members endpoint');
-  
-  console.log('🔄 Team members request received:', req.query);
+
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
     // Build Supabase query with joins and aggregations
@@ -7049,7 +6795,6 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
 app.get('/api/team-members/verify-invitation', async (req, res) => {
   try {
     const { token } = req.query;
-    console.log('🔍 Verifying invitation token:', token);
     
     if (!token) {
       return res.status(400).json({ error: 'Token is required' });
@@ -7069,17 +6814,11 @@ app.get('/api/team-members/verify-invitation', async (req, res) => {
     }
     
     if (!teamMembers || teamMembers.length === 0) {
-      console.log('❌ No valid team member found for token:', token);
       return res.status(404).json({ error: 'Invalid or expired invitation token' });
     }
     
     const teamMember = teamMembers[0];
-    console.log('✅ Valid team member found:', {
-      id: teamMember.id,
-      email: teamMember.email,
-      status: teamMember.status,
-      expires: teamMember.invitation_expires
-    });
+  
     
     res.json({
       firstName: teamMember.first_name,
@@ -7427,12 +7166,9 @@ app.put('/api/team-members/:id', async (req, res) => {
         
         if (!testError) {
           updateData.color = color;
-          console.log('Setting team member color:', color);
         } else {
-          console.log('Color column does not exist, skipping color update');
         }
       } catch (err) {
-        console.log('Color column does not exist, skipping color update');
       }
     }
     
@@ -7484,11 +7220,9 @@ app.put('/api/team-members/:id', async (req, res) => {
 app.delete('/api/team-members/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    console.log(`🗑️ Delete team member request for ID: ${id}`);
     
     // Validate team member ID
     if (!id || isNaN(parseInt(id))) {
-      console.log('❌ Invalid team member ID provided');
       return res.status(400).json({ 
         error: 'Invalid team member ID',
         errorType: 'VALIDATION_ERROR',
@@ -7497,7 +7231,6 @@ app.delete('/api/team-members/:id', async (req, res) => {
     }
     
     // First, get the team member's current status
-    console.log('🔍 Fetching team member details...');
     const { data: teamMember, error: memberError } = await supabase
       .from('team_members')
       .select('id, status, first_name, last_name, user_id')
@@ -7532,7 +7265,6 @@ app.delete('/api/team-members/:id', async (req, res) => {
     }
     
     // Check if team member has active job assignments
-    console.log('🔍 Checking for active job assignments...');
     const { data: assignedJobs, error: jobsError } = await supabase
       .from('jobs')
       .select('id, status', { count: 'exact' })
@@ -7575,7 +7307,6 @@ app.delete('/api/team-members/:id', async (req, res) => {
     // 4. Non-admin team members
     
     // Actually DELETE the team member from the database
-    console.log('🗑️ Attempting to delete team member from database...');
     const { error: deleteError } = await supabase
       .from('team_members')
       .delete()
@@ -7600,8 +7331,6 @@ app.delete('/api/team-members/:id', async (req, res) => {
       });
     }
     
-    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} permanently deleted from database`);
-    console.log('✅ Team member deletion completed successfully');
     res.json({ 
       message: 'Team member permanently deleted successfully',
       success: true,
@@ -7679,8 +7408,6 @@ app.put('/api/team-members/:id/deactivate', async (req, res) => {
       console.error('Error deactivating team member:', updateError);
       return res.status(500).json({ error: 'Failed to deactivate team member' });
     }
-    
-    console.log(`✅ Team member ${teamMember.first_name} ${teamMember.last_name} deactivated successfully`);
     res.json({ message: 'Team member deactivated successfully' });
   } catch (error) {
     console.error('Deactivate team member error:', error);
@@ -7759,8 +7486,7 @@ app.put('/api/team-members/:id/availability', async (req, res) => {
 app.post('/api/team-members/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    console.log('🔍 Team member login attempt for username:', username);
-    
+   
     // Find team member by username or email using Supabase
     const { data: teamMembers, error: teamMemberError } = await supabase
       .from('team_members')
@@ -7774,22 +7500,18 @@ app.post('/api/team-members/login', async (req, res) => {
     }
     
     if (!teamMembers || teamMembers.length === 0) {
-      console.log('❌ No team member found for username:', username);
         return res.status(401).json({ error: 'Invalid credentials' });
       }
       
       const teamMember = teamMembers[0];
-    console.log('✅ Team member found:', teamMember.id);
       
       // Check password (handle case where password might not be set for existing team members)
       if (!teamMember.password) {
-      console.log('❌ No password set for team member:', teamMember.id);
         return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
       }
       
       const isValidPassword = await bcrypt.compare(password, teamMember.password);
       if (!isValidPassword) {
-      console.log('❌ Invalid password for team member:', teamMember.id);
         return res.status(401).json({ error: 'Invalid credentials' });
       }
       
@@ -7839,7 +7561,6 @@ app.post('/api/team-members/login', async (req, res) => {
       // Remove password from response
       delete teamMember.password;
       
-    console.log('✅ Team member login successful:', teamMember.id);
       res.json({
         message: 'Login successful',
         teamMember,
@@ -7855,8 +7576,6 @@ app.post('/api/team-members/login', async (req, res) => {
 app.get('/api/team-members/me', authenticateToken, async (req, res) => {
   try {
     const teamMemberId = req.user.userId;
-    console.log('🔍 Getting current team member profile for ID:', teamMemberId);
-    
     // Get team member from Supabase
     const { data: teamMember, error: teamMemberError } = await supabase
       .from('team_members')
@@ -7877,7 +7596,6 @@ app.get('/api/team-members/me', authenticateToken, async (req, res) => {
     // Remove password from response
     delete teamMember.password;
     
-    console.log('✅ Team member profile retrieved successfully');
     res.json(teamMember);
   } catch (error) {
     console.error('❌ Get team member profile error:', error);
@@ -7887,7 +7605,6 @@ app.get('/api/team-members/me', authenticateToken, async (req, res) => {
 
 // Test endpoint to verify backend is working
 app.get('/api/team-members/test', (req, res) => {
-  console.log('🧪 Test endpoint hit at:', new Date().toISOString());
   res.json({ 
     message: 'Backend is working!', 
     timestamp: new Date().toISOString(),
@@ -7896,8 +7613,6 @@ app.get('/api/team-members/test', (req, res) => {
 });
 
 app.post('/api/team-members/register', async (req, res) => {
-  console.log('🚀 Team member registration endpoint hit at:', new Date().toISOString());
-  
   // Set a timeout for this request
   const timeout = setTimeout(() => {
     console.error('⏰ Team member registration request timed out after 30 seconds');
@@ -7907,8 +7622,6 @@ app.post('/api/team-members/register', async (req, res) => {
   }, 30000);
   
   try {
-    console.log('🔍 Team member registration request body:', req.body);
-    
     const { 
       userId, 
       firstName, 
@@ -7957,8 +7670,7 @@ app.post('/api/team-members/register', async (req, res) => {
       });
     }
     
-    console.log('🔍 Step 1: Checking for email conflicts...');
-    
+
     // Check for specific conflicts (email, phone)
     const { data: existingEmail, error: emailCheckError } = await supabase
       .from('team_members')
@@ -8015,38 +7727,13 @@ app.post('/api/team-members/register', async (req, res) => {
       }
     }
     
-    console.log('✅ Step 2: Phone check completed - no conflicts');
-    
+  
     // Generate a unique invitation token
-    console.log('🔍 Step 3: Generating invitation token...');
+   
     const invitationToken = crypto.randomBytes(32).toString('hex');
     const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    console.log('✅ Step 3: Invitation token generated');
-    
-    // Create team member with 'invited' status
-    console.log('🔍 Step 4: Inserting team member into database...');
-    console.log('🔍 Inserting team member with data:', {
-      user_id: userId,
-      first_name: sanitizeInput(firstName),
-      last_name: sanitizeInput(lastName),
-      email: sanitizeInput(email),
-      phone: phone ? sanitizeInput(phone) : null,
-      location: location ? sanitizeInput(location) : null,
-      city: city ? sanitizeInput(city) : null,
-      state: state ? sanitizeInput(state) : null,
-      zip_code: zipCode ? sanitizeInput(zipCode) : null,
-      role: role || 'worker',
-      hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
-      is_service_provider: isServiceProvider || false,
-      territories: territories || [],
-      availability: availability || {},
-      permissions: permissions || {},
-      invitation_token: invitationToken,
-      invitation_expires: invitationExpires.toISOString(),
-      status: 'invited'
-    });
-    
-    console.log('🔍 Attempting database insert...');
+   
+  
     
     // Generate a random color for the team member
     const colors = ['#2563EB', '#DC2626', '#059669', '#D97706', '#7C3AED', '#DB2777', '#6B7280'];
@@ -8077,8 +7764,7 @@ app.post('/api/team-members/register', async (req, res) => {
       .select()
       .single();
     
-    console.log('🔍 Database insert completed. Result:', { teamMember, insertError });
-    
+  
     if (insertError) {
       console.error('❌ Error creating team member:', insertError);
       clearTimeout(timeout); // Clear the timeout
@@ -8117,14 +7803,9 @@ app.post('/api/team-members/register', async (req, res) => {
       });
     }
     
-    console.log('✅ Step 4: Team member inserted into database successfully');
-    console.log('✅ Team member created successfully:', teamMember);
-    
-    // Send invitation email (non-blocking)
-    console.log('🔍 Step 5: Sending invitation email (non-blocking)...');
-    
+ 
     // Generate invitation link
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
     sendTeamMemberEmail({
@@ -8145,15 +7826,12 @@ app.post('/api/team-members/register', async (req, res) => {
           </div>
         `,
         text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
-    }).then(() => {
-      console.log('✅ Step 5: Team member invitation email sent successfully via SendGrid (background)');
-    }).catch((emailError) => {
+    }).then(() => {}).catch((emailError) => {
       console.error('❌ Failed to send team member invitation email:', emailError);
       // Don't fail the request if email fails
     });
     
-    console.log('✅ Step 5: Email sending initiated (continuing without waiting)');
-    
+   
     const responseData = {
       message: 'Team member invited successfully',
       teamMember: {
@@ -8176,8 +7854,7 @@ app.post('/api/team-members/register', async (req, res) => {
         }
     };
     
-    console.log('✅ Step 6: Sending success response to frontend');
-    console.log('✅ Sending success response:', responseData);
+    
     clearTimeout(timeout); // Clear the timeout
     
     // Ensure response headers are set
@@ -8186,8 +7863,6 @@ app.post('/api/team-members/register', async (req, res) => {
     
     // Ensure response is properly sent
     res.status(200).json(responseData);
-    console.log('✅ Response sent successfully at:', new Date().toISOString());
-    console.log('✅ Response headers sent:', res.getHeaders());
   } catch (error) {
     console.error('Team member registration error:', error);
     console.error('Error details:', {
@@ -8252,8 +7927,7 @@ app.post('/api/team-members/logout', async (req, res) => {
 app.post('/api/team-members/complete-signup', async (req, res) => {
   try {
     const { token, username, password, firstName, lastName, phone } = req.body;
-    console.log('🔍 Completing signup for token:', token);
-    
+
     if (!token || !username || !password || !firstName || !lastName) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -8272,13 +7946,11 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
     }
     
     if (!teamMembers || teamMembers.length === 0) {
-      console.log('❌ No valid team member found for token:', token);
-        return res.status(404).json({ error: 'Invalid or expired invitation token' });
+      return res.status(404).json({ error: 'Invalid or expired invitation token' });
       }
       
       const teamMember = teamMembers[0];
-    console.log('✅ Valid team member found for signup:', teamMember.id);
-      
+    
       // Check if username is already taken
     const { data: existingUsers, error: usernameError } = await supabase
       .from('team_members')
@@ -8347,8 +8019,6 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
       return res.status(500).json({ error: 'Failed to complete signup' });
     }
     
-    console.log('✅ Team member signup completed successfully');
-    
     // Send activation confirmation email to team member
     try {
       await sendTeamMemberEmail({
@@ -8369,7 +8039,7 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
               </ul>
             </div>
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/dashboard" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+              <a href="${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard" style="background-color: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
                 Access Your Dashboard
               </a>
             </div>
@@ -8377,10 +8047,9 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
             <p>Best regards,<br>The Service Flow Team</p>
           </div>
         `,
-        text: `Welcome to Service Flow! Your account has been activated. Visit ${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/dashboard to access your dashboard.`
+        text: `Welcome to Service Flow! Your account has been activated. Visit ${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/dashboard to access your dashboard.`
       });
-      console.log('✅ Activation confirmation email sent to team member');
-    } catch (emailError) {
+     } catch (emailError) {
       console.error('❌ Failed to send activation confirmation email:', emailError);
       // Don't fail the signup process if email fails
     }
@@ -8425,7 +8094,6 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
           `,
           text: `Team member ${firstName} ${lastName} has activated their account and joined your team. You can manage them from your team dashboard.`
         });
-        console.log('✅ Admin notification email sent');
       }
     } catch (adminEmailError) {
       console.error('❌ Failed to send admin notification email:', adminEmailError);
@@ -8443,7 +8111,6 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
 app.post('/api/team-members/:id/resend-invite', async (req, res) => {
   try {
     const { id } = req.params;
-    console.log('🔄 Resending invite for team member ID:', id);
     
     // Get team member details from Supabase
     const { data: teamMember, error: fetchError } = await supabase
@@ -8485,7 +8152,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       
       // Send new invitation email
       try {
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
         
       await sendTeamMemberEmail({
           to: teamMember.email,
@@ -8507,7 +8174,6 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
         text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account.`
         });
       
-      console.log('✅ Invitation email sent successfully via SendGrid');
       } catch (emailError) {
       console.error('❌ Failed to send invitation email:', emailError);
       console.error('❌ Email error details:', {
@@ -8527,12 +8193,10 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
         errorMessage = 'Email service connection timeout. Please try again later or contact support.';
       }
       
-      // Return success but with a warning about email delivery
-      console.log('⚠️ Continuing with invitation token update despite email failure');
-      return res.status(200).json({ 
+    return res.status(200).json({ 
         message: 'Invitation token updated successfully, but email delivery failed',
         warning: errorMessage,
-        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`
+        invitationLink: `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`
         });
       }
       
@@ -8548,9 +8212,7 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
   try {
     const { teamMemberId } = req.params;
     const { startDate, endDate } = req.query;
-    
-    console.log('🔍 Team member dashboard request:', { teamMemberId, startDate, endDate });
-    
+   
     // Get team member info using Supabase
     const { data: teamMembers, error: teamMemberError } = await supabase
       .from('team_members')
@@ -8563,18 +8225,14 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       }
       
     if (!teamMembers || teamMembers.length === 0) {
-        console.log('❌ Team member not found with ID:', teamMemberId);
         return res.status(404).json({ error: 'Team member not found' });
       }
       
       const teamMember = teamMembers[0];
-      console.log('✅ Team member data:', { id: teamMember.id, name: `${teamMember.first_name} ${teamMember.last_name}` });
       
     // Get jobs assigned to this team member using Supabase
       let jobs = [];
       try {
-        console.log('📋 Fetching jobs for team member:', teamMemberId);
-      
       // Build the date filter
       const startDateFilter = startDate || '2024-01-01';
       const endDateFilter = endDate || '2030-12-31';
@@ -8615,7 +8273,6 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
           service_name: job.services?.name || '',
           duration: job.services?.duration || 60
         }));
-        console.log('✅ Jobs found:', jobs.length);
       }
       } catch (jobsError) {
         console.error('❌ Error fetching jobs for team member:', jobsError);
@@ -8636,13 +8293,11 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
           : 0
       };
       
-      console.log('📊 Stats calculated:', stats);
       
     // Get notifications using Supabase (optional - continue if table doesn't exist)
       let notifications = [];
       try {
-        console.log('📋 Fetching notifications for team member:', teamMemberId);
-      const { data: notificationsData, error: notificationError } = await supabase
+        const { data: notificationsData, error: notificationError } = await supabase
         .from('team_member_notifications')
         .select('*')
         .eq('team_member_id', teamMemberId)
@@ -8654,7 +8309,6 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         notifications = [];
       } else {
         notifications = notificationsData || [];
-        console.log('✅ Notifications found:', notifications.length);
       }
       } catch (notificationError) {
         console.warn('⚠️ Team member notifications table not found, skipping notifications:', notificationError.message);
@@ -8679,7 +8333,6 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         notifications: notifications
       };
       
-      console.log('✅ Dashboard response prepared successfully');
       res.json(response);
   } catch (error) {
     console.error('❌ Team member dashboard error:', error);
@@ -8699,8 +8352,6 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
     const { jobId } = req.params;
     const { teamMemberId, status, notes } = req.body;
     
-    console.log('🔍 Updating job status:', { jobId, teamMemberId, status, notes });
-    
     // Update job status using Supabase
     const { error: updateError } = await supabase
       .from('jobs')
@@ -8717,7 +8368,6 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
       return res.status(500).json({ error: 'Failed to update job status' });
     }
     
-    console.log('✅ Job status updated successfully');
     
     // Create notification for business owner using Supabase (optional)
     try {
@@ -8736,7 +8386,6 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
         console.warn('⚠️ Failed to create notification:', notificationError);
         // Continue without notification
       } else {
-        console.log('✅ Notification created successfully');
       }
     } catch (notificationError) {
       console.warn('⚠️ Notification creation failed:', notificationError);
@@ -10544,7 +10193,6 @@ app.put('/api/invoices/:id/status', async (req, res) => {
     const { id } = req.params;
     const { userId, status } = req.body;
     
-    console.log('Simple invoice status update:', { id, userId, status });
     
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
@@ -10561,7 +10209,6 @@ app.put('/api/invoices/:id/status', async (req, res) => {
         WHERE id = ? AND user_id = ?
       `, [status, id, userId]);
       
-      console.log('Simple update result:', result);
       
       if (result.affectedRows === 0) {
         return res.status(404).json({ error: 'Invoice not found' });
@@ -10592,8 +10239,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
     
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
     
-    console.log('Places API request:', { input, key: GOOGLE_API_KEY.substring(0, 10) + '...' });
-    
+  
     if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ') {
       console.warn('Using provided Google API key - ensure it has Places API enabled');
     }
@@ -10609,7 +10255,6 @@ app.get('/api/places/autocomplete', async (req, res) => {
       }
     );
     
-    console.log("Google Places API response:", response.data);
     
     if (response.data.status === 'OK') {
       res.json({ predictions: response.data.predictions });
@@ -10633,7 +10278,6 @@ app.get('/api/places/details', async (req, res) => {
     
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
     
-    console.log('Fetching place details for:', place_id);
     
     const response = await axios.get(
       "https://maps.googleapis.com/maps/api/place/details/json",
@@ -10646,7 +10290,6 @@ app.get('/api/places/details', async (req, res) => {
       }
     );
     
-    console.log("Google Places API details response:", response.data);
     
     if (response.data.status === 'OK') {
       res.json({ result: response.data.result });
@@ -10745,8 +10388,7 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to create team assignment' });
       }
       
-      console.log('🔄 Created team assignment for job:', jobId, 'team member:', teamMemberId);
-      }
+     }
       
       res.json({ message: 'Job assigned successfully' });
   } catch (error) {
@@ -10866,9 +10508,7 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
         }
         }
       }
-      
-      console.log('🔄 Removed team assignment for job:', jobId, 'team member:', teamMemberId);
-      res.json({ message: 'Team member assignment removed successfully' });
+     res.json({ message: 'Team member assignment removed successfully' });
   } catch (error) {
     console.error('Remove team assignment error:', error);
     res.status(500).json({ error: 'Failed to remove team member assignment' });
@@ -10974,8 +10614,7 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
         [primaryId, jobId]
       );
       
-      console.log('🔄 Created multiple team assignments for job:', jobId, 'team members:', teamMemberIds);
-      res.json({ message: 'Team members assigned successfully' });
+     res.json({ message: 'Team members assigned successfully' });
     } finally {
       connection.release();
     }
@@ -11041,32 +10680,26 @@ app.get('/api/test-team-assignment/:jobId', authenticateToken, async (req, res) 
 // Database health check endpoint
 app.get('/api/health/database', async (req, res) => {
   try {
-    console.log('🔍 Database health check requested');
-    const connection = await pool.getConnection();
+   const connection = await pool.getConnection();
     
     try {
       // Test basic connection
       const [result] = await connection.query('SELECT 1 as test');
-      console.log('✅ Database connection successful');
-      
+     
       // Test team_members table
       let teamMembersTable = false;
       try {
         const [teamMembersResult] = await connection.query('SELECT COUNT(*) as count FROM team_members LIMIT 1');
         teamMembersTable = true;
-        console.log('✅ team_members table exists');
       } catch (error) {
-        console.log('❌ team_members table error:', error.message);
-      }
+     }
       
       // Test jobs table
       let jobsTable = false;
       try {
         const [jobsResult] = await connection.query('SELECT COUNT(*) as count FROM jobs LIMIT 1');
         jobsTable = true;
-        console.log('✅ jobs table exists');
       } catch (error) {
-        console.log('❌ jobs table error:', error.message);
       }
       
       // Test customers table
@@ -11074,9 +10707,7 @@ app.get('/api/health/database', async (req, res) => {
       try {
         const [customersResult] = await connection.query('SELECT COUNT(*) as count FROM customers LIMIT 1');
         customersTable = true;
-        console.log('✅ customers table exists');
       } catch (error) {
-        console.log('❌ customers table error:', error.message);
       }
       
       // Test services table
@@ -11084,9 +10715,7 @@ app.get('/api/health/database', async (req, res) => {
       try {
         const [servicesResult] = await connection.query('SELECT COUNT(*) as count FROM services LIMIT 1');
         servicesTable = true;
-        console.log('✅ services table exists');
       } catch (error) {
-        console.log('❌ services table error:', error.message);
       }
       
       res.json({
@@ -11117,7 +10746,6 @@ app.get('/api/health/database', async (req, res) => {
 app.get('/api/test/team-member/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    console.log('🔍 Testing team member with ID:', id);
     
     const connection = await pool.getConnection();
     
@@ -11128,7 +10756,6 @@ app.get('/api/test/team-member/:id', async (req, res) => {
       );
       
       if (teamMembers.length === 0) {
-        console.log('❌ Team member not found');
         return res.json({ 
           found: false, 
           message: 'Team member not found',
@@ -11136,7 +10763,6 @@ app.get('/api/test/team-member/:id', async (req, res) => {
         });
       }
       
-      console.log('✅ Team member found:', teamMembers[0]);
       res.json({ 
         found: true, 
         teamMember: teamMembers[0] 
@@ -11153,7 +10779,6 @@ app.get('/api/test/team-member/:id', async (req, res) => {
 // Test jobs table structure
 app.get('/api/test/jobs-structure', async (req, res) => {
   try {
-    console.log('🔍 Testing jobs table structure');
     
     const connection = await pool.getConnection();
     
@@ -11166,7 +10791,6 @@ app.get('/api/test/jobs-structure', async (req, res) => {
         ORDER BY ORDINAL_POSITION
       `);
       
-      console.log('✅ Jobs table columns:', columns.map(c => c.COLUMN_NAME));
       
       // Check if team_member_id column exists
       const hasTeamMemberId = columns.some(col => col.COLUMN_NAME === 'team_member_id');
@@ -11176,7 +10800,6 @@ app.get('/api/test/jobs-structure', async (req, res) => {
       try {
         const [jobsResult] = await connection.query('SELECT COUNT(*) as count FROM jobs');
         jobsCount = jobsResult[0].count;
-        console.log('✅ Jobs table accessible, count:', jobsCount);
       } catch (jobsError) {
         console.error('❌ Jobs table error:', jobsError.message);
       }
@@ -11192,7 +10815,6 @@ app.get('/api/test/jobs-structure', async (req, res) => {
             LIMIT 5
           `);
           teamMemberJobs = teamJobsResult;
-          console.log('✅ Team member jobs found:', teamMemberJobs.length);
         } catch (teamJobsError) {
           console.error('❌ Team member jobs query error:', teamJobsError.message);
         }
@@ -11324,9 +10946,7 @@ app.get('/api/team-members/:id/performance', async (req, res) => {
           console.error('Error querying jobs for team member:', queryError);
           // Use default values if query fails
         }
-      } else {
-        console.log('team_member_id column does not exist in jobs table, using default values');
-      }
+      } else { }
       
       const performance = performanceMetrics[0] || {
         jobs_completed: 0,
@@ -11432,8 +11052,7 @@ app.get('/api/team-members/:id/settings', async (req, res) => {
 // Database migration endpoint for team member settings
 app.post('/api/migrate/team-member-settings', async (req, res) => {
   try {
-    console.log('🔧 Adding settings column to team_members table...');
-    
+   
     const connection = await pool.getConnection();
     
     try {
@@ -11449,8 +11068,7 @@ app.post('/api/migrate/team-member-settings', async (req, res) => {
       if (columnCheck[0].count === 0) {
         // Add settings column to team_members table
         await connection.query('ALTER TABLE team_members ADD COLUMN settings JSON NULL');
-        console.log('✅ Added settings column to team_members table');
-        
+       
         // Update existing team members with default settings
         await connection.query(`
           UPDATE team_members SET settings = JSON_OBJECT(
@@ -11467,15 +11085,12 @@ app.post('/api/migrate/team-member-settings', async (req, res) => {
             )
           ) WHERE settings IS NULL
         `);
-        console.log('✅ Updated existing team members with default settings');
       } else {
-        console.log('✅ Settings column already exists');
       }
       
       // Show table structure
       const [columns] = await connection.query('DESCRIBE team_members');
-      console.log('📋 Team members table structure:', columns.map(c => c.Field));
-      
+    
       res.json({
         success: true,
         message: 'Team member settings migration completed successfully',
@@ -11493,8 +11108,7 @@ app.post('/api/migrate/team-member-settings', async (req, res) => {
 // Database migration endpoint for jobs team member assignment
 app.post('/api/migrate/jobs-team-member', async (req, res) => {
   try {
-    console.log('🔧 Adding team_member_id column to jobs table...');
-    
+   
     const connection = await pool.getConnection();
     
     try {
@@ -11510,8 +11124,7 @@ app.post('/api/migrate/jobs-team-member', async (req, res) => {
       if (columnCheck[0].count === 0) {
         // Add team_member_id column to jobs table
         await connection.query('ALTER TABLE jobs ADD COLUMN team_member_id INT NULL');
-        console.log('✅ Added team_member_id column to jobs table');
-        
+       
         // Add foreign key constraint if team_members table exists
         try {
           await connection.query(`
@@ -11520,25 +11133,20 @@ app.post('/api/migrate/jobs-team-member', async (req, res) => {
             FOREIGN KEY (team_member_id) REFERENCES team_members(id) 
             ON DELETE SET NULL
           `);
-          console.log('✅ Added foreign key constraint');
         } catch (fkError) {
-          console.log('⚠️ Could not add foreign key constraint:', fkError.message);
         }
         
         // Add index for better performance
         try {
           await connection.query('CREATE INDEX idx_jobs_team_member_id ON jobs(team_member_id)');
-          console.log('✅ Added index for team_member_id');
+        
         } catch (indexError) {
-          console.log('⚠️ Could not add index:', indexError.message);
         }
       } else {
-        console.log('✅ team_member_id column already exists');
       }
       
       // Show table structure
       const [columns] = await connection.query('DESCRIBE jobs');
-      console.log('📋 Jobs table structure:', columns.map(c => c.Field));
       
       res.json({
         success: true,
@@ -11557,7 +11165,6 @@ app.post('/api/migrate/jobs-team-member', async (req, res) => {
 // Database migration endpoint for team member skills
 app.post('/api/migrate/team-member-skills', async (req, res) => {
   try {
-    console.log('🔧 Adding skills column to team_members table...');
     
     const connection = await pool.getConnection();
     
@@ -11574,7 +11181,7 @@ app.post('/api/migrate/team-member-skills', async (req, res) => {
       if (columnCheck[0].count === 0) {
         // Add skills column to team_members table
         await connection.query('ALTER TABLE team_members ADD COLUMN skills JSON NULL');
-        console.log('✅ Added skills column to team_members table');
+        
         
         // Update existing team members with sample skills
         await connection.query(`
@@ -11584,9 +11191,7 @@ app.post('/api/migrate/team-member-skills', async (req, res) => {
             JSON_OBJECT('name', 'Window Cleaning', 'level', 'Intermediate')
           ) WHERE skills IS NULL
         `);
-        console.log('✅ Updated existing team members with sample skills');
       } else {
-        console.log('✅ Skills column already exists');
       }
       
       // Show table structure
@@ -11610,7 +11215,6 @@ app.post('/api/migrate/team-member-skills', async (req, res) => {
 // Database migration endpoint for team member territories
 app.post('/api/migrate/team-member-territories', async (req, res) => {
   try {
-    console.log('🔧 Adding territories column to team_members table...');
     
     const connection = await pool.getConnection();
     
@@ -11627,20 +11231,17 @@ app.post('/api/migrate/team-member-territories', async (req, res) => {
       if (columnCheck[0].count === 0) {
         // Add territories column to team_members table
         await connection.query('ALTER TABLE team_members ADD COLUMN territories JSON NULL');
-        console.log('✅ Added territories column to team_members table');
+        
         
         // Assign territory 1 to team member 3 (Mike Davis) for testing
         await connection.query(`
           UPDATE team_members SET territories = JSON_ARRAY(1) WHERE id = 3
         `);
-        console.log('✅ Assigned territory 1 to team member 3 for testing');
       } else {
-        console.log('✅ Territories column already exists');
       }
       
       // Show table structure
       const [columns] = await connection.query('DESCRIBE team_members');
-      console.log('📋 Team members table structure:', columns.map(c => c.Field));
       
       res.json({
         success: true,
@@ -11659,26 +11260,23 @@ app.post('/api/migrate/team-member-territories', async (req, res) => {
 // Manual endpoint to add territories column for testing
 app.post('/api/test/add-territories-column', async (req, res) => {
   try {
-    console.log('🔧 Manually adding territories column for testing...');
     
     const connection = await pool.getConnection();
     
     try {
       // Add territories column to team_members table
       await connection.query('ALTER TABLE team_members ADD COLUMN IF NOT EXISTS territories JSON NULL');
-      console.log('✅ Added territories column to team_members table');
+     
       
       // Assign territory 1 to team member 3 (Mike Davis) for testing
       await connection.query(`
         UPDATE team_members SET territories = JSON_ARRAY(1) WHERE id = 3
       `);
-      console.log('✅ Assigned territory 1 to team member 3 for testing');
       
       // Verify the update
       const [result] = await connection.query(`
         SELECT id, first_name, last_name, territories FROM team_members WHERE id = 3
       `);
-      console.log('✅ Verification result:', result[0]);
       
       res.json({
         success: true,
@@ -11697,14 +11295,11 @@ app.post('/api/test/add-territories-column', async (req, res) => {
 // Debug endpoint to test database connections
 app.get('/api/debug/database', async (req, res) => {
   try {
-    console.log('🔍 Database debug requested');
     const connection = await pool.getConnection();
     
     try {
       // Test basic connection
       const [result] = await connection.query('SELECT 1 as test');
-      console.log('✅ Database connection successful');
-      
       // Test all tables
       const tables = ['jobs', 'team_members', 'customers', 'services', 'users'];
       const tableStatus = {};
@@ -11713,10 +11308,8 @@ app.get('/api/debug/database', async (req, res) => {
         try {
           const [tableResult] = await connection.query(`SELECT COUNT(*) as count FROM ${table} LIMIT 1`);
           tableStatus[table] = { exists: true, count: tableResult[0].count };
-          console.log(`✅ ${table} table exists with ${tableResult[0].count} records`);
-        } catch (error) {
+       } catch (error) {
           tableStatus[table] = { exists: false, error: error.message };
-          console.log(`❌ ${table} table error:`, error.message);
         }
       }
       
@@ -11724,10 +11317,8 @@ app.get('/api/debug/database', async (req, res) => {
       try {
         const [notificationsResult] = await connection.query('SELECT COUNT(*) as count FROM team_member_notifications LIMIT 1');
         tableStatus.team_member_notifications = { exists: true, count: notificationsResult[0].count };
-        console.log(`✅ team_member_notifications table exists with ${notificationsResult[0].count} records`);
       } catch (error) {
         tableStatus.team_member_notifications = { exists: false, error: error.message };
-        console.log(`❌ team_member_notifications table error:`, error.message);
       }
       
       res.json({
@@ -11855,13 +11446,88 @@ app.get('/api/test-branding', (req, res) => {
 app.get('/api/test-cors', (req, res) => {
   // CORS handled by middleware
   
-  console.log('🧪 CORS test endpoint hit at:', new Date().toISOString());
   res.json({ 
     message: 'CORS is working!', 
     timestamp: new Date().toISOString(),
     status: 'success',
     origin: req.headers.origin
   });
+});
+
+// Team member reset password endpoint
+app.post('/api/team-members/reset-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    
+    // Find team member by email
+    const { data: teamMember, error: findError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, email, user_id')
+      .eq('email', email)
+      .single();
+    
+    if (findError || !teamMember) {
+      return res.status(404).json({ error: 'Team member not found with this email address' });
+    }
+    
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetExpires = new Date(Date.now() + 3600000); // 1 hour from now
+    
+    // Store reset token in database
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({
+        reset_token: resetToken,
+        reset_token_expires: resetExpires.toISOString()
+      })
+      .eq('id', teamMember.id);
+    
+    if (updateError) {
+      console.error('❌ Error storing reset token:', updateError);
+      return res.status(500).json({ error: 'Failed to generate reset token' });
+    }
+    
+    // Send reset email
+    const resetUrl = `${process.env.FRONTEND_URL || 'https://www.service-flow.pro'}/team-member/reset-password?token=${resetToken}`;
+    
+    const emailContent = {
+      to: email,
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.com',
+      subject: 'Reset Your Team Member Password',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #2563eb;">Password Reset Request</h2>
+          <p>Hello ${teamMember.first_name},</p>
+          <p>You requested to reset your password for your team member account.</p>
+          <p>Click the button below to reset your password:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${resetUrl}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
+          </div>
+          <p>This link will expire in 1 hour.</p>
+          <p>If you didn't request this password reset, please ignore this email.</p>
+          <p>Best regards,<br>Service Flow Team</p>
+        </div>
+      `
+    };
+    
+    try {
+      await sgMail.send(emailContent);
+      res.json({ message: 'Password reset instructions sent to your email' });
+    } catch (emailError) {
+      console.error('❌ Error sending reset email:', emailError);
+      res.status(500).json({ error: 'Failed to send reset email' });
+    }
+    
+  } catch (error) {
+    console.error('❌ Team member reset password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Add OPTIONS handler for test endpoint
@@ -11983,21 +11649,16 @@ app.post('/api/upload-service-image', authenticateToken, upload.single('image'),
 
 // Modifier image upload endpoint
 app.post('/api/upload-modifier-image', authenticateToken, upload.single('image'), async (req, res) => {
-  console.log('🔍 Modifier image upload endpoint called');
-  console.log('🔍 Request file:', req.file);
-  console.log('🔍 Request body:', req.body);
+ 
   
   try {
     if (!req.file) {
-      console.log('❌ No file uploaded');
       return res.status(400).json({ error: 'No image uploaded' });
     }
 
     // Upload to Supabase Storage
     const result = await uploadToStorage(req.file, BUCKETS.MODIFIER_IMAGES, 'modifiers');
-
-    console.log('✅ Modifier image uploaded successfully:', result.imageUrl);
-    res.json(result);
+ res.json(result);
   } catch (error) {
     console.error('❌ Error uploading modifier image:', error);
     res.status(500).json({ error: 'Failed to upload modifier image' });
@@ -12006,20 +11667,16 @@ app.post('/api/upload-modifier-image', authenticateToken, upload.single('image')
 
 // Intake image upload endpoint
 app.post('/api/upload-intake-image', authenticateToken, upload.single('image'), async (req, res) => {
-  console.log('🔍 Intake image upload endpoint called');
-  console.log('🔍 Request file:', req.file);
-  console.log('🔍 Request body:', req.body);
+
   
   try {
     if (!req.file) {
-      console.log('❌ No file uploaded');
       return res.status(400).json({ error: 'No image uploaded' });
     }
 
     // Upload to Supabase Storage
     const result = await uploadToStorage(req.file, BUCKETS.INTAKE_IMAGES, 'intake');
 
-    console.log('✅ Intake image uploaded successfully:', result.imageUrl);
     res.json(result);
   } catch (error) {
     console.error('❌ Error uploading intake image:', error);
@@ -12089,7 +11746,6 @@ app.put('/api/user/password', async (req, res) => {
         UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?
       `, [newPassword, userId]);
 
-      console.log('🔍 Password updated successfully');
       res.json({ 
         message: 'Password updated successfully'
       });
@@ -12105,7 +11761,6 @@ app.put('/api/user/password', async (req, res) => {
 // Update email endpoint
 app.put('/api/user/email', async (req, res) => {
   try {
-    console.log('🔍 PUT /api/user/email called with body:', req.body);
     const { userId, newEmail, password } = req.body;
     
     if (!userId || !newEmail || !password) {
@@ -12143,7 +11798,6 @@ app.put('/api/user/email', async (req, res) => {
         UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?
       `, [newEmail, userId]);
 
-      console.log('🔍 Email updated successfully');
       res.json({ 
         message: 'Email updated successfully',
         email: newEmail
@@ -12160,7 +11814,6 @@ app.put('/api/user/email', async (req, res) => {
 // Branding API endpoints
 app.get('/api/user/branding', async (req, res) => {
   try {
-    console.log('🔍 GET /api/user/branding called with query:', req.query);
     const { userId } = req.query;
     
     if (!userId) {
@@ -12171,7 +11824,6 @@ app.get('/api/user/branding', async (req, res) => {
     
     try {
       // Get branding settings for the user
-      console.log('🔍 Querying user_branding table for userId:', userId);
       const [brandingData] = await connection.query(`
         SELECT 
           logo_url as logo,
@@ -12181,7 +11833,6 @@ app.get('/api/user/branding', async (req, res) => {
         WHERE user_id = ?
       `, [userId]);
 
-      console.log('🔍 Branding data found:', brandingData);
       if (brandingData.length > 0) {
         const branding = brandingData[0];
         // Ensure logo URL is complete
@@ -12191,7 +11842,6 @@ app.get('/api/user/branding', async (req, res) => {
         res.json(branding);
       } else {
         // Return default branding if none exists
-        console.log('🔍 No branding data found, returning defaults');
         res.json({
           logo: null,
           showLogoInAdmin: false,
@@ -12209,7 +11859,6 @@ app.get('/api/user/branding', async (req, res) => {
 
 app.put('/api/user/branding', async (req, res) => {
   try {
-    console.log('🔍 PUT /api/user/branding called with body:', req.body);
     const { userId, logo, showLogoInAdmin, primaryColor } = req.body;
     
     if (!userId) {
@@ -12220,15 +11869,12 @@ app.put('/api/user/branding', async (req, res) => {
     
     try {
       // Check if branding record exists
-      console.log('🔍 Checking if branding record exists for userId:', userId);
       const [existing] = await connection.query(`
         SELECT id FROM user_branding WHERE user_id = ?
       `, [userId]);
 
-      console.log('🔍 Existing branding records:', existing);
       if (existing.length > 0) {
         // Update existing record
-        console.log('🔍 Updating existing branding record');
         await connection.query(`
           UPDATE user_branding 
           SET 
@@ -12238,15 +11884,12 @@ app.put('/api/user/branding', async (req, res) => {
             updated_at = NOW()
           WHERE user_id = ?
         `, [logo, showLogoInAdmin ? 1 : 0, primaryColor, userId]);
-        console.log('🔍 Branding record updated successfully');
       } else {
         // Create new record
-        console.log('🔍 Creating new branding record');
         await connection.query(`
           INSERT INTO user_branding (user_id, logo_url, show_logo_in_admin, primary_color)
           VALUES (?, ?, ?, ?)
         `, [userId, logo, showLogoInAdmin ? 1 : 0, primaryColor]);
-        console.log('🔍 Branding record created successfully');
       }
 
       res.json({ 
@@ -12269,7 +11912,6 @@ app.put('/api/user/branding', async (req, res) => {
 // User Profile API endpoints
 app.get('/api/user/profile', async (req, res) => {
   try {
-    console.log('🔍 GET /api/user/profile called with query:', req.query);
     const { userId } = req.query;
     
     if (!userId) {
@@ -12280,7 +11922,6 @@ app.get('/api/user/profile', async (req, res) => {
     
     try {
       // Get user profile data
-      console.log('🔍 Querying users table for userId:', userId);
       const [userData] = await connection.query(`
         SELECT 
           id,
@@ -13222,9 +12863,34 @@ app.post('/api/migrate/add-color-column', async (req, res) => {
   }
 });
 
+// Final CORS safety net - ensure all responses have CORS headers
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Set CORS headers on every response as a safety net
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  }
+  
+  next();
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
+  
+  // Set CORS headers even on errors
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  }
+  
   res.status(500).json({ error: 'Something went wrong!' });
 });
 
