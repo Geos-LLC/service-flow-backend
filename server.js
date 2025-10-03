@@ -2224,10 +2224,12 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         workers_needed: workers,
         skills_required: skillsRequired,
         price: finalPrice,
+        service_price: finalPrice,
         discount: discount,
         additional_fees: additionalFees,
         taxes: taxes,
         total: finalTotal,
+        total_amount: finalTotal,
         payment_method: paymentMethod,
         territory: territory,
         is_recurring: recurringJob,
@@ -2504,6 +2506,8 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       workers: 'workers_needed',
       skillsRequired: 'skills_required',
       price: 'price',
+      service_price: 'service_price',
+      modifier_price: 'modifier_price',
       discount: 'discount',
       additionalFees: 'additional_fees',
       taxes: 'taxes',
@@ -2539,6 +2543,9 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 
     
 
+    console.log('🔧 Job Update Debug - Received updateData:', updateData);
+    console.log('🔧 Job Update Debug - Field mappings:', fieldMappings);
+    
     Object.keys(updateData).forEach(key => {
      if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
         // Handle special cases
@@ -2624,6 +2631,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       }
     }
 
+    console.log('🔧 Job Update Debug - Sending to database:', updateDataToSend);
     
     const { error: updateError } = await supabase
       .from('jobs')
@@ -11940,7 +11948,6 @@ app.get('/api/user/profile', async (req, res) => {
         WHERE id = ?
       `, [userId]);
 
-      console.log('🔍 User data found:', userData);
       if (userData.length > 0) {
         const user = userData[0];
         // Ensure profile picture URL is complete
@@ -11957,7 +11964,6 @@ app.get('/api/user/profile', async (req, res) => {
         
         res.json(responseData);
       } else {
-        console.log('🔍 No user data found');
         res.status(404).json({ error: 'User not found' });
       }
     } finally {
@@ -11971,7 +11977,6 @@ app.get('/api/user/profile', async (req, res) => {
 
 app.put('/api/user/profile', async (req, res) => {
   try {
-    console.log('🔍 PUT /api/user/profile called with body:', req.body);
     const { userId, firstName, lastName, email, phone, businessName, businessEmail, emailNotifications, smsNotifications } = req.body;
     
     if (!userId) {
@@ -11982,7 +11987,6 @@ app.put('/api/user/profile', async (req, res) => {
     
     try {
       // Update user profile
-      console.log('🔍 Updating user profile for userId:', userId);
       await connection.query(`
         UPDATE users 
         SET 
@@ -11998,7 +12002,6 @@ app.put('/api/user/profile', async (req, res) => {
         WHERE id = ?
       `, [firstName, lastName, email, phone, businessName, businessEmail, emailNotifications ? 1 : 0, smsNotifications ? 1 : 0, userId]);
 
-      console.log('🔍 User profile updated successfully');
       res.json({ 
         message: 'Profile updated successfully',
         profile: {
@@ -12025,8 +12028,7 @@ app.put('/api/user/profile', async (req, res) => {
 // Notification Templates API endpoints
 app.get('/api/user/notification-templates', async (req, res) => {
   try {
-    console.log('🔍 GET /api/user/notification-templates called with query:', req.query);
-    const { userId, templateType, notificationName } = req.query;
+   const { userId, templateType, notificationName } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
@@ -12062,10 +12064,8 @@ app.get('/api/user/notification-templates', async (req, res) => {
 
       query += ' ORDER BY notification_name, template_type';
 
-      console.log('🔍 Querying notification templates for userId:', userId);
       const [templates] = await connection.query(query, params);
 
-      console.log('🔍 Templates found:', templates.length);
       res.json(templates);
     } finally {
       connection.release();
@@ -12078,7 +12078,6 @@ app.get('/api/user/notification-templates', async (req, res) => {
 
 app.put('/api/user/notification-templates', async (req, res) => {
   try {
-    console.log('🔍 PUT /api/user/notification-templates called with body:', req.body);
     const { userId, templateType, notificationName, subject, content, isEnabled } = req.body;
     
     if (!userId || !templateType || !notificationName) {
@@ -12129,7 +12128,6 @@ app.put('/api/user/notification-templates', async (req, res) => {
 // Notification Settings API endpoints
 app.get('/api/user/notification-settings', async (req, res) => {
   try {
-    console.log('🔍 GET /api/user/notification-settings called with query:', req.query);
     const { userId } = req.query;
     
     if (!userId) {
@@ -12139,7 +12137,6 @@ app.get('/api/user/notification-settings', async (req, res) => {
     const connection = await pool.getConnection();
     
     try {
-      console.log('🔍 Querying notification settings for userId:', userId);
       const [settings] = await connection.query(`
         SELECT 
           notification_type,
@@ -12153,7 +12150,6 @@ app.get('/api/user/notification-settings', async (req, res) => {
         ORDER BY notification_type
       `, [userId]);
 
-      console.log('🔍 Settings found:', settings.length);
       res.json(settings);
     } finally {
       connection.release();
@@ -12166,7 +12162,6 @@ app.get('/api/user/notification-settings', async (req, res) => {
 
 app.put('/api/user/notification-settings', async (req, res) => {
   try {
-    console.log('🔍 PUT /api/user/notification-settings called with body:', req.body);
     const { userId, notificationType, emailEnabled, smsEnabled, pushEnabled } = req.body;
     
     if (!userId || !notificationType) {
@@ -12201,7 +12196,6 @@ app.put('/api/user/notification-settings', async (req, res) => {
         `, [userId, notificationType, emailEnabled ? 1 : 0, smsEnabled ? 1 : 0, pushEnabled ? 1 : 0]);
       }
 
-      console.log('🔍 Notification setting updated successfully');
       res.json({ 
         message: 'Notification setting updated successfully'
       });
@@ -12217,9 +12211,7 @@ app.put('/api/user/notification-settings', async (req, res) => {
 app.post('/api/services/categories', async (req, res) => {
   try {
     const { userId, name, description, color } = req.body;
-    
-    console.log('Creating category with data:', { userId, name, description, color });
-    
+  
     // Validate required fields
     if (!userId || !name) {
       return res.status(400).json({ error: 'userId and name are required' });
@@ -12270,8 +12262,7 @@ app.put('/api/services/categories/:id', async (req, res) => {
     const { id } = req.params;
     const { name, description, color } = req.body;
     
-    console.log('🔄 Category update request for ID:', id);
-    console.log('🔄 Request body:', req.body);
+   
     
     // Check if category exists
     const { data: existing, error: checkError } = await supabase
@@ -12347,7 +12338,6 @@ app.delete('/api/services/categories/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    console.log('🔄 Category delete request for ID:', id);
     
     // Check if category exists
     const { data: existing, error: checkError } = await supabase
@@ -12380,8 +12370,7 @@ app.delete('/api/services/categories/:id', async (req, res) => {
     
     if (serviceCount > 0) {
       // Instead of preventing deletion, set services to uncategorized
-      console.log(`🔄 Setting ${serviceCount} services to uncategorized before deleting category`);
-      const { error: updateError } = await supabase
+     const { error: updateError } = await supabase
         .from('services')
         .update({ category_id: null })
         .eq('category_id', id);
@@ -12511,7 +12500,6 @@ app.put('/api/user/business-details', async (req, res) => {
 // Initialize database schema on startup
 const initializeDatabase = async () => {
   try {
-    console.log('🔧 Checking Supabase connection...');
     
     // Test Supabase connection
     const { data, error } = await supabase
@@ -12524,7 +12512,6 @@ const initializeDatabase = async () => {
       return;
     }
     
-    console.log('✅ Supabase database connection verified');
   } catch (error) {
     console.error('❌ Database initialization error:', error);
   }
@@ -12665,7 +12652,6 @@ app.post('/api/address/validate', async (req, res) => {
       
       // If Google API fails, fall back to geocoding
       try {
-        console.log('Falling back to geocoding API...');
         const geocodeResponse = await axios.get(
           `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`
         );
@@ -12817,7 +12803,6 @@ async function checkColorColumn() {
 // Migration endpoint to add color column
 app.post('/api/migrate/add-color-column', async (req, res) => {
   try {
-    console.log('Starting color column migration...');
     
     // Add color column
     const { error: alterError } = await supabase.rpc('exec_sql', {
@@ -12851,7 +12836,6 @@ app.post('/api/migrate/add-color-column', async (req, res) => {
       return res.status(500).json({ error: 'Failed to update colors', details: updateError.message });
     }
     
-    console.log('Color column migration completed successfully');
     res.json({ 
       success: true, 
       message: 'Color column added and existing team members updated with default colors' 
