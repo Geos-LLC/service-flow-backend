@@ -2627,6 +2627,52 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       }
     }
 
+    // If service_price is being updated, recalculate total
+    if (updateDataToSend.service_price !== undefined) {
+      // Get current job data to calculate new total
+      const { data: currentJob } = await supabase
+        .from('jobs')
+        .select('service_modifiers, additional_fees, taxes, discount')
+        .eq('id', id)
+        .single();
+      
+      if (currentJob) {
+        // Calculate modifier price from service_modifiers
+        let modifierPrice = 0;
+        if (currentJob.service_modifiers) {
+          try {
+            const modifiers = typeof currentJob.service_modifiers === 'string' 
+              ? JSON.parse(currentJob.service_modifiers) 
+              : currentJob.service_modifiers;
+            
+            modifiers.forEach(modifier => {
+              if (modifier.selectedOptions) {
+                modifier.selectedOptions.forEach(option => {
+                  const price = parseFloat(option.price || 0);
+                  const quantity = parseInt(option.selectedQuantity || 1);
+                  modifierPrice += price * quantity;
+                });
+              }
+            });
+          } catch (error) {
+            console.error('Error parsing service modifiers:', error);
+          }
+        }
+        
+        // Calculate new total
+        const servicePrice = parseFloat(updateDataToSend.service_price) || 0;
+        const additionalFees = parseFloat(updateDataToSend.additional_fees || currentJob.additional_fees || 0);
+        const taxes = parseFloat(updateDataToSend.taxes || currentJob.taxes || 0);
+        const discount = parseFloat(updateDataToSend.discount || currentJob.discount || 0);
+        
+        const newTotal = servicePrice + modifierPrice + additionalFees + taxes - discount;
+        
+        // Add calculated total to update data
+        updateDataToSend.total = newTotal;
+        updateDataToSend.total_amount = newTotal;
+      }
+    }
+
     const { error: updateError } = await supabase
       .from('jobs')
       .update(updateDataToSend)
