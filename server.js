@@ -702,15 +702,24 @@ const authenticateToken = (req, res, next) => {
 
 // Input validation helpers
 const validateEmail = (email) => {
+  if (!email || typeof email !== 'string') {
+    return false;
+  }
   return validator.isEmail(email) && email.length <= 255;
 };
 
 const validatePassword = (password) => {
-  return password && password.length >= 8 && password.length <= 128;
+  if (!password || typeof password !== 'string') {
+    return false;
+  }
+  return password.length >= 8 && password.length <= 128;
 };
 
 const validateName = (name) => {
-  return name && name.trim().length >= 2 && name.trim().length <= 50;
+  if (!name || typeof name !== 'string') {
+    return false;
+  }
+  return name.trim().length >= 2 && name.trim().length <= 50;
 };
 
 const sanitizeInput = (input) => {
@@ -845,6 +854,11 @@ app.post('/api/auth/signup', async (req, res) => {
 app.post('/api/auth/signin', async (req, res) => {
   try {
     const { email, password } = req.body;
+    
+    // Check if email is provided
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
     
     // Input validation
     if (!validateEmail(email)) {
