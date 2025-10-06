@@ -875,7 +875,7 @@ app.post('/api/auth/signin', async (req, res) => {
     // Get user with hashed password
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, email, password, first_name, last_name, business_name, profile_picture')
+      .select('id, email, password, first_name, last_name, business_name, profile_picture, google_id')
       .eq('email', sanitizedEmail)
       .limit(1);
     
@@ -890,7 +890,14 @@ app.post('/api/auth/signin', async (req, res) => {
     
     const user = users[0];
     
-    // Verify password
+    // Check if this is an OAuth user
+    if (user.google_id && user.password.startsWith('oauth_user_')) {
+      return res.status(401).json({ 
+        error: 'This account was created with Google. Please sign in with Google instead.' 
+      });
+    }
+    
+    // Verify password for regular users
     const isPasswordValid = await bcrypt.compare(password, user.password);
     
     if (!isPasswordValid) {
@@ -1060,7 +1067,7 @@ app.post('/api/auth/google', async (req, res) => {
           business_name: `${firstName}'s Business`,
           profile_picture: picture,
           google_id: googleId,
-          password: null // No password for OAuth users
+          password: 'oauth_user_' + googleId // Special password for OAuth users
         })
         .select('id, email, first_name, last_name, business_name, profile_picture')
         .single();
