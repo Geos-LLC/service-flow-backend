@@ -3821,10 +3821,13 @@ app.get('/api/public/availability', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch existing bookings' });
     }
 
-    // Normalize booked times to "HH:MM"
+    // Normalize booked times to "HH:MM" - extract directly from string to avoid timezone conversion
     const bookedSlots = (existingBookings || []).map(booking => {
-      const dt = new Date(booking.scheduled_date);
-      return dt.toISOString().substring(11, 16); // "HH:MM"
+      // Extract time directly from string format "2025-10-07 09:00:00"
+      if (booking.scheduled_date && booking.scheduled_date.includes(' ')) {
+        return booking.scheduled_date.split(' ')[1]?.substring(0, 5) || '09:00';
+      }
+      return '09:00'; // fallback
     });
 
     // Generate available slots (9 AM - 5 PM, 30 mins)
@@ -8627,9 +8630,13 @@ app.get('/api/public/availability/:userId', async (req, res) => {
         WHERE user_id = ? AND DATE(scheduled_date) = ? AND status != 'cancelled'
       `, [userId, date]);
       
-      const bookedTimes = bookings.map(booking => 
-        new Date(booking.scheduled_date).toTimeString().slice(0, 5)
-      );
+      const bookedTimes = bookings.map(booking => {
+        // Extract time directly from string format "2025-10-07 09:00:00" to avoid timezone conversion
+        if (booking.scheduled_date && booking.scheduled_date.includes(' ')) {
+          return booking.scheduled_date.split(' ')[1]?.substring(0, 5) || '09:00';
+        }
+        return '09:00'; // fallback
+      });
       
       // Generate available time slots
       const dayOfWeek = new Date(date).toLocaleDateString('en-US', { weekday: 'lowercase' });
