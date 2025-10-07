@@ -1838,6 +1838,110 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
 
 // OPTIONS handled by catch-all above
 
+// Jobs export endpoint - MUST come before /api/jobs/:id to avoid route conflict
+app.get('/api/jobs/export', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { 
+      format = 'csv', 
+      status, 
+      dateFrom, 
+      dateTo, 
+      customerId, 
+      teamMemberId,
+      territoryId,
+      invoiceStatus,
+      paymentStatus,
+      priority,
+      includeAnswers = false
+    } = req.query;
+
+    // Build query with filters
+    let query = supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        services!left(name, price, duration),
+        team_members!left(first_name, last_name, email)
+      `)
+      .eq('user_id', userId);
+
+    // Apply filters
+    if (status) {
+      const statusArray = status.split(',');
+      const mappedStatusArray = statusArray.map(s => {
+        switch (s) {
+          case 'in_progress': return 'in-progress';
+          default: return s;
+        }
+      });
+      query = query.in('status', mappedStatusArray);
+    }
+
+    if (dateFrom) {
+      query = query.gte('scheduled_date', dateFrom);
+    }
+
+    if (dateTo) {
+      query = query.lte('scheduled_date', dateTo);
+    }
+
+    if (customerId) {
+      query = query.eq('customer_id', customerId);
+    }
+
+    if (teamMemberId) {
+      query = query.eq('team_member_id', teamMemberId);
+    }
+
+    if (territoryId) {
+      query = query.eq('territory_id', territoryId);
+    }
+
+    if (invoiceStatus) {
+      query = query.eq('invoice_status', invoiceStatus);
+    }
+
+    if (paymentStatus) {
+      query = query.eq('payment_status', paymentStatus);
+    }
+
+    if (priority) {
+      query = query.eq('priority', priority);
+    }
+
+    const { data: jobs, error } = await query.order('scheduled_date', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching jobs for export:', error);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    if (format === 'csv') {
+      // Generate CSV with all fields
+      const csvHeader = 'Job ID,Customer ID,Customer Name,Customer Email,Customer Phone,Service ID,Service Name,Service Price,Team Member ID,Team Member Name,Territory ID,Territory,Notes,Status,Invoice Status,Invoice ID,Invoice Amount,Invoice Date,Payment Date,Is Recurring,Recurring Frequency,Next Billing Date,Stripe Payment Intent ID,Duration,Workers,Skills Required,Price,Discount,Additional Fees,Taxes,Total,Payment Method,Schedule Type,Let Customer Schedule,Offer To Providers,Internal Notes,Customer Notes,Scheduled Date,Scheduled Time,Service Address Street,Service Address City,Service Address State,Service Address Zip,Service Address Country,Service Address Lat,Service Address Lng,Service Name,Bathroom Count,Workers Needed,Skills,Service Price,Total Amount,Estimated Duration,Special Instructions,Payment Status,Priority,Quality Check,Photos Required,Customer Signature,Auto Invoice,Auto Reminders,Recurring End Date,Tags,Intake Question Answers,Service Modifiers,Service Intake Questions,Created At,Updated At\n';
+      
+      const csvRows = (jobs || []).map(job => {
+        const customer = job.customers || {};
+        const service = job.services || {};
+        const teamMember = job.team_members || {};
+        
+        return `"${job.id || ''}","${job.customer_id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_id || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.team_member_id || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.territory_id || ''}","${job.territory || ''}","${job.notes || ''}","${job.status || ''}","${job.invoice_status || ''}","${job.invoice_id || ''}","${job.invoice_amount || ''}","${job.invoice_date || ''}","${job.payment_date || ''}","${job.is_recurring || false}","${job.recurring_frequency || ''}","${job.next_billing_date || ''}","${job.stripe_payment_intent_id || ''}","${job.duration || ''}","${job.workers || ''}","${job.skills_required || ''}","${job.price || ''}","${job.discount || ''}","${job.additional_fees || ''}","${job.taxes || ''}","${job.total || ''}","${job.payment_method || ''}","${job.schedule_type || ''}","${job.let_customer_schedule || false}","${job.offer_to_providers || false}","${job.internal_notes || ''}","${job.customer_notes || ''}","${job.scheduled_date || ''}","${job.scheduled_time || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.service_address_country || ''}","${job.service_address_lat || ''}","${job.service_address_lng || ''}","${job.service_name || ''}","${job.bathroom_count || ''}","${job.workers_needed || ''}","${job.skills || ''}","${job.service_price || ''}","${job.total_amount || ''}","${job.estimated_duration || ''}","${job.special_instructions || ''}","${job.payment_status || ''}","${job.priority || ''}","${job.quality_check || true}","${job.photos_required || false}","${job.customer_signature || false}","${job.auto_invoice || true}","${job.auto_reminders || true}","${job.recurring_end_date || ''}","${job.tags || ''}","${job.intake_question_answers || ''}","${job.service_modifiers || ''}","${job.service_intake_questions || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
+      }).join('\n');
+        
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="jobs_export_${new Date().toISOString().split('T')[0]}.csv"`);
+      res.send(csvHeader + csvRows);
+    } else {
+      res.json({ jobs, count: jobs?.length || 0 });
+    }
+  } catch (error) {
+    console.error('Jobs export error:', error);
+    res.status(500).json({ error: 'Failed to export jobs' });
+  }
+});
+
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
@@ -3139,109 +3243,6 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Jobs export endpoint
-app.get('/api/jobs/export', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { 
-      format = 'csv', 
-      status, 
-      dateFrom, 
-      dateTo, 
-      customerId, 
-      teamMemberId,
-      territoryId,
-      invoiceStatus,
-      paymentStatus,
-      priority,
-      includeAnswers = false
-    } = req.query;
-
-    // Build query with filters
-    let query = supabase
-      .from('jobs')
-      .select(`
-        *,
-        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
-        services!left(name, price, duration),
-        team_members!left(first_name, last_name, email)
-      `)
-      .eq('user_id', userId);
-
-    // Apply filters
-    if (status) {
-      const statusArray = status.split(',');
-      const mappedStatusArray = statusArray.map(s => {
-        switch (s) {
-          case 'in_progress': return 'in-progress';
-          default: return s;
-        }
-      });
-      query = query.in('status', mappedStatusArray);
-    }
-
-    if (dateFrom) {
-      query = query.gte('scheduled_date', dateFrom);
-    }
-
-    if (dateTo) {
-      query = query.lte('scheduled_date', dateTo);
-    }
-
-    if (customerId) {
-      query = query.eq('customer_id', customerId);
-    }
-
-    if (teamMemberId) {
-      query = query.eq('team_member_id', teamMemberId);
-    }
-
-    if (territoryId) {
-      query = query.eq('territory_id', territoryId);
-    }
-
-    if (invoiceStatus) {
-      query = query.eq('invoice_status', invoiceStatus);
-    }
-
-    if (paymentStatus) {
-      query = query.eq('payment_status', paymentStatus);
-    }
-
-    if (priority) {
-      query = query.eq('priority', priority);
-    }
-
-    const { data: jobs, error } = await query.order('scheduled_date', { ascending: false });
-
-    if (error) {
-      console.error('Error fetching jobs for export:', error);
-      return res.status(500).json({ error: 'Failed to fetch jobs' });
-    }
-
-    if (format === 'csv') {
-      // Generate CSV with all fields
-      const csvHeader = 'Job ID,Customer ID,Customer Name,Customer Email,Customer Phone,Service ID,Service Name,Service Price,Team Member ID,Team Member Name,Territory ID,Territory,Notes,Status,Invoice Status,Invoice ID,Invoice Amount,Invoice Date,Payment Date,Is Recurring,Recurring Frequency,Next Billing Date,Stripe Payment Intent ID,Duration,Workers,Skills Required,Price,Discount,Additional Fees,Taxes,Total,Payment Method,Schedule Type,Let Customer Schedule,Offer To Providers,Internal Notes,Customer Notes,Scheduled Date,Scheduled Time,Service Address Street,Service Address City,Service Address State,Service Address Zip,Service Address Country,Service Address Lat,Service Address Lng,Service Name,Bathroom Count,Workers Needed,Skills,Service Price,Total Amount,Estimated Duration,Special Instructions,Payment Status,Priority,Quality Check,Photos Required,Customer Signature,Auto Invoice,Auto Reminders,Recurring End Date,Tags,Intake Question Answers,Service Modifiers,Service Intake Questions,Created At,Updated At\n';
-      
-      const csvRows = (jobs || []).map(job => {
-        const customer = job.customers || {};
-        const service = job.services || {};
-        const teamMember = job.team_members || {};
-        
-        return `"${job.id || ''}","${job.customer_id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_id || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.team_member_id || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.territory_id || ''}","${job.territory || ''}","${job.notes || ''}","${job.status || ''}","${job.invoice_status || ''}","${job.invoice_id || ''}","${job.invoice_amount || ''}","${job.invoice_date || ''}","${job.payment_date || ''}","${job.is_recurring || false}","${job.recurring_frequency || ''}","${job.next_billing_date || ''}","${job.stripe_payment_intent_id || ''}","${job.duration || ''}","${job.workers || ''}","${job.skills_required || ''}","${job.price || ''}","${job.discount || ''}","${job.additional_fees || ''}","${job.taxes || ''}","${job.total || ''}","${job.payment_method || ''}","${job.schedule_type || ''}","${job.let_customer_schedule || false}","${job.offer_to_providers || false}","${job.internal_notes || ''}","${job.customer_notes || ''}","${job.scheduled_date || ''}","${job.scheduled_time || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.service_address_country || ''}","${job.service_address_lat || ''}","${job.service_address_lng || ''}","${job.service_name || ''}","${job.bathroom_count || ''}","${job.workers_needed || ''}","${job.skills || ''}","${job.service_price || ''}","${job.total_amount || ''}","${job.estimated_duration || ''}","${job.special_instructions || ''}","${job.payment_status || ''}","${job.priority || ''}","${job.quality_check || true}","${job.photos_required || false}","${job.customer_signature || false}","${job.auto_invoice || true}","${job.auto_reminders || true}","${job.recurring_end_date || ''}","${job.tags || ''}","${job.intake_question_answers || ''}","${job.service_modifiers || ''}","${job.service_intake_questions || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
-      }).join('\n');
-        
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="jobs_export_${new Date().toISOString().split('T')[0]}.csv"`);
-      res.send(csvHeader + csvRows);
-    } else {
-      res.json({ jobs, count: jobs?.length || 0 });
-    }
-  } catch (error) {
-    console.error('Jobs export error:', error);
-    res.status(500).json({ error: 'Failed to export jobs' });
-  }
-});
 
 // Jobs import endpoint
 app.post('/api/jobs/import', authenticateToken, async (req, res) => {
