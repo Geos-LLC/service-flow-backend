@@ -3139,6 +3139,269 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Jobs export endpoint
+app.get('/api/jobs/export', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { 
+      format = 'csv', 
+      status, 
+      dateFrom, 
+      dateTo, 
+      customerId, 
+      teamMemberId,
+      territoryId,
+      invoiceStatus,
+      paymentStatus,
+      priority,
+      includeAnswers = false
+    } = req.query;
+
+    // Build query with filters
+    let query = supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        services!left(name, price, duration),
+        team_members!left(first_name, last_name, email)
+      `)
+      .eq('user_id', userId);
+
+    // Apply filters
+    if (status) {
+      const statusArray = status.split(',');
+      const mappedStatusArray = statusArray.map(s => {
+        switch (s) {
+          case 'in_progress': return 'in-progress';
+          default: return s;
+        }
+      });
+      query = query.in('status', mappedStatusArray);
+    }
+
+    if (dateFrom) {
+      query = query.gte('scheduled_date', dateFrom);
+    }
+
+    if (dateTo) {
+      query = query.lte('scheduled_date', dateTo);
+    }
+
+    if (customerId) {
+      query = query.eq('customer_id', customerId);
+    }
+
+    if (teamMemberId) {
+      query = query.eq('team_member_id', teamMemberId);
+    }
+
+    if (territoryId) {
+      query = query.eq('territory_id', territoryId);
+    }
+
+    if (invoiceStatus) {
+      query = query.eq('invoice_status', invoiceStatus);
+    }
+
+    if (paymentStatus) {
+      query = query.eq('payment_status', paymentStatus);
+    }
+
+    if (priority) {
+      query = query.eq('priority', priority);
+    }
+
+    const { data: jobs, error } = await query.order('scheduled_date', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching jobs for export:', error);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    if (format === 'csv') {
+      // Generate CSV
+      const csvHeader = 'Job ID,Customer Name,Customer Email,Customer Phone,Service Name,Service Price,Duration,Status,Scheduled Date,Team Member,Priority,Invoice Status,Payment Status,Total Amount,Notes,Service Address,City,State,Zip Code,Created At,Updated At\n';
+      
+      const csvRows = (jobs || []).map(job => {
+        const customer = job.customers || {};
+        const service = job.services || {};
+        const teamMember = job.team_members || {};
+        
+        return `"${job.id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.duration || service.duration || ''}","${job.status || ''}","${job.scheduled_date || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.priority || ''}","${job.invoice_status || ''}","${job.payment_status || ''}","${job.total || ''}","${job.notes || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
+      }).join('\n');
+        
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="jobs_export_${new Date().toISOString().split('T')[0]}.csv"`);
+      res.send(csvHeader + csvRows);
+    } else {
+      res.json({ jobs, count: jobs?.length || 0 });
+    }
+  } catch (error) {
+    console.error('Jobs export error:', error);
+    res.status(500).json({ error: 'Failed to export jobs' });
+  }
+});
+
+// Jobs import endpoint
+app.post('/api/jobs/import', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { jobs } = req.body;
+
+    if (!jobs || !Array.isArray(jobs)) {
+      return res.status(400).json({ error: 'Jobs array is required' });
+    }
+
+    const results = {
+      imported: 0,
+      skipped: 0,
+      errors: []
+    };
+
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      
+      try {
+        // Validate required fields
+        if (!job.customerId && !job.customerEmail) {
+          results.errors.push(`Row ${i + 1}: Customer ID or email is required`);
+          results.skipped++;
+          continue;
+        }
+
+        // Find customer by ID or email
+        let customerId = job.customerId;
+        if (!customerId && job.customerEmail) {
+          const { data: customer } = await supabase
+            .from('customers')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('email', job.customerEmail)
+            .single();
+          
+          if (customer) {
+            customerId = customer.id;
+          } else {
+            results.errors.push(`Row ${i + 1}: Customer with email ${job.customerEmail} not found`);
+            results.skipped++;
+            continue;
+          }
+        }
+
+        // Find service by name if provided
+        let serviceId = job.serviceId;
+        if (!serviceId && job.serviceName) {
+          const { data: service } = await supabase
+            .from('services')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('name', job.serviceName)
+            .single();
+          
+          if (service) {
+            serviceId = service.id;
+          }
+        }
+
+        // Find team member by name if provided
+        let teamMemberId = job.teamMemberId;
+        if (!teamMemberId && job.teamMemberName) {
+          const nameParts = job.teamMemberName.split(' ');
+          const firstName = nameParts[0];
+          const lastName = nameParts.slice(1).join(' ');
+          
+          const { data: teamMember } = await supabase
+            .from('team_members')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('first_name', firstName)
+            .eq('last_name', lastName)
+            .single();
+          
+          if (teamMember) {
+            teamMemberId = teamMember.id;
+          }
+        }
+
+        // Sanitize inputs
+        const sanitizedNotes = job.notes ? sanitizeInput(job.notes) : null;
+        const sanitizedServiceAddress = job.serviceAddress ? sanitizeInput(job.serviceAddress) : null;
+        const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
+
+        // Create job
+        const jobData = {
+          user_id: userId,
+          customer_id: customerId,
+          service_id: serviceId,
+          team_member_id: teamMemberId,
+          scheduled_date: job.scheduledDate || job.scheduled_date,
+          notes: sanitizedNotes,
+          status: job.status || 'pending',
+          duration: parseFloat(job.duration) || null,
+          workers_needed: parseInt(job.workersNeeded) || null,
+          price: parseFloat(job.price) || 0,
+          service_price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+          discount: parseFloat(job.discount) || 0,
+          additional_fees: parseFloat(job.additionalFees) || 0,
+          taxes: parseFloat(job.taxes) || 0,
+          total: parseFloat(job.total) || parseFloat(job.price) || 0,
+          total_amount: parseFloat(job.total) || parseFloat(job.price) || 0,
+          payment_method: job.paymentMethod || null,
+          territory: job.territory || null,
+          is_recurring: job.isRecurring || false,
+          schedule_type: job.scheduleType || 'one-time',
+          let_customer_schedule: job.letCustomerSchedule || false,
+          offer_to_providers: job.offerToProviders || false,
+          internal_notes: sanitizedInternalNotes,
+          service_address_street: job.serviceAddressStreet || sanitizedServiceAddress,
+          service_address_city: job.serviceAddressCity,
+          service_address_state: job.serviceAddressState,
+          service_address_zip: job.serviceAddressZip,
+          service_name: job.serviceName,
+          invoice_status: job.invoiceStatus || 'draft',
+          payment_status: job.paymentStatus || 'pending',
+          priority: job.priority || 'normal',
+          estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
+          skills_required: job.skillsRequired || null,
+          special_instructions: job.specialInstructions || null,
+          customer_notes: job.customerNotes || null,
+          tags: job.tags || null,
+          attachments: job.attachments || null,
+          recurring_frequency: job.recurringFrequency || 'weekly',
+          recurring_end_date: job.recurringEndDate || null,
+          auto_invoice: job.autoInvoice !== false,
+          auto_reminders: job.autoReminders !== false,
+          customer_signature: job.customerSignature || false,
+          photos_required: job.photosRequired || false,
+          quality_check: job.qualityCheck !== false
+        };
+
+        const { data: newJob, error: insertError } = await supabase
+          .from('jobs')
+          .insert(jobData)
+          .select()
+          .single();
+
+        if (insertError) {
+          results.errors.push(`Row ${i + 1}: ${insertError.message}`);
+          results.skipped++;
+        } else {
+          results.imported++;
+        }
+      } catch (error) {
+        results.errors.push(`Row ${i + 1}: ${error.message}`);
+        results.skipped++;
+      }
+    }
+
+    res.json(results);
+  } catch (error) {
+    console.error('Jobs import error:', error);
+    res.status(500).json({ error: 'Failed to import jobs' });
+  }
+});
+
 // Customer import/export endpoints
 app.post('/api/customers/import', authenticateToken, async (req, res) => {
   try {
