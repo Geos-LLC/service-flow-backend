@@ -3220,15 +3220,15 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
     }
 
     if (format === 'csv') {
-      // Generate CSV
-      const csvHeader = 'Job ID,Customer Name,Customer Email,Customer Phone,Service Name,Service Price,Duration,Status,Scheduled Date,Team Member,Priority,Invoice Status,Payment Status,Total Amount,Notes,Service Address,City,State,Zip Code,Created At,Updated At\n';
+      // Generate CSV with all fields
+      const csvHeader = 'Job ID,Customer ID,Customer Name,Customer Email,Customer Phone,Service ID,Service Name,Service Price,Team Member ID,Team Member Name,Territory ID,Territory,Notes,Status,Invoice Status,Invoice ID,Invoice Amount,Invoice Date,Payment Date,Is Recurring,Recurring Frequency,Next Billing Date,Stripe Payment Intent ID,Duration,Workers,Skills Required,Price,Discount,Additional Fees,Taxes,Total,Payment Method,Schedule Type,Let Customer Schedule,Offer To Providers,Internal Notes,Customer Notes,Scheduled Date,Scheduled Time,Service Address Street,Service Address City,Service Address State,Service Address Zip,Service Address Country,Service Address Lat,Service Address Lng,Service Name,Bathroom Count,Workers Needed,Skills,Service Price,Total Amount,Estimated Duration,Special Instructions,Payment Status,Priority,Quality Check,Photos Required,Customer Signature,Auto Invoice,Auto Reminders,Recurring End Date,Tags,Intake Question Answers,Service Modifiers,Service Intake Questions,Created At,Updated At\n';
       
       const csvRows = (jobs || []).map(job => {
         const customer = job.customers || {};
         const service = job.services || {};
         const teamMember = job.team_members || {};
         
-        return `"${job.id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.duration || service.duration || ''}","${job.status || ''}","${job.scheduled_date || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.priority || ''}","${job.invoice_status || ''}","${job.payment_status || ''}","${job.total || ''}","${job.notes || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
+        return `"${job.id || ''}","${job.customer_id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_id || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.team_member_id || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.territory_id || ''}","${job.territory || ''}","${job.notes || ''}","${job.status || ''}","${job.invoice_status || ''}","${job.invoice_id || ''}","${job.invoice_amount || ''}","${job.invoice_date || ''}","${job.payment_date || ''}","${job.is_recurring || false}","${job.recurring_frequency || ''}","${job.next_billing_date || ''}","${job.stripe_payment_intent_id || ''}","${job.duration || ''}","${job.workers || ''}","${job.skills_required || ''}","${job.price || ''}","${job.discount || ''}","${job.additional_fees || ''}","${job.taxes || ''}","${job.total || ''}","${job.payment_method || ''}","${job.schedule_type || ''}","${job.let_customer_schedule || false}","${job.offer_to_providers || false}","${job.internal_notes || ''}","${job.customer_notes || ''}","${job.scheduled_date || ''}","${job.scheduled_time || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.service_address_country || ''}","${job.service_address_lat || ''}","${job.service_address_lng || ''}","${job.service_name || ''}","${job.bathroom_count || ''}","${job.workers_needed || ''}","${job.skills || ''}","${job.service_price || ''}","${job.total_amount || ''}","${job.estimated_duration || ''}","${job.special_instructions || ''}","${job.payment_status || ''}","${job.priority || ''}","${job.quality_check || true}","${job.photos_required || false}","${job.customer_signature || false}","${job.auto_invoice || true}","${job.auto_reminders || true}","${job.recurring_end_date || ''}","${job.tags || ''}","${job.intake_question_answers || ''}","${job.service_modifiers || ''}","${job.service_intake_questions || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
       }).join('\n');
         
       res.setHeader('Content-Type', 'text/csv');
@@ -3329,52 +3329,69 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedServiceAddress = job.serviceAddress ? sanitizeInput(job.serviceAddress) : null;
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
-        // Create job
+        // Create job with all fields
         const jobData = {
           user_id: userId,
           customer_id: customerId,
           service_id: serviceId,
           team_member_id: teamMemberId,
-          scheduled_date: job.scheduledDate || job.scheduled_date,
+          territory_id: job.territoryId || null,
           notes: sanitizedNotes,
           status: job.status || 'pending',
-          duration: parseFloat(job.duration) || null,
-          workers_needed: parseInt(job.workersNeeded) || null,
+          invoice_status: job.invoiceStatus || 'draft',
+          invoice_id: job.invoiceId || null,
+          invoice_amount: parseFloat(job.invoiceAmount) || null,
+          invoice_date: job.invoiceDate || null,
+          payment_date: job.paymentDate || null,
+          is_recurring: job.isRecurring || false,
+          recurring_frequency: job.recurringFrequency || 'weekly',
+          next_billing_date: job.nextBillingDate || null,
+          stripe_payment_intent_id: job.stripePaymentIntentId || null,
+          duration: parseFloat(job.duration) || 360,
+          workers: parseInt(job.workers) || 1,
+          skills_required: parseInt(job.skillsRequired) || 0,
           price: parseFloat(job.price) || 0,
-          service_price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
           discount: parseFloat(job.discount) || 0,
           additional_fees: parseFloat(job.additionalFees) || 0,
           taxes: parseFloat(job.taxes) || 0,
           total: parseFloat(job.total) || parseFloat(job.price) || 0,
-          total_amount: parseFloat(job.total) || parseFloat(job.price) || 0,
           payment_method: job.paymentMethod || null,
           territory: job.territory || null,
-          is_recurring: job.isRecurring || false,
           schedule_type: job.scheduleType || 'one-time',
           let_customer_schedule: job.letCustomerSchedule || false,
           offer_to_providers: job.offerToProviders || false,
           internal_notes: sanitizedInternalNotes,
+          contact_info: job.contactInfo || null,
+          customer_notes: job.customerNotes || null,
+          scheduled_date: job.scheduledDate || job.scheduled_date,
+          scheduled_time: job.scheduledTime || '09:00:00',
           service_address_street: job.serviceAddressStreet || sanitizedServiceAddress,
           service_address_city: job.serviceAddressCity,
           service_address_state: job.serviceAddressState,
           service_address_zip: job.serviceAddressZip,
+          service_address_country: job.serviceAddressCountry || 'USA',
+          service_address_lat: parseFloat(job.serviceAddressLat) || null,
+          service_address_lng: parseFloat(job.serviceAddressLng) || null,
           service_name: job.serviceName,
-          invoice_status: job.invoiceStatus || 'draft',
+          bathroom_count: job.bathroomCount || null,
+          workers_needed: parseInt(job.workersNeeded) || 1,
+          skills: job.skills || null,
+          service_price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+          total_amount: parseFloat(job.totalAmount) || parseFloat(job.total) || parseFloat(job.price) || 0,
+          estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
+          special_instructions: job.specialInstructions || null,
           payment_status: job.paymentStatus || 'pending',
           priority: job.priority || 'normal',
-          estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
-          skills_required: job.skillsRequired || null,
-          special_instructions: job.specialInstructions || null,
-          customer_notes: job.customerNotes || null,
-          tags: job.tags || null,
-          attachments: job.attachments || null,
-          recurring_frequency: job.recurringFrequency || 'weekly',
-          recurring_end_date: job.recurringEndDate || null,
+          quality_check: job.qualityCheck !== false,
+          photos_required: job.photosRequired || false,
+          customer_signature: job.customerSignature || false,
           auto_invoice: job.autoInvoice !== false,
           auto_reminders: job.autoReminders !== false,
-          customer_signature: job.customerSignature || false,
-          photos_required: job.photosRequired || false,
-          quality_check: job.qualityCheck !== false
+          recurring_end_date: job.recurringEndDate || null,
+          tags: job.tags || null,
+          intake_question_answers: job.intakeQuestionAnswers || null,
+          service_modifiers: job.serviceModifiers || null,
+          service_intake_questions: job.serviceIntakeQuestions || null
         };
 
         const { data: newJob, error: insertError } = await supabase
