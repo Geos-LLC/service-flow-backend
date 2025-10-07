@@ -667,6 +667,13 @@ const authenticateToken = (req, res, next) => {
 
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+  
+  console.log('🔐 Auth check:', { 
+    url: req.url, 
+    method: req.method, 
+    hasAuthHeader: !!authHeader, 
+    hasToken: !!token 
+  });
 
 
   if (!token) {
@@ -3181,6 +3188,7 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
 
 app.get('/api/customers/export', authenticateToken, async (req, res) => {
   try {
+    console.log('📊 Export customers request:', { userId: req.user?.userId, format: req.query.format });
     const userId = req.user.userId;
     const { format = 'json' } = req.query;
     
