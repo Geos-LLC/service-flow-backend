@@ -2938,9 +2938,9 @@ app.get('/api/customers/export', authenticateToken, async (req, res) => {
     
     if (format === 'csv') {
       // Generate CSV
-      const csvHeader = 'First Name,Last Name,Email,Phone,Address,Notes,Status,Created At\n';
+      const csvHeader = 'First Name,Last Name,Email,Phone,Address,Suite,City,State,Zip Code,Notes,Status,Created At,Updated At\n';
       const csvRows = (customers || []).map(customer => 
-        `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}"`
+        `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.suite || ''}","${customer.city || ''}","${customer.state || ''}","${customer.zip_code || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}","${customer.updated_at || ''}"`
       ).join('\n');
         
         res.setHeader('Content-Type', 'text/csv');
@@ -3184,6 +3184,10 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
         const sanitizedEmail = customer.email ? customer.email.toLowerCase().trim() : null;
         const sanitizedPhone = customer.phone ? customer.phone.trim() : null;
         const sanitizedAddress = customer.address ? sanitizeInput(customer.address) : null;
+        const sanitizedSuite = customer.suite ? sanitizeInput(customer.suite) : null;
+        const sanitizedCity = customer.city ? sanitizeInput(customer.city) : null;
+        const sanitizedState = customer.state ? sanitizeInput(customer.state) : null;
+        const sanitizedZipCode = customer.zipCode ? sanitizeInput(customer.zipCode) : null;
         const sanitizedNotes = customer.notes ? sanitizeInput(customer.notes) : null;
         
         // Note: Multiple customers can have the same email address
@@ -3199,6 +3203,10 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
             email: sanitizedEmail,
             phone: sanitizedPhone,
             address: sanitizedAddress,
+            suite: sanitizedSuite,
+            city: sanitizedCity,
+            state: sanitizedState,
+            zip_code: sanitizedZipCode,
             notes: sanitizedNotes,
             status: customer.status || 'active'
           })
