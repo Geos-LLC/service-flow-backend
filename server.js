@@ -13374,6 +13374,10 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Import Google Import setup
+const { setupGoogleImportEndpoints } = require('./google-import-setup');
+setupGoogleImportEndpoints(app, authenticateToken, supabase, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
