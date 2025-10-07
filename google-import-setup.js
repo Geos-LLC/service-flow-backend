@@ -10,6 +10,7 @@ function setupGoogleImportEndpoints(app, authenticateToken, supabase, GOOGLE_CLI
 // Google Sheets Import endpoints
 app.get('/api/google/sheets/list', authenticateToken, async (req, res) => {
   try {
+    console.log('📊 Google Sheets List Request:', { userId: req.user?.userId });
     const userId = req.user.userId;
     
     // Get user's Google access token

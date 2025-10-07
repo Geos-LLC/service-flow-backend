@@ -13385,7 +13385,9 @@ app.get('/api/health', (req, res) => {
 
 // Import Google Import setup
 const { setupGoogleImportEndpoints } = require('./google-import-setup');
+console.log('🔧 Setting up Google Import endpoints...');
 setupGoogleImportEndpoints(app, authenticateToken, supabase, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+console.log('✅ Google Import endpoints setup complete');
 
 // 404 handler
 app.use((req, res) => {
