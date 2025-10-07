@@ -2918,6 +2918,48 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
+// Move export route before :id route to avoid conflicts
+app.get('/api/customers/export', authenticateToken, async (req, res) => {
+  try {
+    console.log('📊 Export customers request:', { userId: req.user?.userId, format: req.query.format });
+    const userId = req.user.userId;
+    const { format = 'json' } = req.query;
+    
+    const { data: customers, error } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching customers for export:', error);
+      return res.status(500).json({ error: 'Failed to fetch customers for export' });
+    }
+    
+    if (format === 'csv') {
+      // Generate CSV
+      const csvHeader = 'First Name,Last Name,Email,Phone,Address,Notes,Status,Created At\n';
+      const csvRows = (customers || []).map(customer => 
+        `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}"`
+      ).join('\n');
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="customers.csv"');
+        res.send(csvHeader + csvRows);
+      } else {
+        // Return JSON
+        res.json({
+          customers,
+          total: customers.length,
+          exportedAt: new Date().toISOString()
+        });
+      }
+  } catch (error) {
+    console.error('Export customers error:', error);
+    res.status(500).json({ error: 'Failed to export customers' });
+  }
+});
+
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -3183,47 +3225,6 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Import customers error:', error);
     res.status(500).json({ error: 'Failed to import customers' });
-  }
-});
-
-app.get('/api/customers/export', authenticateToken, async (req, res) => {
-  try {
-    console.log('📊 Export customers request:', { userId: req.user?.userId, format: req.query.format });
-    const userId = req.user.userId;
-    const { format = 'json' } = req.query;
-    
-    const { data: customers, error } = await supabase
-      .from('customers')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
-    
-    if (error) {
-      console.error('Error fetching customers for export:', error);
-      return res.status(500).json({ error: 'Failed to fetch customers for export' });
-    }
-    
-    if (format === 'csv') {
-      // Generate CSV
-      const csvHeader = 'First Name,Last Name,Email,Phone,Address,Notes,Status,Created At\n';
-      const csvRows = (customers || []).map(customer => 
-        `"${customer.first_name || ''}","${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${customer.address || ''}","${customer.notes || ''}","${customer.status || ''}","${customer.created_at || ''}"`
-      ).join('\n');
-        
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', 'attachment; filename="customers.csv"');
-        res.send(csvHeader + csvRows);
-      } else {
-        // Return JSON
-        res.json({
-          customers,
-          total: customers.length,
-          exportedAt: new Date().toISOString()
-        });
-      }
-  } catch (error) {
-    console.error('Export customers error:', error);
-    res.status(500).json({ error: 'Failed to export customers' });
   }
 });
 
