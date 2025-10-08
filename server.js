@@ -13328,25 +13328,28 @@ app.post('/api/twilio/connect/account-link', authenticateToken, async (req, res)
   try {
     const userId = req.user.userId;
     
-    // Create Twilio Connect account for user
-    const connectAccount = await twilioClient.accounts.create({
-      friendlyName: `Serviceflow User ${userId}`,
-      type: 'full' // Full access to Twilio services
-    });
+    // For Twilio Connect, we need to create a Connect App first
+    // This should be done once by the platform owner, not per user
+    const connectAppSid = process.env.TWILIO_CONNECT_ACCOUNT_SID;
     
-    // Create account link for user to authorize
-    const accountLink = await twilioClient.accounts(connectAccount.sid)
-      .accountLinks.create({
-        type: 'account_link',
-        returnUrl: `${process.env.FRONTEND_URL}/settings/twilio?connected=true`,
-        refreshUrl: `${process.env.FRONTEND_URL}/settings/twilio?refresh=true`
+    if (!connectAppSid) {
+      return res.status(500).json({ 
+        error: 'Twilio Connect App not configured. Please contact support.' 
       });
+    }
     
-    // Store connect account SID in user's database record
+    // Create authorization URL for user to connect their Twilio account
+    const authUrl = `https://connect.twilio.com/oauth/authorize?` +
+      `client_id=${connectAppSid}&` +
+      `redirect_uri=${encodeURIComponent(process.env.FRONTEND_URL + '/api/twilio/connect/callback')}&` +
+      `response_type=code&` +
+      `scope=read&` +
+      `state=${userId}`;
+    
+    // Store pending connection status
     const { error: updateError } = await supabase
       .from('users')
       .update({ 
-        twilio_connect_account_sid: connectAccount.sid,
         twilio_connect_status: 'pending'
       })
       .eq('id', userId);
@@ -13356,18 +13359,71 @@ app.post('/api/twilio/connect/account-link', authenticateToken, async (req, res)
       return res.status(500).json({ error: 'Failed to store Twilio Connect data' });
     }
     
-    console.log('🔗 Twilio Connect account created:', connectAccount.sid);
+    console.log('🔗 Twilio Connect authorization URL created for user:', userId);
     
     res.json({
       success: true,
-      message: 'Twilio Connect account created',
-      accountSid: connectAccount.sid,
-      accountLinkUrl: accountLink.url
+      message: 'Twilio Connect authorization URL created',
+      authUrl: authUrl
     });
     
   } catch (error) {
-    console.error('Twilio Connect account creation error:', error);
-    res.status(500).json({ error: 'Failed to create Twilio Connect account' });
+    console.error('Twilio Connect authorization error:', error);
+    res.status(500).json({ error: 'Failed to create Twilio Connect authorization' });
+  }
+});
+
+// Twilio Connect OAuth callback
+app.get('/api/twilio/connect/callback', async (req, res) => {
+  try {
+    const { code, state: userId } = req.query;
+    
+    if (!code || !userId) {
+      return res.redirect(`${process.env.FRONTEND_URL}/settings/sms-settings?error=invalid_callback`);
+    }
+    
+    // Exchange authorization code for access token
+    const tokenResponse = await fetch('https://connect.twilio.com/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: process.env.TWILIO_CONNECT_ACCOUNT_SID,
+        client_secret: process.env.TWILIO_CONNECT_AUTH_TOKEN,
+        code: code,
+        redirect_uri: process.env.FRONTEND_URL + '/settings/sms-settings?connected=true'
+      })
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    if (!tokenData.access_token) {
+      throw new Error('Failed to get access token');
+    }
+    
+    // Store the access token and account info
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        twilio_connect_access_token: tokenData.access_token,
+        twilio_connect_account_sid: tokenData.account_sid,
+        twilio_connect_status: 'connected'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating user Twilio Connect data:', updateError);
+      return res.redirect(`${process.env.FRONTEND_URL}/settings/sms-settings?error=storage_failed`);
+    }
+    
+    console.log('🔗 Twilio Connect account connected for user:', userId);
+    res.redirect(`${process.env.FRONTEND_URL}/settings/sms-settings?connected=true`);
+    
+  } catch (error) {
+    console.error('Twilio Connect callback error:', error);
+    res.redirect(`${process.env.FRONTEND_URL}/settings/sms-settings?error=connection_failed`);
   }
 });
 
@@ -13376,10 +13432,10 @@ app.get('/api/twilio/connect/account-status', authenticateToken, async (req, res
   try {
     const userId = req.user.userId;
     
-    // Get user's Twilio Connect account SID
+    // Get user's Twilio Connect data
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('twilio_connect_account_sid, twilio_connect_status')
+      .select('twilio_connect_account_sid, twilio_connect_status, twilio_connect_access_token')
       .eq('id', userId)
       .single();
     
@@ -13391,29 +13447,224 @@ app.get('/api/twilio/connect/account-status', authenticateToken, async (req, res
       });
     }
     
-    // Check account status with Twilio
-    const account = await twilioClient.accounts(userData.twilio_connect_account_sid).fetch();
-    
-    const isConnected = account.status === 'active';
-    
-    // Update status in database
-    if (isConnected && userData.twilio_connect_status !== 'connected') {
-      await supabase
-        .from('users')
-        .update({ twilio_connect_status: 'connected' })
-        .eq('id', userId);
-    }
+    // If we have an access token, the account is connected
+    const isConnected = userData.twilio_connect_status === 'connected' && userData.twilio_connect_access_token;
     
     res.json({
       connected: isConnected,
-      status: account.status,
-      accountSid: account.sid,
-      friendlyName: account.friendlyName
+      status: userData.twilio_connect_status,
+      accountSid: userData.twilio_connect_account_sid,
+      friendlyName: `Connected Twilio Account`
     });
     
   } catch (error) {
     console.error('Twilio Connect status check error:', error);
     res.status(500).json({ error: 'Failed to check Twilio Connect status' });
+  }
+});
+
+// Disconnect Twilio Connect account
+app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Clear Twilio Connect data from user's record
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        twilio_connect_account_sid: null,
+        twilio_connect_access_token: null,
+        twilio_connect_status: 'disconnected'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error disconnecting Twilio Connect:', updateError);
+      return res.status(500).json({ error: 'Failed to disconnect Twilio account' });
+    }
+    
+    console.log('🔗 Twilio Connect account disconnected for user:', userId);
+    
+    res.json({
+      success: true,
+      message: 'Twilio account disconnected successfully'
+    });
+    
+  } catch (error) {
+    console.error('Twilio Connect disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Twilio account' });
+  }
+});
+
+// Stripe Connect endpoints
+app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // For Stripe Connect, we need to create a Connect App first
+    const stripeConnectAppId = process.env.STRIPE_PUBLISHABLE_KEY;
+    
+    if (!stripeConnectAppId) {
+      return res.status(500).json({ 
+        error: 'Stripe Connect App not configured. Please contact support.' 
+      });
+    }
+    
+    // Create authorization URL for user to connect their Stripe account
+    const authUrl = `https://connect.stripe.com/oauth/authorize?` +
+      `client_id=${stripeConnectAppId}&` +
+      `redirect_uri=${encodeURIComponent(process.env.FRONTEND_URL + '/api/stripe/connect/callback')}&` +
+      `response_type=code&` +
+      `scope=read_write&` +
+      `state=${userId}`;
+    
+    // Store pending connection status
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        stripe_connect_status: 'pending'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating user Stripe Connect data:', updateError);
+      return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
+    }
+    
+    console.log('🔗 Stripe Connect authorization URL created for user:', userId);
+    
+    res.json({
+      success: true,
+      message: 'Stripe Connect authorization URL created',
+      authUrl: authUrl
+    });
+    
+  } catch (error) {
+    console.error('Stripe Connect authorization error:', error);
+    res.status(500).json({ error: 'Failed to create Stripe Connect authorization' });
+  }
+});
+
+// Stripe Connect OAuth callback
+app.get('/api/stripe/connect/callback', async (req, res) => {
+  try {
+    const { code, state: userId } = req.query;
+    
+    if (!code || !userId) {
+      return res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=invalid_callback`);
+    }
+    
+    // Exchange authorization code for access token
+    const tokenResponse = await fetch('https://connect.stripe.com/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: process.env.STRIPE_PUBLISHABLE_KEY,
+        client_secret: process.env.STRIPE_SECRET_KEY,
+        code: code,
+        redirect_uri: process.env.FRONTEND_URL + '/api/stripe/connect/callback'
+      })
+    });
+    
+    const tokenData = await tokenResponse.json();
+    
+    if (!tokenData.access_token) {
+      throw new Error('Failed to get access token');
+    }
+    
+    // Store the access token and account info
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        stripe_connect_access_token: tokenData.access_token,
+        stripe_connect_account_id: tokenData.stripe_user_id,
+        stripe_connect_status: 'connected'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating user Stripe Connect data:', updateError);
+      return res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=storage_failed`);
+    }
+    
+    console.log('🔗 Stripe Connect account connected for user:', userId);
+    res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?connected=true`);
+    
+  } catch (error) {
+    console.error('Stripe Connect callback error:', error);
+    res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=connection_failed`);
+  }
+});
+
+// Check Stripe Connect account status
+app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Get user's Stripe Connect data
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('stripe_connect_account_id, stripe_connect_status, stripe_connect_access_token')
+      .eq('id', userId)
+      .single();
+    
+    if (userError || !userData?.stripe_connect_account_id) {
+      return res.json({ 
+        connected: false, 
+        status: 'not_connected',
+        message: 'Stripe account not connected'
+      });
+    }
+    
+    // If we have an access token, the account is connected
+    const isConnected = userData.stripe_connect_status === 'connected' && userData.stripe_connect_access_token;
+    
+    res.json({
+      connected: isConnected,
+      status: userData.stripe_connect_status,
+      accountId: userData.stripe_connect_account_id,
+      friendlyName: `Connected Stripe Account`
+    });
+    
+  } catch (error) {
+    console.error('Stripe Connect status check error:', error);
+    res.status(500).json({ error: 'Failed to check Stripe Connect status' });
+  }
+});
+
+// Disconnect Stripe Connect account
+app.delete('/api/stripe/connect/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Clear Stripe Connect data from user's record
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        stripe_connect_account_id: null,
+        stripe_connect_access_token: null,
+        stripe_connect_status: 'disconnected'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error disconnecting Stripe Connect:', updateError);
+      return res.status(500).json({ error: 'Failed to disconnect Stripe account' });
+    }
+    
+    console.log('🔗 Stripe Connect account disconnected for user:', userId);
+    
+    res.json({
+      success: true,
+      message: 'Stripe account disconnected successfully'
+    });
+    
+  } catch (error) {
+    console.error('Stripe Connect disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Stripe account' });
   }
 });
 
