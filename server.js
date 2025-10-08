@@ -13502,26 +13502,41 @@ app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res)
     const userId = req.user.userId;
     
     // For Stripe Connect, we need to create a Connect App first
-    const stripeConnectAppId = process.env.STRIPE_PUBLISHABLE_KEY;
+    const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
     
-    if (!stripeConnectAppId) {
+    if (!stripeSecretKey) {
       return res.status(500).json({ 
-        error: 'Stripe Connect App not configured. Please contact support.' 
+        error: 'Stripe not configured. Please contact support.' 
       });
     }
     
-    // Create authorization URL for user to connect their Stripe account
-    const authUrl = `https://connect.stripe.com/oauth/authorize?` +
-      `client_id=${stripeConnectAppId}&` +
-      `redirect_uri=${encodeURIComponent(process.env.FRONTEND_URL + '/api/stripe/connect/callback')}&` +
-      `response_type=code&` +
-      `scope=read_write&` +
-      `state=${userId}`;
+    // Create a Stripe Connect account for the user
+    const stripe = require('stripe')(stripeSecretKey);
     
-    // Store pending connection status
+    // Create a Connect account
+    const account = await stripe.accounts.create({
+      type: 'express',
+      country: 'US',
+      email: req.user.email,
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+    });
+    
+    // Create account link for onboarding
+    const accountLink = await stripe.accountLinks.create({
+      account: account.id,
+      refresh_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?refresh=true`,
+      return_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?connected=true`,
+      type: 'account_onboarding',
+    });
+    
+    // Store the account ID in user's record
     const { error: updateError } = await supabase
       .from('users')
       .update({ 
+        stripe_connect_account_id: account.id,
         stripe_connect_status: 'pending'
       })
       .eq('id', userId);
@@ -13531,71 +13546,56 @@ app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res)
       return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
     }
     
-    console.log('🔗 Stripe Connect authorization URL created for user:', userId);
+    console.log('🔗 Stripe Connect account created for user:', userId, 'Account ID:', account.id);
     
     res.json({
       success: true,
-      message: 'Stripe Connect authorization URL created',
-      authUrl: authUrl
+      message: 'Stripe Connect account created',
+      accountId: account.id,
+      authUrl: accountLink.url
     });
     
   } catch (error) {
     console.error('Stripe Connect authorization error:', error);
-    res.status(500).json({ error: 'Failed to create Stripe Connect authorization' });
+    res.status(500).json({ error: 'Failed to create Stripe Connect account: ' + error.message });
   }
 });
 
-// Stripe Connect OAuth callback
-app.get('/api/stripe/connect/callback', async (req, res) => {
+// Stripe Connect webhook handler (optional - for account updates)
+app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   try {
-    const { code, state: userId } = req.query;
+    const sig = req.headers['stripe-signature'];
+    const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
     
-    if (!code || !userId) {
-      return res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=invalid_callback`);
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.log(`Webhook signature verification failed.`, err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
     }
     
-    // Exchange authorization code for access token
-    const tokenResponse = await fetch('https://connect.stripe.com/oauth/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        client_id: process.env.STRIPE_PUBLISHABLE_KEY,
-        client_secret: process.env.STRIPE_SECRET_KEY,
-        code: code,
-        redirect_uri: process.env.FRONTEND_URL + '/api/stripe/connect/callback'
-      })
-    });
-    
-    const tokenData = await tokenResponse.json();
-    
-    if (!tokenData.access_token) {
-      throw new Error('Failed to get access token');
+    // Handle the event
+    if (event.type === 'account.updated') {
+      const account = event.data.object;
+      
+      // Update user's Stripe Connect status
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({ 
+          stripe_connect_status: account.details_submitted ? 'connected' : 'pending'
+        })
+        .eq('stripe_connect_account_id', account.id);
+      
+      if (updateError) {
+        console.error('Error updating user Stripe Connect status:', updateError);
+      }
     }
     
-    // Store the access token and account info
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ 
-        stripe_connect_access_token: tokenData.access_token,
-        stripe_connect_account_id: tokenData.stripe_user_id,
-        stripe_connect_status: 'connected'
-      })
-      .eq('id', userId);
-    
-    if (updateError) {
-      console.error('Error updating user Stripe Connect data:', updateError);
-      return res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=storage_failed`);
-    }
-    
-    console.log('🔗 Stripe Connect account connected for user:', userId);
-    res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?connected=true`);
-    
+    res.json({received: true});
   } catch (error) {
-    console.error('Stripe Connect callback error:', error);
-    res.redirect(`${process.env.FRONTEND_URL}/settings/stripe-connect?error=connection_failed`);
+    console.error('Stripe webhook error:', error);
+    res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
@@ -13607,7 +13607,7 @@ app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res
     // Get user's Stripe Connect data
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('stripe_connect_account_id, stripe_connect_status, stripe_connect_access_token')
+      .select('stripe_connect_account_id, stripe_connect_status')
       .eq('id', userId)
       .single();
     
@@ -13619,14 +13619,25 @@ app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res
       });
     }
     
-    // If we have an access token, the account is connected
-    const isConnected = userData.stripe_connect_status === 'connected' && userData.stripe_connect_access_token;
+    // Check account status with Stripe
+    const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    const account = await stripe.accounts.retrieve(userData.stripe_connect_account_id);
+    
+    const isConnected = account.details_submitted && account.charges_enabled;
+    
+    // Update status in database
+    if (isConnected && userData.stripe_connect_status !== 'connected') {
+      await supabase
+        .from('users')
+        .update({ stripe_connect_status: 'connected' })
+        .eq('id', userId);
+    }
     
     res.json({
       connected: isConnected,
-      status: userData.stripe_connect_status,
-      accountId: userData.stripe_connect_account_id,
-      friendlyName: `Connected Stripe Account`
+      status: isConnected ? 'connected' : 'pending',
+      accountId: account.id,
+      friendlyName: account.business_profile?.name || `Stripe Account ${account.id.slice(-4)}`
     });
     
   } catch (error) {
@@ -13640,12 +13651,24 @@ app.delete('/api/stripe/connect/disconnect', authenticateToken, async (req, res)
   try {
     const userId = req.user.userId;
     
+    // Get user's Stripe Connect account ID
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('stripe_connect_account_id')
+      .eq('id', userId)
+      .single();
+    
+    if (userData?.stripe_connect_account_id) {
+      // Delete the Stripe Connect account
+      const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+      await stripe.accounts.del(userData.stripe_connect_account_id);
+    }
+    
     // Clear Stripe Connect data from user's record
     const { error: updateError } = await supabase
       .from('users')
       .update({ 
         stripe_connect_account_id: null,
-        stripe_connect_access_token: null,
         stripe_connect_status: 'disconnected'
       })
       .eq('id', userId);
