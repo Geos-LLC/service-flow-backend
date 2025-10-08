@@ -1017,10 +1017,15 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 app.post('/api/auth/google', async (req, res) => {
   try {
     console.log('🔍 Google OAuth request received');
-    const { idToken } = req.body;
+    console.log('🔍 Full request body:', JSON.stringify(req.body, null, 2));
+    console.log('🔍 Request headers:', req.headers);
     
-    console.log('🔍 Request body:', req.body);
-    console.log('🔍 ID token type:', typeof idToken, 'Value:', idToken);
+    const { idToken, accessToken, refreshToken } = req.body;
+    
+    console.log('🔍 Extracted values:');
+    console.log('  - idToken type:', typeof idToken, 'Length:', idToken ? idToken.length : 'null');
+    console.log('  - accessToken type:', typeof accessToken, 'Value:', accessToken);
+    console.log('  - refreshToken type:', typeof refreshToken, 'Value:', refreshToken);
     
     if (!idToken) {
       console.log('❌ No ID token provided');
