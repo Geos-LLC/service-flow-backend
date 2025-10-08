@@ -1016,11 +1016,20 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 // Google OAuth endpoints
 app.post('/api/auth/google', async (req, res) => {
   try {
+    console.log('🔍 Google OAuth request received');
     const { idToken } = req.body;
     
     if (!idToken) {
+      console.log('❌ No ID token provided');
       return res.status(400).json({ error: 'Google ID token is required' });
     }
+    
+    if (!GOOGLE_CLIENT_ID) {
+      console.log('❌ GOOGLE_CLIENT_ID not configured');
+      return res.status(500).json({ error: 'Google OAuth not configured' });
+    }
+    
+    console.log('🔍 Verifying Google ID token with client ID:', GOOGLE_CLIENT_ID);
     
     // Verify the Google ID token
     const ticket = await googleClient.verifyIdToken({
@@ -1114,8 +1123,16 @@ app.post('/api/auth/google', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Google OAuth error:', error);
-    res.status(500).json({ error: 'Google authentication failed' });
+    console.error('❌ Google OAuth error:', error);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      status: error.status
+    });
+    res.status(500).json({ 
+      error: 'Google authentication failed',
+      details: error.message 
+    });
   }
 });
 
