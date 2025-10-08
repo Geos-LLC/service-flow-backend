@@ -1020,7 +1020,20 @@ app.post('/api/auth/google', async (req, res) => {
     console.log('🔍 Full request body:', JSON.stringify(req.body, null, 2));
     console.log('🔍 Request headers:', req.headers);
     
-    const { idToken, accessToken, refreshToken } = req.body;
+    // Handle nested structure from frontend
+    let idToken, accessToken, refreshToken;
+    
+    if (req.body.idToken && typeof req.body.idToken === 'object') {
+      // Nested structure: { idToken: { idToken: "...", accessToken: null, refreshToken: null } }
+      idToken = req.body.idToken.idToken;
+      accessToken = req.body.idToken.accessToken;
+      refreshToken = req.body.idToken.refreshToken;
+    } else {
+      // Direct structure: { idToken: "...", accessToken: null, refreshToken: null }
+      idToken = req.body.idToken;
+      accessToken = req.body.accessToken;
+      refreshToken = req.body.refreshToken;
+    }
     
     console.log('🔍 Extracted values:');
     console.log('  - idToken type:', typeof idToken, 'Length:', idToken ? idToken.length : 'null');
