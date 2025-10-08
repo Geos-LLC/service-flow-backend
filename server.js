@@ -1019,9 +1019,17 @@ app.post('/api/auth/google', async (req, res) => {
     console.log('🔍 Google OAuth request received');
     const { idToken } = req.body;
     
+    console.log('🔍 Request body:', req.body);
+    console.log('🔍 ID token type:', typeof idToken, 'Value:', idToken);
+    
     if (!idToken) {
       console.log('❌ No ID token provided');
       return res.status(400).json({ error: 'Google ID token is required' });
+    }
+    
+    if (typeof idToken !== 'string') {
+      console.log('❌ ID token is not a string:', typeof idToken);
+      return res.status(400).json({ error: 'Google ID token must be a string' });
     }
     
     if (!GOOGLE_CLIENT_ID) {
