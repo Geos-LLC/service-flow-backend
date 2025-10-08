@@ -3330,6 +3330,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedServiceAddress = job.serviceAddress ? sanitizeInput(job.serviceAddress) : null;
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
+        // Check for duplicate jobs (same customer, service, and scheduled date)
+        if (job.scheduledDate) {
+          const { data: existingJob } = await supabase
+            .from('jobs')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('customer_id', customerId)
+            .eq('scheduled_date', job.scheduledDate)
+            .single();
+          
+          if (existingJob) {
+            results.errors.push(`Row ${i + 1}: Job already exists for this customer on ${job.scheduledDate}`);
+            results.skipped++;
+            continue;
+          }
+        }
+
         // Create job with all fields
         const jobData = {
           user_id: userId,
@@ -13261,6 +13278,179 @@ app.use((err, req, res, next) => {
     message: 'Something went wrong on the server',
     ...(process.env.NODE_ENV === 'development' && { details: err.message })
   });
+});
+
+// Twilio Connect endpoints
+app.post('/api/twilio/connect/account-link', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Create Twilio Connect account for user
+    const connectAccount = await twilioClient.accounts.create({
+      friendlyName: `Serviceflow User ${userId}`,
+      type: 'full' // Full access to Twilio services
+    });
+    
+    // Create account link for user to authorize
+    const accountLink = await twilioClient.accounts(connectAccount.sid)
+      .accountLinks.create({
+        type: 'account_link',
+        returnUrl: `${process.env.FRONTEND_URL}/settings/twilio?connected=true`,
+        refreshUrl: `${process.env.FRONTEND_URL}/settings/twilio?refresh=true`
+      });
+    
+    // Store connect account SID in user's database record
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        twilio_connect_account_sid: connectAccount.sid,
+        twilio_connect_status: 'pending'
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error updating user Twilio Connect data:', updateError);
+      return res.status(500).json({ error: 'Failed to store Twilio Connect data' });
+    }
+    
+    console.log('🔗 Twilio Connect account created:', connectAccount.sid);
+    
+    res.json({
+      success: true,
+      message: 'Twilio Connect account created',
+      accountSid: connectAccount.sid,
+      accountLinkUrl: accountLink.url
+    });
+    
+  } catch (error) {
+    console.error('Twilio Connect account creation error:', error);
+    res.status(500).json({ error: 'Failed to create Twilio Connect account' });
+  }
+});
+
+// Check Twilio Connect account status
+app.get('/api/twilio/connect/account-status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Get user's Twilio Connect account SID
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_connect_account_sid, twilio_connect_status')
+      .eq('id', userId)
+      .single();
+    
+    if (userError || !userData?.twilio_connect_account_sid) {
+      return res.json({ 
+        connected: false, 
+        status: 'not_connected',
+        message: 'Twilio account not connected'
+      });
+    }
+    
+    // Check account status with Twilio
+    const account = await twilioClient.accounts(userData.twilio_connect_account_sid).fetch();
+    
+    const isConnected = account.status === 'active';
+    
+    // Update status in database
+    if (isConnected && userData.twilio_connect_status !== 'connected') {
+      await supabase
+        .from('users')
+        .update({ twilio_connect_status: 'connected' })
+        .eq('id', userId);
+    }
+    
+    res.json({
+      connected: isConnected,
+      status: account.status,
+      accountSid: account.sid,
+      friendlyName: account.friendlyName
+    });
+    
+  } catch (error) {
+    console.error('Twilio Connect status check error:', error);
+    res.status(500).json({ error: 'Failed to check Twilio Connect status' });
+  }
+});
+
+// Send SMS using user's connected Twilio account
+app.post('/api/sms/send-connect', authenticateToken, async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    const userId = req.user.userId;
+    
+    if (!to || !message) {
+      return res.status(400).json({ error: 'Phone number and message are required' });
+    }
+    
+    // Get user's Twilio Connect account SID
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_connect_account_sid, twilio_connect_status, twilio_phone_number')
+      .eq('id', userId)
+      .single();
+    
+    if (userError || !userData?.twilio_connect_account_sid) {
+      return res.status(400).json({ error: 'Twilio account not connected. Please connect your Twilio account first.' });
+    }
+    
+    if (userData.twilio_connect_status !== 'connected') {
+      return res.status(400).json({ error: 'Twilio account not active. Please complete the connection process.' });
+    }
+    
+    // Send SMS using user's connected Twilio account
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: userData.twilio_phone_number, // User's Twilio phone number
+      to: to
+    }, {
+      accountSid: userData.twilio_connect_account_sid
+    });
+    
+    console.log('📱 SMS sent via Twilio Connect:', result.sid);
+    
+    res.json({ 
+      success: true, 
+      message: 'SMS sent successfully',
+      sid: result.sid
+    });
+    
+  } catch (error) {
+    console.error('Twilio Connect SMS error:', error);
+    res.status(500).json({ error: 'Failed to send SMS via Twilio Connect' });
+  }
+});
+
+// Disconnect Twilio Connect account
+app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Remove Twilio Connect data from user's record
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ 
+        twilio_connect_account_sid: null,
+        twilio_connect_status: null,
+        twilio_phone_number: null
+      })
+      .eq('id', userId);
+    
+    if (updateError) {
+      console.error('Error disconnecting Twilio Connect:', updateError);
+      return res.status(500).json({ error: 'Failed to disconnect Twilio account' });
+    }
+    
+    res.json({ 
+      success: true, 
+      message: 'Twilio account disconnected successfully' 
+    });
+    
+  } catch (error) {
+    console.error('Twilio Connect disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Twilio account' });
+  }
 });
 
 // Twilio SMS endpoints
