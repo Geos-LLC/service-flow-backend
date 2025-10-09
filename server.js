@@ -13823,19 +13823,17 @@ app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
-    // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
       .from('user_billing')
       .select('stripe_secret_key')
       .eq('user_id', userId)
-      .limit(1);
+      .single();
 
-    if (billingError || !billingData?.[0]?.stripe_secret_key) {
-      return res.json({ connected: false });
+    if (billingError || !billingData?.stripe_secret_key) {
+      return res.json({ connected: false, error: 'No Stripe key found' });
     }
 
-    // Test connection with user's credentials
-    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+    const stripe = require('stripe')(billingData.stripe_secret_key);
     const account = await stripe.accounts.retrieve();
 
     res.json({
@@ -13845,10 +13843,14 @@ app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
       payouts_enabled: account.payouts_enabled
     });
   } catch (error) {
+    if (error.type === 'StripeAuthenticationError') {
+      return res.json({ connected: false, error: 'Invalid Stripe credentials' });
+    }
     console.error('Stripe connection test error:', error);
     res.json({ connected: false, error: error.message });
   }
 });
+
 
 app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
   try {
