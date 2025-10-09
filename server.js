@@ -702,6 +702,8 @@ const authenticateToken = (req, res, next) => {
         });
       }
     }
+    
+    console.log('🔐 JWT decoded user:', user);
     req.user = user;
     next();
   });
@@ -13774,7 +13776,17 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
 app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) => {
   try {
     const { publishableKey, secretKey } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
+
+    console.log('🔐 Stripe setup - User info:', { 
+      userId, 
+      user: req.user,
+      hasUserId: !!userId 
+    });
+
+    if (!userId) {
+      return res.status(401).json({ error: 'User ID not found in token' });
+    }
 
     if (!publishableKey || !secretKey) {
       return res.status(400).json({ error: 'Publishable key and secret key are required' });
@@ -13809,7 +13821,7 @@ app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) =>
 
 app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -13841,7 +13853,7 @@ app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
 app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
   try {
     const { customerId, amount, description, dueDate } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -13878,7 +13890,7 @@ app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
 app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
   try {
     const { invoiceId, customerEmail } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -13909,7 +13921,7 @@ app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
 app.post('/api/stripe/create-payment-intent', authenticateToken, async (req, res) => {
   try {
     const { amount, currency, customerId, metadata } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -13945,7 +13957,7 @@ app.post('/api/stripe/create-payment-intent', authenticateToken, async (req, res
 app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, async (req, res) => {
   try {
     const { paymentIntentId } = req.params;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -13976,7 +13988,7 @@ app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, async 
 app.post('/api/stripe/create-customer', authenticateToken, async (req, res) => {
   try {
     const { email, name, phone } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Stripe credentials
     const { data: billingData, error: billingError } = await supabase
@@ -14010,7 +14022,7 @@ app.post('/api/stripe/create-customer', authenticateToken, async (req, res) => {
 
 app.delete('/api/stripe/disconnect', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Clear Stripe credentials
     const { error: updateError } = await supabase
@@ -14041,7 +14053,7 @@ app.delete('/api/stripe/disconnect', authenticateToken, async (req, res) => {
 app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) => {
   try {
     const { accountSid, authToken, phoneNumber } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     if (!accountSid || !authToken || !phoneNumber) {
       return res.status(400).json({ error: 'Account SID, Auth Token, and Phone Number are required' });
@@ -14083,7 +14095,7 @@ app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) =>
 
 app.get('/api/twilio/phone-numbers', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Twilio credentials
     const { data: userData, error: userError } = await supabase
@@ -14115,7 +14127,7 @@ app.get('/api/twilio/phone-numbers', authenticateToken, async (req, res) => {
 app.post('/api/twilio/setup-sms-notifications', authenticateToken, async (req, res) => {
   try {
     const { phoneNumber, notificationTypes } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Store SMS notification settings
     const { error: updateError } = await supabase
@@ -14145,7 +14157,7 @@ app.post('/api/twilio/setup-sms-notifications', authenticateToken, async (req, r
 app.post('/api/twilio/send-sms', authenticateToken, async (req, res) => {
   try {
     const { to, message } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     if (!to || !message) {
       return res.status(400).json({ error: 'Phone number and message are required' });
@@ -14185,7 +14197,7 @@ app.post('/api/twilio/send-sms', authenticateToken, async (req, res) => {
 app.post('/api/twilio/test-sms', authenticateToken, async (req, res) => {
   try {
     const { phoneNumber } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Get user's Twilio credentials
     const { data: userData, error: userError } = await supabase
@@ -14220,7 +14232,7 @@ app.post('/api/twilio/test-sms', authenticateToken, async (req, res) => {
 
 app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
 
     // Clear Twilio credentials
     const { error: updateError } = await supabase
