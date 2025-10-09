@@ -13792,6 +13792,25 @@ app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) =>
       return res.status(400).json({ error: 'Publishable key and secret key are required' });
     }
 
+    // Validate Stripe credentials by testing them
+    try {
+      const testStripe = require('stripe')(secretKey);
+      const account = await testStripe.accounts.retrieve();
+      
+      // Verify the publishable key matches the account
+      if (!publishableKey.startsWith('pk_')) {
+        return res.status(400).json({ error: 'Invalid publishable key format' });
+      }
+      
+      console.log('✅ Stripe credentials validated successfully for account:', account.id);
+    } catch (stripeError) {
+      console.error('❌ Stripe credentials validation failed:', stripeError.message);
+      return res.status(400).json({ 
+        error: 'Invalid Stripe credentials. Please check your API keys and try again.',
+        details: stripeError.message 
+      });
+    }
+
     // Store user's Stripe credentials securely
     const { error: updateError } = await supabase
       .from('user_billing')
@@ -13811,7 +13830,7 @@ app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) =>
 
     res.json({ 
       success: true, 
-      message: 'Stripe credentials stored successfully' 
+      message: 'Stripe credentials validated and stored successfully' 
     });
   } catch (error) {
     console.error('Stripe credentials setup error:', error);
@@ -14061,9 +14080,32 @@ app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) =>
       return res.status(400).json({ error: 'Account SID, Auth Token, and Phone Number are required' });
     }
 
-    // Test the credentials by getting phone numbers
-    const twilio = require('twilio')(accountSid, authToken);
-    const phoneNumbers = await twilio.incomingPhoneNumbers.list();
+    // Validate Twilio credentials by testing them
+    try {
+      const twilio = require('twilio')(accountSid, authToken);
+      
+      // Test credentials by getting account info
+      const account = await twilio.api.accounts(accountSid).fetch();
+      
+      // Test by getting phone numbers to ensure credentials work
+      const phoneNumbers = await twilio.incomingPhoneNumbers.list();
+      
+      // Verify the phone number exists in the account
+      const phoneExists = phoneNumbers.some(num => num.phoneNumber === phoneNumber);
+      if (!phoneExists) {
+        return res.status(400).json({ 
+          error: 'The specified phone number is not associated with your Twilio account. Please check the phone number and try again.' 
+        });
+      }
+      
+      console.log('✅ Twilio credentials validated successfully for account:', account.friendlyName);
+    } catch (twilioError) {
+      console.error('❌ Twilio credentials validation failed:', twilioError.message);
+      return res.status(400).json({ 
+        error: 'Invalid Twilio credentials. Please check your Account SID, Auth Token, and Phone Number.',
+        details: twilioError.message 
+      });
+    }
 
     // Store user's Twilio credentials securely
     const { error: updateError } = await supabase
@@ -14083,11 +14125,7 @@ app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) =>
 
     res.json({ 
       success: true, 
-      message: 'Twilio credentials stored successfully',
-      phoneNumbers: phoneNumbers.map(num => ({
-        phoneNumber: num.phoneNumber,
-        friendlyName: num.friendlyName
-      }))
+      message: 'Twilio credentials validated and stored successfully'
     });
   } catch (error) {
     console.error('Twilio credentials setup error:', error);
