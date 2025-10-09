@@ -13770,6 +13770,486 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
   }
 });
 
+// Simple Stripe API Integration endpoints
+app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) => {
+  try {
+    const { publishableKey, secretKey } = req.body;
+    const userId = req.user.id;
+
+    if (!publishableKey || !secretKey) {
+      return res.status(400).json({ error: 'Publishable key and secret key are required' });
+    }
+
+    // Store user's Stripe credentials securely
+    const { error: updateError } = await supabase
+      .from('user_billing')
+      .upsert({
+        user_id: userId,
+        stripe_publishable_key: publishableKey,
+        stripe_secret_key: secretKey, // In production, this should be encrypted
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'user_id'
+      });
+
+    if (updateError) {
+      console.error('Error storing Stripe credentials:', updateError);
+      return res.status(500).json({ error: 'Failed to store Stripe credentials' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Stripe credentials stored successfully' 
+    });
+  } catch (error) {
+    console.error('Stripe credentials setup error:', error);
+    res.status(500).json({ error: 'Failed to setup Stripe credentials' });
+  }
+});
+
+app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.json({ connected: false });
+    }
+
+    // Test connection with user's credentials
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+    const account = await stripe.accounts.retrieve();
+
+    res.json({
+      connected: true,
+      account_id: account.id,
+      charges_enabled: account.charges_enabled,
+      payouts_enabled: account.payouts_enabled
+    });
+  } catch (error) {
+    console.error('Stripe connection test error:', error);
+    res.json({ connected: false, error: error.message });
+  }
+});
+
+app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
+  try {
+    const { customerId, amount, description, dueDate } = req.body;
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+
+    // Create invoice
+    const invoice = await stripe.invoices.create({
+      customer: customerId,
+      amount: amount,
+      currency: 'usd',
+      description: description,
+      due_date: dueDate ? Math.floor(new Date(dueDate).getTime() / 1000) : undefined
+    });
+
+    res.json({
+      success: true,
+      invoice: invoice
+    });
+  } catch (error) {
+    console.error('Stripe invoice creation error:', error);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
+});
+
+app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
+  try {
+    const { invoiceId, customerEmail } = req.body;
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+
+    // Send invoice
+    const invoice = await stripe.invoices.sendInvoice(invoiceId);
+
+    res.json({
+      success: true,
+      invoice: invoice
+    });
+  } catch (error) {
+    console.error('Stripe send invoice error:', error);
+    res.status(500).json({ error: 'Failed to send invoice' });
+  }
+});
+
+app.post('/api/stripe/create-payment-intent', authenticateToken, async (req, res) => {
+  try {
+    const { amount, currency, customerId, metadata } = req.body;
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+
+    // Create payment intent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount,
+      currency: currency || 'usd',
+      customer: customerId,
+      metadata: metadata || {}
+    });
+
+    res.json({
+      success: true,
+      paymentIntent: paymentIntent
+    });
+  } catch (error) {
+    console.error('Stripe payment intent creation error:', error);
+    res.status(500).json({ error: 'Failed to create payment intent' });
+  }
+});
+
+app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, async (req, res) => {
+  try {
+    const { paymentIntentId } = req.params;
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+
+    // Get payment intent status
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    res.json({
+      success: true,
+      paymentIntent: paymentIntent
+    });
+  } catch (error) {
+    console.error('Stripe payment status error:', error);
+    res.status(500).json({ error: 'Failed to get payment status' });
+  }
+});
+
+app.post('/api/stripe/create-customer', authenticateToken, async (req, res) => {
+  try {
+    const { email, name, phone } = req.body;
+    const userId = req.user.id;
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (billingError || !billingData?.[0]?.stripe_secret_key) {
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData[0].stripe_secret_key);
+
+    // Create customer
+    const customer = await stripe.customers.create({
+      email: email,
+      name: name,
+      phone: phone
+    });
+
+    res.json({
+      success: true,
+      customer: customer
+    });
+  } catch (error) {
+    console.error('Stripe customer creation error:', error);
+    res.status(500).json({ error: 'Failed to create customer' });
+  }
+});
+
+app.delete('/api/stripe/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Clear Stripe credentials
+    const { error: updateError } = await supabase
+      .from('user_billing')
+      .update({
+        stripe_publishable_key: null,
+        stripe_secret_key: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('user_id', userId);
+
+    if (updateError) {
+      console.error('Error clearing Stripe credentials:', updateError);
+      return res.status(500).json({ error: 'Failed to disconnect Stripe' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Stripe disconnected successfully' 
+    });
+  } catch (error) {
+    console.error('Stripe disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Stripe' });
+  }
+});
+
+// Simple Twilio API Integration endpoints
+app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) => {
+  try {
+    const { accountSid, authToken, phoneNumber } = req.body;
+    const userId = req.user.id;
+
+    if (!accountSid || !authToken || !phoneNumber) {
+      return res.status(400).json({ error: 'Account SID, Auth Token, and Phone Number are required' });
+    }
+
+    // Test the credentials by getting phone numbers
+    const twilio = require('twilio')(accountSid, authToken);
+    const phoneNumbers = await twilio.incomingPhoneNumbers.list();
+
+    // Store user's Twilio credentials securely
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        twilio_account_sid: accountSid,
+        twilio_auth_token: authToken, // In production, this should be encrypted
+        twilio_phone_number: phoneNumber,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error storing Twilio credentials:', updateError);
+      return res.status(500).json({ error: 'Failed to store Twilio credentials' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Twilio credentials stored successfully',
+      phoneNumbers: phoneNumbers.map(num => ({
+        phoneNumber: num.phoneNumber,
+        friendlyName: num.friendlyName
+      }))
+    });
+  } catch (error) {
+    console.error('Twilio credentials setup error:', error);
+    res.status(500).json({ error: 'Failed to setup Twilio credentials: ' + error.message });
+  }
+});
+
+app.get('/api/twilio/phone-numbers', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get user's Twilio credentials
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_account_sid, twilio_auth_token')
+      .eq('id', userId)
+      .limit(1);
+
+    if (userError || !userData?.[0]?.twilio_account_sid || !userData?.[0]?.twilio_auth_token) {
+      return res.status(400).json({ error: 'Twilio not configured' });
+    }
+
+    const twilio = require('twilio')(userData[0].twilio_account_sid, userData[0].twilio_auth_token);
+    const phoneNumbers = await twilio.incomingPhoneNumbers.list();
+
+    res.json({
+      success: true,
+      phoneNumbers: phoneNumbers.map(num => ({
+        phoneNumber: num.phoneNumber,
+        friendlyName: num.friendlyName
+      }))
+    });
+  } catch (error) {
+    console.error('Twilio phone numbers error:', error);
+    res.status(500).json({ error: 'Failed to get phone numbers' });
+  }
+});
+
+app.post('/api/twilio/setup-sms-notifications', authenticateToken, async (req, res) => {
+  try {
+    const { phoneNumber, notificationTypes } = req.body;
+    const userId = req.user.id;
+
+    // Store SMS notification settings
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        twilio_notification_phone: phoneNumber,
+        twilio_notification_types: notificationTypes,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error storing SMS notification settings:', updateError);
+      return res.status(500).json({ error: 'Failed to store notification settings' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'SMS notifications configured successfully' 
+    });
+  } catch (error) {
+    console.error('SMS notification setup error:', error);
+    res.status(500).json({ error: 'Failed to setup SMS notifications' });
+  }
+});
+
+app.post('/api/twilio/send-sms', authenticateToken, async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    const userId = req.user.id;
+
+    if (!to || !message) {
+      return res.status(400).json({ error: 'Phone number and message are required' });
+    }
+
+    // Get user's Twilio credentials
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_account_sid, twilio_auth_token, twilio_phone_number')
+      .eq('id', userId)
+      .limit(1);
+
+    if (userError || !userData?.[0]?.twilio_account_sid || !userData?.[0]?.twilio_auth_token) {
+      return res.status(400).json({ error: 'Twilio not configured' });
+    }
+
+    const twilio = require('twilio')(userData[0].twilio_account_sid, userData[0].twilio_auth_token);
+
+    // Send SMS
+    const result = await twilio.messages.create({
+      body: message,
+      from: userData[0].twilio_phone_number,
+      to: to
+    });
+
+    res.json({
+      success: true,
+      message: 'SMS sent successfully',
+      sid: result.sid
+    });
+  } catch (error) {
+    console.error('Twilio SMS send error:', error);
+    res.status(500).json({ error: 'Failed to send SMS: ' + error.message });
+  }
+});
+
+app.post('/api/twilio/test-sms', authenticateToken, async (req, res) => {
+  try {
+    const { phoneNumber } = req.body;
+    const userId = req.user.id;
+
+    // Get user's Twilio credentials
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_account_sid, twilio_auth_token, twilio_phone_number')
+      .eq('id', userId)
+      .limit(1);
+
+    if (userError || !userData?.[0]?.twilio_account_sid || !userData?.[0]?.twilio_auth_token) {
+      return res.status(400).json({ error: 'Twilio not configured' });
+    }
+
+    const twilio = require('twilio')(userData[0].twilio_account_sid, userData[0].twilio_auth_token);
+
+    // Send test SMS
+    const result = await twilio.messages.create({
+      body: 'Test SMS from your ZenBooker integration. Your Twilio setup is working correctly!',
+      from: userData[0].twilio_phone_number,
+      to: phoneNumber
+    });
+
+    res.json({
+      success: true,
+      message: 'Test SMS sent successfully',
+      sid: result.sid
+    });
+  } catch (error) {
+    console.error('Twilio test SMS error:', error);
+    res.status(500).json({ error: 'Failed to send test SMS: ' + error.message });
+  }
+});
+
+app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Clear Twilio credentials
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        twilio_account_sid: null,
+        twilio_auth_token: null,
+        twilio_phone_number: null,
+        twilio_notification_phone: null,
+        twilio_notification_types: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error clearing Twilio credentials:', updateError);
+      return res.status(500).json({ error: 'Failed to disconnect Twilio' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Twilio disconnected successfully' 
+    });
+  } catch (error) {
+    console.error('Twilio disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Twilio' });
+  }
+});
+
 // Twilio SMS endpoints
 app.post('/api/sms/send', authenticateToken, async (req, res) => {
   try {
