@@ -12605,23 +12605,57 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
   try {
     const { invoiceId } = req.params;
     
-    // For now, return mock data - in production, fetch from database
-    const mockInvoice = {
-      id: invoiceId,
-      invoiceNumber: '152482',
-      customerName: 'Georgiy Sayapin',
-      serviceDate: '2025-10-10',
-      jobNumber: '415482',
-      serviceAddress: 'Connecticut',
-      service: 'Deep Cleaning',
-      description: '1 Bedroom, 1 Bathroom',
-      amount: 1.00,
-      dueDate: '2025-10-17',
-      status: 'unpaid'
+    console.log('📄 Public invoice requested:', invoiceId);
+    
+    // Fetch job data from Supabase
+    const { data: job, error } = await supabase
+      .from('jobs')
+      .select(`
+        id,
+        service_name,
+        service_price,
+        total_amount,
+        customer_first_name,
+        customer_last_name,
+        customer_email,
+        customer_address,
+        scheduled_date,
+        created_at,
+        invoice_status
+      `)
+      .eq('id', invoiceId)
+      .single();
+
+    if (error) {
+      console.error('❌ Error fetching job from database:', error);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (!job) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Calculate total amount
+    const totalAmount = job.total_amount || job.service_price || 0;
+    
+    // Format invoice data
+    const invoiceData = {
+      id: job.id,
+      invoiceNumber: `INV-${job.id}`,
+      customerName: `${job.customer_first_name} ${job.customer_last_name}`,
+      customerEmail: job.customer_email,
+      serviceDate: job.scheduled_date,
+      jobNumber: job.id,
+      serviceAddress: job.customer_address,
+      service: job.service_name,
+      description: job.service_name, // You can enhance this with more details
+      amount: totalAmount,
+      dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // 7 days from now
+      status: job.invoice_status || 'unpaid'
     };
     
-    console.log('📄 Public invoice requested:', invoiceId);
-    res.json(mockInvoice);
+    console.log('📄 Invoice data fetched:', invoiceData);
+    res.json(invoiceData);
   } catch (error) {
     console.error('❌ Error fetching public invoice:', error);
     res.status(500).json({ error: 'Failed to fetch invoice' });
@@ -12773,7 +12807,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
           </div>
           
           <div style="text-align: center; margin: 20px 0;">
-            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
           </div>
           
           <div class="footer">
@@ -12803,7 +12837,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
       subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
       html: invoiceHtml,
-      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
     };
 
     console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
