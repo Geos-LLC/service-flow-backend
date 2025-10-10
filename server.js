@@ -12600,6 +12600,34 @@ app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   }
 });
 
+// Public Invoice API endpoints (no authentication required)
+app.get('/api/public/invoice/:invoiceId', async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    
+    // For now, return mock data - in production, fetch from database
+    const mockInvoice = {
+      id: invoiceId,
+      invoiceNumber: '152482',
+      customerName: 'Georgiy Sayapin',
+      serviceDate: '2025-10-10',
+      jobNumber: '415482',
+      serviceAddress: 'Connecticut',
+      service: 'Deep Cleaning',
+      description: '1 Bedroom, 1 Bathroom',
+      amount: 1.00,
+      dueDate: '2025-10-17',
+      status: 'unpaid'
+    };
+    
+    console.log('📄 Public invoice requested:', invoiceId);
+    res.json(mockInvoice);
+  } catch (error) {
+    console.error('❌ Error fetching public invoice:', error);
+    res.status(500).json({ error: 'Failed to fetch invoice' });
+  }
+});
+
 // Stripe Payment Intent API endpoints
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
@@ -12745,7 +12773,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
           </div>
           
           <div style="text-align: center; margin: 20px 0;">
-            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}" class="payment-button">Pay Invoice</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
           </div>
           
           <div class="footer">
