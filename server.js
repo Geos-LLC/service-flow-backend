@@ -12610,6 +12610,22 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
     
     console.log('📄 Public invoice requested:', invoiceId);
     
+    // Validate invoice ID
+    if (!invoiceId || isNaN(parseInt(invoiceId))) {
+      console.error('❌ Invalid invoice ID:', invoiceId);
+      return res.status(400).json({ error: 'Invalid invoice ID' });
+    }
+    
+    // Debug: Check if any invoices exist
+    const { data: allInvoices, error: debugError } = await supabase
+      .from('invoices')
+      .select('id, status, created_at')
+      .limit(5);
+    
+    if (!debugError) {
+      console.log('📄 Available invoices in database:', allInvoices);
+    }
+    
     // Fetch invoice data with related customer and job information
     const { data: invoice, error } = await supabase
       .from('invoices')
@@ -12640,10 +12656,14 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
 
     if (error) {
       console.error('❌ Error fetching invoice from database:', error);
-      return res.status(404).json({ error: 'Invoice not found' });
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Invoice not found' });
+      }
+      return res.status(500).json({ error: 'Failed to fetch invoice' });
     }
 
     if (!invoice) {
+      console.error('❌ Invoice not found in database:', invoiceId);
       return res.status(404).json({ error: 'Invoice not found' });
     }
 
@@ -12686,7 +12706,7 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
     const { data: invoice, error } = await supabase
       .from('invoices')
       .insert({
-        user_id: req.user.id,
+        user_id: req.user.userId,
         customer_id: customerId,
         job_id: jobId,
         amount: amount,
