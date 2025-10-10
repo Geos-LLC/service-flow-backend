@@ -12448,50 +12448,50 @@ app.put('/api/user/branding', async (req, res) => {
 // REMOVED DUPLICATE PUT /api/user/profile endpoint (using Supabase version above)
 
 // Notification Templates API endpoints
+// NOTE: Create the notification_templates table in Supabase with this SQL:
+// CREATE TABLE notification_templates (
+//   id SERIAL PRIMARY KEY,
+//   user_id INTEGER NOT NULL,
+//   template_type VARCHAR(50) NOT NULL,
+//   notification_name VARCHAR(100) NOT NULL,
+//   subject TEXT,
+//   content TEXT,
+//   is_enabled BOOLEAN DEFAULT true,
+//   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+//   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+//   UNIQUE(user_id, template_type, notification_name)
+// );
 app.get('/api/user/notification-templates', async (req, res) => {
   try {
-   const { userId, templateType, notificationName } = req.query;
+    const { userId, templateType, notificationName } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      let query = `
-        SELECT 
-          id,
-          template_type,
-          notification_name,
-          subject,
-          content,
-          is_enabled,
-          created_at,
-          updated_at
-        FROM notification_templates 
-        WHERE user_id = ?
-      `;
-      let params = [userId];
+    let query = supabase
+      .from('notification_templates')
+      .select('*')
+      .eq('user_id', userId);
 
-      if (templateType) {
-        query += ' AND template_type = ?';
-        params.push(templateType);
-      }
-
-      if (notificationName) {
-        query += ' AND notification_name = ?';
-        params.push(notificationName);
-      }
-
-      query += ' ORDER BY notification_name, template_type';
-
-      const [templates] = await connection.query(query, params);
-
-      res.json(templates);
-    } finally {
-      connection.release();
+    if (templateType) {
+      query = query.eq('template_type', templateType);
     }
+
+    if (notificationName) {
+      query = query.eq('notification_name', notificationName);
+    }
+
+    query = query.order('notification_name').order('template_type');
+
+    const { data: templates, error } = await query;
+
+    if (error) {
+      console.error('Error fetching notification templates:', error);
+      return res.status(500).json({ error: 'Failed to fetch notification templates' });
+    }
+
+    res.json(templates || []);
   } catch (error) {
     console.error('Error fetching notification templates:', error);
     res.status(500).json({ error: 'Failed to fetch notification templates' });
@@ -12506,41 +12506,63 @@ app.put('/api/user/notification-templates', async (req, res) => {
       return res.status(400).json({ error: 'User ID, template type, and notification name are required' });
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if template exists
-      const [existing] = await connection.query(`
-        SELECT id FROM notification_templates 
-        WHERE user_id = ? AND template_type = ? AND notification_name = ?
-      `, [userId, templateType, notificationName]);
+    // Check if template exists
+    const { data: existing, error: checkError } = await supabase
+      .from('notification_templates')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('template_type', templateType)
+      .eq('notification_name', notificationName)
+      .single();
 
-      if (existing.length > 0) {
-        // Update existing template
-        await connection.query(`
-          UPDATE notification_templates 
-          SET 
-            subject = ?,
-            content = ?,
-            is_enabled = ?,
-            updated_at = NOW()
-          WHERE user_id = ? AND template_type = ? AND notification_name = ?
-        `, [subject, content, isEnabled ? 1 : 0, userId, templateType, notificationName]);
-      } else {
-        // Create new template
-        await connection.query(`
-          INSERT INTO notification_templates (user_id, template_type, notification_name, subject, content, is_enabled)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `, [userId, templateType, notificationName, subject, content, isEnabled ? 1 : 0]);
-      }
-
-      console.log('🔍 Notification template updated successfully');
-      res.json({ 
-        message: 'Notification template updated successfully'
-      });
-    } finally {
-      connection.release();
+    if (checkError && checkError.code !== 'PGRST116') {
+      console.error('Error checking existing template:', checkError);
+      return res.status(500).json({ error: 'Failed to check existing template' });
     }
+
+    if (existing) {
+      // Update existing template
+      const { error: updateError } = await supabase
+        .from('notification_templates')
+        .update({
+          subject,
+          content,
+          is_enabled: isEnabled,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .eq('template_type', templateType)
+        .eq('notification_name', notificationName);
+
+      if (updateError) {
+        console.error('Error updating template:', updateError);
+        return res.status(500).json({ error: 'Failed to update notification template' });
+      }
+    } else {
+      // Create new template
+      const { error: insertError } = await supabase
+        .from('notification_templates')
+        .insert({
+          user_id: userId,
+          template_type: templateType,
+          notification_name: notificationName,
+          subject,
+          content,
+          is_enabled: isEnabled,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+
+      if (insertError) {
+        console.error('Error creating template:', insertError);
+        return res.status(500).json({ error: 'Failed to create notification template' });
+      }
+    }
+
+    console.log('🔍 Notification template updated successfully');
+    res.json({ 
+      message: 'Notification template updated successfully'
+    });
   } catch (error) {
     console.error('Error updating notification template:', error);
     res.status(500).json({ error: 'Failed to update notification template' });
