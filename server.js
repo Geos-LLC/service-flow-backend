@@ -229,30 +229,45 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
-// Removed sendEmail function - using SendGrid only
-
-// Test SendGrid configuration
-async function testSendGridConfig() {
+// SendEmail function using SendGrid
+async function sendEmail({ to, subject, html, text }) {
+  console.log('📧 Sending email via SendGrid...');
+  console.log('📧 To:', to);
+  console.log('📧 Subject:', subject);
+  
+  // Check if SendGrid is configured
+  if (!SENDGRID_API_KEY) {
+    console.error('❌ SendGrid API key not configured');
+    throw new Error('SendGrid API key not configured. Please set SENDGRID_API_KEY environment variable.');
+  }
+  
   try {
-    console.log('🧪 Testing SendGrid configuration...');
-    console.log('📧 API Key present: Yes (hardcoded)');
-    console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
-    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
-    
-    // Test the API key by making a simple request
-    const testMsg = {
-      to: 'test@example.com',
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-      subject: 'Test Email',
-      text: 'This is a test email'
+    const msg = {
+      to,
+      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      subject,
+      html,
+      text
     };
     
-    console.log('✅ SendGrid configuration appears valid');
-    console.log('📧 From email:', testMsg.from);
-    return true;
+    console.log('📧 SendGrid message prepared:', { to, subject, from: msg.from });
+    const result = await sgMail.send(msg);
+    console.log('✅ Email sent successfully via SendGrid');
+    return { messageId: result[0].headers['x-message-id'] };
   } catch (error) {
-    console.error('❌ SendGrid configuration test failed:', error);
-    return false;
+    console.error('❌ SendGrid error:', error);
+    if (error.code === 401) {
+      console.error('❌ The SendGrid API key is invalid or expired');
+      console.error('❌ Please check your SendGrid API key configuration');
+      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
+    }
+    if (error.code === 403) {
+      console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
+      console.error('❌ Make sure your SendGrid API key has mail.send permissions');
+      console.error('❌ Verify your sender email is verified in SendGrid');
+      throw new Error('SendGrid API key lacks permissions. Please check your SendGrid account settings.');
+    }
+    throw error;
   }
 }
 
@@ -14299,6 +14314,68 @@ app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Twilio disconnect error:', error);
     res.status(500).json({ error: 'Failed to disconnect Twilio' });
+  }
+});
+
+// Get current default phone number
+app.get('/api/twilio/default-phone-number', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get user's default phone number
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_default_phone_number')
+      .eq('id', userId)
+      .limit(1);
+
+    if (userError) {
+      console.error('Error getting default phone number:', userError);
+      return res.status(500).json({ error: 'Failed to get default phone number' });
+    }
+
+    res.json({
+      success: true,
+      defaultPhoneNumber: userData?.[0]?.twilio_default_phone_number || null
+    });
+  } catch (error) {
+    console.error('Get default phone number error:', error);
+    res.status(500).json({ error: 'Failed to get default phone number' });
+  }
+});
+
+// Set default phone number
+app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, res) => {
+  try {
+    const { phoneNumber } = req.body;
+    const userId = req.user.userId;
+
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    // Update user's default phone number
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        twilio_default_phone_number: phoneNumber,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error setting default phone number:', updateError);
+      return res.status(500).json({ error: 'Failed to set default phone number' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Default phone number updated successfully',
+      defaultPhoneNumber: phoneNumber
+    });
+  } catch (error) {
+    console.error('Set default phone number error:', error);
+    res.status(500).json({ error: 'Failed to set default phone number' });
   }
 });
 
