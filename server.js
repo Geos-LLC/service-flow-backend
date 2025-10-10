@@ -6143,7 +6143,7 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { 
       status, amount, taxAmount, 
-      totalAmount, dueDate, notes 
+      totalAmount, dueDate 
     } = req.body;
     
     const userId = req.user.userId; // Get userId from authenticated user
@@ -6167,8 +6167,7 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
         amount: amountValue,
         tax_amount: taxAmountValue,
         total_amount: totalAmountValue,
-        due_date: dueDate || null,
-        notes: notes || null
+        due_date: dueDate || null
       })
       .eq('id', id)
       .eq('user_id', userId);
