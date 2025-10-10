@@ -12607,51 +12607,59 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
     
     console.log('📄 Public invoice requested:', invoiceId);
     
-    // Fetch job data from Supabase
-    const { data: job, error } = await supabase
-      .from('jobs')
+    // Fetch invoice data with related customer and job information
+    const { data: invoice, error } = await supabase
+      .from('invoices')
       .select(`
         id,
-        service_name,
-        service_price,
+        amount,
+        tax_amount,
         total_amount,
-        customer_first_name,
-        customer_last_name,
-        customer_email,
-        customer_address,
-        scheduled_date,
+        status,
+        due_date,
         created_at,
-        invoice_status
+        job_id,
+        customer_id,
+        customers!invoices_customer_id_fkey (
+          first_name,
+          last_name,
+          email,
+          address
+        ),
+        jobs!invoices_job_id_fkey (
+          id,
+          service_name,
+          scheduled_date
+        )
       `)
       .eq('id', invoiceId)
       .single();
 
     if (error) {
-      console.error('❌ Error fetching job from database:', error);
+      console.error('❌ Error fetching invoice from database:', error);
       return res.status(404).json({ error: 'Invoice not found' });
     }
 
-    if (!job) {
+    if (!invoice) {
       return res.status(404).json({ error: 'Invoice not found' });
     }
 
-    // Calculate total amount
-    const totalAmount = job.total_amount || job.service_price || 0;
-    
     // Format invoice data
     const invoiceData = {
-      id: job.id,
-      invoiceNumber: `INV-${job.id}`,
-      customerName: `${job.customer_first_name} ${job.customer_last_name}`,
-      customerEmail: job.customer_email,
-      serviceDate: job.scheduled_date,
-      jobNumber: job.id,
-      serviceAddress: job.customer_address,
-      service: job.service_name,
-      description: job.service_name, // You can enhance this with more details
-      amount: totalAmount,
-      dueDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // 7 days from now
-      status: job.invoice_status || 'unpaid'
+      id: invoice.id,
+      invoiceNumber: `INV-${invoice.id}`,
+      customerName: `${invoice.customers?.first_name || ''} ${invoice.customers?.last_name || ''}`.trim(),
+      customerEmail: invoice.customers?.email,
+      serviceDate: invoice.jobs?.scheduled_date,
+      jobNumber: invoice.job_id,
+      serviceAddress: invoice.customers?.address,
+      service: invoice.jobs?.service_name,
+      description: invoice.jobs?.service_name,
+      amount: parseFloat(invoice.total_amount),
+      taxAmount: parseFloat(invoice.tax_amount || 0),
+      dueDate: invoice.due_date,
+      status: invoice.status,
+      createdAt: invoice.created_at
     };
     
     console.log('📄 Invoice data fetched:', invoiceData);
@@ -12659,6 +12667,80 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
   } catch (error) {
     console.error('❌ Error fetching public invoice:', error);
     res.status(500).json({ error: 'Failed to fetch invoice' });
+  }
+});
+
+// Invoice Management API endpoints
+app.post('/api/create-invoice', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, customerId, amount, taxAmount, totalAmount, dueDate } = req.body;
+    
+    if (!jobId || !customerId || !amount || !totalAmount) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Create invoice in database
+    const { data: invoice, error } = await supabase
+      .from('invoices')
+      .insert({
+        user_id: req.user.id,
+        customer_id: customerId,
+        job_id: jobId,
+        amount: amount,
+        tax_amount: taxAmount || 0,
+        total_amount: totalAmount,
+        due_date: dueDate,
+        status: 'draft'
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('❌ Error creating invoice:', error);
+      return res.status(500).json({ error: 'Failed to create invoice' });
+    }
+
+    console.log('✅ Invoice created:', invoice.id);
+    res.json(invoice);
+  } catch (error) {
+    console.error('❌ Error creating invoice:', error);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
+});
+
+app.put('/api/invoices/:invoiceId', authenticateToken, async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    const { status, amount, taxAmount, totalAmount, dueDate } = req.body;
+    
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+    
+    if (status) updateData.status = status;
+    if (amount !== undefined) updateData.amount = amount;
+    if (taxAmount !== undefined) updateData.tax_amount = taxAmount;
+    if (totalAmount !== undefined) updateData.total_amount = totalAmount;
+    if (dueDate) updateData.due_date = dueDate;
+
+    const { data: invoice, error } = await supabase
+      .from('invoices')
+      .update(updateData)
+      .eq('id', invoiceId)
+      .eq('user_id', req.user.id) // Ensure user can only update their own invoices
+      .select()
+      .single();
+
+    if (error) {
+      console.error('❌ Error updating invoice:', error);
+      return res.status(500).json({ error: 'Failed to update invoice' });
+    }
+
+    console.log('✅ Invoice updated:', invoice.id);
+    res.json(invoice);
+  } catch (error) {
+    console.error('❌ Error updating invoice:', error);
+    res.status(500).json({ error: 'Failed to update invoice' });
   }
 });
 
@@ -12744,6 +12826,7 @@ app.post('/api/stripe/create-payment-link', authenticateToken, async (req, res) 
 app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
   try {
     const { 
+      invoiceId,
       jobId, 
       customerEmail, 
       customerName, 
@@ -12807,7 +12890,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
           </div>
           
           <div style="text-align: center; margin: 20px 0;">
-            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
           </div>
           
           <div class="footer">
@@ -12837,7 +12920,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
       subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
       html: invoiceHtml,
-      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
     };
 
     console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
