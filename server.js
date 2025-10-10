@@ -12742,15 +12742,29 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
       console.error('❌ Missing required fields:', { jobId, customerId, amount, totalAmount });
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    
+    // Validate amount values
+    const parsedAmount = parseFloat(amount);
+    const parsedTotalAmount = parseFloat(totalAmount);
+    
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      console.error('❌ Invalid amount:', { amount, parsedAmount });
+      return res.status(400).json({ error: 'Invalid amount. Amount must be greater than 0.' });
+    }
+    
+    if (isNaN(parsedTotalAmount) || parsedTotalAmount <= 0) {
+      console.error('❌ Invalid total amount:', { totalAmount, parsedTotalAmount });
+      return res.status(400).json({ error: 'Invalid total amount. Total amount must be greater than 0.' });
+    }
 
     // Create invoice in database
     const invoiceData = {
       user_id: req.user.userId,
       customer_id: customerId,
       job_id: jobId,
-      amount: parseFloat(amount),
+      amount: parsedAmount,
       tax_amount: parseFloat(taxAmount || 0),
-      total_amount: parseFloat(totalAmount),
+      total_amount: parsedTotalAmount,
       due_date: dueDate,
       status: 'draft'
     };
