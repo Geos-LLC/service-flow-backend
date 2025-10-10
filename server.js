@@ -6146,7 +6146,14 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
       totalAmount, dueDate, notes 
     } = req.body;
     
-    const userId = req.user.id; // Get userId from authenticated user
+    const userId = req.user.userId; // Get userId from authenticated user
+    
+    console.log('📄 Invoice update request:', { 
+      invoiceId: id, 
+      userId, 
+      user: req.user,
+      body: req.body 
+    });
 
     // Convert string values to numbers for decimal fields
     const amountValue = parseFloat(amount) || 0;
