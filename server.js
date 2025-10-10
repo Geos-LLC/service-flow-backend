@@ -12693,6 +12693,30 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
   }
 });
 
+// Check if Stripe is connected
+app.get('/api/stripe/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const { data: userData, error } = await supabase
+      .from('users')
+      .select('stripe_connect_status')
+      .eq('id', userId)
+      .single();
+    
+    if (error) {
+      console.error('❌ Error checking Stripe status:', error);
+      return res.status(500).json({ error: 'Failed to check Stripe status' });
+    }
+    
+    const isConnected = userData.stripe_connect_status === 'connected';
+    res.json({ connected: isConnected, status: userData.stripe_connect_status });
+  } catch (error) {
+    console.error('❌ Error checking Stripe status:', error);
+    res.status(500).json({ error: 'Failed to check Stripe status' });
+  }
+});
+
 // Invoice Management API endpoints
 app.post('/api/create-invoice', authenticateToken, async (req, res) => {
   try {
@@ -12714,18 +12738,22 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
     }
 
     // Create invoice in database
+    const invoiceData = {
+      user_id: req.user.userId,
+      customer_id: customerId,
+      job_id: jobId,
+      amount: parseFloat(amount),
+      tax_amount: parseFloat(taxAmount || 0),
+      total_amount: parseFloat(totalAmount),
+      due_date: dueDate,
+      status: 'draft'
+    };
+    
+    console.log('💰 Inserting invoice data:', invoiceData);
+    
     const { data: invoice, error } = await supabase
       .from('invoices')
-      .insert({
-        user_id: req.user.userId,
-        customer_id: customerId,
-        job_id: jobId,
-        amount: amount,
-        tax_amount: taxAmount || 0,
-        total_amount: totalAmount,
-        due_date: dueDate,
-        status: 'draft'
-      })
+      .insert(invoiceData)
       .select()
       .single();
 
