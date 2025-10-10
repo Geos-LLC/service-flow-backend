@@ -12744,11 +12744,9 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
             <p><strong>Total Due:</strong> $${amount.toFixed(2)}</p>
           </div>
           
-          ${includePaymentLink && paymentLink ? `
-            <div style="text-align: center; margin: 20px 0;">
-              <a href="${paymentLink}" class="payment-button">Pay Invoice</a>
-            </div>
-          ` : ''}
+          <div style="text-align: center; margin: 20px 0;">
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}" class="payment-button">Pay Invoice</a>
+          </div>
           
           <div class="footer">
             <p>We appreciate your business.</p>
@@ -12768,6 +12766,8 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
     console.log('📧 Sending invoice email to:', customerEmail);
     console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
     console.log('📧 Business name:', req.user.business_name || 'Your Business');
+    console.log('📧 Include payment link:', includePaymentLink);
+    console.log('📧 Job ID:', jobId);
 
     // Send email using SendGrid
     const msg = {
@@ -12775,7 +12775,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
       subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
       html: invoiceHtml,
-      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\n${includePaymentLink && paymentLink ? `Pay online: ${paymentLink}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/invoice/${jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
     };
 
     console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
