@@ -12698,6 +12698,8 @@ app.get('/api/stripe/status', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     
+    console.log('🔍 Checking Stripe status for user:', userId);
+    
     const { data: userData, error } = await supabase
       .from('users')
       .select('stripe_connect_status')
@@ -12709,7 +12711,11 @@ app.get('/api/stripe/status', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to check Stripe status' });
     }
     
+    console.log('🔍 User Stripe status:', userData.stripe_connect_status);
+    
     const isConnected = userData.stripe_connect_status === 'connected';
+    console.log('🔍 Stripe connected:', isConnected);
+    
     res.json({ connected: isConnected, status: userData.stripe_connect_status });
   } catch (error) {
     console.error('❌ Error checking Stripe status:', error);
