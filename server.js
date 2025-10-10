@@ -12600,6 +12600,39 @@ app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   }
 });
 
+// Stripe Payment Intent API endpoints
+app.post('/api/create-payment-intent', async (req, res) => {
+  try {
+    const { amount, currency, invoiceId, customerEmail } = req.body;
+    
+    if (!amount || !currency) {
+      return res.status(400).json({ error: 'Amount and currency are required' });
+    }
+
+    // Create payment intent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount, // Amount in cents
+      currency: currency,
+      metadata: {
+        invoiceId: invoiceId,
+        customerEmail: customerEmail,
+      },
+      automatic_payment_methods: {
+        enabled: true,
+      },
+    });
+
+    console.log('✅ Payment intent created:', paymentIntent.id);
+    res.json({ 
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id 
+    });
+  } catch (error) {
+    console.error('❌ Error creating payment intent:', error);
+    res.status(500).json({ error: 'Failed to create payment intent' });
+  }
+});
+
 // Stripe Payment Link API endpoints
 app.post('/api/stripe/create-payment-link', authenticateToken, async (req, res) => {
   try {
