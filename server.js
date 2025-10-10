@@ -6138,18 +6138,15 @@ app.post('/api/invoices', async (req, res) => {
   }
 });
 
-app.put('/api/invoices/:id', async (req, res) => {
+app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { 
-      userId, status, amount, taxAmount, 
+      status, amount, taxAmount, 
       totalAmount, dueDate, notes 
     } = req.body;
     
-  
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
-    }
+    const userId = req.user.id; // Get userId from authenticated user
 
     // Convert string values to numbers for decimal fields
     const amountValue = parseFloat(amount) || 0;
@@ -12708,41 +12705,6 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/invoices/:invoiceId', authenticateToken, async (req, res) => {
-  try {
-    const { invoiceId } = req.params;
-    const { status, amount, taxAmount, totalAmount, dueDate } = req.body;
-    
-    const updateData = {
-      updated_at: new Date().toISOString()
-    };
-    
-    if (status) updateData.status = status;
-    if (amount !== undefined) updateData.amount = amount;
-    if (taxAmount !== undefined) updateData.tax_amount = taxAmount;
-    if (totalAmount !== undefined) updateData.total_amount = totalAmount;
-    if (dueDate) updateData.due_date = dueDate;
-
-    const { data: invoice, error } = await supabase
-      .from('invoices')
-      .update(updateData)
-      .eq('id', invoiceId)
-      .eq('user_id', req.user.id) // Ensure user can only update their own invoices
-      .select()
-      .single();
-
-    if (error) {
-      console.error('❌ Error updating invoice:', error);
-      return res.status(500).json({ error: 'Failed to update invoice' });
-    }
-
-    console.log('✅ Invoice updated:', invoice.id);
-    res.json(invoice);
-  } catch (error) {
-    console.error('❌ Error updating invoice:', error);
-    res.status(500).json({ error: 'Failed to update invoice' });
-  }
-});
 
 // Stripe Payment Intent API endpoints
 app.post('/api/create-payment-intent', async (req, res) => {
