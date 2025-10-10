@@ -12569,6 +12569,37 @@ app.put('/api/user/notification-templates', async (req, res) => {
   }
 });
 
+// Test SendGrid endpoint
+app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
+  try {
+    const { testEmail } = req.body;
+    
+    if (!testEmail) {
+      return res.status(400).json({ error: 'Test email is required' });
+    }
+
+    console.log('🧪 Testing SendGrid with email:', testEmail);
+    console.log('🧪 SendGrid API Key configured:', !!SENDGRID_API_KEY);
+    console.log('🧪 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
+
+    const msg = {
+      to: testEmail,
+      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      subject: 'Test Email from Service Flow',
+      html: '<h1>Test Email</h1><p>This is a test email to verify SendGrid configuration.</p>',
+      text: 'Test Email - This is a test email to verify SendGrid configuration.'
+    };
+
+    const result = await sgMail.send(msg);
+    console.log('✅ Test email sent successfully:', result);
+    
+    res.json({ message: 'Test email sent successfully', result });
+  } catch (error) {
+    console.error('❌ Error sending test email:', error);
+    res.status(500).json({ error: 'Failed to send test email', details: error.message });
+  }
+});
+
 // Stripe Payment Link API endpoints
 app.post('/api/stripe/create-payment-link', authenticateToken, async (req, res) => {
   try {
@@ -12695,6 +12726,16 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       </html>
     `;
 
+    // Check SendGrid configuration
+    if (!SENDGRID_API_KEY) {
+      console.error('❌ SendGrid API key not configured');
+      return res.status(500).json({ error: 'SendGrid API key not configured' });
+    }
+
+    console.log('📧 Sending invoice email to:', customerEmail);
+    console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
+    console.log('📧 Business name:', req.user.business_name || 'Your Business');
+
     // Send email using SendGrid
     const msg = {
       to: customerEmail,
@@ -12704,9 +12745,11 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\n${includePaymentLink && paymentLink ? `Pay online: ${paymentLink}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
     };
 
-    await sgMail.send(msg);
+    console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
     
-    console.log('✅ Invoice email sent successfully');
+    const result = await sgMail.send(msg);
+    console.log('✅ Invoice email sent successfully via SendGrid:', result);
+    
     res.json({ message: 'Invoice email sent successfully' });
   } catch (error) {
     console.error('❌ Error sending invoice email:', error);
