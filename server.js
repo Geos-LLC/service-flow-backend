@@ -12569,6 +12569,151 @@ app.put('/api/user/notification-templates', async (req, res) => {
   }
 });
 
+// Stripe Payment Link API endpoints
+app.post('/api/stripe/create-payment-link', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, amount, currency, customerEmail, customerName, description } = req.body;
+    
+    if (!jobId || !amount || !currency) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Create Stripe payment link
+    const paymentLink = await stripe.paymentLinks.create({
+      line_items: [{
+        price_data: {
+          currency: currency,
+          product_data: {
+            name: description || 'Service Payment',
+          },
+          unit_amount: amount, // Amount in cents
+        },
+        quantity: 1,
+      }],
+      after_completion: {
+        type: 'redirect',
+        redirect: {
+          url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/payment-success?jobId=${jobId}`,
+        },
+      },
+      metadata: {
+        jobId: jobId.toString(),
+        customerEmail: customerEmail,
+        customerName: customerName,
+      },
+    });
+
+    console.log('✅ Stripe payment link created:', paymentLink.id);
+    res.json({ 
+      paymentLink: paymentLink.url,
+      paymentLinkId: paymentLink.id 
+    });
+  } catch (error) {
+    console.error('❌ Error creating Stripe payment link:', error);
+    res.status(500).json({ error: 'Failed to create payment link' });
+  }
+});
+
+// Invoice Email API endpoint
+app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      jobId, 
+      customerEmail, 
+      customerName, 
+      amount, 
+      serviceName, 
+      serviceDate, 
+      address, 
+      paymentLink, 
+      includePaymentLink 
+    } = req.body;
+
+    if (!jobId || !customerEmail || !customerName || !amount) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Create invoice email content
+    const invoiceHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Invoice</title>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+          .header { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+          .invoice-details { background: #fff; border: 1px solid #e9ecef; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+          .amount-due { background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 15px; margin-bottom: 20px; }
+          .service-details { background: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 20px; }
+          .payment-button { background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold; }
+          .footer { text-align: center; margin-top: 30px; color: #6c757d; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h2>Invoice</h2>
+            <p>Hi ${customerName},</p>
+            <p>Please find your invoice for the recent service.</p>
+          </div>
+          
+          <div class="amount-due">
+            <h3>AMOUNT DUE: $${amount.toFixed(2)}</h3>
+            <p><strong>DUE BY:</strong> ${new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</p>
+            <p><strong>SERVICE DATE:</strong> ${new Date(serviceDate).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}</p>
+            <p><strong>SERVICE ADDRESS:</strong> ${address || 'Address not provided'}</p>
+          </div>
+          
+          <div class="service-details">
+            <h4>Service Details</h4>
+            <p><strong>Service:</strong> ${serviceName}</p>
+            <p><strong>Amount:</strong> $${amount.toFixed(2)}</p>
+          </div>
+          
+          <div class="invoice-details">
+            <h4>Financial Summary</h4>
+            <p><strong>Subtotal:</strong> $${amount.toFixed(2)}</p>
+            <p><strong>Total:</strong> $${amount.toFixed(2)}</p>
+            <p><strong>Total Paid:</strong> $0.00</p>
+            <p><strong>Total Due:</strong> $${amount.toFixed(2)}</p>
+          </div>
+          
+          ${includePaymentLink && paymentLink ? `
+            <div style="text-align: center; margin: 20px 0;">
+              <a href="${paymentLink}" class="payment-button">Pay Invoice</a>
+            </div>
+          ` : ''}
+          
+          <div class="footer">
+            <p>We appreciate your business.</p>
+            <p>Thank you for choosing our services!</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    // Send email using SendGrid
+    const msg = {
+      to: customerEmail,
+      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
+      html: invoiceHtml,
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\n${includePaymentLink && paymentLink ? `Pay online: ${paymentLink}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
+    };
+
+    await sgMail.send(msg);
+    
+    console.log('✅ Invoice email sent successfully');
+    res.json({ message: 'Invoice email sent successfully' });
+  } catch (error) {
+    console.error('❌ Error sending invoice email:', error);
+    res.status(500).json({ error: 'Failed to send invoice email' });
+  }
+});
+
 // Notification Settings API endpoints
 app.get('/api/user/notification-settings', async (req, res) => {
   try {
