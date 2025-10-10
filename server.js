@@ -12698,7 +12698,18 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
   try {
     const { jobId, customerId, amount, taxAmount, totalAmount, dueDate } = req.body;
     
+    console.log('💰 Creating invoice with data:', {
+      jobId,
+      customerId,
+      amount,
+      taxAmount,
+      totalAmount,
+      dueDate,
+      userId: req.user.userId
+    });
+    
     if (!jobId || !customerId || !amount || !totalAmount) {
+      console.error('❌ Missing required fields:', { jobId, customerId, amount, totalAmount });
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
