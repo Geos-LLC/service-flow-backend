@@ -12783,6 +12783,12 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
     }
 
     console.log('✅ Invoice created:', invoice.id);
+    console.log('✅ Invoice data from database:', {
+      id: invoice.id,
+      amount: invoice.amount,
+      total_amount: invoice.total_amount,
+      tax_amount: invoice.tax_amount
+    });
     res.json(invoice);
   } catch (error) {
     console.error('❌ Error creating invoice:', error);
