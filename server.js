@@ -12685,7 +12685,13 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
       createdAt: invoice.created_at
     };
     
-    console.log('📄 Invoice data fetched:', invoiceData);
+    console.log('📄 Raw invoice data from database:', {
+      id: invoice.id,
+      amount: invoice.amount,
+      tax_amount: invoice.tax_amount,
+      total_amount: invoice.total_amount
+    });
+    console.log('📄 Formatted invoice data:', invoiceData);
     res.json(invoiceData);
   } catch (error) {
     console.error('❌ Error fetching public invoice:', error);
