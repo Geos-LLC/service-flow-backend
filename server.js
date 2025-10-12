@@ -12746,9 +12746,11 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
       .single();
     
     if (invoiceError || !invoice) {
-      console.error('❌ Invoice not found:', invoiceId);
+      console.error('❌ Invoice not found:', invoiceId, 'Error:', invoiceError);
       return res.status(404).json({ error: 'Invoice not found' });
     }
+    
+    console.log('🔍 Invoice found, user_id:', invoice.user_id);
     
     // Get user's Stripe credentials
     const { data: userData, error: userError } = await supabase
@@ -12758,12 +12760,14 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
       .single();
     
     if (userError || !userData) {
-      console.error('❌ User not found for invoice:', invoiceId);
+      console.error('❌ User not found for invoice:', invoiceId, 'Error:', userError);
       return res.status(404).json({ error: 'User not found' });
     }
     
+    console.log('🔍 User found, stripe_connect_status:', userData.stripe_connect_status);
+    
     if (userData.stripe_connect_status !== 'connected') {
-      console.error('❌ Stripe not connected for user:', invoice.user_id);
+      console.error('❌ Stripe not connected for user:', invoice.user_id, 'Status:', userData.stripe_connect_status);
       return res.status(400).json({ error: 'Stripe not connected' });
     }
     
@@ -12775,7 +12779,7 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
       .single();
     
     if (billingError || !billingData?.stripe_publishable_key) {
-      console.error('❌ Stripe publishable key not found for user:', invoice.user_id);
+      console.error('❌ Stripe publishable key not found for user:', invoice.user_id, 'Error:', billingError, 'Data:', billingData);
       return res.status(400).json({ error: 'Stripe not configured' });
     }
     
