@@ -12795,6 +12795,20 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
       total_amount: invoice.total_amount,
       tax_amount: invoice.tax_amount
     });
+    
+    // Double-check by querying the database again
+    const { data: verifyInvoice, error: verifyError } = await supabase
+      .from('invoices')
+      .select('id, amount, total_amount, tax_amount')
+      .eq('id', invoice.id)
+      .single();
+    
+    if (!verifyError) {
+      console.log('🔍 Verification query result:', verifyInvoice);
+    } else {
+      console.error('❌ Error verifying invoice:', verifyError);
+    }
+    
     res.json(invoice);
   } catch (error) {
     console.error('❌ Error creating invoice:', error);
