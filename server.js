@@ -5894,7 +5894,7 @@ app.post('/api/territories/detect', async (req, res) => {
 // Invoices endpoints
 app.get('/api/invoices', async (req, res) => {
   try {
-    const { userId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId } = req.query;
+    const { userId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId, job_id } = req.query;
     
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
@@ -5930,6 +5930,11 @@ app.get('/api/invoices', async (req, res) => {
     // Add customer filter
     if (customerId) {
       query = query.eq('customer_id', customerId);
+    }
+    
+    // Add job filter
+    if (job_id) {
+      query = query.eq('job_id', job_id);
     }
     
     // Add sorting
@@ -12893,18 +12898,52 @@ app.post('/api/create-invoice', authenticateToken, async (req, res) => {
 app.post('/api/create-payment-intent', async (req, res) => {
   try {
     const { amount, currency, invoiceId, customerEmail } = req.body;
-    
-    if (!amount || !currency) {
-      return res.status(400).json({ error: 'Amount and currency are required' });
+
+    console.log('💳 Creating payment intent:', { amount, currency, invoiceId, customerEmail });
+
+    if (!amount || !currency || !invoiceId) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Create payment intent
+    // Get the invoice to find the user
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select('user_id, amount, total_amount, status')
+      .eq('id', invoiceId)
+      .single();
+
+    if (invoiceError || !invoice) {
+      console.error('❌ Invoice not found for payment:', invoiceId);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Check if invoice is already paid
+    if (invoice.status === 'paid') {
+      console.error('❌ Invoice already paid:', invoiceId);
+      return res.status(400).json({ error: 'Invoice has already been paid' });
+    }
+
+    // Get user's Stripe credentials
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', invoice.user_id)
+      .single();
+
+    if (billingError || !billingData?.stripe_secret_key) {
+      console.error('❌ Stripe credentials not found for user:', invoice.user_id);
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData.stripe_secret_key);
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amount, // Amount in cents
       currency: currency,
       metadata: {
         invoiceId: invoiceId,
         customerEmail: customerEmail,
+        userId: invoice.user_id,
       },
       automatic_payment_methods: {
         enabled: true,
@@ -12919,6 +12958,126 @@ app.post('/api/create-payment-intent', async (req, res) => {
   } catch (error) {
     console.error('❌ Error creating payment intent:', error);
     res.status(500).json({ error: 'Failed to create payment intent' });
+  }
+});
+
+/*
+CREATE TABLE public.transactions (
+  id serial NOT NULL,
+  user_id integer NOT NULL,
+  invoice_id integer NOT NULL,
+  customer_id integer,
+  job_id integer,
+  amount numeric(10, 2) NOT NULL,
+  payment_intent_id varchar(255) NOT NULL,
+  status varchar(50) NOT NULL DEFAULT 'pending',
+  payment_method varchar(50) NOT NULL DEFAULT 'card',
+  created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT transactions_pkey PRIMARY KEY (id),
+  CONSTRAINT transactions_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+  CONSTRAINT transactions_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES invoices (id) ON DELETE CASCADE,
+  CONSTRAINT transactions_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE SET NULL,
+  CONSTRAINT transactions_job_id_fkey FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE SET NULL
+);
+*/
+
+// Handle successful payment
+app.post('/api/payment-success', async (req, res) => {
+  try {
+    const { paymentIntentId, invoiceId } = req.body;
+
+    console.log('✅ Payment success:', { paymentIntentId, invoiceId });
+
+    if (!paymentIntentId || !invoiceId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Get invoice details
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select('user_id, amount, total_amount, customer_id, job_id')
+      .eq('id', invoiceId)
+      .single();
+
+    if (invoiceError || !invoice) {
+      console.error('❌ Invoice not found:', invoiceId);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    // Get user's Stripe credentials to verify payment
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', invoice.user_id)
+      .single();
+
+    if (billingError || !billingData?.stripe_secret_key) {
+      console.error('❌ Stripe credentials not found for user:', invoice.user_id);
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+
+    const stripe = require('stripe')(billingData.stripe_secret_key);
+
+    // Verify payment intent with Stripe
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (paymentIntent.status !== 'succeeded') {
+      console.error('❌ Payment not succeeded:', paymentIntent.status);
+      return res.status(400).json({ error: 'Payment not successful' });
+    }
+
+    // Create transaction record
+    const { data: transaction, error: transactionError } = await supabase
+      .from('transactions')
+      .insert({
+        user_id: invoice.user_id,
+        invoice_id: invoiceId,
+        customer_id: invoice.customer_id,
+        job_id: invoice.job_id,
+        amount: invoice.total_amount,
+        payment_intent_id: paymentIntentId,
+        status: 'completed',
+        payment_method: 'card',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (transactionError) {
+      console.error('❌ Error creating transaction:', transactionError);
+      return res.status(500).json({ error: 'Failed to record transaction' });
+    }
+
+    // Update invoice status to paid
+    const { error: updateError } = await supabase
+      .from('invoices')
+      .update({ 
+        status: 'paid',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', invoiceId);
+
+    if (updateError) {
+      console.error('❌ Error updating invoice status:', updateError);
+      return res.status(500).json({ error: 'Failed to update invoice status' });
+    }
+
+    console.log('✅ Payment processed successfully:', {
+      transactionId: transaction.id,
+      invoiceId: invoiceId,
+      amount: invoice.total_amount
+    });
+
+    res.json({ 
+      success: true, 
+      transactionId: transaction.id,
+      amount: invoice.total_amount,
+      paymentIntentId: paymentIntentId
+    });
+  } catch (error) {
+    console.error('❌ Error processing payment success:', error);
+    res.status(500).json({ error: 'Failed to process payment' });
   }
 });
 
