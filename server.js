@@ -12987,7 +12987,8 @@ app.post('/api/payment-success', async (req, res) => {
   try {
     const { paymentIntentId, invoiceId } = req.body;
 
-    console.log('✅ Payment success:', { paymentIntentId, invoiceId });
+    console.log('✅ Payment success endpoint called:', { paymentIntentId, invoiceId });
+    console.log('✅ Request body:', req.body);
 
     if (!paymentIntentId || !invoiceId) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -13079,12 +13080,15 @@ app.post('/api/payment-success', async (req, res) => {
       amount: invoice.total_amount
     });
 
-    res.json({ 
+    const responseData = { 
       success: true, 
       transactionId: transaction?.id || null,
       amount: invoice.total_amount,
       paymentIntentId: paymentIntentId
-    });
+    };
+
+    console.log('✅ Sending response:', responseData);
+    res.json(responseData);
   } catch (error) {
     console.error('❌ Error processing payment success:', error);
     res.status(500).json({ error: 'Failed to process payment' });
