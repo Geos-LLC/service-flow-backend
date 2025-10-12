@@ -6155,20 +6155,22 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
       body: req.body 
     });
 
-    // Convert string values to numbers for decimal fields
-    const amountValue = parseFloat(amount) || 0;
-    const taxAmountValue = parseFloat(taxAmount) || 0;
-    const totalAmountValue = parseFloat(totalAmount) || 0;
+    // Only update fields that are provided
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+    
+    if (status) updateData.status = status;
+    if (amount !== undefined) updateData.amount = parseFloat(amount);
+    if (taxAmount !== undefined) updateData.tax_amount = parseFloat(taxAmount);
+    if (totalAmount !== undefined) updateData.total_amount = parseFloat(totalAmount);
+    if (dueDate) updateData.due_date = dueDate;
+
+    console.log('📄 Update data:', updateData);
 
     const { error: updateError } = await supabase
       .from('invoices')
-      .update({
-        status: status,
-        amount: amountValue,
-        tax_amount: taxAmountValue,
-        total_amount: totalAmountValue,
-        due_date: dueDate || null
-      })
+      .update(updateData)
       .eq('id', id)
       .eq('user_id', userId);
     
