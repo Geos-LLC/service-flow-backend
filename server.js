@@ -12731,6 +12731,65 @@ app.get('/api/stripe/status', authenticateToken, async (req, res) => {
   }
 });
 
+// Get Stripe publishable key for public payment pages
+app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    
+    console.log('🔑 Getting Stripe config for invoice:', invoiceId);
+    
+    // Get the invoice to find the user
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select('user_id')
+      .eq('id', invoiceId)
+      .single();
+    
+    if (invoiceError || !invoice) {
+      console.error('❌ Invoice not found:', invoiceId);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    // Get user's Stripe credentials
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('stripe_connect_status')
+      .eq('id', invoice.user_id)
+      .single();
+    
+    if (userError || !userData) {
+      console.error('❌ User not found for invoice:', invoiceId);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (userData.stripe_connect_status !== 'connected') {
+      console.error('❌ Stripe not connected for user:', invoice.user_id);
+      return res.status(400).json({ error: 'Stripe not connected' });
+    }
+    
+    // Get user's Stripe publishable key
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_publishable_key')
+      .eq('user_id', invoice.user_id)
+      .single();
+    
+    if (billingError || !billingData?.stripe_publishable_key) {
+      console.error('❌ Stripe publishable key not found for user:', invoice.user_id);
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+    
+    console.log('🔑 Stripe config retrieved for invoice:', invoiceId);
+    res.json({ 
+      publishableKey: billingData.stripe_publishable_key,
+      connected: true 
+    });
+  } catch (error) {
+    console.error('❌ Error getting Stripe config:', error);
+    res.status(500).json({ error: 'Failed to get Stripe configuration' });
+  }
+});
+
 // Invoice Management API endpoints
 app.post('/api/create-invoice', authenticateToken, async (req, res) => {
   try {
