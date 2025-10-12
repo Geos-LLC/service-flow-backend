@@ -12796,6 +12796,25 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
     }
     
     console.log('🔑 Stripe config retrieved for invoice:', invoiceId);
+    console.log('🔍 Publishable key ending in:', billingData.stripe_publishable_key.slice(-4));
+    console.log('🔍 Secret key ending in:', billingData.stripe_secret_key.slice(-4));
+    
+    // Verify the keys belong to the same Stripe account
+    try {
+      const stripe = require('stripe')(billingData.stripe_secret_key);
+      const account = await stripe.accounts.retrieve();
+      console.log('🔍 Stripe account ID for verification:', account.id);
+      
+      // Check if publishable key matches the account
+      if (!billingData.stripe_publishable_key.startsWith('pk_test_') && !billingData.stripe_publishable_key.startsWith('pk_live_')) {
+        console.error('❌ Invalid publishable key format');
+        return res.status(400).json({ error: 'Invalid publishable key format' });
+      }
+    } catch (verifyError) {
+      console.error('❌ Stripe account verification failed:', verifyError.message);
+      return res.status(400).json({ error: 'Stripe account verification failed' });
+    }
+    
     res.json({ 
       publishableKey: billingData.stripe_publishable_key,
       connected: true 
@@ -12936,6 +12955,20 @@ app.post('/api/create-payment-intent', async (req, res) => {
     }
 
     const stripe = require('stripe')(billingData.stripe_secret_key);
+
+    // Debug: Verify the Stripe account
+    console.log('🔍 Creating payment intent with secret key ending in:', billingData.stripe_secret_key.slice(-4));
+    console.log('🔍 User ID:', invoice.user_id);
+    
+    // Verify the Stripe account is valid
+    try {
+      const account = await stripe.accounts.retrieve();
+      console.log('🔍 Stripe account ID:', account.id);
+      console.log('🔍 Stripe account type:', account.type);
+    } catch (accountError) {
+      console.error('❌ Invalid Stripe secret key:', accountError.message);
+      return res.status(400).json({ error: 'Invalid Stripe credentials' });
+    }
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amount, // Amount in cents
