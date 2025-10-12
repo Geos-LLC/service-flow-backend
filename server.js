@@ -12810,6 +12810,24 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
         console.error('❌ Invalid publishable key format');
         return res.status(400).json({ error: 'Invalid publishable key format' });
       }
+      
+      // CRITICAL: Verify the publishable key belongs to the same account as the secret key
+      // Extract account ID from publishable key (first part after pk_test_ or pk_live_)
+      const publishableKeyAccount = billingData.stripe_publishable_key.split('_')[2];
+      const secretKeyAccount = billingData.stripe_secret_key.split('_')[2];
+      
+      console.log('🔍 Publishable key account:', publishableKeyAccount);
+      console.log('🔍 Secret key account:', secretKeyAccount);
+      
+      if (publishableKeyAccount !== secretKeyAccount) {
+        console.error('❌ CRITICAL: Publishable and secret keys belong to different Stripe accounts!');
+        console.error('❌ This will cause payment intent confirmation failures');
+        return res.status(400).json({ 
+          error: 'Stripe key mismatch: publishable and secret keys belong to different accounts' 
+        });
+      }
+      
+      console.log('✅ Stripe account verification passed - keys belong to same account');
     } catch (verifyError) {
       console.error('❌ Stripe account verification failed:', verifyError.message);
       return res.status(400).json({ error: 'Stripe account verification failed' });
@@ -12965,6 +12983,30 @@ app.post('/api/create-payment-intent', async (req, res) => {
       const account = await stripe.accounts.retrieve();
       console.log('🔍 Stripe account ID:', account.id);
       console.log('🔍 Stripe account type:', account.type);
+      
+      // CRITICAL: Also verify the publishable key matches this account
+      const { data: billingDataForPublishable, error: billingErrorForPublishable } = await supabase
+        .from('user_billing')
+        .select('stripe_publishable_key')
+        .eq('user_id', invoice.user_id)
+        .single();
+        
+      if (billingDataForPublishable?.stripe_publishable_key) {
+        const publishableKeyAccount = billingDataForPublishable.stripe_publishable_key.split('_')[2];
+        const secretKeyAccount = billingData.stripe_secret_key.split('_')[2];
+        
+        console.log('🔍 Payment intent - Publishable key account:', publishableKeyAccount);
+        console.log('🔍 Payment intent - Secret key account:', secretKeyAccount);
+        
+        if (publishableKeyAccount !== secretKeyAccount) {
+          console.error('❌ CRITICAL: Payment intent will fail - keys belong to different accounts!');
+          return res.status(400).json({ 
+            error: 'Stripe key mismatch: cannot create payment intent with mismatched keys' 
+          });
+        }
+        
+        console.log('✅ Payment intent - Stripe account verification passed');
+      }
     } catch (accountError) {
       console.error('❌ Invalid Stripe secret key:', accountError.message);
       return res.status(400).json({ error: 'Invalid Stripe credentials' });
@@ -12981,6 +13023,14 @@ app.post('/api/create-payment-intent', async (req, res) => {
       automatic_payment_methods: {
         enabled: true,
       },
+    });
+
+    console.log('✅ Payment intent created successfully:', {
+      id: paymentIntent.id,
+      clientSecret: paymentIntent.client_secret,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      status: paymentIntent.status
     });
 
     console.log('✅ Payment intent created:', paymentIntent.id);
