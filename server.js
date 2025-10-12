@@ -12929,6 +12929,50 @@ app.post('/api/fix-stripe-keys/:userId', authenticateToken, async (req, res) => 
   }
 });
 
+// Transaction-based payment checking
+app.get('/api/transactions/job/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    
+    console.log('💳 Checking transactions for job:', jobId);
+    
+    // Check if there are completed transactions for this job
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('job_id', jobId)
+      .eq('status', 'completed')
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('❌ Error fetching transactions:', error);
+      return res.status(500).json({ error: 'Failed to fetch transactions' });
+    }
+    
+    console.log('💳 Found transactions:', transactions?.length || 0);
+    if (transactions && transactions.length > 0) {
+      console.log('💳 First transaction:', transactions[0]);
+    }
+    
+    // Calculate totals
+    const totalPaid = transactions?.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0) || 0;
+    const transactionCount = transactions?.length || 0;
+    
+    console.log('💳 Payment summary:', { totalPaid, transactionCount });
+    
+    res.json({
+      hasPayment: transactionCount > 0,
+      totalPaid,
+      transactionCount,
+      transactions: transactions || []
+    });
+    
+  } catch (error) {
+    console.error('❌ Error checking transactions:', error);
+    res.status(500).json({ error: 'Failed to check transactions' });
+  }
+});
+
 // Receipt Management API endpoints
 app.post('/api/generate-receipt-pdf', async (req, res) => {
   try {
