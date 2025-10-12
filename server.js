@@ -9391,8 +9391,24 @@ app.post('/api/coupons/apply', async (req, res) => {
 app.post('/api/payments/create-payment-intent', authenticateToken, async (req, res) => {
   try {
     const { amount, currency = 'usd', metadata = {} } = req.body;
+    const userId = req.user.userId;
     
-    const paymentIntent = await stripe.paymentIntents.create({
+    // Get user's Stripe credentials from database
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_secret_key')
+      .eq('user_id', userId)
+      .single();
+    
+    if (billingError || !billingData?.stripe_secret_key) {
+      console.error('❌ Stripe credentials not found for user:', userId);
+      return res.status(400).json({ error: 'Stripe not configured' });
+    }
+    
+    // Use user's Stripe secret key, not environment variable
+    const userStripe = require('stripe')(billingData.stripe_secret_key);
+    
+    const paymentIntent = await userStripe.paymentIntents.create({
       amount: Math.round(amount * 100), // Convert to cents
       currency,
       metadata,
@@ -12822,8 +12838,18 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
       if (publishableKeyAccount !== secretKeyAccount) {
         console.error('❌ CRITICAL: Publishable and secret keys belong to different Stripe accounts!');
         console.error('❌ This will cause payment intent confirmation failures');
+        console.error('🔧 SOLUTION: Update the publishable key in user_billing table to match the secret key account');
+        console.error('🔧 Current secret key account:', secretKeyAccount);
+        console.error('🔧 Expected publishable key should start with: pk_test_' + secretKeyAccount);
+        
         return res.status(400).json({ 
-          error: 'Stripe key mismatch: publishable and secret keys belong to different accounts' 
+          error: 'Stripe key mismatch: publishable and secret keys belong to different accounts',
+          details: {
+            secretKeyAccount: secretKeyAccount,
+            publishableKeyAccount: publishableKeyAccount,
+            expectedPublishableKeyPrefix: 'pk_test_' + secretKeyAccount,
+            solution: 'Update the publishable key in user_billing table to match the secret key account'
+          }
         });
       }
       
@@ -12840,6 +12866,70 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
   } catch (error) {
     console.error('❌ Error getting Stripe config:', error);
     res.status(500).json({ error: 'Failed to get Stripe configuration' });
+  }
+});
+
+// Helper endpoint to fix Stripe key mismatches
+app.post('/api/fix-stripe-keys/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    console.log('🔧 Fixing Stripe keys for user:', userId);
+    
+    // Get current billing data
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
+      .select('stripe_publishable_key, stripe_secret_key')
+      .eq('user_id', userId)
+      .single();
+    
+    if (billingError || !billingData) {
+      return res.status(404).json({ error: 'User billing data not found' });
+    }
+    
+    // Extract account ID from secret key
+    const secretKeyAccount = billingData.stripe_secret_key.split('_')[2];
+    const publishableKeyAccount = billingData.stripe_publishable_key.split('_')[2];
+    
+    console.log('🔍 Current secret key account:', secretKeyAccount);
+    console.log('🔍 Current publishable key account:', publishableKeyAccount);
+    
+    if (secretKeyAccount === publishableKeyAccount) {
+      return res.json({ 
+        message: 'Stripe keys are already matched',
+        secretKeyAccount,
+        publishableKeyAccount 
+      });
+    }
+    
+    // Generate the correct publishable key
+    const correctPublishableKey = `pk_test_${secretKeyAccount}`;
+    
+    console.log('🔧 Updating publishable key to:', correctPublishableKey);
+    
+    // Update the publishable key
+    const { error: updateError } = await supabase
+      .from('user_billing')
+      .update({ stripe_publishable_key: correctPublishableKey })
+      .eq('user_id', userId);
+    
+    if (updateError) {
+      console.error('❌ Error updating publishable key:', updateError);
+      return res.status(500).json({ error: 'Failed to update publishable key' });
+    }
+    
+    console.log('✅ Stripe keys fixed successfully');
+    res.json({ 
+      message: 'Stripe keys fixed successfully',
+      oldPublishableKey: billingData.stripe_publishable_key,
+      newPublishableKey: correctPublishableKey,
+      secretKeyAccount,
+      publishableKeyAccount: secretKeyAccount
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fixing Stripe keys:', error);
+    res.status(500).json({ error: 'Failed to fix Stripe keys' });
   }
 });
 
