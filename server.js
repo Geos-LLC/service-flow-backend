@@ -5896,8 +5896,9 @@ app.get('/api/invoices', async (req, res) => {
   try {
     const { userId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId, job_id } = req.query;
     
-    if (!userId) {
-      return res.status(400).json({ error: 'userId is required' });
+    // If job_id is provided, we don't need userId (for public access)
+    if (!userId && !job_id) {
+      return res.status(400).json({ error: 'userId or job_id is required' });
     }
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -5909,8 +5910,12 @@ app.get('/api/invoices', async (req, res) => {
         *,
         customers!left(first_name, last_name, email, phone),
         jobs!left(scheduled_date, status, services!left(name))
-      `, { count: 'exact' })
-      .eq('user_id', userId);
+      `, { count: 'exact' });
+    
+    // Only filter by user_id if userId is provided
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
     
     // Add search filter
     if (search) {
@@ -12911,6 +12916,299 @@ app.post('/api/fix-stripe-keys/:userId', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('❌ Error fixing Stripe keys:', error);
     res.status(500).json({ error: 'Failed to fix Stripe keys' });
+  }
+});
+
+// Receipt Management API endpoints
+app.post('/api/generate-receipt-pdf', async (req, res) => {
+  try {
+    const { invoiceId, paymentIntentId, transactionId, amount } = req.body;
+    
+    console.log('📄 Generating receipt PDF for invoice:', invoiceId);
+    
+    // Get invoice details
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select(`
+        *,
+        customers:customer_id (
+          first_name,
+          last_name,
+          email,
+          phone
+        ),
+        jobs:job_id (
+          service_name,
+          scheduled_date,
+          address
+        )
+      `)
+      .eq('id', invoiceId)
+      .single();
+    
+    if (invoiceError || !invoice) {
+      console.error('❌ Invoice not found:', invoiceId);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    // Generate receipt HTML
+    const receiptHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Payment Receipt</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+          .receipt { background: white; max-width: 600px; margin: 0 auto; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          .header { text-align: center; border-bottom: 2px solid #e5e5e5; padding-bottom: 20px; margin-bottom: 30px; }
+          .logo { font-size: 24px; font-weight: bold; color: #2563eb; margin-bottom: 10px; }
+          .receipt-title { font-size: 28px; color: #1f2937; margin: 0; }
+          .receipt-subtitle { color: #6b7280; margin: 5px 0 0 0; }
+          .section { margin-bottom: 25px; }
+          .section-title { font-size: 18px; font-weight: bold; color: #1f2937; margin-bottom: 10px; border-bottom: 1px solid #e5e5e5; padding-bottom: 5px; }
+          .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+          .info-item { margin-bottom: 10px; }
+          .info-label { font-weight: bold; color: #374151; }
+          .info-value { color: #6b7280; }
+          .payment-details { background: #f8fafc; padding: 20px; border-radius: 6px; margin: 20px 0; }
+          .amount { font-size: 24px; font-weight: bold; color: #059669; text-align: center; margin: 20px 0; }
+          .status { text-align: center; padding: 10px; background: #d1fae5; color: #065f46; border-radius: 6px; font-weight: bold; }
+          .footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e5e5; color: #6b7280; font-size: 14px; }
+          .transaction-id { font-family: monospace; background: #f3f4f6; padding: 5px 10px; border-radius: 4px; }
+        </style>
+      </head>
+      <body>
+        <div class="receipt">
+          <div class="header">
+            <div class="logo">ZenBooker</div>
+            <h1 class="receipt-title">Payment Receipt</h1>
+            <p class="receipt-subtitle">Thank you for your payment!</p>
+          </div>
+          
+          <div class="amount">$${(amount / 100).toFixed(2)}</div>
+          
+          <div class="status">✅ Payment Successful</div>
+          
+          <div class="section">
+            <h2 class="section-title">Payment Details</h2>
+            <div class="info-grid">
+              <div class="info-item">
+                <div class="info-label">Transaction ID:</div>
+                <div class="info-value transaction-id">${paymentIntentId}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Payment Date:</div>
+                <div class="info-value">${new Date().toLocaleDateString('en-US', { 
+                  weekday: 'long', 
+                  month: 'long', 
+                  day: 'numeric', 
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit'
+                })}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Payment Method:</div>
+                <div class="info-value">Credit Card</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Status:</div>
+                <div class="info-value">Completed</div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="section">
+            <h2 class="section-title">Invoice Information</h2>
+            <div class="info-grid">
+              <div class="info-item">
+                <div class="info-label">Invoice Number:</div>
+                <div class="info-value">#INV-${invoice.id}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Customer:</div>
+                <div class="info-value">${invoice.customers?.first_name} ${invoice.customers?.last_name}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Service:</div>
+                <div class="info-value">${invoice.jobs?.service_name || 'Service'}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Service Date:</div>
+                <div class="info-value">${new Date(invoice.jobs?.scheduled_date || invoice.created_at).toLocaleDateString('en-US')}</div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="section">
+            <h2 class="section-title">Service Address</h2>
+            <div class="info-value">${invoice.jobs?.address || 'N/A'}</div>
+          </div>
+          
+          <div class="footer">
+            <p>This is an automated receipt. Please keep this for your records.</p>
+            <p>Generated on ${new Date().toLocaleString()}</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    
+    // For now, return the HTML (in production, you'd use a PDF library like puppeteer)
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
+    res.send(receiptHtml);
+    
+  } catch (error) {
+    console.error('❌ Error generating receipt PDF:', error);
+    res.status(500).json({ error: 'Failed to generate receipt' });
+  }
+});
+
+app.post('/api/send-receipt-email', async (req, res) => {
+  try {
+    const { invoiceId, customerEmail, paymentIntentId, amount } = req.body;
+    
+    console.log('📧 Sending receipt email to:', customerEmail);
+    
+    // Get invoice details
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select(`
+        *,
+        customers:customer_id (
+          first_name,
+          last_name,
+          email
+        ),
+        jobs:job_id (
+          service_name,
+          scheduled_date,
+          address
+        )
+      `)
+      .eq('id', invoiceId)
+      .single();
+    
+    if (invoiceError || !invoice) {
+      console.error('❌ Invoice not found:', invoiceId);
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    // Get user's business info
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('business_name, email')
+      .eq('id', invoice.user_id)
+      .single();
+    
+    const businessName = userData?.business_name || 'Your Business';
+    const businessEmail = userData?.email || 'noreply@zenbooker.com';
+    
+    // Create receipt email
+    const receiptHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Payment Receipt</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+          .email-container { background: white; max-width: 600px; margin: 0 auto; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          .header { text-align: center; border-bottom: 2px solid #e5e5e5; padding-bottom: 20px; margin-bottom: 30px; }
+          .logo { font-size: 24px; font-weight: bold; color: #2563eb; margin-bottom: 10px; }
+          .receipt-title { font-size: 28px; color: #1f2937; margin: 0; }
+          .amount { font-size: 32px; font-weight: bold; color: #059669; text-align: center; margin: 20px 0; }
+          .status { text-align: center; padding: 15px; background: #d1fae5; color: #065f46; border-radius: 6px; font-weight: bold; margin: 20px 0; }
+          .section { margin-bottom: 25px; }
+          .section-title { font-size: 18px; font-weight: bold; color: #1f2937; margin-bottom: 10px; }
+          .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+          .info-item { margin-bottom: 10px; }
+          .info-label { font-weight: bold; color: #374151; }
+          .info-value { color: #6b7280; }
+          .footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e5e5; color: #6b7280; font-size: 14px; }
+        </style>
+      </head>
+      <body>
+        <div class="email-container">
+          <div class="header">
+            <div class="logo">${businessName}</div>
+            <h1 class="receipt-title">Payment Receipt</h1>
+            <p>Thank you for your payment!</p>
+          </div>
+          
+          <div class="amount">$${(amount / 100).toFixed(2)}</div>
+          <div class="status">✅ Payment Successful</div>
+          
+          <div class="section">
+            <h2 class="section-title">Payment Details</h2>
+            <div class="info-grid">
+              <div class="info-item">
+                <div class="info-label">Transaction ID:</div>
+                <div class="info-value">${paymentIntentId}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Payment Date:</div>
+                <div class="info-value">${new Date().toLocaleDateString('en-US', { 
+                  weekday: 'long', 
+                  month: 'long', 
+                  day: 'numeric', 
+                  year: 'numeric'
+                })}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Invoice Number:</div>
+                <div class="info-value">#INV-${invoice.id}</div>
+              </div>
+              <div class="info-item">
+                <div class="info-label">Service:</div>
+                <div class="info-value">${invoice.jobs?.service_name || 'Service'}</div>
+              </div>
+            </div>
+          </div>
+          
+          <div class="footer">
+            <p>This receipt has been automatically generated and sent to your email.</p>
+            <p>If you have any questions, please contact us.</p>
+            <p>Generated on ${new Date().toLocaleString()}</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    
+    // Send email using SendGrid
+    const msg = {
+      to: customerEmail,
+      from: businessEmail,
+      subject: `Payment Receipt - ${businessName}`,
+      html: receiptHtml,
+      text: `
+        Payment Receipt - ${businessName}
+        
+        Amount: $${(amount / 100).toFixed(2)}
+        Transaction ID: ${paymentIntentId}
+        Invoice: #INV-${invoice.id}
+        Service: ${invoice.jobs?.service_name || 'Service'}
+        Date: ${new Date().toLocaleDateString()}
+        
+        Thank you for your payment!
+      `
+    };
+    
+    await sgMail.send(msg);
+    console.log('✅ Receipt email sent successfully');
+    
+    res.json({ 
+      success: true, 
+      message: 'Receipt email sent successfully',
+      email: customerEmail 
+    });
+    
+  } catch (error) {
+    console.error('❌ Error sending receipt email:', error);
+    res.status(500).json({ error: 'Failed to send receipt email' });
   }
 });
 
