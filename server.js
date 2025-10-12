@@ -12766,21 +12766,28 @@ app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
     
     console.log('🔍 User found, stripe_connect_status:', userData.stripe_connect_status);
     
-    if (userData.stripe_connect_status !== 'connected') {
-      console.error('❌ Stripe not connected for user:', invoice.user_id, 'Status:', userData.stripe_connect_status);
-      return res.status(400).json({ error: 'Stripe not connected' });
-    }
-    
-    // Get user's Stripe publishable key
+    // Get user's Stripe publishable key (check if they have credentials even if status is not 'connected')
     const { data: billingData, error: billingError } = await supabase
       .from('user_billing')
-      .select('stripe_publishable_key')
+      .select('stripe_publishable_key, stripe_secret_key')
       .eq('user_id', invoice.user_id)
       .single();
+    
+    console.log('🔍 Billing data:', { 
+      hasPublishableKey: !!billingData?.stripe_publishable_key,
+      hasSecretKey: !!billingData?.stripe_secret_key,
+      error: billingError 
+    });
     
     if (billingError || !billingData?.stripe_publishable_key) {
       console.error('❌ Stripe publishable key not found for user:', invoice.user_id, 'Error:', billingError, 'Data:', billingData);
       return res.status(400).json({ error: 'Stripe not configured' });
+    }
+    
+    // Check if Stripe credentials are valid by testing the connection
+    if (!billingData.stripe_secret_key) {
+      console.error('❌ Stripe secret key not found for user:', invoice.user_id);
+      return res.status(400).json({ error: 'Stripe credentials incomplete' });
     }
     
     console.log('🔑 Stripe config retrieved for invoice:', invoiceId);
