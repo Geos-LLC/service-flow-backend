@@ -5896,8 +5896,11 @@ app.get('/api/invoices', async (req, res) => {
   try {
     const { userId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId, job_id } = req.query;
     
+    console.log('📋 Invoices API called with params:', { userId, job_id, customerId, status });
+    
     // If job_id is provided, we don't need userId (for public access)
     if (!userId && !job_id) {
+      console.log('❌ No userId or job_id provided');
       return res.status(400).json({ error: 'userId or job_id is required' });
     }
 
@@ -5939,6 +5942,7 @@ app.get('/api/invoices', async (req, res) => {
     
     // Add job filter
     if (job_id) {
+      console.log('📋 Filtering by job_id:', job_id);
       query = query.eq('job_id', job_id);
     }
     
@@ -5948,7 +5952,13 @@ app.get('/api/invoices', async (req, res) => {
     // Add pagination
     query = query.range(offset, offset + parseInt(limit) - 1);
     
+    console.log('📋 Executing query for invoices...');
     const { data: invoices, error, count } = await query;
+    
+    console.log('📋 Query result:', { invoices: invoices?.length || 0, error: error?.message, count });
+    if (invoices && invoices.length > 0) {
+      console.log('📋 First invoice:', invoices[0]);
+    }
     
     if (error) {
       console.error('Error fetching invoices:', error);
