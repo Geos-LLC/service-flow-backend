@@ -14917,7 +14917,7 @@ app.post('/api/sms/send-connect', authenticateToken, async (req, res) => {
     // Get user's Twilio Connect account SID
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('twilio_connect_account_sid, twilio_connect_status, twilio_phone_number')
+      .select('twilio_connect_account_sid, twilio_connect_status, twilio_notification_phone')
       .eq('id', userId)
       .single();
     
@@ -14932,7 +14932,7 @@ app.post('/api/sms/send-connect', authenticateToken, async (req, res) => {
     // Send SMS using user's connected Twilio account
     const result = await twilioClient.messages.create({
       body: message,
-      from: userData.twilio_phone_number, // User's Twilio phone number
+      from: userData.twilio_notification_phone, // User's default Twilio phone number
       to: to
     }, {
       accountSid: userData.twilio_connect_account_sid
@@ -14963,7 +14963,7 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
       .update({ 
         twilio_connect_account_sid: null,
         twilio_connect_status: null,
-        twilio_phone_number: null
+        twilio_notification_phone: null
       })
       .eq('id', userId);
     
@@ -15324,7 +15324,7 @@ app.post('/api/twilio/setup-credentials', authenticateToken, async (req, res) =>
       .update({
         twilio_account_sid: accountSid,
         twilio_auth_token: authToken, // In production, this should be encrypted
-        twilio_phone_number: phoneNumber,
+        twilio_notification_phone: phoneNumber,
         updated_at: new Date().toISOString()
       })
       .eq('id', userId);
@@ -15417,7 +15417,7 @@ app.post('/api/twilio/send-sms', authenticateToken, async (req, res) => {
     // Get user's Twilio credentials
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('twilio_account_sid, twilio_auth_token, twilio_phone_number')
+      .select('twilio_account_sid, twilio_auth_token, twilio_notification_phone')
       .eq('id', userId)
       .limit(1);
 
@@ -15430,7 +15430,7 @@ app.post('/api/twilio/send-sms', authenticateToken, async (req, res) => {
     // Send SMS
     const result = await twilio.messages.create({
       body: message,
-      from: userData[0].twilio_phone_number,
+      from: userData[0].twilio_notification_phone,
       to: to
     });
 
@@ -15453,7 +15453,7 @@ app.post('/api/twilio/test-sms', authenticateToken, async (req, res) => {
     // Get user's Twilio credentials
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('twilio_account_sid, twilio_auth_token, twilio_phone_number')
+      .select('twilio_account_sid, twilio_auth_token, twilio_notification_phone')
       .eq('id', userId)
       .limit(1);
 
@@ -15466,7 +15466,7 @@ app.post('/api/twilio/test-sms', authenticateToken, async (req, res) => {
     // Send test SMS
     const result = await twilio.messages.create({
       body: 'Test SMS from your ZenBooker integration. Your Twilio setup is working correctly!',
-      from: userData[0].twilio_phone_number,
+      from: userData[0].twilio_notification_phone,
       to: phoneNumber
     });
 
@@ -15491,7 +15491,7 @@ app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
       .update({
         twilio_account_sid: null,
         twilio_auth_token: null,
-        twilio_phone_number: null,
+        twilio_notification_phone: null,
         twilio_notification_phone: null,
         twilio_notification_types: null,
         updated_at: new Date().toISOString()
