@@ -15519,21 +15519,21 @@ app.get('/api/twilio/default-phone-number', authenticateToken, async (req, res) 
     const userId = req.user.userId;
     console.log('📞 Getting default phone number for user:', userId);
 
-    // Get user's default phone number from user_billing table
-    const { data: billingData, error: billingError } = await supabase
-      .from('user_billing')
-      .select('twilio_default_phone_number')
-      .eq('user_id', userId)
+    // Get user's Twilio notification phone from users table
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('twilio_notification_phone')
+      .eq('id', userId)
       .limit(1);
 
-    console.log('📞 Billing data query result:', { billingData, billingError });
+    console.log('📞 User data query result:', { userData, userError });
 
-    if (billingError) {
-      console.error('Error getting default phone number:', billingError);
+    if (userError) {
+      console.error('Error getting default phone number:', userError);
       return res.status(500).json({ error: 'Failed to get default phone number' });
     }
 
-    const defaultPhone = billingData?.[0]?.twilio_default_phone_number || null;
+    const defaultPhone = userData?.[0]?.twilio_notification_phone || null;
     console.log('📞 Default phone number:', defaultPhone);
 
     res.json({
@@ -15558,14 +15558,14 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
       return res.status(400).json({ error: 'Phone number is required' });
     }
 
-    // Update user's default phone number in user_billing table
+    // Update user's Twilio notification phone in users table
     const { error: updateError } = await supabase
-      .from('user_billing')
-      .upsert({
-        user_id: userId,
-        twilio_default_phone_number: phoneNumber,
+      .from('users')
+      .update({
+        twilio_notification_phone: phoneNumber,
         updated_at: new Date().toISOString()
-      });
+      })
+      .eq('id', userId);
 
     console.log('📞 Update result:', { updateError });
 
