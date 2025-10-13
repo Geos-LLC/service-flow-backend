@@ -397,40 +397,18 @@ const upload = multer({
   }
 });
 
-// CORS configuration - Enhanced for development and production
+// CORS configuration - Simplified and more permissive for production
 const corsOptions = {
-  origin: function (origin, callback) {
-    
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) {
-      return callback(null, true);
-    }
-    
-    const allowedOrigins = [
-      'https://www.service-flow.pro', 
-      'https://service-flow.pro',
-      'https://service-flow-frontend.vercel.app', // Vercel deployment
-      'https://service-flow.vercel.app', // Alternative Vercel URL
-      'http://localhost:3000', // for development
-      'http://localhost:3001',   // for development
-      'http://127.0.0.1:3000',   // alternative localhost
-      'http://127.0.0.1:3001'    // alternative localhost
-    ];
-    
-    // Check if origin matches any allowed origin
-    const isAllowed = allowedOrigins.some(allowedOrigin => {
-      if (allowedOrigin.includes('*')) {
-        return origin.includes(allowedOrigin.replace('*', ''));
-      }
-      return origin === allowedOrigin;
-    });
-    
-    if (isAllowed) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: [
+    'https://www.service-flow.pro', 
+    'https://service-flow.pro',
+    'https://service-flow-frontend.vercel.app',
+    'https://service-flow.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001'
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control', 'X-HTTP-Method-Override'],
@@ -445,41 +423,7 @@ app.use(cors(corsOptions));
 // Handle preflight requests using cors middleware
 app.options('*', cors(corsOptions));
 
-// Additional explicit OPTIONS handler for better CORS support
-app.options('*', (req, res) => {
-  
-  // Set CORS headers explicitly - more permissive for production
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else {
-    res.header('Access-Control-Allow-Origin', '*');
-  }
-  
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Max-Age', '86400'); // 24 hours
-  
-  res.status(200).end();
-});
-
-// Aggressive CORS bypass for all origins
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  
-  // Set CORS headers for ALL requests to fix production issues
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-    res.header('Access-Control-Max-Age', '86400');
-  }
-  
-  next();
-});
+// CORS is handled by the main cors middleware above
 
 // Log all requests for debugging
 app.use((req, res, next) => {
@@ -14465,33 +14409,13 @@ app.post('/api/migrate/add-color-column', async (req, res) => {
   }
 });
 
-// Final CORS safety net - ensure all responses have CORS headers
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  // Set CORS headers on every response as a safety net
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  }
-  
-  next();
-});
+// CORS is handled by the main cors middleware
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
   
-  // Set CORS headers even on errors
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
-  }
+  // CORS headers are handled by the main cors middleware
   
   res.status(500).json({ error: 'Something went wrong!' });
 });
