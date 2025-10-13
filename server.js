@@ -15517,22 +15517,28 @@ app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
 app.get('/api/twilio/default-phone-number', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
+    console.log('📞 Getting default phone number for user:', userId);
 
-    // Get user's default phone number
-    const { data: userData, error: userError } = await supabase
-      .from('users')
+    // Get user's default phone number from user_billing table
+    const { data: billingData, error: billingError } = await supabase
+      .from('user_billing')
       .select('twilio_default_phone_number')
-      .eq('id', userId)
+      .eq('user_id', userId)
       .limit(1);
 
-    if (userError) {
-      console.error('Error getting default phone number:', userError);
+    console.log('📞 Billing data query result:', { billingData, billingError });
+
+    if (billingError) {
+      console.error('Error getting default phone number:', billingError);
       return res.status(500).json({ error: 'Failed to get default phone number' });
     }
 
+    const defaultPhone = billingData?.[0]?.twilio_default_phone_number || null;
+    console.log('📞 Default phone number:', defaultPhone);
+
     res.json({
       success: true,
-      defaultPhoneNumber: userData?.[0]?.twilio_default_phone_number || null
+      defaultPhoneNumber: defaultPhone
     });
   } catch (error) {
     console.error('Get default phone number error:', error);
@@ -15546,23 +15552,29 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
     const { phoneNumber } = req.body;
     const userId = req.user.userId;
 
+    console.log('📞 Setting default phone number:', { phoneNumber, userId });
+
     if (!phoneNumber) {
       return res.status(400).json({ error: 'Phone number is required' });
     }
 
-    // Update user's default phone number
+    // Update user's default phone number in user_billing table
     const { error: updateError } = await supabase
-      .from('users')
-      .update({
+      .from('user_billing')
+      .upsert({
+        user_id: userId,
         twilio_default_phone_number: phoneNumber,
         updated_at: new Date().toISOString()
-      })
-      .eq('id', userId);
+      });
+
+    console.log('📞 Update result:', { updateError });
 
     if (updateError) {
       console.error('Error setting default phone number:', updateError);
       return res.status(500).json({ error: 'Failed to set default phone number' });
     }
+
+    console.log('📞 Successfully updated default phone number');
 
     res.json({
       success: true,
