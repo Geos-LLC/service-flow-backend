@@ -12958,6 +12958,112 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
   }
 });
 
+// Helper function to generate receipt HTML
+function generateReceiptHtml(invoice, paymentIntentId, amount) {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Payment Receipt</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .receipt { background: white; max-width: 600px; margin: 0 auto; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { text-align: center; border-bottom: 2px solid #e5e5e5; padding-bottom: 20px; margin-bottom: 30px; }
+        .logo { font-size: 24px; font-weight: bold; color: #2563eb; margin-bottom: 10px; }
+        .receipt-title { font-size: 28px; color: #1f2937; margin: 0; }
+        .receipt-subtitle { color: #6b7280; margin: 5px 0 0 0; }
+        .section { margin-bottom: 25px; }
+        .section-title { font-size: 18px; font-weight: bold; color: #1f2937; margin-bottom: 10px; border-bottom: 1px solid #e5e5e5; padding-bottom: 5px; }
+        .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .info-item { margin-bottom: 10px; }
+        .info-label { font-weight: bold; color: #374151; }
+        .info-value { color: #6b7280; }
+        .payment-details { background: #f8fafc; padding: 20px; border-radius: 6px; margin: 20px 0; }
+        .amount { font-size: 24px; font-weight: bold; color: #059669; text-align: center; margin: 20px 0; }
+        .status { text-align: center; padding: 10px; background: #d1fae5; color: #065f46; border-radius: 6px; font-weight: bold; }
+        .footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e5e5; color: #6b7280; font-size: 14px; }
+        .transaction-id { font-family: monospace; background: #f3f4f6; padding: 5px 10px; border-radius: 4px; }
+      </style>
+    </head>
+    <body>
+      <div class="receipt">
+        <div class="header">
+          <div class="logo">ZenBooker</div>
+          <h1 class="receipt-title">Payment Receipt</h1>
+          <p class="receipt-subtitle">Thank you for your payment!</p>
+        </div>
+        
+        <div class="amount">$${(amount / 100).toFixed(2)}</div>
+        
+        <div class="status">✅ Payment Successful</div>
+        
+        <div class="section">
+          <h2 class="section-title">Payment Details</h2>
+          <div class="info-grid">
+            <div class="info-item">
+              <div class="info-label">Transaction ID:</div>
+              <div class="info-value transaction-id">${paymentIntentId}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Payment Date:</div>
+              <div class="info-value">${new Date().toLocaleDateString('en-US', { 
+                weekday: 'long', 
+                month: 'long', 
+                day: 'numeric', 
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+              })}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Payment Method:</div>
+              <div class="info-value">Credit Card</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Status:</div>
+              <div class="info-value">Completed</div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="section">
+          <h2 class="section-title">Invoice Information</h2>
+          <div class="info-grid">
+            <div class="info-item">
+              <div class="info-label">Invoice Number:</div>
+              <div class="info-value">#INV-${invoice.id}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Customer:</div>
+              <div class="info-value">${invoice.customers?.first_name || 'Customer'} ${invoice.customers?.last_name || ''}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Service:</div>
+              <div class="info-value">${invoice.jobs?.service_name || 'Service'}</div>
+            </div>
+            <div class="info-item">
+              <div class="info-label">Service Date:</div>
+              <div class="info-value">${new Date(invoice.jobs?.scheduled_date || invoice.created_at).toLocaleDateString('en-US')}</div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="section">
+          <h2 class="section-title">Service Address</h2>
+          <div class="info-value">${invoice.jobs?.service_address || 'N/A'}</div>
+        </div>
+        
+        <div class="footer">
+          <p>This is an automated receipt. Please keep this for your records.</p>
+          <p>Generated on ${new Date().toLocaleString()}</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
 // Receipt Management API endpoints
 app.post('/api/generate-receipt-pdf', async (req, res) => {
   try {
@@ -12965,7 +13071,16 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
     
     console.log('📄 Generating receipt PDF for invoice:', invoiceId);
     
-    // Get invoice details
+    // First, let's try a simple query without joins
+    const { data: simpleInvoice, error: simpleError } = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('id', invoiceId)
+      .single();
+    
+    console.log('📄 Simple invoice query result:', { simpleInvoice, simpleError });
+    
+    // Get invoice details with joins
     const { data: invoice, error: invoiceError } = await supabase
       .from('invoices')
       .select(`
@@ -12985,8 +13100,30 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       .eq('id', invoiceId)
       .single();
     
+    console.log('📄 Full invoice query result:', { invoice, invoiceError });
+    
     if (invoiceError || !invoice) {
       console.error('❌ Invoice not found:', invoiceId);
+      console.error('❌ Invoice error details:', invoiceError);
+      
+      // If the full query failed but simple query worked, use the simple invoice
+      if (simpleInvoice && !simpleError) {
+        console.log('📄 Using simple invoice data as fallback');
+        const fallbackInvoice = {
+          ...simpleInvoice,
+          customers: null,
+          jobs: null
+        };
+        
+        // Generate receipt with basic data
+        const receiptHtml = generateReceiptHtml(fallbackInvoice, paymentIntentId, amount);
+        res.setHeader('Content-Type', 'text/html');
+        res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(receiptHtml);
+        return;
+      }
+      
       return res.status(404).json({ error: 'Invoice not found' });
     }
     
@@ -13118,7 +13255,16 @@ app.post('/api/send-receipt-email', async (req, res) => {
       return res.status(500).json({ error: 'SendGrid API key not configured' });
     }
     
-    // Get invoice details
+    // First, let's try a simple query without joins
+    const { data: simpleInvoice, error: simpleError } = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('id', invoiceId)
+      .single();
+    
+    console.log('📧 Simple invoice query result:', { simpleInvoice, simpleError });
+    
+    // Get invoice details with joins
     const { data: invoice, error: invoiceError } = await supabase
       .from('invoices')
       .select(`
@@ -13137,8 +13283,11 @@ app.post('/api/send-receipt-email', async (req, res) => {
       .eq('id', invoiceId)
       .single();
     
+    console.log('📧 Full invoice query result:', { invoice, invoiceError });
+    
     if (invoiceError || !invoice) {
       console.error('❌ Invoice not found:', invoiceId);
+      console.error('❌ Invoice error details:', invoiceError);
       return res.status(404).json({ error: 'Invoice not found' });
     }
     
