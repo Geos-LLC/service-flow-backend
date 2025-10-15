@@ -12964,6 +12964,16 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
     const { invoiceId, paymentIntentId, transactionId, amount } = req.body;
     
     console.log('📄 Generating receipt PDF for invoice:', invoiceId);
+    console.log('📄 Request body:', req.body);
+    
+    // First, let's check if any invoices exist
+    const { data: allInvoices, error: allInvoicesError } = await supabase
+      .from('invoices')
+      .select('id, invoice_number, status')
+      .limit(10);
+    
+    console.log('📄 Available invoices:', allInvoices);
+    console.log('📄 All invoices error:', allInvoicesError);
     
     // Get invoice details
     const { data: invoice, error: invoiceError } = await supabase
@@ -12985,8 +12995,11 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       .eq('id', invoiceId)
       .single();
     
+    console.log('📄 Invoice query result:', { invoice, invoiceError });
+    
     if (invoiceError || !invoice) {
       console.error('❌ Invoice not found:', invoiceId);
+      console.error('❌ Invoice error details:', invoiceError);
       return res.status(404).json({ error: 'Invoice not found' });
     }
     
@@ -13111,12 +13124,22 @@ app.post('/api/send-receipt-email', async (req, res) => {
     const { invoiceId, customerEmail, paymentIntentId, amount } = req.body;
     
     console.log('📧 Sending receipt email to:', customerEmail);
+    console.log('📧 Request body:', req.body);
     
     // Check SendGrid configuration
     if (!SENDGRID_API_KEY) {
       console.error('❌ SendGrid API key not configured');
       return res.status(500).json({ error: 'SendGrid API key not configured' });
     }
+    
+    // First, let's check if any invoices exist
+    const { data: allInvoices, error: allInvoicesError } = await supabase
+      .from('invoices')
+      .select('id, invoice_number, status')
+      .limit(10);
+    
+    console.log('📧 Available invoices:', allInvoices);
+    console.log('📧 All invoices error:', allInvoicesError);
     
     // Get invoice details
     const { data: invoice, error: invoiceError } = await supabase
@@ -13137,8 +13160,11 @@ app.post('/api/send-receipt-email', async (req, res) => {
       .eq('id', invoiceId)
       .single();
     
+    console.log('📧 Invoice query result:', { invoice, invoiceError });
+    
     if (invoiceError || !invoice) {
       console.error('❌ Invoice not found:', invoiceId);
+      console.error('❌ Invoice error details:', invoiceError);
       return res.status(404).json({ error: 'Invoice not found' });
     }
     
