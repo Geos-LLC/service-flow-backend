@@ -423,11 +423,52 @@ app.use(cors(corsOptions));
 // Handle preflight requests using cors middleware
 app.options('*', cors(corsOptions));
 
+// Additional CORS handling for preflight requests
+app.use((req, res, next) => {
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+    return res.status(200).end();
+  }
+  next();
+});
+
 // CORS is handled by the main cors middleware above
 
 // Log all requests for debugging
 app.use((req, res, next) => {
- 
+  console.log(`${req.method} ${req.path} - ${req.headers.origin || 'No Origin'}`);
+  next();
+});
+
+// Content-Type handling to reduce preflight issues
+app.use((req, res, next) => {
+  // Set default Content-Type for JSON responses to avoid preflight
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    if (!req.headers['content-type']) {
+      req.headers['content-type'] = 'application/json';
+    }
+  }
+  next();
+});
+
+// Response headers middleware to ensure consistent CORS handling
+app.use((req, res, next) => {
+  // Set consistent headers for all responses
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+  
+  // Set Content-Type for JSON responses
+  if (req.path.startsWith('/api/')) {
+    res.header('Content-Type', 'application/json');
+  }
+  
   next();
 });
 
@@ -13641,9 +13682,11 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
             <p><strong>Total Due:</strong> $${amount.toFixed(2)}</p>
           </div>
           
+          ${includePaymentLink ? `
           <div style="text-align: center; margin: 20px 0;">
             <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}" class="payment-button" style="background: #ffc107; color: #000; padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block; font-weight: bold;">Pay Invoice</a>
           </div>
+          ` : ''}
           
           <div class="footer">
             <p>We appreciate your business.</p>
@@ -13672,7 +13715,7 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
       subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
       html: invoiceHtml,
-      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}${includePaymentLink ? `\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
     };
 
     console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
