@@ -13094,9 +13094,10 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       </html>
     `;
     
-    // For now, return the HTML (in production, you'd use a PDF library like puppeteer)
+    // Return HTML as downloadable file (can be converted to PDF by browser)
     res.setHeader('Content-Type', 'text/html');
     res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
+    res.setHeader('Cache-Control', 'no-cache');
     res.send(receiptHtml);
     
   } catch (error) {
@@ -13110,6 +13111,12 @@ app.post('/api/send-receipt-email', async (req, res) => {
     const { invoiceId, customerEmail, paymentIntentId, amount } = req.body;
     
     console.log('📧 Sending receipt email to:', customerEmail);
+    
+    // Check SendGrid configuration
+    if (!SENDGRID_API_KEY) {
+      console.error('❌ SendGrid API key not configured');
+      return res.status(500).json({ error: 'SendGrid API key not configured' });
+    }
     
     // Get invoice details
     const { data: invoice, error: invoiceError } = await supabase
