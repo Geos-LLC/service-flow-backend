@@ -423,15 +423,24 @@ app.use(cors(corsOptions));
 // Handle preflight requests using cors middleware
 app.options('*', cors(corsOptions));
 
-// Additional CORS handling for preflight requests
+// Additional CORS handling for preflight requests - Windows Defender/Firewall compatible
 app.use((req, res, next) => {
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
+    // More permissive headers for Windows Defender/firewall compatibility
     res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, X-HTTP-Method-Override, X-Forwarded-For, X-Real-IP');
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+    res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Type, Date, Server');
+    
+    // Additional headers for Windows compatibility
+    res.header('Vary', 'Origin');
+    res.header('X-Content-Type-Options', 'nosniff');
+    res.header('X-Frame-Options', 'SAMEORIGIN');
+    
+    console.log('🔄 Preflight request handled for:', req.headers.origin, req.url);
     return res.status(200).end();
   }
   next();
@@ -1988,7 +1997,7 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
-  // CORS handled by middleware
+  // CORS handled by middleware - Windows Defender/Firewall compatible
   
   try {
     const userId = req.user.userId;
