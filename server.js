@@ -11,6 +11,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const validator = require('validator');
+const puppeteer = require('puppeteer');
 
 // Nodemailer removed - using SendGrid only
 const sgMail = require('@sendgrid/mail');
@@ -13334,11 +13335,43 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       </html>
     `;
     
-    // Return HTML as downloadable file (can be converted to PDF by browser)
-    res.setHeader('Content-Type', 'text/html');
-    res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.send(receiptHtml);
+    // Generate PDF using Puppeteer
+    try {
+      const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      });
+      
+      const page = await browser.newPage();
+      await page.setContent(receiptHtml, { waitUntil: 'networkidle0' });
+      
+      const pdfBuffer = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: {
+          top: '20px',
+          right: '20px',
+          bottom: '20px',
+          left: '20px'
+        }
+      });
+      
+      await browser.close();
+      
+      // Return PDF
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'attachment; filename="receipt.pdf"');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(pdfBuffer);
+      
+    } catch (pdfError) {
+      console.error('❌ Error generating PDF:', pdfError);
+      // Fallback to HTML if PDF generation fails
+      res.setHeader('Content-Type', 'text/html');
+      res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(receiptHtml);
+    }
     
   } catch (error) {
     console.error('❌ Error generating receipt PDF:', error);

@@ -38,6 +38,7 @@
         "passport": "^0.7.0",
         "passport-google-oauth20": "^2.0.0",
         "pdfkit": "^0.15.2",
+        "puppeteer": "^21.0.0",
         "qrcode": "^1.5.4",
         "stripe": "^12.18.0",
         "twilio": "^5.10.1",
