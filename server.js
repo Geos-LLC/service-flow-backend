@@ -12483,22 +12483,24 @@ app.put('/api/user/branding', async (req, res) => {
 // REMOVED DUPLICATE PUT /api/user/profile endpoint (using Supabase version above)
 
 // Notification Templates API endpoints
-// NOTE: Create the notification_templates table in Supabase with this SQL:
+// NOTE: Using Supabase notification_templates table with schema:
 // CREATE TABLE notification_templates (
 //   id SERIAL PRIMARY KEY,
-//   user_id INTEGER NOT NULL,
-//   template_type VARCHAR(50) NOT NULL,
-//   notification_name VARCHAR(100) NOT NULL,
-//   subject TEXT,
-//   content TEXT,
-//   is_enabled BOOLEAN DEFAULT true,
-//   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-//   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-//   UNIQUE(user_id, template_type, notification_name)
+//   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+//   name VARCHAR(255) NOT NULL,
+//   type notification_type NOT NULL,
+//   subject VARCHAR(255),
+//   message TEXT NOT NULL,
+//   variables JSONB,
+//   is_active BOOLEAN DEFAULT true,
+//   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+//   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 // );
 app.get('/api/user/notification-templates', async (req, res) => {
   try {
     const { userId, templateType, notificationName } = req.query;
+    
+    console.log('🔍 Fetching notification templates:', { userId, templateType, notificationName });
     
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
@@ -12510,23 +12512,115 @@ app.get('/api/user/notification-templates', async (req, res) => {
       .eq('user_id', userId);
 
     if (templateType) {
-      query = query.eq('template_type', templateType);
+      query = query.eq('type', templateType);
     }
 
     if (notificationName) {
-      query = query.eq('notification_name', notificationName);
+      query = query.eq('name', notificationName);
     }
 
-    query = query.order('notification_name').order('template_type');
+    query = query.order('name').order('type');
 
     const { data: templates, error } = await query;
+
+    console.log('🔍 Notification templates query result:', { templates, error });
 
     if (error) {
       console.error('Error fetching notification templates:', error);
       return res.status(500).json({ error: 'Failed to fetch notification templates' });
     }
 
-    res.json(templates || []);
+    // Map Supabase schema to expected API format
+    const mappedTemplates = templates?.map(template => ({
+      id: template.id,
+      user_id: template.user_id,
+      template_type: template.type,
+      notification_name: template.name,
+      subject: template.subject,
+      content: template.message,
+      is_enabled: template.is_active ? 1 : 0,
+      created_at: template.created_at,
+      updated_at: template.updated_at
+    })) || [];
+
+    console.log('🔍 Mapped templates:', mappedTemplates);
+
+    // If no templates found and we're looking for appointment_confirmation, create default templates
+    if (mappedTemplates.length === 0 && notificationName === 'appointment_confirmation') {
+      console.log('🔍 No templates found, creating default appointment confirmation templates');
+      
+      try {
+        // Create default email template
+        const { error: emailError } = await supabase
+          .from('notification_templates')
+          .insert({
+            user_id: userId,
+            type: 'email',
+            name: 'appointment_confirmation',
+            subject: 'Appointment Confirmed - {business_name}',
+            message: 'Hi {customer_name},\n\nYour appointment has been confirmed for {appointment_date} at {appointment_time}.\n\nService: {service_name}\nLocation: {location}\n\nWe look forward to serving you!\n\nBest regards,\n{business_name}',
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+
+        if (emailError) {
+          console.error('Error creating default email template:', emailError);
+        }
+
+        // Create default SMS template
+        const { error: smsError } = await supabase
+          .from('notification_templates')
+          .insert({
+            user_id: userId,
+            type: 'sms',
+            name: 'appointment_confirmation',
+            subject: null,
+            message: 'Hi {customer_name}, your appointment is confirmed for {appointment_date} at {appointment_time}. Service: {service_name}. Location: {location}. - {business_name}',
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+
+        if (smsError) {
+          console.error('Error creating default SMS template:', smsError);
+        }
+
+        // Return default templates
+        const defaultTemplates = [
+          {
+            id: 'default-email',
+            user_id: userId,
+            template_type: 'email',
+            notification_name: 'appointment_confirmation',
+            subject: 'Appointment Confirmed - {business_name}',
+            content: 'Hi {customer_name},\n\nYour appointment has been confirmed for {appointment_date} at {appointment_time}.\n\nService: {service_name}\nLocation: {location}\n\nWe look forward to serving you!\n\nBest regards,\n{business_name}',
+            is_enabled: 1,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          },
+          {
+            id: 'default-sms',
+            user_id: userId,
+            template_type: 'sms',
+            notification_name: 'appointment_confirmation',
+            subject: null,
+            content: 'Hi {customer_name}, your appointment is confirmed for {appointment_date} at {appointment_time}. Service: {service_name}. Location: {location}. - {business_name}',
+            is_enabled: 1,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          }
+        ];
+
+        return res.json(defaultTemplates);
+      } catch (createError) {
+        console.error('Error creating default templates:', createError);
+        // Return empty array if creation fails
+        return res.json([]);
+      }
+    }
+
+    res.json(mappedTemplates);
   } catch (error) {
     console.error('Error fetching notification templates:', error);
     res.status(500).json({ error: 'Failed to fetch notification templates' });
@@ -12546,8 +12640,8 @@ app.put('/api/user/notification-templates', async (req, res) => {
       .from('notification_templates')
       .select('id')
       .eq('user_id', userId)
-      .eq('template_type', templateType)
-      .eq('notification_name', notificationName)
+      .eq('type', templateType)
+      .eq('name', notificationName)
       .single();
 
     if (checkError && checkError.code !== 'PGRST116') {
@@ -12561,13 +12655,13 @@ app.put('/api/user/notification-templates', async (req, res) => {
         .from('notification_templates')
         .update({
           subject,
-          content,
-          is_enabled: isEnabled,
+          message: content,
+          is_active: isEnabled,
           updated_at: new Date().toISOString()
         })
         .eq('user_id', userId)
-        .eq('template_type', templateType)
-        .eq('notification_name', notificationName);
+        .eq('type', templateType)
+        .eq('name', notificationName);
 
       if (updateError) {
         console.error('Error updating template:', updateError);
@@ -12579,11 +12673,11 @@ app.put('/api/user/notification-templates', async (req, res) => {
         .from('notification_templates')
         .insert({
           user_id: userId,
-          template_type: templateType,
-          notification_name: notificationName,
+          type: templateType,
+          name: notificationName,
           subject,
-          content,
-          is_enabled: isEnabled,
+          message: content,
+          is_active: isEnabled,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         });
