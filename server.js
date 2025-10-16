@@ -12720,10 +12720,25 @@ app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
       text: 'Test Email - This is a test email to verify SendGrid configuration.'
     };
 
-    const result = await sgMail.send(msg);
-    console.log('✅ Test email sent successfully:', result);
-    
-    res.json({ message: 'Test email sent successfully', result });
+    try {
+      const result = await sgMail.send(msg);
+      console.log('✅ Test email sent successfully:', result);
+      
+      res.json({ message: 'Test email sent successfully', result });
+    } catch (sendError) {
+      console.error('❌ SendGrid test error:', sendError);
+      console.error('❌ Error code:', sendError.code);
+      console.error('❌ Error response:', sendError.response?.body);
+      
+      if (sendError.code === 403) {
+        return res.status(500).json({ 
+          error: 'SendGrid 403 Forbidden - The sender email address must be verified in SendGrid',
+          details: 'Please verify the sender email address in your SendGrid account settings.'
+        });
+      }
+      
+      throw sendError;
+    }
   } catch (error) {
     console.error('❌ Error sending test email:', error);
     res.status(500).json({ error: 'Failed to send test email', details: error.message });
@@ -13514,6 +13529,14 @@ app.post('/api/send-receipt-email', async (req, res) => {
     const businessName = userData?.business_name || 'Your Business';
     const businessEmail = userData?.email || 'noreply@zenbooker.com';
     
+    // Use a verified sender email as fallback
+    const verifiedSenderEmail = process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro';
+    const fromEmail = businessEmail === verifiedSenderEmail ? businessEmail : verifiedSenderEmail;
+    
+    console.log('📧 Using from email:', fromEmail);
+    console.log('📧 Business email:', businessEmail);
+    console.log('📧 Verified sender email:', verifiedSenderEmail);
+    
     // Create receipt email
     const receiptHtml = `
       <!DOCTYPE html>
@@ -13589,7 +13612,7 @@ app.post('/api/send-receipt-email', async (req, res) => {
     // Send email using SendGrid
     const msg = {
       to: customerEmail,
-      from: businessEmail,
+      from: fromEmail,
       subject: `Payment Receipt - ${businessName}`,
       html: receiptHtml,
       text: `
@@ -13605,14 +13628,43 @@ app.post('/api/send-receipt-email', async (req, res) => {
       `
     };
     
-    await sgMail.send(msg);
-    console.log('✅ Receipt email sent successfully');
-    
-    res.json({ 
-      success: true, 
-      message: 'Receipt email sent successfully',
-      email: customerEmail 
+    console.log('📧 SendGrid message details:', {
+      to: msg.to,
+      from: msg.from,
+      subject: msg.subject,
+      hasHtml: !!msg.html,
+      hasText: !!msg.text
     });
+    
+    try {
+      await sgMail.send(msg);
+      console.log('✅ Receipt email sent successfully');
+      
+      res.json({ 
+        success: true, 
+        message: 'Receipt email sent successfully',
+        email: customerEmail 
+      });
+    } catch (sendError) {
+      console.error('❌ SendGrid send error:', sendError);
+      console.error('❌ Error code:', sendError.code);
+      console.error('❌ Error response:', sendError.response?.body);
+      
+      if (sendError.code === 403) {
+        console.error('❌ SendGrid 403 Forbidden - Possible causes:');
+        console.error('❌ 1. From email not verified in SendGrid');
+        console.error('❌ 2. API key lacks permissions');
+        console.error('❌ 3. Account suspended or restricted');
+        console.error('❌ From email being used:', businessEmail);
+        
+        return res.status(500).json({ 
+          error: 'SendGrid configuration error. Please verify the sender email address in SendGrid.',
+          details: 'The from email address must be verified in your SendGrid account.'
+        });
+      }
+      
+      throw sendError;
+    }
     
   } catch (error) {
     console.error('❌ Error sending receipt email:', error);
