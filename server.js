@@ -5907,7 +5907,7 @@ app.get('/api/invoices', async (req, res) => {
       .select(`
         *,
         customers!left(first_name, last_name, email, phone),
-        jobs!left(scheduled_date, status, services!left(name))
+        jobs!left(scheduled_date, status, service_address_street, service_address_city, service_address_state, service_address_zip, service_address_country, services!left(name))
       `, { count: 'exact' });
     
     // Only filter by user_id if userId is provided
@@ -5969,7 +5969,21 @@ app.get('/api/invoices', async (req, res) => {
       customer_phone: invoice.customers?.phone,
       service_name: invoice.jobs?.services?.name,
       scheduled_date: invoice.jobs?.scheduled_date,
-      job_status: invoice.jobs?.status
+      job_status: invoice.jobs?.status,
+      service_address: (() => {
+        // Construct service address from job address fields
+        if (invoice.jobs?.service_address_street) {
+          const addressParts = [
+            invoice.jobs.service_address_street,
+            invoice.jobs.service_address_city,
+            invoice.jobs.service_address_state,
+            invoice.jobs.service_address_zip,
+            invoice.jobs.service_address_country
+          ].filter(Boolean);
+          return addressParts.join(', ');
+        }
+        return 'N/A';
+      })()
     }));
     
     const totalPages = Math.ceil((count || 0) / parseInt(limit));
@@ -6003,7 +6017,7 @@ app.get('/api/invoices/:id', async (req, res) => {
       .select(`
         *,
         customers!left(first_name, last_name, email, phone),
-        jobs!left(scheduled_date, status, services!left(name))
+        jobs!left(scheduled_date, status, service_address_street, service_address_city, service_address_state, service_address_zip, service_address_country, services!left(name))
       `)
       .eq('id', id)
       .eq('user_id', userId)
@@ -6027,7 +6041,21 @@ app.get('/api/invoices/:id', async (req, res) => {
       customer_phone: invoices[0].customers?.phone,
       service_name: invoices[0].jobs?.services?.name,
       scheduled_date: invoices[0].jobs?.scheduled_date,
-      job_status: invoices[0].jobs?.status
+      job_status: invoices[0].jobs?.status,
+      service_address: (() => {
+        // Construct service address from job address fields
+        if (invoices[0].jobs?.service_address_street) {
+          const addressParts = [
+            invoices[0].jobs.service_address_street,
+            invoices[0].jobs.service_address_city,
+            invoices[0].jobs.service_address_state,
+            invoices[0].jobs.service_address_zip,
+            invoices[0].jobs.service_address_country
+          ].filter(Boolean);
+          return addressParts.join(', ');
+        }
+        return 'N/A';
+      })()
     };
     
     res.json(invoice);
@@ -12790,7 +12818,12 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
         jobs!invoices_job_id_fkey (
           id,
           service_name,
-          scheduled_date
+          scheduled_date,
+          service_address_street,
+          service_address_city,
+          service_address_state,
+          service_address_zip,
+          service_address_country
         )
       `)
       .eq('id', invoiceId)
@@ -12817,7 +12850,20 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
       customerEmail: invoice.customers?.email,
       serviceDate: invoice.jobs?.scheduled_date,
       jobNumber: invoice.job_id,
-      serviceAddress: invoice.customers?.address,
+      serviceAddress: (() => {
+        // Use job service address if available, otherwise fall back to customer address
+        if (invoice.jobs?.service_address_street) {
+          const addressParts = [
+            invoice.jobs.service_address_street,
+            invoice.jobs.service_address_city,
+            invoice.jobs.service_address_state,
+            invoice.jobs.service_address_zip,
+            invoice.jobs.service_address_country
+          ].filter(Boolean);
+          return addressParts.join(', ');
+        }
+        return invoice.customers?.address || 'N/A';
+      })(),
       service: invoice.jobs?.service_name,
       description: invoice.jobs?.service_name,
       amount: parseFloat(invoice.total_amount),
