@@ -13155,7 +13155,17 @@ function generateReceiptHtml(invoice, paymentIntentId, amount) {
         
         <div class="section">
           <h2 class="section-title">Service Address</h2>
-          <div class="info-value">${invoice.jobs?.service_address || 'N/A'}</div>
+          <div class="info-value">${(() => {
+            if (!invoice.jobs?.service_address_street) return 'N/A';
+            const addressParts = [
+              invoice.jobs.service_address_street,
+              invoice.jobs.service_address_city,
+              invoice.jobs.service_address_state,
+              invoice.jobs.service_address_zip,
+              invoice.jobs.service_address_country
+            ].filter(Boolean);
+            return addressParts.join(', ');
+          })()}</div>
         </div>
         
         <div class="footer">
@@ -13198,7 +13208,11 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
         jobs:job_id (
           service_name,
           scheduled_date,
-          service_address
+          service_address_street,
+          service_address_city,
+          service_address_state,
+          service_address_zip,
+          service_address_country
         )
       `)
       .eq('id', invoiceId)
@@ -13323,7 +13337,17 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
           
           <div class="section">
             <h2 class="section-title">Service Address</h2>
-            <div class="info-value">${invoice.jobs?.service_address || 'N/A'}</div>
+            <div class="info-value">${(() => {
+              if (!invoice.jobs?.service_address_street) return 'N/A';
+              const addressParts = [
+                invoice.jobs.service_address_street,
+                invoice.jobs.service_address_city,
+                invoice.jobs.service_address_state,
+                invoice.jobs.service_address_zip,
+                invoice.jobs.service_address_country
+              ].filter(Boolean);
+              return addressParts.join(', ');
+            })()}</div>
           </div>
           
           <div class="footer">
@@ -13393,10 +13417,17 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       doc.moveDown(2);
       
       // Service Address
-      if (invoice.jobs?.service_address) {
+      if (invoice.jobs?.service_address_street) {
         doc.fontSize(16).text('Service Address', { underline: true });
         doc.moveDown();
-        doc.fontSize(12).text(invoice.jobs.service_address);
+        const addressParts = [
+          invoice.jobs.service_address_street,
+          invoice.jobs.service_address_city,
+          invoice.jobs.service_address_state,
+          invoice.jobs.service_address_zip,
+          invoice.jobs.service_address_country
+        ].filter(Boolean);
+        doc.fontSize(12).text(addressParts.join(', '));
         doc.moveDown(2);
       }
       
@@ -13455,7 +13486,11 @@ app.post('/api/send-receipt-email', async (req, res) => {
         jobs:job_id (
           service_name,
           scheduled_date,
-          service_address
+          service_address_street,
+          service_address_city,
+          service_address_state,
+          service_address_zip,
+          service_address_country
         )
       `)
       .eq('id', invoiceId)
