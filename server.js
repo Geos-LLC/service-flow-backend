@@ -11,7 +11,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const validator = require('validator');
-const puppeteer = require('puppeteer');
+const PDFDocument = require('pdfkit');
 
 // Nodemailer removed - using SendGrid only
 const sgMail = require('@sendgrid/mail');
@@ -478,7 +478,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) {
     res.header('Content-Type', 'application/json');
   }
-  
+ 
   next();
 });
 
@@ -13335,34 +13335,76 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
       </html>
     `;
     
-    // Generate PDF using Puppeteer
+    // Generate PDF using PDFKit
     try {
-      const browser = await puppeteer.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      const doc = new PDFDocument({ size: 'A4', margin: 50 });
+      const buffers = [];
+      
+      doc.on('data', buffers.push.bind(buffers));
+      doc.on('end', () => {
+        const pdfBuffer = Buffer.concat(buffers);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'attachment; filename="receipt.pdf"');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(pdfBuffer);
       });
       
-      const page = await browser.newPage();
-      await page.setContent(receiptHtml, { waitUntil: 'networkidle0' });
+      // Add content to PDF
+      doc.fontSize(24).text('Payment Receipt', { align: 'center' });
+      doc.moveDown();
       
-      const pdfBuffer = await page.pdf({
-        format: 'A4',
-        printBackground: true,
-        margin: {
-          top: '20px',
-          right: '20px',
-          bottom: '20px',
-          left: '20px'
-        }
-      });
+      doc.fontSize(16).text('Thank you for your payment!', { align: 'center' });
+      doc.moveDown(2);
       
-      await browser.close();
+      // Amount
+      doc.fontSize(20).text(`$${(amount / 100).toFixed(2)}`, { align: 'center' });
+      doc.moveDown();
       
-      // Return PDF
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', 'attachment; filename="receipt.pdf"');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.send(pdfBuffer);
+      // Status
+      doc.fontSize(14).fillColor('green').text('✅ Payment Successful', { align: 'center' });
+      doc.fillColor('black');
+      doc.moveDown(2);
+      
+      // Payment Details
+      doc.fontSize(16).text('Payment Details', { underline: true });
+      doc.moveDown();
+      
+      doc.fontSize(12).text(`Transaction ID: ${paymentIntentId}`);
+      doc.text(`Payment Date: ${new Date().toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        month: 'long', 
+        day: 'numeric', 
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      })}`);
+      doc.text('Payment Method: Credit Card');
+      doc.text('Status: Completed');
+      doc.moveDown(2);
+      
+      // Invoice Information
+      doc.fontSize(16).text('Invoice Information', { underline: true });
+      doc.moveDown();
+      
+      doc.fontSize(12).text(`Invoice Number: #INV-${invoice.id}`);
+      doc.text(`Customer: ${invoice.customers?.first_name || 'Customer'} ${invoice.customers?.last_name || ''}`);
+      doc.text(`Service: ${invoice.jobs?.service_name || 'Service'}`);
+      doc.text(`Service Date: ${new Date(invoice.jobs?.scheduled_date || invoice.created_at).toLocaleDateString('en-US')}`);
+      doc.moveDown(2);
+      
+      // Service Address
+      if (invoice.jobs?.service_address) {
+        doc.fontSize(16).text('Service Address', { underline: true });
+        doc.moveDown();
+        doc.fontSize(12).text(invoice.jobs.service_address);
+        doc.moveDown(2);
+      }
+      
+      // Footer
+      doc.fontSize(10).text('This is an automated receipt. Please keep this for your records.', { align: 'center' });
+      doc.text(`Generated on ${new Date().toLocaleString()}`, { align: 'center' });
+      
+      doc.end();
       
     } catch (pdfError) {
       console.error('❌ Error generating PDF:', pdfError);
