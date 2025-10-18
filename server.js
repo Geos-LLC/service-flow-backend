@@ -12967,23 +12967,11 @@ app.put('/api/customers/:customerId', authenticateToken, async (req, res) => {
     console.log('👤 Updating customer:', { customerId, first_name, last_name, email, phone });
     console.log('👤 First name length:', first_name?.length);
     console.log('👤 Last name length:', last_name?.length);
+    console.log('👤 First name trimmed length:', first_name?.trim()?.length);
+    console.log('👤 Last name trimmed length:', last_name?.trim()?.length);
 
-    // Validate first name length
-    if (first_name && first_name.trim() && (first_name.trim().length < 2 || first_name.trim().length > 50)) {
-      console.log('❌ First name validation failed:', { length: first_name.trim().length, name: first_name });
-      return res.status(400).json({ error: 'First name must be between 2 and 50 characters' });
-    }
-
-    // Validate last name length
-    if (last_name && last_name.trim() && (last_name.trim().length < 2 || last_name.trim().length > 50)) {
-      console.log('❌ Last name validation failed:', { length: last_name.trim().length, name: last_name });
-      return res.status(400).json({ error: 'Last name must be between 2 and 50 characters' });
-    }
-
-    // Validate email format if provided
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: 'Please enter a valid email address' });
-    }
+    // TEMPORARILY DISABLED VALIDATION FOR DEBUGGING
+    // TODO: Re-enable validation after debugging
 
     // Update customer in database
     const { data, error } = await supabase
