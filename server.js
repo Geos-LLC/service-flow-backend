@@ -12966,6 +12966,21 @@ app.put('/api/customers/:customerId', authenticateToken, async (req, res) => {
     
     console.log('👤 Updating customer:', { customerId, first_name, last_name, email, phone });
 
+    // Validate first name length
+    if (first_name && (first_name.length < 2 || first_name.length > 50)) {
+      return res.status(400).json({ error: 'First name must be between 2 and 50 characters' });
+    }
+
+    // Validate last name length
+    if (last_name && (last_name.length < 2 || last_name.length > 50)) {
+      return res.status(400).json({ error: 'Last name must be between 2 and 50 characters' });
+    }
+
+    // Validate email format if provided
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address' });
+    }
+
     // Update customer in database
     const { data, error } = await supabase
       .from('customers')
