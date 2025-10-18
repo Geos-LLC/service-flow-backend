@@ -12727,6 +12727,157 @@ app.put('/api/user/notification-templates', async (req, res) => {
   }
 });
 
+// Send appointment notification endpoint
+app.post('/api/send-appointment-notification', authenticateToken, async (req, res) => {
+  try {
+    const { notificationType, customerEmail, jobId, customerName, serviceName, scheduledDate, serviceAddress } = req.body;
+    
+    if (!customerEmail || !notificationType) {
+      return res.status(400).json({ error: 'Customer email and notification type are required' });
+    }
+
+    console.log('📧 Sending appointment notification:', { notificationType, customerEmail, jobId });
+
+    // Generate email content based on notification type
+    let subject, htmlContent, textContent;
+    
+    if (notificationType === 'confirmation') {
+      subject = 'Appointment Confirmation';
+      htmlContent = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #2563eb; margin: 0;">Appointment Confirmed</h1>
+          </div>
+          
+          <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+            <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+              Your appointment has been confirmed for <strong>${new Date(scheduledDate).toLocaleDateString('en-US', { 
+                weekday: 'long', 
+                month: 'long', 
+                day: 'numeric', 
+                year: 'numeric' 
+              })} at ${new Date(scheduledDate).toLocaleTimeString('en-US', { 
+                hour: 'numeric', 
+                minute: '2-digit',
+                hour12: true 
+              })}</strong>.
+            </p>
+            <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+              <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+              <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+            </div>
+            <p style="color: #374151; margin: 15px 0 0 0;">We look forward to serving you!</p>
+          </div>
+          
+          <div style="text-align: center; color: #6b7280; font-size: 14px;">
+            <p>Best regards,<br>Your Service Team</p>
+          </div>
+        </div>
+      `;
+      textContent = `Hi ${customerName},\n\nYour appointment has been confirmed for ${new Date(scheduledDate).toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        month: 'long', 
+        day: 'numeric', 
+        year: 'numeric' 
+      })} at ${new Date(scheduledDate).toLocaleTimeString('en-US', { 
+        hour: 'numeric', 
+        minute: '2-digit',
+        hour12: true 
+      })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe look forward to serving you!\n\nBest regards,\nYour Service Team`;
+    } else if (notificationType === 'reminder') {
+      subject = 'Appointment Reminder';
+      htmlContent = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #f59e0b; margin: 0;">Appointment Reminder</h1>
+          </div>
+          
+          <div style="background: #fef3c7; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+            <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+              This is a friendly reminder that you have an appointment scheduled for <strong>${new Date(scheduledDate).toLocaleDateString('en-US', { 
+                weekday: 'long', 
+                month: 'long', 
+                day: 'numeric', 
+                year: 'numeric' 
+              })} at ${new Date(scheduledDate).toLocaleTimeString('en-US', { 
+                hour: 'numeric', 
+                minute: '2-digit',
+                hour12: true 
+              })}</strong>.
+            </p>
+            <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+              <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+              <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+            </div>
+            <p style="color: #374151; margin: 15px 0 0 0;">Please arrive on time. If you need to reschedule, please contact us as soon as possible.</p>
+          </div>
+          
+          <div style="text-align: center; color: #6b7280; font-size: 14px;">
+            <p>Best regards,<br>Your Service Team</p>
+          </div>
+        </div>
+      `;
+      textContent = `Hi ${customerName},\n\nThis is a friendly reminder that you have an appointment scheduled for ${new Date(scheduledDate).toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        month: 'long', 
+        day: 'numeric', 
+        year: 'numeric' 
+      })} at ${new Date(scheduledDate).toLocaleTimeString('en-US', { 
+        hour: 'numeric', 
+        minute: '2-digit',
+        hour12: true 
+      })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nPlease arrive on time. If you need to reschedule, please contact us as soon as possible.\n\nBest regards,\nYour Service Team`;
+    }
+
+    // Send email using SendGrid
+    const msg = {
+      to: customerEmail,
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+      subject: subject,
+      html: htmlContent,
+      text: textContent
+    };
+
+    console.log('📧 SendGrid message details:', {
+      to: msg.to,
+      from: msg.from,
+      subject: msg.subject,
+      hasHtml: !!msg.html,
+      hasText: !!msg.text
+    });
+
+    try {
+      await sgMail.send(msg);
+      console.log('✅ Appointment notification sent successfully');
+      
+      res.json({ 
+        success: true, 
+        message: `${notificationType === 'confirmation' ? 'Confirmation' : 'Reminder'} sent successfully`,
+        email: customerEmail 
+      });
+    } catch (sendError) {
+      console.error('❌ SendGrid send error:', sendError);
+      console.error('❌ Error code:', sendError.code);
+      console.error('❌ Error response:', sendError.response?.body);
+      
+      if (sendError.code === 403) {
+        return res.status(500).json({ 
+          error: 'SendGrid configuration error. Please verify the sender email address in SendGrid.',
+          details: 'The from email address must be verified in your SendGrid account.'
+        });
+      }
+      
+      throw sendError;
+    }
+    
+  } catch (error) {
+    console.error('❌ Error sending appointment notification:', error);
+    res.status(500).json({ error: 'Failed to send appointment notification' });
+  }
+});
+
 // Test SendGrid endpoint
 app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   try {
