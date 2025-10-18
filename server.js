@@ -12878,6 +12878,129 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
   }
 });
 
+// Send custom message endpoint
+app.post('/api/send-custom-message', authenticateToken, async (req, res) => {
+  try {
+    const { customerEmail, jobId, customerName, message } = req.body;
+    
+    if (!customerEmail || !message) {
+      return res.status(400).json({ error: 'Customer email and message are required' });
+    }
+
+    console.log('📧 Sending custom message:', { customerEmail, jobId, messageLength: message.length });
+
+    // Generate email content for custom message
+    const subject = 'Message from Your Service Team';
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #2563eb; margin: 0;">Message from Your Service Team</h1>
+        
+        <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+          <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+          <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2563eb;">
+            <p style="margin: 0; color: #374151; font-size: 16px; line-height: 1.6; white-space: pre-wrap;">${message}</p>
+          </div>
+        </div>
+        
+        <div style="text-align: center; color: #6b7280; font-size: 14px;">
+          <p>Best regards,<br>Your Service Team</p>
+        </div>
+      </div>
+    `;
+    const textContent = `Hi ${customerName},\n\n${message}\n\nBest regards,\nYour Service Team`;
+
+    // Send email using SendGrid
+    const msg = {
+      to: customerEmail,
+      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+      subject: subject,
+      html: htmlContent,
+      text: textContent
+    };
+
+    console.log('📧 SendGrid message details:', {
+      to: msg.to,
+      from: msg.from,
+      subject: msg.subject,
+      hasHtml: !!msg.html,
+      hasText: !!msg.text
+    });
+
+    try {
+      await sgMail.send(msg);
+      console.log('✅ Custom message sent successfully');
+      
+      res.json({ 
+        success: true, 
+        message: 'Custom message sent successfully',
+        email: customerEmail 
+      });
+    } catch (sendError) {
+      console.error('❌ SendGrid send error:', sendError);
+      console.error('❌ Error code:', sendError.code);
+      console.error('❌ Error response:', sendError.response?.body);
+      
+      if (sendError.code === 403) {
+        return res.status(500).json({ 
+          error: 'SendGrid configuration error. Please verify the sender email address in SendGrid.',
+          details: 'The from email address must be verified in your SendGrid account.'
+        });
+      }
+      
+      throw sendError;
+    }
+    
+  } catch (error) {
+    console.error('❌ Error sending custom message:', error);
+    res.status(500).json({ error: 'Failed to send custom message' });
+  }
+});
+
+// Update customer endpoint
+app.put('/api/customers/:customerId', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { first_name, last_name, email, phone } = req.body;
+    
+    console.log('👤 Updating customer:', { customerId, first_name, last_name, email, phone });
+
+    // Update customer in database
+    const { data, error } = await supabase
+      .from('customers')
+      .update({
+        first_name: first_name || null,
+        last_name: last_name || null,
+        email: email || null,
+        phone: phone || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', customerId)
+      .eq('user_id', req.user.id) // Ensure user can only update their own customers
+      .select();
+
+    if (error) {
+      console.error('❌ Error updating customer:', error);
+      return res.status(500).json({ error: 'Failed to update customer' });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    console.log('✅ Customer updated successfully:', data[0]);
+    res.json({ 
+      success: true, 
+      message: 'Customer updated successfully',
+      customer: data[0]
+    });
+    
+  } catch (error) {
+    console.error('❌ Error updating customer:', error);
+    res.status(500).json({ error: 'Failed to update customer' });
+  }
+});
+
 // Test SendGrid endpoint
 app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   try {
@@ -12900,10 +13023,10 @@ app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
     };
 
     try {
-      const result = await sgMail.send(msg);
-      console.log('✅ Test email sent successfully:', result);
-      
-      res.json({ message: 'Test email sent successfully', result });
+    const result = await sgMail.send(msg);
+    console.log('✅ Test email sent successfully:', result);
+    
+    res.json({ message: 'Test email sent successfully', result });
     } catch (sendError) {
       console.error('❌ SendGrid test error:', sendError);
       console.error('❌ Error code:', sendError.code);
@@ -13652,10 +13775,10 @@ app.post('/api/generate-receipt-pdf', async (req, res) => {
     } catch (pdfError) {
       console.error('❌ Error generating PDF:', pdfError);
       // Fallback to HTML if PDF generation fails
-      res.setHeader('Content-Type', 'text/html');
-      res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Content-Disposition', 'attachment; filename="receipt.html"');
       res.setHeader('Cache-Control', 'no-cache');
-      res.send(receiptHtml);
+    res.send(receiptHtml);
     }
     
   } catch (error) {
@@ -13834,14 +13957,14 @@ app.post('/api/send-receipt-email', async (req, res) => {
     });
     
     try {
-      await sgMail.send(msg);
-      console.log('✅ Receipt email sent successfully');
-      
-      res.json({ 
-        success: true, 
-        message: 'Receipt email sent successfully',
-        email: customerEmail 
-      });
+    await sgMail.send(msg);
+    console.log('✅ Receipt email sent successfully');
+    
+    res.json({ 
+      success: true, 
+      message: 'Receipt email sent successfully',
+      email: customerEmail 
+    });
     } catch (sendError) {
       console.error('❌ SendGrid send error:', sendError);
       console.error('❌ Error code:', sendError.code);
