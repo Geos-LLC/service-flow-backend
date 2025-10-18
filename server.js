@@ -12895,6 +12895,7 @@ app.post('/api/send-custom-message', authenticateToken, async (req, res) => {
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
         <div style="text-align: center; margin-bottom: 30px;">
           <h1 style="color: #2563eb; margin: 0;">Message from Your Service Team</h1>
+        </div>
         
         <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
           <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
