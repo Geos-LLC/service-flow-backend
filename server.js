@@ -12958,57 +12958,6 @@ app.post('/api/send-custom-message', authenticateToken, async (req, res) => {
   }
 });
 
-// Update customer endpoint
-app.put('/api/customers/:customerId', authenticateToken, async (req, res) => {
-  try {
-    const { customerId } = req.params;
-    const { first_name, last_name, email, phone } = req.body;
-    
-    console.log('👤 Updating customer:', { customerId, first_name, last_name, email, phone });
-    console.log('👤 First name length:', first_name?.length);
-    console.log('👤 Last name length:', last_name?.length);
-    console.log('👤 First name trimmed length:', first_name?.trim()?.length);
-    console.log('👤 Last name trimmed length:', last_name?.trim()?.length);
-
-    // TEMPORARILY DISABLED VALIDATION FOR DEBUGGING
-    // TODO: Re-enable validation after debugging
-
-    // Update customer in database
-    const { data, error } = await supabase
-      .from('customers')
-      .update({
-        first_name: first_name || null,
-        last_name: last_name || null,
-        email: email || null,
-        phone: phone || null,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', customerId)
-      .eq('user_id', req.user.id) // Ensure user can only update their own customers
-      .select();
-
-    if (error) {
-      console.error('❌ Error updating customer:', error);
-      return res.status(500).json({ error: 'Failed to update customer' });
-    }
-
-    if (!data || data.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
-
-    console.log('✅ Customer updated successfully:', data[0]);
-    res.json({ 
-      success: true, 
-      message: 'Customer updated successfully',
-      customer: data[0]
-    });
-    
-  } catch (error) {
-    console.error('❌ Error updating customer:', error);
-    res.status(500).json({ error: 'Failed to update customer' });
-  }
-});
-
 // Test SendGrid endpoint
 app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   try {
