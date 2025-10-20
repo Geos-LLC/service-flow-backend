@@ -2474,6 +2474,108 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                }
             }
       
+      // Send automatic confirmation if customer has email
+      if (result.customer_id) {
+        try {
+          const { data: customerData, error: customerError } = await supabase
+            .from('customers')
+            .select('id, first_name, last_name, email, phone')
+            .eq('id', result.customer_id)
+            .single();
+          
+          if (!customerError && customerData && customerData.email) {
+            // Get service and business information
+            const { data: serviceData, error: serviceError } = await supabase
+              .from('services')
+              .select('name')
+              .eq('id', result.service_id)
+              .single();
+            
+            const { data: businessData, error: businessError } = await supabase
+              .from('users')
+              .select('business_name')
+              .eq('id', userId)
+              .single();
+            
+            if (!serviceError && !businessError) {
+              // Send confirmation email
+              const customerName = customerData.first_name && customerData.last_name 
+                ? `${customerData.first_name} ${customerData.last_name}`
+                : customerData.first_name || customerData.last_name || 'Valued Customer';
+              
+              const serviceName = serviceData?.name || 'Service';
+              const businessName = businessData?.business_name || 'Your Service Team';
+              const serviceAddress = result.service_address || 'Service Location';
+              
+              const subject = 'Appointment Confirmation';
+              const htmlContent = `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                  <div style="text-align: center; margin-bottom: 30px;">
+                    <h1 style="color: #2563eb; margin: 0;">Appointment Confirmed</h1>
+                  </div>
+                  
+                  <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                    <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+                    <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+                      Your appointment has been confirmed for <strong>${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
+                        weekday: 'long', 
+                        month: 'long', 
+                        day: 'numeric', 
+                        year: 'numeric' 
+                      })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
+                        hour: 'numeric', 
+                        minute: '2-digit',
+                        hour12: true 
+                      })}</strong>.
+                    </p>
+                    <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+                      <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+                      <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+                    </div>
+                    <p style="color: #374151; margin: 15px 0 0 0;">We look forward to serving you!</p>
+                  </div>
+                  
+                  <div style="text-align: center; color: #6b7280; font-size: 14px;">
+                    <p>Best regards,<br>${businessName}</p>
+                  </div>
+                </div>
+              `;
+              
+              const textContent = `Hi ${customerName},\n\nYour appointment has been confirmed for ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
+                weekday: 'long', 
+                month: 'long', 
+                day: 'numeric', 
+                year: 'numeric' 
+              })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
+                hour: 'numeric', 
+                minute: '2-digit',
+                hour12: true 
+              })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe look forward to serving you!\n\nBest regards,\n${businessName}`;
+
+              // Send email using SendGrid
+              const msg = {
+                to: customerData.email,
+                from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+                subject: subject,
+                html: htmlContent,
+                text: textContent
+              };
+
+              try {
+                await sgMail.send(msg);
+                console.log('✅ Automatic job confirmation sent successfully to:', customerData.email);
+              } catch (sendError) {
+                console.error('❌ Error sending automatic confirmation:', sendError);
+                // Don't fail the job creation if email sending fails
+              }
+            }
+          }
+        } catch (confirmationError) {
+          console.error('❌ Error in automatic confirmation process:', confirmationError);
+          // Don't fail the job creation if confirmation fails
+        }
+      }
+
       // Send success response
       res.json({
         success: true,
@@ -2639,6 +2741,153 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     if (updateError) {
       console.error('Error updating job status:', updateError);
       return res.status(500).json({ error: 'Failed to update job status' });
+    }
+
+    // Send automatic confirmation for certain status changes
+    if (status === 'confirmed' || status === 'completed' || status === 'cancelled') {
+      try {
+        // Get job details with customer and service information
+        const { data: jobData, error: jobError } = await supabase
+          .from('jobs')
+          .select(`
+            *,
+            customers!left(first_name, last_name, email, phone),
+            services!left(name),
+            users!left(business_name)
+          `)
+          .eq('id', id)
+          .single();
+
+        if (!jobError && jobData && jobData.customers && jobData.customers.email) {
+          const customerName = jobData.customers.first_name && jobData.customers.last_name 
+            ? `${jobData.customers.first_name} ${jobData.customers.last_name}`
+            : jobData.customers.first_name || jobData.customers.last_name || 'Valued Customer';
+          
+          const serviceName = jobData.services?.name || 'Service';
+          const businessName = jobData.users?.business_name || 'Your Service Team';
+          const serviceAddress = jobData.service_address || 'Service Location';
+          
+          let subject, htmlContent, textContent;
+          
+          if (status === 'confirmed') {
+            subject = 'Appointment Confirmed';
+            htmlContent = `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <h1 style="color: #2563eb; margin: 0;">Appointment Confirmed</h1>
+                </div>
+                
+                <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                  <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+                  <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+                    Your appointment has been confirmed for <strong>${new Date(jobData.scheduled_date).toLocaleDateString('en-US', { 
+                      weekday: 'long', 
+                      month: 'long', 
+                      day: 'numeric', 
+                      year: 'numeric' 
+                    })} at ${new Date(jobData.scheduled_date).toLocaleTimeString('en-US', { 
+                      hour: 'numeric', 
+                      minute: '2-digit',
+                      hour12: true 
+                    })}</strong>.
+                  </p>
+                  <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+                    <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+                    <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+                  </div>
+                  <p style="color: #374151; margin: 15px 0 0 0;">We look forward to serving you!</p>
+                </div>
+                
+                <div style="text-align: center; color: #6b7280; font-size: 14px;">
+                  <p>Best regards,<br>${businessName}</p>
+                </div>
+              </div>
+            `;
+            textContent = `Hi ${customerName},\n\nYour appointment has been confirmed for ${new Date(jobData.scheduled_date).toLocaleDateString('en-US', { 
+              weekday: 'long', 
+              month: 'long', 
+              day: 'numeric', 
+              year: 'numeric' 
+            })} at ${new Date(jobData.scheduled_date).toLocaleTimeString('en-US', { 
+              hour: 'numeric', 
+              minute: '2-digit',
+              hour12: true 
+            })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe look forward to serving you!\n\nBest regards,\n${businessName}`;
+          } else if (status === 'completed') {
+            subject = 'Service Completed';
+            htmlContent = `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <h1 style="color: #10b981; margin: 0;">Service Completed</h1>
+                </div>
+                
+                <div style="background: #f0fdf4; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                  <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+                  <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+                    Your service has been completed successfully!
+                  </p>
+                  <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+                    <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+                    <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+                  </div>
+                  <p style="color: #374151; margin: 15px 0 0 0;">Thank you for choosing our services!</p>
+                </div>
+                
+                <div style="text-align: center; color: #6b7280; font-size: 14px;">
+                  <p>Best regards,<br>${businessName}</p>
+                </div>
+              </div>
+            `;
+            textContent = `Hi ${customerName},\n\nYour service has been completed successfully!\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nThank you for choosing our services!\n\nBest regards,\n${businessName}`;
+          } else if (status === 'cancelled') {
+            subject = 'Appointment Cancelled';
+            htmlContent = `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <h1 style="color: #ef4444; margin: 0;">Appointment Cancelled</h1>
+                </div>
+                
+                <div style="background: #fef2f2; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                  <h2 style="color: #1f2937; margin: 0 0 15px 0;">Hi ${customerName},</h2>
+                  <p style="color: #374151; margin: 0 0 15px 0; font-size: 16px;">
+                    Your appointment has been cancelled.
+                  </p>
+                  <div style="background: white; padding: 15px; border-radius: 6px; margin: 15px 0;">
+                    <p style="margin: 0 0 10px 0; color: #374151;"><strong>Service:</strong> ${serviceName}</p>
+                    <p style="margin: 0; color: #374151;"><strong>Location:</strong> ${serviceAddress}</p>
+                  </div>
+                  <p style="color: #374151; margin: 15px 0 0 0;">We apologize for any inconvenience. Please contact us to reschedule.</p>
+                </div>
+                
+                <div style="text-align: center; color: #6b7280; font-size: 14px;">
+                  <p>Best regards,<br>${businessName}</p>
+                </div>
+              </div>
+            `;
+            textContent = `Hi ${customerName},\n\nYour appointment has been cancelled.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe apologize for any inconvenience. Please contact us to reschedule.\n\nBest regards,\n${businessName}`;
+          }
+
+          // Send email using SendGrid
+          const msg = {
+            to: jobData.customers.email,
+            from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+            subject: subject,
+            html: htmlContent,
+            text: textContent
+          };
+
+          try {
+            await sgMail.send(msg);
+            console.log(`✅ Automatic ${status} notification sent successfully to:`, jobData.customers.email);
+          } catch (sendError) {
+            console.error(`❌ Error sending automatic ${status} notification:`, sendError);
+            // Don't fail the status update if email sending fails
+          }
+        }
+      } catch (notificationError) {
+        console.error('❌ Error in automatic status notification process:', notificationError);
+        // Don't fail the status update if notification fails
+      }
     }
 
     res.json({
@@ -5544,7 +5793,7 @@ app.get('/api/territories', authenticateToken, async (req, res) => {
       const completedJobs = jobs.filter(job => job.status === 'completed');
       const completedJobsCount = completedJobs.length;
       const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0);
-      const avgJobValue = completedJobsCount > 0 ? totalRevenue / completedJobsCount : 0;
+      const avgJobValue = completedJobsCount > 0 ? Math.round((totalRevenue / completedJobsCount) * 100) / 100 : 0;
       
       return {
         ...territory,
@@ -7261,8 +7510,8 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       const totalJobs = jobs.length;
       const completedJobs = jobs.filter(job => job.status === 'completed').length;
       const avgJobValue = completedJobs > 0 
-        ? jobs.filter(job => job.status === 'completed')
-            .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs
+        ? Math.round((jobs.filter(job => job.status === 'completed')
+            .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
         : 0;
       
       return {
