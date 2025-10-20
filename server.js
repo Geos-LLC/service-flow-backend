@@ -13238,21 +13238,34 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
       await sgMail.send(msg);
       console.log('✅ Appointment notification sent successfully');
       
-      // Update job confirmation status if it's a confirmation
-      if (notificationType === 'confirmation' && jobId) {
+      // Update job confirmation or reminder status
+      if (jobId) {
         try {
-          await supabase
-            .from('jobs')
-            .update({
-              confirmation_sent: true,
-              confirmation_sent_at: new Date().toISOString(),
-              confirmation_email: customerEmail,
-              confirmation_failed: false,
-              confirmation_error: null
-            })
-            .eq('id', jobId);
+          if (notificationType === 'confirmation') {
+            await supabase
+              .from('jobs')
+              .update({
+                confirmation_sent: true,
+                confirmation_sent_at: new Date().toISOString(),
+                confirmation_email: customerEmail,
+                confirmation_failed: false,
+                confirmation_error: null
+              })
+              .eq('id', jobId);
+          } else if (notificationType === 'reminder') {
+            await supabase
+              .from('jobs')
+              .update({
+                reminder_sent: true,
+                reminder_sent_at: new Date().toISOString(),
+                reminder_email: customerEmail,
+                reminder_failed: false,
+                reminder_error: null
+              })
+              .eq('id', jobId);
+          }
         } catch (updateError) {
-          console.error('Error updating confirmation status:', updateError);
+          console.error('Error updating notification status:', updateError);
           // Don't fail the email send if status update fails
         }
       }
@@ -13267,19 +13280,30 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
       console.error('❌ Error code:', sendError.code);
       console.error('❌ Error response:', sendError.response?.body);
       
-      // Update job with failed confirmation status if it's a confirmation
-      if (notificationType === 'confirmation' && jobId) {
+      // Update job with failed notification status
+      if (jobId) {
         try {
-          await supabase
-            .from('jobs')
-            .update({
-              confirmation_sent: false,
-              confirmation_failed: true,
-              confirmation_error: sendError.message
-            })
-            .eq('id', jobId);
+          if (notificationType === 'confirmation') {
+            await supabase
+              .from('jobs')
+              .update({
+                confirmation_sent: false,
+                confirmation_failed: true,
+                confirmation_error: sendError.message
+              })
+              .eq('id', jobId);
+          } else if (notificationType === 'reminder') {
+            await supabase
+              .from('jobs')
+              .update({
+                reminder_sent: false,
+                reminder_failed: true,
+                reminder_error: sendError.message
+              })
+              .eq('id', jobId);
+          }
         } catch (updateError) {
-          console.error('Error updating failed confirmation status:', updateError);
+          console.error('Error updating failed notification status:', updateError);
         }
       }
       
