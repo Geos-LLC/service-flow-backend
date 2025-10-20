@@ -2564,11 +2564,40 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               try {
                 await sgMail.send(msg);
                 console.log('✅ Automatic job confirmation sent successfully to:', customerData.email);
+                
+                // Update job with confirmation status
+                await supabase
+                  .from('jobs')
+                  .update({
+                    confirmation_sent: true,
+                    confirmation_sent_at: new Date().toISOString(),
+                    confirmation_email: customerData.email
+                  })
+                  .eq('id', result.id);
+                
               } catch (sendError) {
                 console.error('❌ Error sending automatic confirmation:', sendError);
-                // Don't fail the job creation if email sending fails
+                
+                // Update job with failed confirmation status
+                await supabase
+                  .from('jobs')
+                  .update({
+                    confirmation_sent: false,
+                    confirmation_failed: true,
+                    confirmation_error: sendError.message
+                  })
+                  .eq('id', result.id);
               }
             }
+          } else {
+            // Update job with no email status
+            await supabase
+              .from('jobs')
+              .update({
+                confirmation_sent: false,
+                confirmation_no_email: true
+              })
+              .eq('id', result.id);
           }
         } catch (confirmationError) {
           console.error('❌ Error in automatic confirmation process:', confirmationError);
@@ -2879,9 +2908,29 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
           try {
             await sgMail.send(msg);
             console.log(`✅ Automatic ${status} notification sent successfully to:`, jobData.customers.email);
+            
+            // Update job with notification status
+            await supabase
+              .from('jobs')
+              .update({
+                confirmation_sent: true,
+                confirmation_sent_at: new Date().toISOString(),
+                confirmation_email: jobData.customers.email
+              })
+              .eq('id', id);
+            
           } catch (sendError) {
             console.error(`❌ Error sending automatic ${status} notification:`, sendError);
-            // Don't fail the status update if email sending fails
+            
+            // Update job with failed notification status
+            await supabase
+              .from('jobs')
+              .update({
+                confirmation_sent: false,
+                confirmation_failed: true,
+                confirmation_error: sendError.message
+              })
+              .eq('id', id);
           }
         }
       } catch (notificationError) {
@@ -12209,6 +12258,59 @@ app.get('/api/test/jobs-structure', async (req, res) => {
   }
 });
 
+// Migration endpoint for confirmation tracking
+app.post('/api/migrate/confirmation-tracking', async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    
+    try {
+      // Check if confirmation columns already exist
+      const [columnCheck] = await connection.query(`
+        SELECT COUNT(*) as count
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_SCHEMA = DATABASE() 
+        AND TABLE_NAME = 'jobs' 
+        AND COLUMN_NAME = 'confirmation_sent'
+      `);
+      
+      if (columnCheck[0].count === 0) {
+        // Add confirmation tracking columns
+        await connection.query(`
+          ALTER TABLE jobs 
+          ADD COLUMN confirmation_sent BOOLEAN DEFAULT FALSE,
+          ADD COLUMN confirmation_sent_at TIMESTAMP NULL,
+          ADD COLUMN confirmation_email VARCHAR(255) NULL,
+          ADD COLUMN confirmation_failed BOOLEAN DEFAULT FALSE,
+          ADD COLUMN confirmation_error TEXT NULL,
+          ADD COLUMN confirmation_no_email BOOLEAN DEFAULT FALSE
+        `);
+        
+        // Add indexes for better performance
+        await connection.query('CREATE INDEX idx_jobs_confirmation_sent ON jobs(confirmation_sent)');
+        await connection.query('CREATE INDEX idx_jobs_confirmation_sent_at ON jobs(confirmation_sent_at)');
+        
+        console.log('✅ Confirmation tracking columns added successfully');
+      } else {
+        console.log('✅ Confirmation tracking columns already exist');
+      }
+      
+      // Show updated table structure
+      const [columns] = await connection.query('DESCRIBE jobs');
+      
+      res.json({
+        success: true,
+        message: 'Confirmation tracking migration completed successfully',
+        jobsColumns: columns.map(c => c.Field)
+      });
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('❌ Confirmation tracking migration error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Add sample jobs for testing
 app.post('/api/test/add-sample-jobs', async (req, res) => {
   try {
@@ -12976,6 +13078,41 @@ app.put('/api/user/notification-templates', async (req, res) => {
   }
 });
 
+// Update job confirmation status endpoint
+app.patch('/api/jobs/:id/confirmation-status', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { confirmation_sent, confirmation_sent_at, confirmation_email, confirmation_failed, confirmation_error } = req.body;
+    
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({
+        confirmation_sent,
+        confirmation_sent_at,
+        confirmation_email,
+        confirmation_failed,
+        confirmation_error
+      })
+      .eq('id', id)
+      .eq('user_id', req.user.userId);
+
+    if (updateError) {
+      console.error('Error updating confirmation status:', updateError);
+      return res.status(500).json({ error: 'Failed to update confirmation status' });
+    }
+
+    res.json({
+      message: 'Confirmation status updated successfully',
+      confirmation_sent,
+      confirmation_sent_at,
+      confirmation_email
+    });
+  } catch (error) {
+    console.error('Update confirmation status error:', error);
+    res.status(500).json({ error: 'Failed to update confirmation status' });
+  }
+});
+
 // Send appointment notification endpoint
 app.post('/api/send-appointment-notification', authenticateToken, async (req, res) => {
   try {
@@ -13101,6 +13238,25 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
       await sgMail.send(msg);
       console.log('✅ Appointment notification sent successfully');
       
+      // Update job confirmation status if it's a confirmation
+      if (notificationType === 'confirmation' && jobId) {
+        try {
+          await supabase
+            .from('jobs')
+            .update({
+              confirmation_sent: true,
+              confirmation_sent_at: new Date().toISOString(),
+              confirmation_email: customerEmail,
+              confirmation_failed: false,
+              confirmation_error: null
+            })
+            .eq('id', jobId);
+        } catch (updateError) {
+          console.error('Error updating confirmation status:', updateError);
+          // Don't fail the email send if status update fails
+        }
+      }
+      
       res.json({ 
         success: true, 
         message: `${notificationType === 'confirmation' ? 'Confirmation' : 'Reminder'} sent successfully`,
@@ -13110,6 +13266,22 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
       console.error('❌ SendGrid send error:', sendError);
       console.error('❌ Error code:', sendError.code);
       console.error('❌ Error response:', sendError.response?.body);
+      
+      // Update job with failed confirmation status if it's a confirmation
+      if (notificationType === 'confirmation' && jobId) {
+        try {
+          await supabase
+            .from('jobs')
+            .update({
+              confirmation_sent: false,
+              confirmation_failed: true,
+              confirmation_error: sendError.message
+            })
+            .eq('id', jobId);
+        } catch (updateError) {
+          console.error('Error updating failed confirmation status:', updateError);
+        }
+      }
       
       if (sendError.code === 403) {
         return res.status(500).json({ 
