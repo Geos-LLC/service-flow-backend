@@ -2498,6 +2498,25 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               .single();
             
             if (!serviceError && !businessError) {
+              // Check customer notification preferences
+              let emailNotifications = true; // Default to true for backward compatibility
+              let smsNotifications = false;
+              
+              try {
+                const { data: preferences } = await supabase
+                  .from('customer_notification_preferences')
+                  .select('email_notifications, sms_notifications')
+                  .eq('customer_id', result.customer_id)
+                  .single();
+                
+                if (preferences) {
+                  emailNotifications = preferences.email_notifications;
+                  smsNotifications = preferences.sms_notifications;
+                }
+              } catch (prefError) {
+                console.log('No notification preferences found for new customer, using defaults');
+              }
+              
               // Send confirmation email
               const customerName = customerData.first_name && customerData.last_name 
                 ? `${customerData.first_name} ${customerData.last_name}`
@@ -2552,41 +2571,91 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 hour12: true 
               })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe look forward to serving you!\n\nBest regards,\n${businessName}`;
 
-              // Send email using SendGrid
-              const msg = {
-                to: customerData.email,
-                from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-                subject: subject,
-                html: htmlContent,
-                text: textContent
-              };
+              // Send email notification if enabled
+              if (emailNotifications && customerData.email) {
+                const msg = {
+                  to: customerData.email,
+                  from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+                  subject: subject,
+                  html: htmlContent,
+                  text: textContent
+                };
 
-              try {
-                await sgMail.send(msg);
-                console.log('✅ Automatic job confirmation sent successfully to:', customerData.email);
-                
-                // Update job with confirmation status
-                await supabase
-                  .from('jobs')
-                  .update({
-                    confirmation_sent: true,
-                    confirmation_sent_at: new Date().toISOString(),
-                    confirmation_email: customerData.email
-                  })
-                  .eq('id', result.id);
-                
-              } catch (sendError) {
-                console.error('❌ Error sending automatic confirmation:', sendError);
-                
-                // Update job with failed confirmation status
-                await supabase
-                  .from('jobs')
-                  .update({
-                    confirmation_sent: false,
-                    confirmation_failed: true,
-                    confirmation_error: sendError.message
-                  })
-                  .eq('id', result.id);
+                try {
+                  await sgMail.send(msg);
+                  console.log('✅ Automatic job confirmation email sent successfully to:', customerData.email);
+                  
+                  // Update job with confirmation status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      confirmation_sent: true,
+                      confirmation_sent_at: new Date().toISOString(),
+                      confirmation_email: customerData.email
+                    })
+                    .eq('id', result.id);
+                  
+                } catch (sendError) {
+                  console.error('❌ Error sending automatic confirmation email:', sendError);
+                  
+                  // Update job with failed confirmation status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      confirmation_sent: false,
+                      confirmation_failed: true,
+                      confirmation_error: sendError.message
+                    })
+                    .eq('id', result.id);
+                }
+              }
+
+              // Send SMS notification if enabled
+              if (smsNotifications && customerData.phone) {
+                try {
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
+                    weekday: 'long', 
+                    month: 'long', 
+                    day: 'numeric' 
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit',
+                    hour12: true 
+                  })}. We'll see you soon! - ${businessName}`;
+
+                  // Send SMS using Twilio
+                  const smsResult = await twilioClient.messages.create({
+                    body: smsMessage,
+                    from: process.env.TWILIO_PHONE_NUMBER,
+                    to: customerData.phone
+                  });
+
+                  console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
+                  
+                  // Update job with SMS notification status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      sms_sent: true,
+                      sms_sent_at: new Date().toISOString(),
+                      sms_phone: customerData.phone,
+                      sms_sid: smsResult.sid
+                    })
+                    .eq('id', result.id);
+                  
+                } catch (smsError) {
+                  console.error('❌ Error sending automatic confirmation SMS:', smsError);
+                  
+                  // Update job with failed SMS notification status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      sms_sent: false,
+                      sms_failed: true,
+                      sms_error: smsError.message
+                    })
+                    .eq('id', result.id);
+                }
               }
             }
           } else {
@@ -2787,7 +2856,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
           .eq('id', id)
           .single();
 
-        if (!jobError && jobData && jobData.customers && jobData.customers.email) {
+        if (!jobError && jobData && jobData.customers) {
           const customerName = jobData.customers.first_name && jobData.customers.last_name 
             ? `${jobData.customers.first_name} ${jobData.customers.last_name}`
             : jobData.customers.first_name || jobData.customers.last_name || 'Valued Customer';
@@ -2795,6 +2864,25 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
           const serviceName = jobData.services?.name || 'Service';
           const businessName = jobData.users?.business_name || 'Your Service Team';
           const serviceAddress = jobData.service_address || 'Service Location';
+          
+          // Check customer notification preferences
+          let emailNotifications = true; // Default to true for backward compatibility
+          let smsNotifications = false;
+          
+          try {
+            const { data: preferences } = await supabase
+              .from('customer_notification_preferences')
+              .select('email_notifications, sms_notifications')
+              .eq('customer_id', jobData.customer_id)
+              .single();
+            
+            if (preferences) {
+              emailNotifications = preferences.email_notifications;
+              smsNotifications = preferences.sms_notifications;
+            }
+          } catch (prefError) {
+            console.log('No notification preferences found, using defaults');
+          }
           
           let subject, htmlContent, textContent;
           
@@ -2896,41 +2984,99 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
             textContent = `Hi ${customerName},\n\nYour appointment has been cancelled.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe apologize for any inconvenience. Please contact us to reschedule.\n\nBest regards,\n${businessName}`;
           }
 
-          // Send email using SendGrid
-          const msg = {
-            to: jobData.customers.email,
-            from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-            subject: subject,
-            html: htmlContent,
-            text: textContent
-          };
+          // Send email notification if enabled
+          if (emailNotifications && jobData.customers.email) {
+            const msg = {
+              to: jobData.customers.email,
+              from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+              subject: subject,
+              html: htmlContent,
+              text: textContent
+            };
 
-          try {
-            await sgMail.send(msg);
-            console.log(`✅ Automatic ${status} notification sent successfully to:`, jobData.customers.email);
-            
-            // Update job with notification status
-            await supabase
-              .from('jobs')
-              .update({
-                confirmation_sent: true,
-                confirmation_sent_at: new Date().toISOString(),
-                confirmation_email: jobData.customers.email
-              })
-              .eq('id', id);
-            
-          } catch (sendError) {
-            console.error(`❌ Error sending automatic ${status} notification:`, sendError);
-            
-            // Update job with failed notification status
-            await supabase
-              .from('jobs')
-              .update({
-                confirmation_sent: false,
-                confirmation_failed: true,
-                confirmation_error: sendError.message
-              })
-              .eq('id', id);
+            try {
+              await sgMail.send(msg);
+              console.log(`✅ Automatic ${status} email notification sent successfully to:`, jobData.customers.email);
+              
+              // Update job with notification status
+              await supabase
+                .from('jobs')
+                .update({
+                  confirmation_sent: true,
+                  confirmation_sent_at: new Date().toISOString(),
+                  confirmation_email: jobData.customers.email
+                })
+                .eq('id', id);
+              
+            } catch (sendError) {
+              console.error(`❌ Error sending automatic ${status} email notification:`, sendError);
+              
+              // Update job with failed notification status
+              await supabase
+                .from('jobs')
+                .update({
+                  confirmation_sent: false,
+                  confirmation_failed: true,
+                  confirmation_error: sendError.message
+                })
+                .eq('id', id);
+            }
+          }
+
+          // Send SMS notification if enabled
+          if (smsNotifications && jobData.customers.phone) {
+            try {
+              let smsMessage = '';
+              
+              if (status === 'confirmed') {
+                smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(jobData.scheduled_date).toLocaleDateString('en-US', { 
+                  weekday: 'long', 
+                  month: 'long', 
+                  day: 'numeric' 
+                })} at ${new Date(jobData.scheduled_date).toLocaleTimeString('en-US', { 
+                  hour: 'numeric', 
+                  minute: '2-digit',
+                  hour12: true 
+                })}. We'll see you soon! - ${businessName}`;
+              } else if (status === 'completed') {
+                smsMessage = `Hi ${customerName}! Your ${serviceName} service has been completed successfully. Thank you for choosing us! - ${businessName}`;
+              } else if (status === 'cancelled') {
+                smsMessage = `Hi ${customerName}, we're sorry to inform you that your ${serviceName} appointment has been cancelled. Please contact us to reschedule. - ${businessName}`;
+              }
+
+              // Send SMS using Twilio
+              const result = await twilioClient.messages.create({
+                body: smsMessage,
+                from: process.env.TWILIO_PHONE_NUMBER,
+                to: jobData.customers.phone
+              });
+
+              console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', result.sid);
+              
+              // Update job with SMS notification status
+              await supabase
+                .from('jobs')
+                .update({
+                  sms_sent: true,
+                  sms_sent_at: new Date().toISOString(),
+                  sms_phone: jobData.customers.phone,
+                  sms_sid: result.sid
+                })
+                .eq('id', id);
+              
+            } catch (smsError) {
+              console.error(`❌ Error sending automatic ${status} SMS notification:`, smsError);
+              
+              // Update job with failed SMS notification status
+              await supabase
+                .from('jobs')
+                .update({
+                  sms_sent: false,
+                  sms_failed: true,
+                  sms_error: smsError.message
+                })
+                .eq('id', id);
+            }
           }
         }
       } catch (notificationError) {
