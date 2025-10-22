@@ -15020,14 +15020,10 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
 });
 
 // Notification Settings API endpoints
-app.get('/api/user/notification-settings', async (req, res) => {
+app.get('/api/user/notification-settings', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.query;
+    const userId = req.user.userId;
     
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-
     const connection = await pool.getConnection();
     
     try {
