@@ -15421,11 +15421,11 @@ app.get('/api/customers/:customerId/notifications', async (req, res) => {
       .single();
     
     if (error && error.code === 'PGRST116') {
-      // No preferences found, return defaults
+      // No preferences found, return defaults (matching database schema)
       console.log('📧 No preferences found, returning defaults for customer:', customerId);
       return res.json({
-        email_notifications: true,  // Default to true for email
-        sms_notifications: false    // Default to false for SMS
+        email_notifications: false,  // Default to false for email (matching DB schema)
+        sms_notifications: true     // Default to true for SMS (matching DB schema)
       });
     }
     
@@ -15438,11 +15438,20 @@ app.get('/api/customers/:customerId/notifications', async (req, res) => {
     }
     
     console.log('✅ Notification preferences fetched:', preferences);
+    console.log('📧 Raw database values:', {
+      email_notifications: preferences.email_notifications,
+      sms_notifications: preferences.sms_notifications,
+      email_type: typeof preferences.email_notifications,
+      sms_type: typeof preferences.sms_notifications
+    });
     
-    res.json({
+    const response = {
       email_notifications: preferences.email_notifications === true,
       sms_notifications: preferences.sms_notifications === true
-    });
+    };
+    
+    console.log('📧 Sending response:', response);
+    res.json(response);
   } catch (error) {
     console.error('❌ Get customer notification preferences error:', error);
     res.status(500).json({ 
@@ -15459,7 +15468,9 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
     
     console.log('📧 Updating notification preferences for customer:', customerId, {
       email_notifications,
-      sms_notifications
+      sms_notifications,
+      email_type: typeof email_notifications,
+      sms_type: typeof sms_notifications
     });
     
     // First, try to get existing preferences
@@ -15532,11 +15543,20 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
     }
     
     console.log('✅ Notification preferences updated successfully:', preferences);
-    
-    res.json({
+    console.log('📧 Raw saved values:', {
       email_notifications: preferences.email_notifications,
-      sms_notifications: preferences.sms_notifications
+      sms_notifications: preferences.sms_notifications,
+      email_type: typeof preferences.email_notifications,
+      sms_type: typeof preferences.sms_notifications
     });
+    
+    const response = {
+      email_notifications: preferences.email_notifications === true,
+      sms_notifications: preferences.sms_notifications === true
+    };
+    
+    console.log('📧 Sending update response:', response);
+    res.json(response);
   } catch (error) {
     console.error('❌ Update customer notification preferences error:', error);
     res.status(500).json({ 
