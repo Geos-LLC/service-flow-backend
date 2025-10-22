@@ -2483,7 +2483,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             .eq('id', result.customer_id)
             .single();
           
-          if (!customerError && customerData && customerData.email) {
+          if (!customerError && customerData) {
             // Get service and business information
             const { data: serviceData, error: serviceError } = await supabase
               .from('services')
@@ -2573,6 +2573,16 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
 
               // Check if customer has email address
               const hasEmail = customerData.email && customerData.email.trim() !== '';
+              const hasPhone = customerData.phone && customerData.phone.trim() !== '';
+              
+              console.log('📧 Notification check:', {
+                hasEmail,
+                hasPhone,
+                customerEmail: customerData.email,
+                customerPhone: customerData.phone,
+                emailNotifications,
+                smsNotifications
+              });
               
               // Send email notification if customer has email and email notifications are enabled
               if (hasEmail && emailNotifications) {
@@ -2613,8 +2623,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 }
               }
               // If customer has no email, automatically send SMS instead
-              else if (!hasEmail && customerData.phone) {
+              else if (!hasEmail && hasPhone) {
                 console.log('📱 Customer has no email, sending SMS confirmation instead');
+                console.log('📱 SMS details:', {
+                  customerPhone: customerData.phone,
+                  userId: req.user.userId,
+                  serviceName,
+                  scheduledDate: result.scheduled_date
+                });
                 
                 try {
                   const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
@@ -2627,6 +2643,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     hour12: true 
                   })}. We'll see you soon! - ${businessName}`;
 
+                  console.log('📱 Sending SMS message:', smsMessage);
                   const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
                   console.log('✅ Automatic job confirmation SMS sent (no email) to:', customerData.phone, 'SID:', smsResult.sid);
                   
@@ -2644,13 +2661,25 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     .eq('id', result.id);
                   
                 } catch (smsError) {
+                  console.error('❌ SMS sending failed:', smsError);
                   console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
-                  // Continue without failing the job creation
+                  
+                  // Update job with failed SMS status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      sms_sent: false,
+                      sms_failed: true,
+                      sms_error: smsError.message
+                    })
+                    .eq('id', result.id);
                 }
+              } else if (!hasEmail && !hasPhone) {
+                console.log('⚠️ Customer has no email and no phone number - no confirmation sent');
               }
 
               // Send SMS notification if enabled (for customers with email who also want SMS)
-              if (smsNotifications && customerData.phone && hasEmail) {
+              if (smsNotifications && hasPhone && hasEmail) {
                 try {
                   const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
                     weekday: 'long', 
