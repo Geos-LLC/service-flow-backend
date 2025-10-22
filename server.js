@@ -2571,8 +2571,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 hour12: true 
               })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe look forward to serving you!\n\nBest regards,\n${businessName}`;
 
-              // Send email notification if enabled
-              if (emailNotifications && customerData.email) {
+              // Check if customer has email address
+              const hasEmail = customerData.email && customerData.email.trim() !== '';
+              
+              // Send email notification if customer has email and email notifications are enabled
+              if (hasEmail && emailNotifications) {
                 const msg = {
                   to: customerData.email,
                   from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
@@ -2609,9 +2612,45 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     .eq('id', result.id);
                 }
               }
+              // If customer has no email, automatically send SMS instead
+              else if (!hasEmail && customerData.phone) {
+                console.log('📱 Customer has no email, sending SMS confirmation instead');
+                
+                try {
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
+                    weekday: 'long', 
+                    month: 'long', 
+                    day: 'numeric' 
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit',
+                    hour12: true 
+                  })}. We'll see you soon! - ${businessName}`;
 
-              // Send SMS notification if enabled
-              if (smsNotifications && customerData.phone) {
+                  const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
+                  console.log('✅ Automatic job confirmation SMS sent (no email) to:', customerData.phone, 'SID:', smsResult.sid);
+                  
+                  // Update job with SMS confirmation status
+                  await supabase
+                    .from('jobs')
+                    .update({
+                      sms_sent: true,
+                      sms_sent_at: new Date().toISOString(),
+                      sms_phone: customerData.phone,
+                      sms_sid: smsResult.sid,
+                      sms_failed: false,
+                      sms_error: null
+                    })
+                    .eq('id', result.id);
+                  
+                } catch (smsError) {
+                  console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                  // Continue without failing the job creation
+                }
+              }
+
+              // Send SMS notification if enabled (for customers with email who also want SMS)
+              if (smsNotifications && customerData.phone && hasEmail) {
                 try {
                   const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
                     weekday: 'long', 
