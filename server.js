@@ -15415,6 +15415,8 @@ app.get('/api/customers/:customerId/notifications', async (req, res) => {
   try {
     const { customerId } = req.params;
     
+    console.log('📧 Fetching notification preferences for customer:', customerId);
+    
     // Get customer notification preferences from database
     const { data: preferences, error } = await supabase
       .from('customer_notification_preferences')
@@ -15422,18 +15424,35 @@ app.get('/api/customers/:customerId/notifications', async (req, res) => {
       .eq('customer_id', customerId)
       .single();
     
-    if (error) {
-      console.error('Error fetching customer notification preferences:', error);
-      return res.status(404).json({ error: 'Customer notification preferences not found' });
+    if (error && error.code === 'PGRST116') {
+      // No preferences found, return defaults
+      console.log('📧 No preferences found, returning defaults for customer:', customerId);
+      return res.json({
+        email_notifications: true,  // Default to true for email
+        sms_notifications: false    // Default to false for SMS
+      });
     }
     
+    if (error) {
+      console.error('❌ Error fetching customer notification preferences:', error);
+      return res.status(500).json({ 
+        error: 'Failed to fetch notification preferences',
+        details: error.message
+      });
+    }
+    
+    console.log('✅ Notification preferences fetched:', preferences);
+    
     res.json({
-      email_notifications: preferences.email_notifications || false,
-      sms_notifications: preferences.sms_notifications || false
+      email_notifications: preferences.email_notifications === true,
+      sms_notifications: preferences.sms_notifications === true
     });
   } catch (error) {
-    console.error('Get customer notification preferences error:', error);
-    res.status(500).json({ error: 'Failed to fetch notification preferences' });
+    console.error('❌ Get customer notification preferences error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch notification preferences',
+      details: error.message
+    });
   }
 });
 
@@ -15442,29 +15461,92 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
     const { customerId } = req.params;
     const { email_notifications, sms_notifications } = req.body;
     
-    // Update customer notification preferences
-    const { data: preferences, error } = await supabase
+    console.log('📧 Updating notification preferences for customer:', customerId, {
+      email_notifications,
+      sms_notifications
+    });
+    
+    // First, try to get existing preferences
+    const { data: existingPrefs, error: fetchError } = await supabase
       .from('customer_notification_preferences')
-      .upsert({
-        customer_id: customerId,
-        email_notifications: email_notifications || false,
-        sms_notifications: sms_notifications || false
-      })
-      .select()
+      .select('id, email_notifications, sms_notifications')
+      .eq('customer_id', customerId)
       .single();
+
+    let preferences, error;
+
+    if (fetchError && fetchError.code === 'PGRST116') {
+      // No existing preferences, create new
+      console.log('📧 Creating new notification preferences for customer:', customerId);
+      const { data: newPrefs, error: insertError } = await supabase
+        .from('customer_notification_preferences')
+        .insert({
+          customer_id: customerId,
+          email_notifications: email_notifications === true,
+          sms_notifications: sms_notifications === true
+        })
+        .select()
+        .single();
+      
+      preferences = newPrefs;
+      error = insertError;
+    } else if (fetchError) {
+      // Other error
+      preferences = null;
+      error = fetchError;
+    } else {
+      // Update existing preferences
+      console.log('📧 Updating existing notification preferences for customer:', customerId);
+      const { data: updatedPrefs, error: updateError } = await supabase
+        .from('customer_notification_preferences')
+        .update({
+          email_notifications: email_notifications === true,
+          sms_notifications: sms_notifications === true,
+          updated_at: new Date().toISOString()
+        })
+        .eq('customer_id', customerId)
+        .select()
+        .single();
+      
+      preferences = updatedPrefs;
+      error = updateError;
+    }
     
     if (error) {
-      console.error('Error updating customer notification preferences:', error);
-      return res.status(404).json({ error: 'Customer notification preferences not found' });
+      console.error('❌ Error updating customer notification preferences:', error);
+      console.error('Error details:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint
+      });
+      
+      // Check if it's a table doesn't exist error
+      if (error.code === '42P01' || error.message.includes('relation "customer_notification_preferences" does not exist')) {
+        return res.status(500).json({ 
+          error: 'Database table not found. Please run the migration script to create the customer_notification_preferences table.',
+          details: error.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to update notification preferences',
+        details: error.message
+      });
     }
+    
+    console.log('✅ Notification preferences updated successfully:', preferences);
     
     res.json({
       email_notifications: preferences.email_notifications,
       sms_notifications: preferences.sms_notifications
     });
   } catch (error) {
-    console.error('Update customer notification preferences error:', error);
-    res.status(500).json({ error: 'Failed to update notification preferences' });
+    console.error('❌ Update customer notification preferences error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update notification preferences',
+      details: error.message
+    });
   }
 });
 
