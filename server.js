@@ -2499,8 +2499,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             
             if (!serviceError && !businessError) {
               // Check customer notification preferences
-              let emailNotifications = true; // Default to true for backward compatibility
-              let smsNotifications = false;
+              let emailNotifications = false; // Default to false (matches database schema)
+              let smsNotifications = true; // Default to true (matches database schema)
               
               try {
                 const { data: preferences } = await supabase
@@ -2512,9 +2512,40 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 if (preferences) {
                   emailNotifications = preferences.email_notifications;
                   smsNotifications = preferences.sms_notifications;
+                } else {
+                  // Create default preferences for new customer
+                  console.log('📝 Creating default notification preferences for new customer');
+                  const { error: insertError } = await supabase
+                    .from('customer_notification_preferences')
+                    .insert({
+                      customer_id: result.customer_id,
+                      email_notifications: emailNotifications,
+                      sms_notifications: smsNotifications
+                    });
+                  
+                  if (insertError) {
+                    console.error('❌ Error creating customer notification preferences:', insertError);
+                  } else {
+                    console.log('✅ Created default notification preferences for customer');
+                  }
                 }
               } catch (prefError) {
-                console.log('No notification preferences found for new customer, using defaults');
+                console.log('📝 No notification preferences found for new customer, creating defaults');
+                
+                // Create default preferences for new customer
+                const { error: insertError } = await supabase
+                  .from('customer_notification_preferences')
+                  .insert({
+                    customer_id: result.customer_id,
+                    email_notifications: emailNotifications,
+                    sms_notifications: smsNotifications
+                  });
+                
+                if (insertError) {
+                  console.error('❌ Error creating customer notification preferences:', insertError);
+                } else {
+                  console.log('✅ Created default notification preferences for customer');
+                }
               }
               
               // Send confirmation email
@@ -2651,6 +2682,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   await supabase
                     .from('jobs')
                     .update({
+                      confirmation_sent: true,
+                      confirmation_sent_at: new Date().toISOString(),
+                      confirmation_method: 'sms',
                       sms_sent: true,
                       sms_sent_at: new Date().toISOString(),
                       sms_phone: customerData.phone,
@@ -2668,6 +2702,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   await supabase
                     .from('jobs')
                     .update({
+                      confirmation_sent: false,
+                      confirmation_failed: true,
+                      confirmation_error: smsError.message,
                       sms_sent: false,
                       sms_failed: true,
                       sms_error: smsError.message
