@@ -16925,33 +16925,30 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
   }
 });
 
-// Helper function to send SMS using user's Twilio Connect account
+// Helper function to send SMS using user's direct Twilio credentials
 const sendSMSWithUserTwilio = async (userId, to, message) => {
-  // Get user's Twilio Connect account SID
+  // Get user's Twilio credentials
   const { data: userData, error: userError } = await supabase
     .from('users')
-    .select('twilio_connect_account_sid, twilio_connect_status, twilio_notification_phone')
+    .select('twilio_account_sid, twilio_auth_token, twilio_notification_phone')
     .eq('id', userId)
     .single();
   
-  if (userError || !userData?.twilio_connect_account_sid) {
-    throw new Error('Twilio account not connected. Please connect your Twilio account first.');
+  if (userError || !userData?.twilio_account_sid || !userData?.twilio_auth_token) {
+    throw new Error('Twilio not configured. Please set up your Twilio credentials first.');
   }
   
-  if (userData.twilio_connect_status !== 'connected') {
-    throw new Error('Twilio account not active. Please complete the connection process.');
-  }
+  // Create Twilio client with user's credentials
+  const userTwilioClient = require('twilio')(userData.twilio_account_sid, userData.twilio_auth_token);
   
-  // Send SMS using user's connected Twilio account
-  const result = await twilioClient.messages.create({
+  // Send SMS using user's Twilio account
+  const result = await userTwilioClient.messages.create({
     body: message,
-    from: userData.twilio_notification_phone, // User's default Twilio phone number
+    from: userData.twilio_notification_phone,
     to: to
-  }, {
-    accountSid: userData.twilio_connect_account_sid
   });
   
-  console.log('📱 SMS sent via user Twilio Connect:', result.sid);
+  console.log('📱 SMS sent via user Twilio credentials:', result.sid);
   return result;
 };
 
