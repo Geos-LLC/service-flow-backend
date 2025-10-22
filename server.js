@@ -2623,14 +2623,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     hour12: true 
                   })}. We'll see you soon! - ${businessName}`;
 
-                  // Send SMS using Twilio
-                  const smsResult = await twilioClient.messages.create({
-                    body: smsMessage,
-                    from: process.env.TWILIO_PHONE_NUMBER,
-                    to: customerData.phone
-                  });
-
-                  console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
+                  // Send SMS using user's Twilio Connect account
+                  try {
+                    const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
+                    console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
+                  } catch (smsError) {
+                    console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                    // Continue without failing the job creation
+                  }
                   
                   // Update job with SMS notification status
                   await supabase
@@ -3044,14 +3044,14 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
                 smsMessage = `Hi ${customerName}, we're sorry to inform you that your ${serviceName} appointment has been cancelled. Please contact us to reschedule. - ${businessName}`;
               }
 
-              // Send SMS using Twilio
-              const result = await twilioClient.messages.create({
-                body: smsMessage,
-                from: process.env.TWILIO_PHONE_NUMBER,
-                to: jobData.customers.phone
-              });
-
-              console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', result.sid);
+              // Send SMS using user's Twilio Connect account
+              try {
+                const result = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage);
+                console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', result.sid);
+              } catch (smsError) {
+                console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                // Continue without failing the status update
+              }
               
               // Update job with SMS notification status
               await supabase
@@ -16924,6 +16924,36 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
     res.status(500).json({ error: 'Failed to set default phone number' });
   }
 });
+
+// Helper function to send SMS using user's Twilio Connect account
+const sendSMSWithUserTwilio = async (userId, to, message) => {
+  // Get user's Twilio Connect account SID
+  const { data: userData, error: userError } = await supabase
+    .from('users')
+    .select('twilio_connect_account_sid, twilio_connect_status, twilio_notification_phone')
+    .eq('id', userId)
+    .single();
+  
+  if (userError || !userData?.twilio_connect_account_sid) {
+    throw new Error('Twilio account not connected. Please connect your Twilio account first.');
+  }
+  
+  if (userData.twilio_connect_status !== 'connected') {
+    throw new Error('Twilio account not active. Please complete the connection process.');
+  }
+  
+  // Send SMS using user's connected Twilio account
+  const result = await twilioClient.messages.create({
+    body: message,
+    from: userData.twilio_notification_phone, // User's default Twilio phone number
+    to: to
+  }, {
+    accountSid: userData.twilio_connect_account_sid
+  });
+  
+  console.log('📱 SMS sent via user Twilio Connect:', result.sid);
+  return result;
+};
 
 // Twilio SMS endpoints
 app.post('/api/sms/send', authenticateToken, async (req, res) => {
