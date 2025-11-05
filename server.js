@@ -5960,10 +5960,14 @@ app.get('/api/user/availability', authenticateToken, async (req, res) => {
     
     let availabilityInfo, error;
     try {
+      // Look for records with business_hours JSONB populated
+      // The table might have multiple rows per user, but we only want the one with business_hours
       const result = await supabase
         .from('user_availability')
         .select('business_hours, timeslot_templates')
-        .eq('user_id', userIdNum);
+        .eq('user_id', userIdNum)
+        .not('business_hours', 'is', null)
+        .limit(1);
       
       availabilityInfo = result.data;
       error = result.error;
@@ -6112,6 +6116,11 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
     
+    if (!businessHours) {
+      console.error('No businessHours provided for availability update');
+      return res.status(400).json({ error: 'Business hours are required' });
+    }
+    
     console.log('Updating availability for user:', userId, 'Type:', typeof userId);
     
     // Convert userId to number if it's a string
@@ -6122,79 +6131,215 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid user ID', details: `userId: ${userId}` });
     }
     
-    // Check if availability record exists
-    let existingAvailability, checkError;
+    // Convert businessHours and timeslotTemplates to JSONB format
+    // For Supabase JSONB, we should pass the object directly (Supabase handles conversion)
+    // But if it's already a string, parse it first
+    let businessHoursJson;
+    if (typeof businessHours === 'string') {
+      try {
+        businessHoursJson = JSON.parse(businessHours);
+      } catch (e) {
+        businessHoursJson = businessHours; // Keep as string if parsing fails
+      }
+    } else {
+      businessHoursJson = businessHours; // Pass object directly
+    }
+    
+    let timeslotTemplatesJson;
+    if (timeslotTemplates) {
+      if (typeof timeslotTemplates === 'string') {
+        try {
+          timeslotTemplatesJson = JSON.parse(timeslotTemplates);
+        } catch (e) {
+          timeslotTemplatesJson = timeslotTemplates; // Keep as string if parsing fails
+        }
+      } else {
+        timeslotTemplatesJson = timeslotTemplates; // Pass object/array directly
+      }
+    } else {
+      timeslotTemplatesJson = []; // Default to empty array
+    }
+    
+    // Strategy: Check if user has ANY availability record, then update/create accordingly
+    // First, try to find a record with business_hours populated (preferred)
+    // If not found, check if user has ANY record at all
+    // If no records exist, create a new one
+    
+    let existingAvailabilityWithHours, anyExistingRecord, checkError;
+    
     try {
-      const result = await supabase
+      // First, check for record with business_hours
+      const hoursResult = await supabase
         .from('user_availability')
         .select('id')
         .eq('user_id', userIdNum)
+        .not('business_hours', 'is', null)
         .limit(1);
       
-      existingAvailability = result.data;
-      checkError = result.error;
+      existingAvailabilityWithHours = hoursResult.data;
+      checkError = hoursResult.error;
+      
+      // If no record with business_hours, check for ANY record for this user
+      if ((!existingAvailabilityWithHours || existingAvailabilityWithHours.length === 0) && !checkError) {
+        const anyResult = await supabase
+          .from('user_availability')
+          .select('id, day_of_week, start_time')
+          .eq('user_id', userIdNum)
+          .limit(1);
+        
+        anyExistingRecord = anyResult.data;
+        if (anyResult.error && !checkError) {
+          checkError = anyResult.error;
+        }
+      }
     } catch (dbError) {
       console.error('Database query error:', dbError);
       return res.status(500).json({ 
         error: 'Database query failed', 
-        details: dbError.message
+        details: dbError.message,
+        type: dbError.constructor.name
       });
     }
     
     if (checkError) {
       console.error('Error checking existing availability:', checkError);
       console.error('Error code:', checkError.code, 'Error message:', checkError.message);
-      return res.status(500).json({ 
-        error: 'Failed to check existing availability',
-        details: checkError.message,
-        code: checkError.code
-      });
+      
+      // If it's a column error, try to insert anyway
+      if (checkError.code === '42703' || checkError.message?.includes('column')) {
+        console.warn('⚠️ Column error detected, attempting to insert new record');
+      } else {
+        return res.status(500).json({ 
+          error: 'Failed to check existing availability',
+          details: checkError.message,
+          code: checkError.code
+        });
+      }
     }
     
-    if (existingAvailability && existingAvailability.length > 0) {
-      // Update existing availability
+    // Determine which record to update, or if we need to create
+    const hasRecordWithHours = existingAvailabilityWithHours && existingAvailabilityWithHours.length > 0;
+    const hasAnyRecord = anyExistingRecord && anyExistingRecord.length > 0;
+    
+    if (hasRecordWithHours) {
+      // Update existing record that has business_hours
       const { error: updateError } = await supabase
         .from('user_availability')
         .update({
-          business_hours: JSON.stringify(businessHours),
-          timeslot_templates: JSON.stringify(timeslotTemplates)
+          business_hours: businessHoursJson,
+          timeslot_templates: timeslotTemplatesJson,
+          updated_at: new Date().toISOString()
         })
-        .eq('user_id', userIdNum);
+        .eq('user_id', userIdNum)
+        .not('business_hours', 'is', null);
       
       if (updateError) {
         console.error('Error updating availability:', updateError);
         console.error('Error code:', updateError.code, 'Error message:', updateError.message);
+        console.error('Error details:', updateError.details, 'Error hint:', updateError.hint);
         return res.status(500).json({ 
           error: 'Failed to update availability',
           details: updateError.message,
-          code: updateError.code
+          code: updateError.code,
+          hint: updateError.hint
         });
       }
-    } else {
-      // Create new availability record
-      const { error: insertError } = await supabase
+      
+      console.log('✅ Successfully updated availability (with hours) for user:', userIdNum);
+    } else if (hasAnyRecord) {
+      // User has records but none have business_hours - update the first one
+      const firstRecord = anyExistingRecord[0];
+      const { error: updateError } = await supabase
         .from('user_availability')
-        .insert({
-          user_id: userIdNum,
-          business_hours: JSON.stringify(businessHours),
-          timeslot_templates: JSON.stringify(timeslotTemplates)
-        });
+        .update({
+          business_hours: businessHoursJson,
+          timeslot_templates: timeslotTemplatesJson,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', firstRecord.id);
+      
+      if (updateError) {
+        console.error('Error updating existing availability record:', updateError);
+        console.error('Error code:', updateError.code, 'Error message:', updateError.message);
+        // If update fails, try to create a new one instead
+        console.warn('⚠️ Update failed, attempting to create new record');
+        // Fall through to create logic
+      } else {
+        console.log('✅ Successfully updated existing availability record for user:', userIdNum);
+        return res.json({ message: 'Availability updated successfully' });
+      }
+    }
+    
+    // If we get here, either no records exist or update failed - create new record
+    if (!hasRecordWithHours && (!hasAnyRecord || !hasRecordWithHours)) {
+      // Create new availability record
+      // Use placeholder values for required fields (day_of_week, start_time, end_time)
+      // The unique constraint is on (user_id, day_of_week, start_time)
+      const insertData = {
+        user_id: userIdNum,
+        day_of_week: 0, // Placeholder - required field (0 = Sunday, but we'll use JSONB for actual data)
+        start_time: '00:00:00', // Placeholder - required field
+        end_time: '00:00:00', // Placeholder - required field
+        is_available: true, // Required field
+        business_hours: businessHoursJson,
+        timeslot_templates: timeslotTemplatesJson
+      };
+      
+      const { error: insertError, data: insertDataResult } = await supabase
+        .from('user_availability')
+        .insert(insertData)
+        .select();
       
       if (insertError) {
         console.error('Error creating availability:', insertError);
         console.error('Error code:', insertError.code, 'Error message:', insertError.message);
-        return res.status(500).json({ 
-          error: 'Failed to create availability',
-          details: insertError.message,
-          code: insertError.code
-        });
+        console.error('Error details:', insertError.details, 'Error hint:', insertError.hint);
+        
+        // If unique constraint violation, try to update instead
+        if (insertError.code === '23505' || insertError.message?.includes('unique')) {
+          console.warn('⚠️ Unique constraint violation, attempting to update existing record');
+          const { error: updateError } = await supabase
+            .from('user_availability')
+            .update({
+              business_hours: businessHoursJson,
+              timeslot_templates: timeslotTemplatesJson,
+              updated_at: new Date().toISOString()
+            })
+            .eq('user_id', userIdNum)
+            .eq('day_of_week', 0)
+            .eq('start_time', '00:00:00');
+          
+          if (updateError) {
+            return res.status(500).json({ 
+              error: 'Failed to update availability after insert conflict',
+              details: updateError.message,
+              code: updateError.code
+            });
+          }
+          
+          console.log('✅ Successfully updated availability after insert conflict for user:', userIdNum);
+        } else {
+          return res.status(500).json({ 
+            error: 'Failed to create availability',
+            details: insertError.message,
+            code: insertError.code,
+            hint: insertError.hint
+          });
+        }
+      } else {
+        console.log('✅ Successfully created new availability record for user:', userIdNum);
       }
     }
     
     res.json({ message: 'Availability updated successfully' });
   } catch (error) {
     console.error('Update availability error:', error);
-    res.status(500).json({ error: 'Failed to update availability' });
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Failed to update availability',
+      details: error.message,
+      type: error.constructor.name
+    });
   }
 });
 
