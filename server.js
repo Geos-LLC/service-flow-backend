@@ -5948,16 +5948,95 @@ app.get('/api/user/availability', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
     
-    console.log('Fetching availability for user:', userId);
+    console.log('Fetching availability for user:', userId, 'Type:', typeof userId);
     
-    const { data: availabilityInfo, error } = await supabase
-      .from('user_availability')
-      .select('business_hours, timeslot_templates')
-      .eq('user_id', userId);
+    // Convert userId to number if it's a string
+    const userIdNum = typeof userId === 'string' ? parseInt(userId, 10) : userId;
+    
+    if (isNaN(userIdNum)) {
+      console.error('Invalid userId:', userId);
+      return res.status(400).json({ error: 'Invalid user ID', details: `userId: ${userId}` });
+    }
+    
+    let availabilityInfo, error;
+    try {
+      const result = await supabase
+        .from('user_availability')
+        .select('business_hours, timeslot_templates')
+        .eq('user_id', userIdNum);
+      
+      availabilityInfo = result.data;
+      error = result.error;
+      
+      // Check if error is due to missing table or columns (PGRST116, PGRST103, 42703)
+      if (error && (
+        error.code === 'PGRST116' || 
+        error.code === 'PGRST103' ||
+        error.code === '42703' ||
+        error.message?.includes('relation') || 
+        error.message?.includes('does not exist') ||
+        error.message?.includes('column') ||
+        error.message?.includes('business_hours') ||
+        error.message?.includes('timeslot_templates')
+      )) {
+        console.warn('⚠️ user_availability table may have wrong structure or missing columns, returning default hours');
+        console.warn('Error details:', error.code, error.message);
+        // Return default hours instead of error
+        return res.json({
+          businessHours: {
+            monday: { start: '09:00', end: '17:00', enabled: true },
+            tuesday: { start: '09:00', end: '17:00', enabled: true },
+            wednesday: { start: '09:00', end: '17:00', enabled: true },
+            thursday: { start: '09:00', end: '17:00', enabled: true },
+            friday: { start: '09:00', end: '17:00', enabled: true },
+            saturday: { start: '09:00', end: '17:00', enabled: false },
+            sunday: { start: '09:00', end: '17:00', enabled: false }
+          },
+          timeslotTemplates: []
+        });
+      }
+    } catch (dbError) {
+      console.error('Database query error:', dbError);
+      console.error('Error type:', dbError.constructor.name);
+      console.error('Error message:', dbError.message);
+      return res.status(500).json({ 
+        error: 'Database query failed', 
+        details: dbError.message,
+        type: dbError.constructor.name,
+        stack: process.env.NODE_ENV === 'development' ? dbError.stack : undefined
+      });
+    }
     
     if (error) {
-      console.error('Error fetching availability info:', error);
-      return res.status(500).json({ error: 'Failed to fetch availability information', details: error.message });
+      console.error('Supabase error fetching availability info:', error);
+      console.error('Error code:', error.code);
+      console.error('Error message:', error.message);
+      console.error('Error details:', error.details);
+      console.error('Error hint:', error.hint);
+      
+      // If it's a permission/RLS error, return default instead of error
+      if (error.code === '42501' || error.message?.includes('permission') || error.message?.includes('policy')) {
+        console.warn('⚠️ RLS policy may be blocking access, returning default hours');
+        return res.json({
+          businessHours: {
+            monday: { start: '09:00', end: '17:00', enabled: true },
+            tuesday: { start: '09:00', end: '17:00', enabled: true },
+            wednesday: { start: '09:00', end: '17:00', enabled: true },
+            thursday: { start: '09:00', end: '17:00', enabled: true },
+            friday: { start: '09:00', end: '17:00', enabled: true },
+            saturday: { start: '09:00', end: '17:00', enabled: false },
+            sunday: { start: '09:00', end: '17:00', enabled: false }
+          },
+          timeslotTemplates: []
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch availability information', 
+        details: error.message,
+        code: error.code,
+        hint: error.hint
+      });
     }
     
     if (!availabilityInfo || availabilityInfo.length === 0) {
@@ -6013,7 +6092,12 @@ app.get('/api/user/availability', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Get availability error:', error);
-    res.status(500).json({ error: 'Failed to fetch availability information' });
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Failed to fetch availability information',
+      details: error.message,
+      type: error.constructor.name
+    });
   }
 });
 
@@ -6028,18 +6112,43 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
     
-    console.log('Updating availability for user:', userId);
+    console.log('Updating availability for user:', userId, 'Type:', typeof userId);
+    
+    // Convert userId to number if it's a string
+    const userIdNum = typeof userId === 'string' ? parseInt(userId, 10) : userId;
+    
+    if (isNaN(userIdNum)) {
+      console.error('Invalid userId:', userId);
+      return res.status(400).json({ error: 'Invalid user ID', details: `userId: ${userId}` });
+    }
     
     // Check if availability record exists
-    const { data: existingAvailability, error: checkError } = await supabase
-      .from('user_availability')
-      .select('id')
-      .eq('user_id', userId)
-      .limit(1);
+    let existingAvailability, checkError;
+    try {
+      const result = await supabase
+        .from('user_availability')
+        .select('id')
+        .eq('user_id', userIdNum)
+        .limit(1);
+      
+      existingAvailability = result.data;
+      checkError = result.error;
+    } catch (dbError) {
+      console.error('Database query error:', dbError);
+      return res.status(500).json({ 
+        error: 'Database query failed', 
+        details: dbError.message
+      });
+    }
     
     if (checkError) {
       console.error('Error checking existing availability:', checkError);
-      return res.status(500).json({ error: 'Failed to check existing availability' });
+      console.error('Error code:', checkError.code, 'Error message:', checkError.message);
+      return res.status(500).json({ 
+        error: 'Failed to check existing availability',
+        details: checkError.message,
+        code: checkError.code
+      });
     }
     
     if (existingAvailability && existingAvailability.length > 0) {
@@ -6050,25 +6159,35 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
           business_hours: JSON.stringify(businessHours),
           timeslot_templates: JSON.stringify(timeslotTemplates)
         })
-        .eq('user_id', userId);
+        .eq('user_id', userIdNum);
       
       if (updateError) {
         console.error('Error updating availability:', updateError);
-        return res.status(500).json({ error: 'Failed to update availability' });
+        console.error('Error code:', updateError.code, 'Error message:', updateError.message);
+        return res.status(500).json({ 
+          error: 'Failed to update availability',
+          details: updateError.message,
+          code: updateError.code
+        });
       }
     } else {
       // Create new availability record
       const { error: insertError } = await supabase
         .from('user_availability')
         .insert({
-          user_id: userId,
+          user_id: userIdNum,
           business_hours: JSON.stringify(businessHours),
           timeslot_templates: JSON.stringify(timeslotTemplates)
         });
       
       if (insertError) {
         console.error('Error creating availability:', insertError);
-        return res.status(500).json({ error: 'Failed to create availability' });
+        console.error('Error code:', insertError.code, 'Error message:', insertError.message);
+        return res.status(500).json({ 
+          error: 'Failed to create availability',
+          details: insertError.message,
+          code: insertError.code
+        });
       }
     }
     
