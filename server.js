@@ -5938,9 +5938,17 @@ app.post('/api/user/billing/cancel-subscription', async (req, res) => {
 });
 
 // Availability endpoints
-app.get('/api/user/availability', async (req, res) => {
+app.get('/api/user/availability', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.query;
+    // Use authenticated user's ID from token instead of query parameter
+    const userId = req.user?.userId || req.query?.userId;
+    
+    if (!userId) {
+      console.error('No userId provided for availability fetch');
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+    
+    console.log('Fetching availability for user:', userId);
     
     const { data: availabilityInfo, error } = await supabase
       .from('user_availability')
@@ -5949,7 +5957,7 @@ app.get('/api/user/availability', async (req, res) => {
     
     if (error) {
       console.error('Error fetching availability info:', error);
-      return res.status(500).json({ error: 'Failed to fetch availability information' });
+      return res.status(500).json({ error: 'Failed to fetch availability information', details: error.message });
     }
     
     if (!availabilityInfo || availabilityInfo.length === 0) {
@@ -5968,9 +5976,40 @@ app.get('/api/user/availability', async (req, res) => {
     }
     
     const availability = availabilityInfo[0];
+    
+    // Parse business_hours safely
+    let businessHours = {};
+    try {
+      if (availability.business_hours) {
+        if (typeof availability.business_hours === 'string') {
+          businessHours = JSON.parse(availability.business_hours);
+        } else {
+          businessHours = availability.business_hours;
+        }
+      }
+    } catch (parseError) {
+      console.error('Error parsing business_hours:', parseError);
+      businessHours = {};
+    }
+    
+    // Parse timeslot_templates safely
+    let timeslotTemplates = [];
+    try {
+      if (availability.timeslot_templates) {
+        if (typeof availability.timeslot_templates === 'string') {
+          timeslotTemplates = JSON.parse(availability.timeslot_templates);
+        } else {
+          timeslotTemplates = availability.timeslot_templates;
+        }
+      }
+    } catch (parseError) {
+      console.error('Error parsing timeslot_templates:', parseError);
+      timeslotTemplates = [];
+    }
+    
     res.json({
-      businessHours: JSON.parse(availability.business_hours || '{}'),
-      timeslotTemplates: JSON.parse(availability.timeslot_templates || '[]')
+      businessHours: businessHours,
+      timeslotTemplates: timeslotTemplates
     });
   } catch (error) {
     console.error('Get availability error:', error);
@@ -5978,9 +6017,18 @@ app.get('/api/user/availability', async (req, res) => {
   }
 });
 
-app.put('/api/user/availability', async (req, res) => {
+app.put('/api/user/availability', authenticateToken, async (req, res) => {
   try {
-    const { userId, businessHours, timeslotTemplates } = req.body;
+    // Use authenticated user's ID from token instead of body
+    const userId = req.user?.userId || req.body?.userId;
+    const { businessHours, timeslotTemplates } = req.body;
+    
+    if (!userId) {
+      console.error('No userId provided for availability update');
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+    
+    console.log('Updating availability for user:', userId);
     
     // Check if availability record exists
     const { data: existingAvailability, error: checkError } = await supabase
