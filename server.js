@@ -4041,6 +4041,133 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
   }
 });
 
+// Get available time slots for scheduling
+app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { date, duration = 120, workerId, serviceId } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date parameter is required' });
+    }
+
+    // Parse the date
+    const requestedDate = new Date(date);
+    if (isNaN(requestedDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+
+    // Convert duration to integer
+    const durationMinutes = parseInt(duration);
+
+    // Get business hours (TODO: Fetch from business settings table)
+    const businessStartHour = 9; // 9 AM
+    const businessEndHour = 17; // 5 PM
+    const slotInterval = 60; // 60 minutes between slot starts
+
+    // Get all jobs for the requested date
+    const { data: existingJobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select('scheduled_time, duration, team_member_id, status')
+      .eq('user_id', userId)
+      .eq('scheduled_date', date)
+      .not('status', 'in', '(cancelled)'); // Exclude cancelled jobs
+
+    if (jobsError) {
+      console.error('Error fetching existing jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch existing jobs' });
+    }
+
+    // Get all team members (or specific worker if provided)
+    let teamMembersQuery = supabase
+      .from('team_members')
+      .select('id, first_name, last_name')
+      .eq('user_id', userId)
+      .eq('status', 'active');
+
+    if (workerId) {
+      teamMembersQuery = teamMembersQuery.eq('id', workerId);
+    }
+
+    const { data: teamMembers, error: teamError } = await teamMembersQuery;
+
+    if (teamError) {
+      console.error('Error fetching team members:', teamError);
+      return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    // Helper function to check if a time slot overlaps with existing jobs
+    const isSlotAvailable = (slotStartTime, slotEndTime, workerId) => {
+      const slotStart = new Date(`${date}T${slotStartTime}`);
+      const slotEnd = new Date(`${date}T${slotEndTime}`);
+
+      for (const job of existingJobs) {
+        // Skip if checking for specific worker and this job is assigned to different worker
+        if (workerId && job.team_member_id && job.team_member_id !== workerId) {
+          continue;
+        }
+
+        const jobStart = new Date(`${date}T${job.scheduled_time}`);
+        const jobEnd = new Date(jobStart.getTime() + (job.duration || durationMinutes) * 60000);
+
+        // Check for overlap
+        if (slotStart < jobEnd && slotEnd > jobStart) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    // Generate time slots
+    const slots = [];
+    for (let hour = businessStartHour; hour < businessEndHour; hour++) {
+      for (let minute = 0; minute < 60; minute += slotInterval) {
+        const slotStartTime = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}:00`;
+        const slotStartDate = new Date(`${date}T${slotStartTime}`);
+        const slotEndDate = new Date(slotStartDate.getTime() + durationMinutes * 60000);
+        
+        // Skip if slot would extend beyond business hours
+        if (slotEndDate.getHours() >= businessEndHour && slotEndDate.getMinutes() > 0) {
+          continue;
+        }
+
+        const slotEndTime = `${slotEndDate.getHours().toString().padStart(2, '0')}:${slotEndDate.getMinutes().toString().padStart(2, '0')}:00`;
+
+        // Count available workers for this slot
+        let availableWorkers = 0;
+        
+        if (workerId) {
+          // Check specific worker
+          if (isSlotAvailable(slotStartTime, slotEndTime, workerId)) {
+            availableWorkers = 1;
+          }
+        } else {
+          // Count all available workers
+          for (const worker of teamMembers) {
+            if (isSlotAvailable(slotStartTime, slotEndTime, worker.id)) {
+              availableWorkers++;
+            }
+          }
+        }
+
+        // Only include slot if at least one worker is available
+        if (availableWorkers > 0) {
+          slots.push({
+            time: slotStartTime.substring(0, 5), // Format as HH:MM
+            endTime: slotEndTime.substring(0, 5), // Format as HH:MM
+            availableWorkers: availableWorkers
+          });
+        }
+      }
+    }
+
+    res.json({ slots });
+  } catch (error) {
+    console.error('Error fetching available slots:', error);
+    res.status(500).json({ error: 'Failed to fetch available slots' });
+  }
+});
+
 // Customer import/export endpoints
 app.post('/api/customers/import', authenticateToken, async (req, res) => {
   try {
