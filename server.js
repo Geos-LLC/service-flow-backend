@@ -1214,7 +1214,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
 // Services endpoints
 app.get('/api/services', async (req, res) => {
   try {
-    const { userId, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
+    const { userId, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC', includeInactive } = req.query;
     
     
     // Build Supabase query
@@ -1222,6 +1222,12 @@ app.get('/api/services', async (req, res) => {
       .from('services')
       .select('*', { count: 'exact' })
       .eq('user_id', userId);
+    
+    // Filter out inactive services by default (unless includeInactive is true)
+    // This ensures inactive services don't show in active services list, but can still be accessed by ID for jobs
+    if (includeInactive !== 'true') {
+      query = query.eq('is_active', true);
+    }
     
     // Add search filter
     if (search) {
@@ -1435,7 +1441,8 @@ app.post('/api/services', authenticateToken, async (req, res) => {
         modifiers: modifiersToStore,
         intake_questions: intake_questions,
         require_payment_method: require_payment_method || false,
-        image: image
+        image: image,
+        is_active: true // New services are active by default
       })
       .select()
       .single();
@@ -1581,30 +1588,16 @@ app.delete('/api/services/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Service not found' });
     }
     
-    // Check if service is being used in any jobs
-    const { count: jobsUsingService, error: countError } = await supabase
-      .from('jobs')
-      .select('*', { count: 'exact', head: true })
-      .eq('service_id', id);
-    
-    if (countError) {
-      console.error('Error checking jobs using service:', countError);
-      return res.status(500).json({ error: 'Failed to delete service' });
-    }
-    
-    if (jobsUsingService > 0) {
-      return res.status(400).json({ error: 'Cannot delete service that is being used in jobs' });
-    }
-    
-    // Delete service
-    const { error: deleteError } = await supabase
+    // Mark service as inactive instead of deleting
+    // This allows the service to remain associated with jobs while hiding it from active services list
+    const { error: updateError } = await supabase
       .from('services')
-      .delete()
+      .update({ is_active: false })
       .eq('id', id)
       .eq('user_id', userId);
     
-    if (deleteError) {
-      console.error('Error deleting service:', deleteError);
+    if (updateError) {
+      console.error('Error marking service as inactive:', updateError);
       return res.status(500).json({ error: 'Failed to delete service' });
     }
     
@@ -2020,7 +2013,7 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
     // Get business hours (TODO: Fetch from business settings table)
     const businessStartHour = 9; // 9 AM
     const businessEndHour = 17; // 5 PM
-    const slotInterval = 60; // 60 minutes between slot starts
+    const slotInterval = 30; // 30 minutes between slot starts for flexibility
 
     // Get all jobs for the requested date
     const { data: existingJobs, error: jobsError } = await supabase
@@ -2075,47 +2068,62 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       return true;
     };
 
-    // Generate time slots
+    // Generate time slots with 30-minute intervals
     const slots = [];
-    for (let hour = businessStartHour; hour < businessEndHour; hour++) {
-      for (let minute = 0; minute < 60; minute += slotInterval) {
-        const slotStartTime = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}:00`;
-        const slotStartDate = new Date(`${date}T${slotStartTime}`);
-        const slotEndDate = new Date(slotStartDate.getTime() + durationMinutes * 60000);
-        
-        // Skip if slot would extend beyond business hours
-        if (slotEndDate.getHours() >= businessEndHour && slotEndDate.getMinutes() > 0) {
-          continue;
+    
+    // Start from business hours and create 30-minute interval slots
+    let currentMinutes = businessStartHour * 60; // Convert to minutes from midnight
+    const endMinutes = businessEndHour * 60;
+    
+    while (currentMinutes < endMinutes) {
+      const slotHour = Math.floor(currentMinutes / 60);
+      const slotMinute = currentMinutes % 60;
+      const slotStartTime = `${slotHour.toString().padStart(2, '0')}:${slotMinute.toString().padStart(2, '0')}:00`;
+      
+      const slotStartDate = new Date(`${date}T${slotStartTime}`);
+      const slotEndDate = new Date(slotStartDate.getTime() + durationMinutes * 60000);
+      
+      // Calculate end time in minutes
+      const slotEndMinutes = currentMinutes + durationMinutes;
+      
+      // Skip if slot would extend beyond business hours
+      if (slotEndMinutes > endMinutes) {
+        currentMinutes += slotInterval;
+        continue;
+      }
+
+      const slotEndHour = Math.floor(slotEndMinutes / 60);
+      const slotEndMinute = slotEndMinutes % 60;
+      const slotEndTime = `${slotEndHour.toString().padStart(2, '0')}:${slotEndMinute.toString().padStart(2, '0')}:00`;
+
+      // Count available workers for this slot
+      let availableWorkers = 0;
+      
+      if (workerId) {
+        // Check specific worker
+        if (isSlotAvailable(slotStartTime, slotEndTime, workerId)) {
+          availableWorkers = 1;
         }
-
-        const slotEndTime = `${slotEndDate.getHours().toString().padStart(2, '0')}:${slotEndDate.getMinutes().toString().padStart(2, '0')}:00`;
-
-        // Count available workers for this slot
-        let availableWorkers = 0;
-        
-        if (workerId) {
-          // Check specific worker
-          if (isSlotAvailable(slotStartTime, slotEndTime, workerId)) {
-            availableWorkers = 1;
+      } else {
+        // Count all available workers
+        for (const worker of teamMembers) {
+          if (isSlotAvailable(slotStartTime, slotEndTime, worker.id)) {
+            availableWorkers++;
           }
-        } else {
-          // Count all available workers
-          for (const worker of teamMembers) {
-            if (isSlotAvailable(slotStartTime, slotEndTime, worker.id)) {
-              availableWorkers++;
-            }
-          }
-        }
-
-        // Only include slot if at least one worker is available
-        if (availableWorkers > 0) {
-          slots.push({
-            time: slotStartTime.substring(0, 5), // Format as HH:MM
-            endTime: slotEndTime.substring(0, 5), // Format as HH:MM
-            availableWorkers: availableWorkers
-          });
         }
       }
+
+      // Only include slot if at least one worker is available
+      if (availableWorkers > 0) {
+        slots.push({
+          time: slotStartTime.substring(0, 5), // Format as HH:MM
+          endTime: slotEndTime.substring(0, 5), // Format as HH:MM
+          availableWorkers: availableWorkers
+        });
+      }
+      
+      // Move to next 30-minute interval
+      currentMinutes += slotInterval;
     }
 
     res.json({ slots });
