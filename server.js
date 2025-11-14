@@ -4004,33 +4004,114 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       const job = jobs[i];
       
       try {
-        // Validate required fields
-        if (!job.customerId && !job.customerEmail) {
-          results.errors.push(`Row ${i + 1}: Customer ID or email is required`);
+        // Validate required fields - need customer ID, email, or name
+        if (!job.customerId && !job.customerEmail && !job.customerName) {
+          results.errors.push(`Row ${i + 1}: Customer ID, email, or name is required`);
           results.skipped++;
           continue;
         }
 
-        // Find customer by ID or email
+        // Find or create customer
         let customerId = job.customerId;
-        if (!customerId && job.customerEmail) {
-          const { data: customer } = await supabase
-            .from('customers')
-            .select('id')
-            .eq('user_id', userId)
-            .eq('email', job.customerEmail)
-            .single();
+        
+        if (!customerId) {
+          let customer = null;
           
-          if (customer) {
-            customerId = customer.id;
+          // First, try to find by email if provided
+          if (job.customerEmail) {
+            const { data: foundCustomer, error: emailError } = await supabase
+              .from('customers')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('email', job.customerEmail.toLowerCase().trim())
+              .maybeSingle();
+            
+            if (!emailError && foundCustomer) {
+              customer = foundCustomer;
+            }
+          }
+          
+          // If not found by email, try to find by phone first (more reliable)
+          if (!customer && job.customerPhone) {
+            const phoneDigits = job.customerPhone.replace(/\D/g, '');
+            if (phoneDigits.length >= 10) {
+              // Try to match by phone - use ilike for partial matches
+              const { data: phoneMatches, error: phoneError } = await supabase
+                .from('customers')
+                .select('id')
+                .eq('user_id', userId)
+                .ilike('phone', `%${phoneDigits.slice(-10)}%`);
+              
+              if (!phoneError && phoneMatches && phoneMatches.length > 0) {
+                customer = phoneMatches[0]; // Take first match
+              }
+            }
+          }
+          
+          // If not found by email or phone, try to find by name
+          if (!customer && job.customerName) {
+            // Parse customer name into first and last name
+            const nameParts = job.customerName.trim().split(/\s+/);
+            const firstName = nameParts[0] || '';
+            const lastName = nameParts.slice(1).join(' ') || '';
+            
+            if (firstName) {
+              // Try to find by first and last name
+              let query = supabase
+                .from('customers')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('first_name', firstName);
+              
+              if (lastName) {
+                query = query.eq('last_name', lastName);
+              }
+              
+              const { data: nameMatches, error: nameError } = await query;
+              
+              if (!nameError && nameMatches && nameMatches.length > 0) {
+                customer = nameMatches[0]; // Take first match
+              }
+            }
+          }
+          
+          // If customer still not found, create a new customer
+          if (!customer) {
+            const nameParts = (job.customerName || '').trim().split(/\s+/);
+            const firstName = nameParts[0] || 'Unknown';
+            const lastName = nameParts.slice(1).join(' ') || '';
+            
+            const newCustomer = {
+              user_id: userId,
+              first_name: sanitizeInput(firstName),
+              last_name: sanitizeInput(lastName),
+              email: job.customerEmail ? job.customerEmail.toLowerCase().trim() : null,
+              phone: job.customerPhone ? job.customerPhone.trim() : null,
+              address: job.serviceAddress || null,
+              city: job.serviceAddressCity || null,
+              state: job.serviceAddressState || null,
+              zip_code: job.serviceAddressZip || null
+            };
+            
+            const { data: createdCustomer, error: createError } = await supabase
+              .from('customers')
+              .insert(newCustomer)
+              .select('id')
+              .single();
+            
+            if (createError) {
+              results.errors.push(`Row ${i + 1}: Failed to create customer - ${createError.message}`);
+              results.skipped++;
+              continue;
+            }
+            
+            customerId = createdCustomer.id;
           } else {
-            results.errors.push(`Row ${i + 1}: Customer with email ${job.customerEmail} not found`);
-            results.skipped++;
-            continue;
+            customerId = customer.id;
           }
         }
 
-        // Find service by name if provided
+        // Find or create service by name if provided
         let serviceId = job.serviceId;
         if (!serviceId && job.serviceName) {
           const { data: service } = await supabase
@@ -4042,6 +4123,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           if (service) {
             serviceId = service.id;
+          } else {
+            // Service not found - create it
+            const newService = {
+              user_id: userId,
+              name: sanitizeInput(job.serviceName),
+              description: null,
+              price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+              duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
+              category: null,
+              modifiers: null,
+              intake_questions: null,
+              is_active: true
+            };
+            
+            const { data: createdService, error: createServiceError } = await supabase
+              .from('services')
+              .insert(newService)
+              .select('id')
+              .single();
+            
+            if (createServiceError) {
+              console.error(`Row ${i + 1}: Failed to create service ${job.serviceName}:`, createServiceError);
+              // Continue without service ID - job can still be created
+            } else {
+              serviceId = createdService.id;
+            }
           }
         }
 
@@ -4072,15 +4179,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
 
         // Check for duplicate jobs (same customer, service, and scheduled date)
         if (job.scheduledDate) {
-          const { data: existingJob } = await supabase
+          const { data: existingJob, error: duplicateError } = await supabase
             .from('jobs')
             .select('id')
             .eq('user_id', userId)
             .eq('customer_id', customerId)
             .eq('scheduled_date', job.scheduledDate)
-            .single();
+            .maybeSingle();
           
-          if (existingJob) {
+          if (!duplicateError && existingJob) {
             results.errors.push(`Row ${i + 1}: Job already exists for this customer on ${job.scheduledDate}`);
             results.skipped++;
             continue;
