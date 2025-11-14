@@ -4004,6 +4004,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       const job = jobs[i];
       
       try {
+        // Log first job for debugging
+        if (i === 0) {
+          console.log('📥 Backend received job:', JSON.stringify(job, null, 2));
+        }
+        
         // Validate required fields - need customer ID, email, or name
         if (!job.customerId && !job.customerEmail && !job.customerName) {
           results.errors.push(`Row ${i + 1}: Customer ID, email, or name is required`);
@@ -4114,14 +4119,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // Find or create service by name if provided
         let serviceId = job.serviceId;
         if (!serviceId && job.serviceName) {
-          const { data: service } = await supabase
+          const { data: service, error: serviceError } = await supabase
             .from('services')
             .select('id')
             .eq('user_id', userId)
             .eq('name', job.serviceName)
-            .single();
+            .maybeSingle();
           
-          if (service) {
+          if (!serviceError && service) {
             serviceId = service.id;
           } else {
             // Service not found - create it
@@ -4145,6 +4150,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             if (createServiceError) {
               console.error(`Row ${i + 1}: Failed to create service ${job.serviceName}:`, createServiceError);
+              results.errors.push(`Row ${i + 1}: Failed to create service "${job.serviceName}" - ${createServiceError.message}`);
               // Continue without service ID - job can still be created
             } else {
               serviceId = createdService.id;
