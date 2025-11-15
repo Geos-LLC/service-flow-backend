@@ -4000,13 +4000,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       errors: []
     };
 
+    console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
+    
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       
       try {
-        // Log first job for debugging
-        if (i === 0) {
-          console.log('📥 Backend received job:', JSON.stringify(job, null, 2));
+        // Log every 10th job for debugging
+        if (i === 0 || (i + 1) % 10 === 0) {
+          console.log(`📥 Processing job ${i + 1}/${jobs.length}:`, job.customerName, job.serviceName);
         }
         
         // Validate required fields - need customer ID, email, or name
@@ -4021,9 +4023,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         
         if (!customerId) {
           let customer = null;
+          let customerFound = false;
           
           // First, try to find by email if provided
-          if (job.customerEmail) {
+          if (job.customerEmail && job.customerEmail.trim()) {
             const { data: foundCustomer, error: emailError } = await supabase
               .from('customers')
               .select('id')
@@ -4031,13 +4034,17 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               .eq('email', job.customerEmail.toLowerCase().trim())
               .maybeSingle();
             
-            if (!emailError && foundCustomer) {
+            if (emailError) {
+              console.error(`Row ${i + 1}: Error searching customer by email:`, emailError);
+            } else if (foundCustomer) {
               customer = foundCustomer;
+              customerFound = true;
+              console.log(`Row ${i + 1}: Found customer by email:`, foundCustomer.id);
             }
           }
           
           // If not found by email, try to find by phone first (more reliable)
-          if (!customer && job.customerPhone) {
+          if (!customerFound && job.customerPhone) {
             const phoneDigits = job.customerPhone.replace(/\D/g, '');
             if (phoneDigits.length >= 10) {
               // Try to match by phone - use ilike for partial matches
@@ -4047,14 +4054,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 .eq('user_id', userId)
                 .ilike('phone', `%${phoneDigits.slice(-10)}%`);
               
-              if (!phoneError && phoneMatches && phoneMatches.length > 0) {
+              if (phoneError) {
+                console.error(`Row ${i + 1}: Error searching customer by phone:`, phoneError);
+              } else if (phoneMatches && phoneMatches.length > 0) {
                 customer = phoneMatches[0]; // Take first match
+                customerFound = true;
+                console.log(`Row ${i + 1}: Found customer by phone:`, customer.id);
               }
             }
           }
           
           // If not found by email or phone, try to find by name
-          if (!customer && job.customerName) {
+          if (!customerFound && job.customerName) {
             // Parse customer name into first and last name
             const nameParts = job.customerName.trim().split(/\s+/);
             const firstName = nameParts[0] || '';
@@ -4074,14 +4085,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               
               const { data: nameMatches, error: nameError } = await query;
               
-              if (!nameError && nameMatches && nameMatches.length > 0) {
+              if (nameError) {
+                console.error(`Row ${i + 1}: Error searching customer by name:`, nameError);
+              } else if (nameMatches && nameMatches.length > 0) {
                 customer = nameMatches[0]; // Take first match
+                customerFound = true;
+                console.log(`Row ${i + 1}: Found customer by name:`, customer.id);
               }
             }
           }
           
           // If customer still not found, create a new customer
-          if (!customer) {
+          if (!customerFound) {
             const nameParts = (job.customerName || '').trim().split(/\s+/);
             const firstName = nameParts[0] || 'Unknown';
             const lastName = nameParts.slice(1).join(' ') || '';
@@ -4090,13 +4105,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               user_id: userId,
               first_name: sanitizeInput(firstName),
               last_name: sanitizeInput(lastName),
-              email: job.customerEmail ? job.customerEmail.toLowerCase().trim() : null,
+              email: job.customerEmail && job.customerEmail.trim() ? job.customerEmail.toLowerCase().trim() : null,
               phone: job.customerPhone ? job.customerPhone.trim() : null,
               address: job.serviceAddress || null,
               city: job.serviceAddressCity || null,
               state: job.serviceAddressState || null,
               zip_code: job.serviceAddressZip || null
             };
+            
+            console.log(`Row ${i + 1}: Creating new customer:`, { firstName, lastName, phone: newCustomer.phone });
             
             const { data: createdCustomer, error: createError } = await supabase
               .from('customers')
@@ -4105,15 +4122,24 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               .single();
             
             if (createError) {
+              console.error(`Row ${i + 1}: Failed to create customer:`, createError);
               results.errors.push(`Row ${i + 1}: Failed to create customer - ${createError.message}`);
               results.skipped++;
               continue;
             }
             
             customerId = createdCustomer.id;
+            console.log(`Row ${i + 1}: Created new customer with ID:`, customerId);
           } else {
             customerId = customer.id;
           }
+        }
+        
+        if (!customerId) {
+          console.error(`Row ${i + 1}: No customer ID after lookup/creation`);
+          results.errors.push(`Row ${i + 1}: Could not find or create customer`);
+          results.skipped++;
+          continue;
         }
 
         // Find or create service by name if provided
@@ -4126,8 +4152,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             .eq('name', job.serviceName)
             .maybeSingle();
           
-          if (!serviceError && service) {
+          if (serviceError) {
+            console.error(`Row ${i + 1}: Error searching service:`, serviceError);
+          } else if (service) {
             serviceId = service.id;
+            console.log(`Row ${i + 1}: Found service:`, serviceId, job.serviceName);
           } else {
             // Service not found - create it
             const newService = {
@@ -4142,6 +4171,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               is_active: true
             };
             
+            console.log(`Row ${i + 1}: Creating new service:`, job.serviceName);
+            
             const { data: createdService, error: createServiceError } = await supabase
               .from('services')
               .insert(newService)
@@ -4154,27 +4185,47 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Continue without service ID - job can still be created
             } else {
               serviceId = createdService.id;
+              console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
             }
           }
         }
 
         // Find team member by name if provided
         let teamMemberId = job.teamMemberId;
+        
+        // Validate teamMemberId - must be a valid integer (not a Hostinger ID string)
+        // Hostinger IDs look like "1741901522231x193961618392743940" and contain 'x'
+        if (teamMemberId) {
+          // Check if it's a valid integer
+          const parsedId = parseInt(teamMemberId);
+          if (isNaN(parsedId) || teamMemberId.toString().includes('x') || teamMemberId.toString().includes('X')) {
+            // Invalid ID - looks like a Hostinger crew ID, not a ZenBooker team member ID
+            console.log(`Row ${i + 1}: Invalid team member ID format "${teamMemberId}", setting to null`);
+            teamMemberId = null;
+          } else {
+            teamMemberId = parsedId;
+          }
+        }
+        
+        // Try to find by name if provided and we don't have a valid ID
         if (!teamMemberId && job.teamMemberName) {
           const nameParts = job.teamMemberName.split(' ');
           const firstName = nameParts[0];
           const lastName = nameParts.slice(1).join(' ');
           
-          const { data: teamMember } = await supabase
+          const { data: teamMember, error: teamError } = await supabase
             .from('team_members')
             .select('id')
             .eq('user_id', userId)
             .eq('first_name', firstName)
             .eq('last_name', lastName)
-            .single();
+            .maybeSingle();
           
-          if (teamMember) {
+          if (teamError) {
+            console.error(`Row ${i + 1}: Error searching team member:`, teamError);
+          } else if (teamMember) {
             teamMemberId = teamMember.id;
+            console.log(`Row ${i + 1}: Found team member by name:`, teamMemberId);
           }
         }
 
@@ -4205,7 +4256,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           user_id: userId,
           customer_id: customerId,
           service_id: serviceId,
-          team_member_id: teamMemberId,
+          team_member_id: teamMemberId && !isNaN(parseInt(teamMemberId)) ? parseInt(teamMemberId) : null,
           territory_id: job.territoryId || null,
           notes: sanitizedNotes,
           status: job.status || 'pending',
@@ -4265,6 +4316,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           service_intake_questions: job.serviceIntakeQuestions || null
         };
 
+        console.log(`Row ${i + 1}: Creating job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
+        
         const { data: newJob, error: insertError } = await supabase
           .from('jobs')
           .insert(jobData)
@@ -4272,9 +4325,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           .single();
 
         if (insertError) {
+          console.error(`Row ${i + 1}: Failed to create job:`, insertError);
           results.errors.push(`Row ${i + 1}: ${insertError.message}`);
           results.skipped++;
         } else {
+          console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
         }
       } catch (error) {
@@ -4283,6 +4338,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       }
     }
 
+    console.log(`📊 Import complete: ${results.imported} imported, ${results.skipped} skipped, ${results.errors.length} errors`);
+    if (results.errors.length > 0 && results.errors.length <= 10) {
+      console.log('❌ Errors:', results.errors);
+    } else if (results.errors.length > 10) {
+      console.log('❌ First 10 errors:', results.errors.slice(0, 10));
+    }
+    
     res.json(results);
   } catch (error) {
     console.error('Jobs import error:', error);
