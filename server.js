@@ -3664,26 +3664,110 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
     }
     
     // Add pagination
-    const offset = (page - 1) * limit;
-    query = query.range(offset, offset + parseInt(limit) - 1);
-  
-    const { data: customers, error, count } = await query;
+    const limitValue = parseInt(limit);
+    let allCustomers = [];
+    let totalCount = 0;
     
-    if (error) {
-      console.error('Error fetching customers:', error);
-      return res.status(500).json({ error: 'Failed to fetch customers' });
-    }
-    
-  
-    res.json({
-      customers: customers || [],
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit)
+    // If limit is very high (>= 10000), fetch ALL customers by paginating through all pages
+    if (limitValue >= 10000) {
+      // Supabase has a max limit of 1000 per query, so we need to paginate
+      const pageSize = 1000;
+      let currentPage = 0;
+      let hasMore = true;
+      
+      // First, get the total count
+      const countQuery = supabase
+        .from('customers')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', userId);
+      
+      if (status && status !== 'all') {
+        countQuery.eq('status', status);
       }
-    });
+      
+      if (search) {
+        countQuery.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+      }
+      
+      const { count } = await countQuery;
+      totalCount = count || 0;
+      
+      // Fetch all customers in batches
+      while (hasMore) {
+        const offset = currentPage * pageSize;
+        let batchQuery = supabase
+          .from('customers')
+          .select('*')
+          .eq('user_id', userId)
+          .range(offset, offset + pageSize - 1);
+        
+        // Apply filters
+        if (status && status !== 'all') {
+          batchQuery = batchQuery.eq('status', status);
+        }
+        
+        if (search) {
+          batchQuery = batchQuery.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+        }
+        
+        // Apply sorting
+        if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
+          batchQuery = batchQuery.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+        } else {
+          batchQuery = batchQuery.order('created_at', { ascending: false });
+        }
+        
+        const { data: batch, error: batchError } = await batchQuery;
+        
+        if (batchError) {
+          console.error('Error fetching customer batch:', batchError);
+          return res.status(500).json({ error: 'Failed to fetch customers' });
+        }
+        
+        if (batch && batch.length > 0) {
+          allCustomers = [...allCustomers, ...batch];
+          currentPage++;
+          
+          // Check if there are more customers to fetch
+          if (batch.length < pageSize || allCustomers.length >= totalCount) {
+            hasMore = false;
+          }
+        } else {
+          hasMore = false;
+        }
+      }
+      
+      res.json({
+        customers: allCustomers,
+        pagination: {
+          page: 1,
+          limit: totalCount,
+          total: totalCount,
+          pages: 1
+        }
+      });
+    } else {
+      // Normal pagination for smaller limits
+      const offset = (page - 1) * limitValue;
+      query = query.range(offset, offset + limitValue - 1);
+      
+      const { data: customers, error, count } = await query;
+      
+      if (error) {
+        console.error('Error fetching customers:', error);
+        return res.status(500).json({ error: 'Failed to fetch customers' });
+      }
+      
+      res.json({
+        customers: customers || [],
+        pagination: {
+          page: parseInt(page),
+          limit: limitValue,
+          total: count || 0,
+          pages: Math.ceil((count || 0) / limitValue)
+        }
+      });
+    }
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to get customers' });
