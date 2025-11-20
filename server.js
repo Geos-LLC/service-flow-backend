@@ -1701,14 +1701,24 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     // Add date filter
     if (dateFilter === 'future') {
       const todayString = getTodayString();
+      // For future jobs, include today onwards
+      // Use gte to include jobs starting from today
       query = query.gte('scheduled_date', todayString);
     } else if (dateFilter === 'past') {
       const todayString = getTodayString();
+      // For past jobs, exclude today - only show jobs before today
+      // Use lt to exclude today (only jobs strictly before today)
+      // Compare as date string to handle datetime fields correctly
       query = query.lt('scheduled_date', todayString);
     } else if (dateRange) {
-      const [startDate, endDate] = dateRange.split(':');
+      // Support both ":" and " to " separators for date range
+      const dateSeparator = dateRange.includes(' to ') ? ' to ' : ':';
+      const [startDate, endDate] = dateRange.split(dateSeparator).map(d => d.trim());
       if (startDate && endDate) {
          query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
+      } else if (startDate) {
+        // If only start date provided, use it as minimum
+        query = query.gte('scheduled_date', startDate);
       }
     }
     
@@ -4319,19 +4329,55 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
         // Check for duplicate jobs (same customer, service, and scheduled date)
-        if (job.scheduledDate) {
-          const { data: existingJob, error: duplicateError } = await supabase
-            .from('jobs')
-            .select('id')
-            .eq('user_id', userId)
-            .eq('customer_id', customerId)
-            .eq('scheduled_date', job.scheduledDate)
-            .maybeSingle();
+        // Only check for duplicates if we have all required fields
+        // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
+        // from being incorrectly flagged as duplicates
+        if (job.scheduledDate && customerId) {
+          // Normalize the scheduled date to just the date part (YYYY-MM-DD) for comparison
+          // This handles cases where dates might have time components
+          let normalizedDate = job.scheduledDate;
+          if (normalizedDate && typeof normalizedDate === 'string') {
+            // Extract just the date part (YYYY-MM-DD) if there's a time component
+            const dateMatch = normalizedDate.match(/^(\d{4}-\d{2}-\d{2})/);
+            if (dateMatch) {
+              normalizedDate = dateMatch[1];
+            }
+          }
           
-          if (!duplicateError && existingJob) {
-            results.errors.push(`Row ${i + 1}: Job already exists for this customer on ${job.scheduledDate}`);
-            results.skipped++;
-            continue;
+          let duplicateQuery = supabase
+            .from('jobs')
+            .select('id, scheduled_date')
+            .eq('user_id', userId)
+            .eq('customer_id', customerId);
+          
+          // Also check service_id if available to make duplicate detection more accurate
+          // This prevents recurring jobs with different dates from being flagged as duplicates
+          if (serviceId) {
+            duplicateQuery = duplicateQuery.eq('service_id', serviceId);
+          } else if (job.serviceName) {
+            // If no service_id but we have service name, check by service name
+            duplicateQuery = duplicateQuery.eq('service_name', job.serviceName);
+          }
+          
+          // Get all jobs matching customer and service, then check dates manually
+          // This is more reliable than string comparison
+          const { data: existingJobs, error: duplicateError } = await duplicateQuery;
+          
+          if (!duplicateError && existingJobs && existingJobs.length > 0) {
+            // Check if any existing job has the same date (normalized)
+            const isDuplicate = existingJobs.some(existingJob => {
+              if (!existingJob.scheduled_date) return false;
+              const existingDate = existingJob.scheduled_date.toString();
+              const existingDateMatch = existingDate.match(/^(\d{4}-\d{2}-\d{2})/);
+              const existingDateNormalized = existingDateMatch ? existingDateMatch[1] : existingDate;
+              return existingDateNormalized === normalizedDate;
+            });
+            
+            if (isDuplicate) {
+              results.errors.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate}`);
+              results.skipped++;
+              continue;
+            }
           }
         }
 
