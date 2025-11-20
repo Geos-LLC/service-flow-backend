@@ -4091,7 +4091,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     const results = {
       imported: 0,
       skipped: 0,
-      errors: []
+      errors: [],
+      warnings: [] // Track duplicate warnings separately from errors
     };
 
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
@@ -4355,7 +4356,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // First check if this exact combination already exists in the current import batch
           if (batchJobKeys.has(batchKey)) {
             console.log(`Row ${i + 1}: DUPLICATE in CSV - Same job already being imported in this batch (user ${userId}, customer ${customerId}, ${serviceIdentifier}, date ${normalizedDate})`);
-            results.errors.push(`Row ${i + 1}: Duplicate job in CSV - same customer, service, and date already exists in this import`);
+            results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - same customer, service, and date already exists in this import`);
             results.skipped++;
             continue;
           }
@@ -4411,7 +4412,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             if (isDuplicate) {
               console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId}, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
-              results.errors.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate}`);
+              results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
               results.skipped++;
               continue;
             }
