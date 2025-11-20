@@ -4096,6 +4096,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
 
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
     
+    // Track jobs being imported in this batch to detect duplicates within the CSV
+    const batchJobKeys = new Set(); // Format: "userId_customerId_serviceId_date" or "userId_customerId_serviceName_date"
+    
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       
@@ -4329,6 +4332,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
         // Check for duplicate jobs (same customer, service, and scheduled date)
+        // CRITICAL: Must filter by user_id to ensure we only check duplicates within the same account
         // Only check for duplicates if we have all required fields
         // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
         // from being incorrectly flagged as duplicates
@@ -4344,10 +4348,24 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
           }
           
+          // Create a unique key for this job to check for duplicates within the same import batch
+          const serviceIdentifier = serviceId ? `service_${serviceId}` : (job.serviceName ? `name_${job.serviceName}` : 'no_service');
+          const batchKey = `${userId}_${customerId}_${serviceIdentifier}_${normalizedDate}`;
+          
+          // First check if this exact combination already exists in the current import batch
+          if (batchJobKeys.has(batchKey)) {
+            console.log(`Row ${i + 1}: DUPLICATE in CSV - Same job already being imported in this batch (user ${userId}, customer ${customerId}, ${serviceIdentifier}, date ${normalizedDate})`);
+            results.errors.push(`Row ${i + 1}: Duplicate job in CSV - same customer, service, and date already exists in this import`);
+            results.skipped++;
+            continue;
+          }
+          
+          // CRITICAL: Always filter by user_id FIRST to ensure we only check within the same account
+          // This prevents cross-account duplicate detection
           let duplicateQuery = supabase
             .from('jobs')
-            .select('id, scheduled_date')
-            .eq('user_id', userId)
+            .select('id, scheduled_date, user_id, customer_id, service_id, service_name')
+            .eq('user_id', userId)  // MUST filter by user_id to prevent cross-account duplicates
             .eq('customer_id', customerId);
           
           // Also check service_id if available to make duplicate detection more accurate
@@ -4363,9 +4381,27 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // This is more reliable than string comparison
           const { data: existingJobs, error: duplicateError } = await duplicateQuery;
           
+          // Log for debugging
+          if (existingJobs && existingJobs.length > 0) {
+            console.log(`Row ${i + 1}: Found ${existingJobs.length} existing jobs in database for user ${userId}, customer ${customerId}, checking dates...`);
+            // Verify all returned jobs belong to the correct user (safety check)
+            const wrongUserJobs = existingJobs.filter(j => j.user_id !== userId);
+            if (wrongUserJobs.length > 0) {
+              console.error(`Row ${i + 1}: ERROR - Found jobs from different user! This should not happen.`, wrongUserJobs);
+              // Remove jobs from different users from consideration
+              existingJobs = existingJobs.filter(j => j.user_id === userId);
+            }
+          }
+          
           if (!duplicateError && existingJobs && existingJobs.length > 0) {
             // Check if any existing job has the same date (normalized)
             const isDuplicate = existingJobs.some(existingJob => {
+              // Double-check user_id as a safety measure
+              if (existingJob.user_id && existingJob.user_id !== userId) {
+                console.error(`Row ${i + 1}: WARNING - Job ${existingJob.id} belongs to different user ${existingJob.user_id}, expected ${userId}`);
+                return false; // Don't count as duplicate if it's from a different user
+              }
+              
               if (!existingJob.scheduled_date) return false;
               const existingDate = existingJob.scheduled_date.toString();
               const existingDateMatch = existingDate.match(/^(\d{4}-\d{2}-\d{2})/);
@@ -4374,11 +4410,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             });
             
             if (isDuplicate) {
+              console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId}, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
               results.errors.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate}`);
               results.skipped++;
               continue;
             }
           }
+          
+          // Add this job to the batch tracking set (only if we're going to create it)
+          // We'll add it after successful creation
         }
 
         // Create job with all fields
@@ -4461,6 +4501,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         } else {
           console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
+          
+          // Add to batch tracking set to prevent duplicates within the same import
+          if (job.scheduledDate && customerId) {
+            const normalizedDate = job.scheduledDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || job.scheduledDate;
+            const serviceIdentifier = serviceId ? `service_${serviceId}` : (job.serviceName ? `name_${job.serviceName}` : 'no_service');
+            const batchKey = `${userId}_${customerId}_${serviceIdentifier}_${normalizedDate}`;
+            batchJobKeys.add(batchKey);
+          }
         }
       } catch (error) {
         results.errors.push(`Row ${i + 1}: ${error.message}`);
