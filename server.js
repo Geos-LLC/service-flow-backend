@@ -4096,6 +4096,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     };
 
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
+    console.log(`🔒 IMPORTANT: All duplicate checks will ONLY look at jobs belonging to user ${userId} - jobs from other users are completely separate`);
     
     // Track jobs being imported in this batch to detect duplicates within the CSV
     const batchJobKeys = new Set(); // Format: "userId_customerId_serviceId_date" or "userId_customerId_serviceName_date"
@@ -4363,11 +4364,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           // CRITICAL: Always filter by user_id FIRST to ensure we only check within the same account
           // This prevents cross-account duplicate detection
+          // IMPORTANT: Jobs belong to users - different users can have identical jobs (same customer name, service, date)
+          // but they are NOT duplicates because they belong to different accounts
           let duplicateQuery = supabase
             .from('jobs')
             .select('id, scheduled_date, user_id, customer_id, service_id, service_name')
-            .eq('user_id', userId)  // MUST filter by user_id to prevent cross-account duplicates
-            .eq('customer_id', customerId);
+            .eq('user_id', userId);  // CRITICAL: MUST filter by user_id FIRST to prevent cross-account duplicates
+          
+          // Add customer_id filter (customer IDs are unique per user due to user_id constraint)
+          duplicateQuery = duplicateQuery.eq('customer_id', customerId);
           
           // Also check service_id if available to make duplicate detection more accurate
           // This prevents recurring jobs with different dates from being flagged as duplicates
@@ -4378,28 +4383,38 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             duplicateQuery = duplicateQuery.eq('service_name', job.serviceName);
           }
           
-          // Get all jobs matching customer and service, then check dates manually
+          // Get all jobs matching user, customer and service, then check dates manually
           // This is more reliable than string comparison
           const { data: existingJobs, error: duplicateError } = await duplicateQuery;
           
-          // Log for debugging
+          // CRITICAL SAFETY CHECK: Verify ALL returned jobs belong to the correct user
+          // This is a double-check to ensure no cross-account contamination
+          let validExistingJobs = [];
           if (existingJobs && existingJobs.length > 0) {
-            console.log(`Row ${i + 1}: Found ${existingJobs.length} existing jobs in database for user ${userId}, customer ${customerId}, checking dates...`);
-            // Verify all returned jobs belong to the correct user (safety check)
-            const wrongUserJobs = existingJobs.filter(j => j.user_id !== userId);
-            if (wrongUserJobs.length > 0) {
-              console.error(`Row ${i + 1}: ERROR - Found jobs from different user! This should not happen.`, wrongUserJobs);
-              // Remove jobs from different users from consideration
-              existingJobs = existingJobs.filter(j => j.user_id === userId);
+            validExistingJobs = existingJobs.filter(j => {
+              if (j.user_id !== userId) {
+                console.error(`Row ${i + 1}: SECURITY ERROR - Job ${j.id} belongs to user ${j.user_id}, but we're checking for user ${userId}! This should never happen.`);
+                return false; // Exclude jobs from other users
+              }
+              return true;
+            });
+            
+            if (validExistingJobs.length !== existingJobs.length) {
+              console.error(`Row ${i + 1}: WARNING - Filtered out ${existingJobs.length - validExistingJobs.length} jobs from other users`);
+            }
+            
+            if (validExistingJobs.length > 0) {
+              console.log(`Row ${i + 1}: Found ${validExistingJobs.length} existing jobs in database for user ${userId} only, customer ${customerId}, checking dates...`);
             }
           }
           
-          if (!duplicateError && existingJobs && existingJobs.length > 0) {
+          if (!duplicateError && validExistingJobs.length > 0) {
             // Check if any existing job has the same date (normalized)
-            const isDuplicate = existingJobs.some(existingJob => {
-              // Double-check user_id as a safety measure
-              if (existingJob.user_id && existingJob.user_id !== userId) {
-                console.error(`Row ${i + 1}: WARNING - Job ${existingJob.id} belongs to different user ${existingJob.user_id}, expected ${userId}`);
+            // All jobs in validExistingJobs are already verified to belong to the correct user
+            const isDuplicate = validExistingJobs.some(existingJob => {
+              // Final safety check (should never fail, but just in case)
+              if (existingJob.user_id !== userId) {
+                console.error(`Row ${i + 1}: CRITICAL ERROR - Job ${existingJob.id} user_id mismatch! Expected ${userId}, got ${existingJob.user_id}`);
                 return false; // Don't count as duplicate if it's from a different user
               }
               
@@ -4411,7 +4426,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             });
             
             if (isDuplicate) {
-              console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId}, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
+              console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
               results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
               results.skipped++;
               continue;
