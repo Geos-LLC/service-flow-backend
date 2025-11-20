@@ -4389,7 +4389,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           team_member_id: teamMemberId && !isNaN(parseInt(teamMemberId)) ? parseInt(teamMemberId) : null,
           territory_id: job.territoryId || null,
           notes: sanitizedNotes,
-          status: job.status || 'pending',
+          status: job.status && job.status.trim() ? job.status.trim() : 'pending',
           invoice_status: job.invoiceStatus || 'draft',
           invoice_id: job.invoiceId || null,
           invoice_amount: parseFloat(job.invoiceAmount) || null,
