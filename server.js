@@ -8714,7 +8714,19 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
 
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
-    // Build Supabase query with joins and aggregations
+    
+    // First, fetch the account owner from users table
+    const { data: accountOwner, error: ownerError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, profile_picture, phone')
+      .eq('id', userId)
+      .single();
+    
+    if (ownerError) {
+      console.error('Error fetching account owner:', ownerError);
+    }
+    
+    // Build Supabase query with joins and aggregations for team members
     let query = supabase
       .from('team_members')
       .select(`
@@ -8723,7 +8735,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       `, { count: 'exact' })
       .eq('user_id', userId);
     
-    // Add status filter
+    // Add status filter (but don't filter out account owner)
     if (status) {
       query = query.eq('status', status);
     }
@@ -8772,13 +8784,77 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       };
     });
     
+    // Create account owner entry if user exists
+    let accountOwnerEntry = null;
+    if (accountOwner) {
+      // Check if account owner already exists in team_members
+      const ownerInTeam = processedTeamMembers.find(m => 
+        m.email === accountOwner.email || 
+        (m.first_name === accountOwner.first_name && m.last_name === accountOwner.last_name)
+      );
+      
+      // Only add account owner if not already in team members list
+      if (!ownerInTeam) {
+        // Get job statistics for account owner
+        const { data: ownerJobs, error: jobsError } = await supabase
+          .from('jobs')
+          .select('id, status, invoice_amount')
+          .eq('user_id', userId);
+        
+        const ownerJobsList = ownerJobs || [];
+        const totalOwnerJobs = ownerJobsList.length;
+        const completedOwnerJobs = ownerJobsList.filter(job => job.status === 'completed').length;
+        const avgOwnerJobValue = completedOwnerJobs > 0 
+          ? Math.round((ownerJobsList.filter(job => job.status === 'completed')
+              .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedOwnerJobs) * 100) / 100
+          : 0;
+        
+        accountOwnerEntry = {
+          id: accountOwner.id, // Use user ID as the ID
+          user_id: accountOwner.id,
+          first_name: accountOwner.first_name || '',
+          last_name: accountOwner.last_name || '',
+          email: accountOwner.email,
+          phone: accountOwner.phone || null,
+          role: 'owner', // Set role as 'owner'
+          status: 'active',
+          is_service_provider: true,
+          profile_picture: accountOwner.profile_picture,
+          is_account_owner: true, // Flag to identify account owner
+          total_jobs: totalOwnerJobs,
+          completed_jobs: completedOwnerJobs,
+          avg_job_value: avgOwnerJobValue,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+      } else {
+        // If account owner is already in team_members, ensure role is set to 'owner'
+        ownerInTeam.role = 'owner';
+        ownerInTeam.is_account_owner = true;
+      }
+    }
+    
+    // Combine account owner (if exists and not already in list) with team members
+    let allMembers = processedTeamMembers;
+    if (accountOwnerEntry) {
+      // Put account owner first
+      allMembers = [accountOwnerEntry, ...processedTeamMembers];
+    } else {
+      // If account owner is in the list, move them to first position
+      const ownerIndex = allMembers.findIndex(m => m.is_account_owner || m.role === 'owner' || m.role === 'admin');
+      if (ownerIndex > 0) {
+        const owner = allMembers.splice(ownerIndex, 1)[0];
+        allMembers.unshift(owner);
+      }
+    }
+    
     res.json({
-      teamMembers: processedTeamMembers,
+      teamMembers: allMembers,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit)
+        total: (count || 0) + (accountOwnerEntry ? 1 : 0),
+        pages: Math.ceil(((count || 0) + (accountOwnerEntry ? 1 : 0)) / limit)
       }
     });
   } catch (error) {
