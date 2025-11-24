@@ -968,7 +968,7 @@ app.post('/api/auth/signin', async (req, res) => {
       // Not found in users table, check team_members table
       const { data: teamMembers, error: teamMemberError } = await supabase
         .from('team_members')
-        .select('id, user_id, email, password, first_name, last_name, role, status, profile_picture')
+        .select('id, user_id, email, password, first_name, last_name, role, status, profile_picture, permissions')
         .eq('email', sanitizedEmail)
         .eq('status', 'active')
         .limit(1);
@@ -996,6 +996,19 @@ app.post('/api/auth/signin', async (req, res) => {
         return res.status(401).json({ error: 'Invalid email or password' });
       }
       
+      // Parse permissions if it's a string
+      let permissions = {};
+      if (teamMember.permissions) {
+        try {
+          permissions = typeof teamMember.permissions === 'string' 
+            ? JSON.parse(teamMember.permissions) 
+            : teamMember.permissions;
+        } catch (e) {
+          console.error('Error parsing permissions:', e);
+          permissions = {};
+        }
+      }
+      
       // Use team member data
       user = {
         id: teamMember.user_id, // Use the user_id from team_members (the account owner's user_id)
@@ -1003,7 +1016,9 @@ app.post('/api/auth/signin', async (req, res) => {
         first_name: teamMember.first_name,
         last_name: teamMember.last_name,
         business_name: null, // Team members don't have business_name
-        profile_picture: teamMember.profile_picture
+        profile_picture: teamMember.profile_picture,
+        permissions: permissions,
+        teamMemberId: teamMember.id
       };
       
       // Get role from team member
@@ -1040,7 +1055,9 @@ app.post('/api/auth/signin', async (req, res) => {
       businessName: user.business_name,
       business_name: user.business_name, // Add both for compatibility
       profilePicture: user.profile_picture,
-      role: userRole // Include role in response
+      role: userRole, // Include role in response
+      permissions: user.permissions || {}, // Include permissions for team members
+      teamMemberId: user.teamMemberId || null // Include team member ID if applicable
     };
     
     res.json({ 
@@ -5614,7 +5631,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       // Not found in users table, check team_members table
       const { data: teamMember, error: teamMemberError } = await supabase
         .from('team_members')
-        .select('id, user_id, email, first_name, last_name, phone, role, profile_picture, status')
+        .select('id, user_id, email, first_name, last_name, phone, role, profile_picture, status, permissions')
         .or(`user_id.eq.${userId},email.eq.${userEmail}`)
         .eq('status', 'active')
         .limit(1);
@@ -5630,6 +5647,19 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 
       const member = teamMember[0];
       userRole = member.role || 'worker';
+      
+      // Parse permissions if it's a string
+      let permissions = {};
+      if (member.permissions) {
+        try {
+          permissions = typeof member.permissions === 'string' 
+            ? JSON.parse(member.permissions) 
+            : member.permissions;
+        } catch (e) {
+          console.error('Error parsing permissions:', e);
+          permissions = {};
+        }
+      }
 
       profileData = {
         id: member.user_id, // Use the account owner's user_id
@@ -5641,7 +5671,9 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         emailNotifications: false, // Default for team members
         smsNotifications: false, // Default for team members
         profilePicture: member.profile_picture,
-        role: userRole
+        role: userRole,
+        permissions: permissions, // Include permissions
+        teamMemberId: member.id // Include team member ID
       };
     }
 
@@ -9195,7 +9227,21 @@ app.put('/api/team-members/:id', async (req, res) => {
     }
     
     if (permissions !== undefined) {
-      updateData.permissions = permissions;
+      // Ensure permissions is stored as JSON string if it's an object
+      if (typeof permissions === 'object' && permissions !== null) {
+        updateData.permissions = JSON.stringify(permissions);
+      } else if (typeof permissions === 'string') {
+        // Validate it's valid JSON
+        try {
+          JSON.parse(permissions);
+          updateData.permissions = permissions;
+        } catch (e) {
+          console.error('Invalid JSON permissions, storing as empty object');
+          updateData.permissions = JSON.stringify({});
+        }
+      } else {
+        updateData.permissions = JSON.stringify({});
+      }
     }
     
     // Include color if provided (only if column exists)
