@@ -840,6 +840,29 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(500).json({ error: 'Failed to create account. Please try again.' });
     }
     
+    // Create account owner as a team member with role "account owner"
+    const { data: accountOwnerTeamMember, error: teamMemberError } = await supabase
+      .from('team_members')
+      .insert({
+        user_id: newUser.id,
+        first_name: sanitizedFirstName,
+        last_name: sanitizedLastName,
+        email: sanitizedEmail,
+        role: 'account owner', // Set role as "account owner"
+        status: 'active',
+        is_service_provider: true,
+        username: sanitizedEmail, // Use email as username for account owner
+        password: hashedPassword // Store password for login
+      })
+      .select()
+      .single();
+    
+    if (teamMemberError) {
+      console.error('Error creating account owner team member:', teamMemberError);
+      // Don't fail signup if team member creation fails, but log it
+      console.warn('Account owner created but team member entry failed. User can still login.');
+    }
+    
     // Generate JWT token
     const token = jwt.sign(
       { 
@@ -934,13 +957,12 @@ app.post('/api/auth/signin', async (req, res) => {
         .limit(1);
       
       if (!teamMemberError && teamMemberData && teamMemberData.length > 0) {
-        // Account owner exists in team_members, use their role (should be 'owner' or 'account owner')
+        // Account owner exists in team_members, use their role (should be 'account owner')
         const role = teamMemberData[0].role;
-        if (role && (role.toLowerCase() === 'owner' || role.toLowerCase() === 'account owner' || role.toLowerCase() === 'admin')) {
-          userRole = 'owner';
-        } else {
-          userRole = role || 'owner';
-        }
+        userRole = role || 'account owner'; // Use the role from team_members table
+      } else {
+        // If not found in team_members, default to 'account owner'
+        userRole = 'account owner';
       }
     } else {
       // Not found in users table, check team_members table
@@ -5569,12 +5591,11 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         .limit(1);
       
       if (!teamMemberError && teamMemberData && teamMemberData.length > 0) {
-        const role = teamMemberData[0].role;
-        if (role && (role.toLowerCase() === 'owner' || role.toLowerCase() === 'account owner' || role.toLowerCase() === 'admin')) {
-          userRole = 'owner';
-        } else {
-          userRole = role || 'owner';
-        }
+        // Use the role from team_members table
+        userRole = teamMemberData[0].role || 'account owner';
+      } else {
+        // If not found in team_members, default to 'account owner'
+        userRole = 'account owner';
       }
 
       profileData = {
@@ -8715,17 +8736,6 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
     
-    // First, fetch the account owner from users table
-    const { data: accountOwner, error: ownerError } = await supabase
-      .from('users')
-      .select('id, email, first_name, last_name, profile_picture, phone')
-      .eq('id', userId)
-      .single();
-    
-    if (ownerError) {
-      console.error('Error fetching account owner:', ownerError);
-    }
-    
     // Build Supabase query with joins and aggregations for team members
     let query = supabase
       .from('team_members')
@@ -8735,7 +8745,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       `, { count: 'exact' })
       .eq('user_id', userId);
     
-    // Add status filter (but don't filter out account owner)
+    // Add status filter
     if (status) {
       query = query.eq('status', status);
     }
@@ -8745,14 +8755,19 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       query = query.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%`);
     }
     
-    // Add sorting
+    // Add sorting - account owner should always be first
     const allowedSortFields = ['first_name', 'last_name', 'email', 'role'];
     const allowedSortOrders = ['ASC', 'DESC'];
     
+    // First order by role (account owner first), then by the requested sort field
+    query = query.order('role', { ascending: true }); // This will put 'account owner' first alphabetically
+    
     if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
-      query = query.order(sortBy, { ascending: sortOrder.toUpperCase() === 'ASC' });
+      // Add secondary sort by the requested field
+      // Note: Supabase doesn't support multiple orderBy in a single call easily,
+      // so we'll sort in JavaScript after fetching
     } else {
-      query = query.order('first_name', { ascending: true });
+      // Default secondary sort
     }
     
     // Add pagination
@@ -8767,7 +8782,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     }
     
     // Process team members to add job statistics
-    const processedTeamMembers = (teamMembers || []).map(member => {
+    let processedTeamMembers = (teamMembers || []).map(member => {
       const jobs = member.jobs || [];
       const totalJobs = jobs.length;
       const completedJobs = jobs.filter(job => job.status === 'completed').length;
@@ -8784,77 +8799,33 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       };
     });
     
-    // Create account owner entry if user exists
-    let accountOwnerEntry = null;
-    if (accountOwner) {
-      // Check if account owner already exists in team_members
-      const ownerInTeam = processedTeamMembers.find(m => 
-        m.email === accountOwner.email || 
-        (m.first_name === accountOwner.first_name && m.last_name === accountOwner.last_name)
-      );
+    // Sort: account owner first, then by requested sort field
+    processedTeamMembers.sort((a, b) => {
+      // Account owner always first
+      const aIsOwner = a.role === 'account owner' || a.role === 'owner' || a.role === 'admin';
+      const bIsOwner = b.role === 'account owner' || b.role === 'owner' || b.role === 'admin';
       
-      // Only add account owner if not already in team members list
-      if (!ownerInTeam) {
-        // Get job statistics for account owner
-        const { data: ownerJobs, error: jobsError } = await supabase
-          .from('jobs')
-          .select('id, status, invoice_amount')
-          .eq('user_id', userId);
-        
-        const ownerJobsList = ownerJobs || [];
-        const totalOwnerJobs = ownerJobsList.length;
-        const completedOwnerJobs = ownerJobsList.filter(job => job.status === 'completed').length;
-        const avgOwnerJobValue = completedOwnerJobs > 0 
-          ? Math.round((ownerJobsList.filter(job => job.status === 'completed')
-              .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedOwnerJobs) * 100) / 100
-          : 0;
-        
-        accountOwnerEntry = {
-          id: accountOwner.id, // Use user ID as the ID
-          user_id: accountOwner.id,
-          first_name: accountOwner.first_name || '',
-          last_name: accountOwner.last_name || '',
-          email: accountOwner.email,
-          phone: accountOwner.phone || null,
-          role: 'owner', // Set role as 'owner'
-          status: 'active',
-          is_service_provider: true,
-          profile_picture: accountOwner.profile_picture,
-          is_account_owner: true, // Flag to identify account owner
-          total_jobs: totalOwnerJobs,
-          completed_jobs: completedOwnerJobs,
-          avg_job_value: avgOwnerJobValue,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        };
-      } else {
-        // If account owner is already in team_members, ensure role is set to 'owner'
-        ownerInTeam.role = 'owner';
-        ownerInTeam.is_account_owner = true;
+      if (aIsOwner && !bIsOwner) return -1;
+      if (!aIsOwner && bIsOwner) return 1;
+      
+      // Then sort by requested field
+      if (allowedSortFields.includes(sortBy)) {
+        const aValue = a[sortBy] || '';
+        const bValue = b[sortBy] || '';
+        const comparison = aValue.localeCompare(bValue);
+        return sortOrder.toUpperCase() === 'ASC' ? comparison : -comparison;
       }
-    }
-    
-    // Combine account owner (if exists and not already in list) with team members
-    let allMembers = processedTeamMembers;
-    if (accountOwnerEntry) {
-      // Put account owner first
-      allMembers = [accountOwnerEntry, ...processedTeamMembers];
-    } else {
-      // If account owner is in the list, move them to first position
-      const ownerIndex = allMembers.findIndex(m => m.is_account_owner || m.role === 'owner' || m.role === 'admin');
-      if (ownerIndex > 0) {
-        const owner = allMembers.splice(ownerIndex, 1)[0];
-        allMembers.unshift(owner);
-      }
-    }
+      
+      return 0;
+    });
     
     res.json({
-      teamMembers: allMembers,
+      teamMembers: processedTeamMembers,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: (count || 0) + (accountOwnerEntry ? 1 : 0),
-        pages: Math.ceil(((count || 0) + (accountOwnerEntry ? 1 : 0)) / limit)
+        total: count || 0,
+        pages: Math.ceil((count || 0) / limit)
       }
     });
   } catch (error) {
