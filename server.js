@@ -891,36 +891,108 @@ app.post('/api/auth/signin', async (req, res) => {
     // Sanitize email
     const sanitizedEmail = email.toLowerCase().trim();
     
-    // Get user with hashed password
-    const { data: users, error } = await supabase
+    // First, try to find user in users table (account owners)
+    const { data: users, error: userError } = await supabase
       .from('users')
       .select('id, email, password, first_name, last_name, business_name, profile_picture, google_id')
       .eq('email', sanitizedEmail)
       .limit(1);
     
-    if (error) {
-      console.error('Error fetching user:', error);
+    if (userError) {
+      console.error('Error fetching user:', userError);
       return res.status(500).json({ error: 'Login failed. Please try again.' });
     }
     
-    if (!users || users.length === 0) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    let user = null;
+    let userRole = 'owner'; // Default role for account owners
+    let isTeamMember = false;
     
-    const user = users[0];
-    
-    // Check if this is an OAuth user
-    if (user.google_id && user.password.startsWith('oauth_user_')) {
-      return res.status(401).json({ 
-        error: 'This account was created with Google. Please sign in with Google instead.' 
-      });
-    }
-    
-    // Verify password for regular users
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+    if (users && users.length > 0) {
+      // Found in users table - this is an account owner
+      user = users[0];
+      
+      // Check if this is an OAuth user
+      if (user.google_id && user.password.startsWith('oauth_user_')) {
+        return res.status(401).json({ 
+          error: 'This account was created with Google. Please sign in with Google instead.' 
+        });
+      }
+      
+      // Verify password
+      const isPasswordValid = await bcrypt.compare(password, user.password);
+      
+      if (!isPasswordValid) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+      
+      // Check if account owner exists in team_members table and get their role
+      const { data: teamMemberData, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('role')
+        .eq('user_id', user.id)
+        .eq('email', sanitizedEmail)
+        .limit(1);
+      
+      if (!teamMemberError && teamMemberData && teamMemberData.length > 0) {
+        // Account owner exists in team_members, use their role (should be 'owner' or 'account owner')
+        const role = teamMemberData[0].role;
+        if (role && (role.toLowerCase() === 'owner' || role.toLowerCase() === 'account owner' || role.toLowerCase() === 'admin')) {
+          userRole = 'owner';
+        } else {
+          userRole = role || 'owner';
+        }
+      }
+    } else {
+      // Not found in users table, check team_members table
+      const { data: teamMembers, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('id, user_id, email, password, first_name, last_name, role, status, profile_picture')
+        .eq('email', sanitizedEmail)
+        .eq('status', 'active')
+        .limit(1);
+      
+      if (teamMemberError) {
+        console.error('Error fetching team member:', teamMemberError);
+        return res.status(500).json({ error: 'Login failed. Please try again.' });
+      }
+      
+      if (!teamMembers || teamMembers.length === 0) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+      
+      const teamMember = teamMembers[0];
+      
+      // Check if password is set
+      if (!teamMember.password) {
+        return res.status(401).json({ error: 'Account not set up for login. Please contact your manager.' });
+      }
+      
+      // Verify password
+      const isPasswordValid = await bcrypt.compare(password, teamMember.password);
+      
+      if (!isPasswordValid) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+      
+      // Use team member data
+      user = {
+        id: teamMember.user_id, // Use the user_id from team_members (the account owner's user_id)
+        email: teamMember.email,
+        first_name: teamMember.first_name,
+        last_name: teamMember.last_name,
+        business_name: null, // Team members don't have business_name
+        profile_picture: teamMember.profile_picture
+      };
+      
+      // Get role from team member
+      userRole = teamMember.role || 'worker';
+      isTeamMember = true;
+      
+      // Update last login
+      await supabase
+        .from('team_members')
+        .update({ last_login: new Date().toISOString() })
+        .eq('id', teamMember.id);
     }
     
     // Generate JWT token
@@ -930,24 +1002,29 @@ app.post('/api/auth/signin', async (req, res) => {
         email: user.email,
         firstName: user.first_name,
         lastName: user.last_name,
-        businessName: user.business_name
+        businessName: user.business_name,
+        role: userRole
       },
       JWT_SECRET,
       { expiresIn: '1d' }
     );
     
+    // Build user response object
+    const userResponse = {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      businessName: user.business_name,
+      business_name: user.business_name, // Add both for compatibility
+      profilePicture: user.profile_picture,
+      role: userRole // Include role in response
+    };
+    
     res.json({ 
       message: 'Login successful',
       token,
-      user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        businessName: user.business_name,
-        business_name: user.business_name, // Add both for compatibility
-        profilePicture: user.profile_picture // Include profile picture
-      }
+      user: userResponse
     });
   } catch (error) {
     console.error('Signin error:', error);
@@ -5454,8 +5531,9 @@ app.get('/api/public/business-info', async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const userEmail = req.user.email;
 
-    // Query Supabase directly
+    // Query Supabase directly - first check users table
     const { data: user, error } = await supabase
       .from('users')
       .select(`
@@ -5472,27 +5550,82 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       .eq('id', userId)
       .maybeSingle(); // fetch a single row instead of array
 
+    let userRole = 'owner'; // Default role for account owners
+    let profileData = null;
+
     if (error) {
       console.error('Error fetching user profile:', error);
       return res.status(500).json({ error: 'Failed to fetch user profile' });
     }
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    if (user) {
+      // Found in users table - this is an account owner
+      // Check if they exist in team_members table to get their role
+      const { data: teamMemberData, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('role')
+        .eq('user_id', userId)
+        .eq('email', user.email)
+        .limit(1);
+      
+      if (!teamMemberError && teamMemberData && teamMemberData.length > 0) {
+        const role = teamMemberData[0].role;
+        if (role && (role.toLowerCase() === 'owner' || role.toLowerCase() === 'account owner' || role.toLowerCase() === 'admin')) {
+          userRole = 'owner';
+        } else {
+          userRole = role || 'owner';
+        }
+      }
+
+      profileData = {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name,
+        phone: user.phone || '',
+        emailNotifications: !!user.email_notifications,
+        smsNotifications: !!user.sms_notifications,
+        profilePicture: user.profile_picture,
+        role: userRole
+      };
+    } else {
+      // Not found in users table, check team_members table
+      const { data: teamMember, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('id, user_id, email, first_name, last_name, phone, role, profile_picture, status')
+        .or(`user_id.eq.${userId},email.eq.${userEmail}`)
+        .eq('status', 'active')
+        .limit(1);
+
+      if (teamMemberError) {
+        console.error('Error fetching team member profile:', teamMemberError);
+        return res.status(500).json({ error: 'Failed to fetch user profile' });
+      }
+
+      if (!teamMember || teamMember.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const member = teamMember[0];
+      userRole = member.role || 'worker';
+
+      profileData = {
+        id: member.user_id, // Use the account owner's user_id
+        email: member.email,
+        firstName: member.first_name,
+        lastName: member.last_name,
+        businessName: null, // Team members don't have business_name
+        phone: member.phone || '',
+        emailNotifications: false, // Default for team members
+        smsNotifications: false, // Default for team members
+        profilePicture: member.profile_picture,
+        role: userRole
+      };
     }
 
-    // Return normalized JSON
-    res.json({
-      id: user.id,
-      email: user.email,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      businessName: user.business_name,
-      phone: user.phone || '',
-      emailNotifications: !!user.email_notifications,
-      smsNotifications: !!user.sms_notifications,
-      profilePicture: user.profile_picture
-    });
+    // Return normalized JSON with role
+    res.json(profileData);
 
   } catch (error) {
     console.error('Get user profile error:', error);
