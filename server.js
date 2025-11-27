@@ -9447,6 +9447,7 @@ app.post('/api/team-members', async (req, res) => {
     const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
     
     // Send invitation email in background without waiting
+    // Note: Email sending failure will not prevent team member creation
     sendTeamMemberEmail({
       to: email,
       subject: 'You\'ve been invited to join Service Flow',
@@ -9468,8 +9469,17 @@ app.post('/api/team-members', async (req, res) => {
     }).then(() => {
       console.log('✅ Team member invitation email sent successfully to:', email);
     }).catch((emailError) => {
-      console.error('❌ Failed to send team member invitation email:', emailError);
-      // Don't fail the request if email fails
+      console.error('⚠️ Failed to send team member invitation email (team member was still created):', emailError.message);
+      console.error('⚠️ Email error details:', {
+        code: emailError.code,
+        message: emailError.message
+      });
+      if (emailError.code === 401) {
+        console.error('⚠️ SendGrid API key is invalid or missing. Please check your SENDGRID_API_KEY environment variable.');
+        console.error('⚠️ Team member was created successfully, but invitation email was not sent.');
+        console.error('⚠️ You can manually send the invitation using the "Resend Invite" feature once SendGrid is configured.');
+      }
+      // Don't fail the request if email fails - team member creation succeeds regardless
     });
     
     res.status(201).json({
@@ -9559,7 +9569,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
             .select('id, email, first_name, last_name, phone, business_name, profile_picture')
             .eq('id', userId)
             .maybeSingle();
-          
+    
           if (ownerError || !ownerData) {
             return res.status(404).json({ error: 'Account owner not found' });
           }
@@ -9630,8 +9640,8 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
             parsedAvailability = JSON.parse(availability);
           } else {
             parsedAvailability = availability;
-          }
-          
+    }
+    
           // Convert team member availability format to user_availability business_hours format
           if (parsedAvailability.workingHours) {
             const businessHours = {};
@@ -9788,11 +9798,11 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       }
       
       const { data: newMember, error: createError } = await supabase
-        .from('team_members')
+          .from('team_members')
         .insert(dataToSave)
         .select()
         .single();
-      
+        
       if (createError) {
         console.error('Error creating account owner team member:', createError);
         console.error('Create error details:', {
