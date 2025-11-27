@@ -8768,6 +8768,13 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
   try {
     const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
     
+    // First, get the account owner from users table
+    const { data: accountOwner, error: ownerError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, phone, business_name, profile_picture')
+      .eq('id', userId)
+      .maybeSingle();
+    
     // Build Supabase query with joins and aggregations for team members
     let query = supabase
       .from('team_members')
@@ -8777,7 +8784,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       `, { count: 'exact' })
       .eq('user_id', userId);
     
-    // Add status filter
+    // Add status filter (but don't filter out account owner if they don't have status)
     if (status) {
       query = query.eq('status', status);
     }
@@ -8813,6 +8820,50 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
     
+    // Check if account owner exists in team_members
+    const accountOwnerInTeam = teamMembers?.find(member => 
+      member.role === 'account owner' || member.role === 'owner' || member.role === 'admin' ||
+      (accountOwner && member.email === accountOwner.email)
+    );
+    
+    // If account owner doesn't exist in team_members, create a virtual entry
+    let accountOwnerEntry = null;
+    if (accountOwner && !accountOwnerInTeam) {
+      // Get jobs assigned to the account owner (using user_id)
+      const { data: ownerJobs, error: jobsError } = await supabase
+        .from('jobs')
+        .select('id, status, invoice_amount')
+        .eq('user_id', userId)
+        .limit(100);
+      
+      const jobs = ownerJobs || [];
+      const totalJobs = jobs.length;
+      const completedJobs = jobs.filter(job => job.status === 'completed').length;
+      const avgJobValue = completedJobs > 0 
+        ? Math.round((jobs.filter(job => job.status === 'completed')
+            .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
+        : 0;
+      
+      // Create virtual account owner entry
+      accountOwnerEntry = {
+        id: accountOwner.id, // Use user id as team member id
+        user_id: userId,
+        email: accountOwner.email,
+        first_name: accountOwner.first_name,
+        last_name: accountOwner.last_name,
+        phone: accountOwner.phone || null,
+        role: 'account owner',
+        status: 'active',
+        is_service_provider: true,
+        profile_picture: accountOwner.profile_picture || null,
+        color: '#DC2626', // Default red color
+        total_jobs: totalJobs,
+        completed_jobs: completedJobs,
+        avg_job_value: avgJobValue,
+        jobs: jobs
+      };
+    }
+    
     // Process team members to add job statistics
     let processedTeamMembers = (teamMembers || []).map(member => {
       const jobs = member.jobs || [];
@@ -8830,6 +8881,11 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
         avg_job_value: avgJobValue
       };
     });
+    
+    // Add account owner entry if it doesn't exist
+    if (accountOwnerEntry) {
+      processedTeamMembers.unshift(accountOwnerEntry); // Add to beginning
+    }
     
     // Sort: account owner first, then by requested sort field
     processedTeamMembers.sort((a, b) => {
@@ -8856,8 +8912,8 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit)
+        total: (count || 0) + (accountOwnerEntry ? 1 : 0),
+        pages: Math.ceil(((count || 0) + (accountOwnerEntry ? 1 : 0)) / limit)
       }
     });
   } catch (error) {
