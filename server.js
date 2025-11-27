@@ -933,19 +933,19 @@ app.post('/api/auth/signin', async (req, res) => {
     if (users && users.length > 0) {
       // Found in users table - this is an account owner
       user = users[0];
-      
-      // Check if this is an OAuth user
-      if (user.google_id && user.password.startsWith('oauth_user_')) {
-        return res.status(401).json({ 
-          error: 'This account was created with Google. Please sign in with Google instead.' 
-        });
-      }
-      
+    
+    // Check if this is an OAuth user
+    if (user.google_id && user.password.startsWith('oauth_user_')) {
+      return res.status(401).json({ 
+        error: 'This account was created with Google. Please sign in with Google instead.' 
+      });
+    }
+    
       // Verify password
-      const isPasswordValid = await bcrypt.compare(password, user.password);
-      
-      if (!isPasswordValid) {
-        return res.status(401).json({ error: 'Invalid email or password' });
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
       }
       
       // Check if account owner exists in team_members table and get their role
@@ -1048,12 +1048,12 @@ app.post('/api/auth/signin', async (req, res) => {
     
     // Build user response object
     const userResponse = {
-      id: user.id,
-      email: user.email,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      businessName: user.business_name,
-      business_name: user.business_name, // Add both for compatibility
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        businessName: user.business_name,
+        business_name: user.business_name, // Add both for compatibility
       profilePicture: user.profile_picture,
       role: userRole, // Include role in response
       permissions: user.permissions || {}, // Include permissions for team members
@@ -5616,14 +5616,14 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       }
 
       profileData = {
-        id: user.id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        businessName: user.business_name,
-        phone: user.phone || '',
-        emailNotifications: !!user.email_notifications,
-        smsNotifications: !!user.sms_notifications,
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      businessName: user.business_name,
+      phone: user.phone || '',
+      emailNotifications: !!user.email_notifications,
+      smsNotifications: !!user.sms_notifications,
         profilePicture: user.profile_picture,
         role: userRole
       };
@@ -9056,8 +9056,8 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
           .maybeSingle();
 
         if (ownerError || !accountOwner) {
-          return res.status(404).json({ error: 'Team member not found' });
-        }
+      return res.status(404).json({ error: 'Team member not found' });
+    }
 
         // Fetch availability from user_availability table for account owner
         let accountOwnerAvailability = null;
@@ -9252,16 +9252,16 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
         jobsError = result.error;
       } else {
         const result = await supabase
-          .from('jobs')
-          .select(`
-            *,
-            customers!left(first_name, last_name, phone, address),
-            services!left(name, duration)
-          `)
-          .eq('team_member_id', id)
-          .gte('scheduled_date', startDate || '2024-01-01')
-          .lte('scheduled_date', endDate || '2030-12-31')
-          .order('scheduled_date', { ascending: true });
+        .from('jobs')
+        .select(`
+          *,
+          customers!left(first_name, last_name, phone, address),
+          services!left(name, duration)
+        `)
+        .eq('team_member_id', id)
+        .gte('scheduled_date', startDate || '2024-01-01')
+        .lte('scheduled_date', endDate || '2030-12-31')
+        .order('scheduled_date', { ascending: true });
         jobsResult = result.data;
         jobsError = result.error;
       }
@@ -9486,7 +9486,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     const firstNameValue = firstName || first_name;
     const lastNameValue = lastName || last_name;
     
-    // Check if team member exists
+    // Check if team member exists by ID
     const { data: existingMember, error: checkError } = await supabase
       .from('team_members')
       .select('id, user_id, role')
@@ -9495,23 +9495,47 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     
     let isAccountOwner = false;
     let shouldCreate = false;
+    let actualTeamMemberId = id; // The ID to use for updates
+    let accountOwner = null; // Account owner data if needed for creation
     
     // If not found, check if it's the account owner
     if (!existingMember || existingMember.length === 0) {
       if (parseInt(id) === userId) {
         // This is the account owner trying to save their settings
-        isAccountOwner = true;
-        shouldCreate = true;
+        // Check if they have a team_members entry by user_id and role
+        const { data: accountOwnerMember, error: ownerMemberError } = await supabase
+          .from('team_members')
+          .select('id, user_id, role')
+          .eq('user_id', userId)
+          .or('role.eq.account owner,role.eq.owner,role.eq.admin')
+          .limit(1);
         
-        // Fetch account owner data from users table
-        const { data: accountOwner, error: ownerError } = await supabase
-          .from('users')
-          .select('id, email, first_name, last_name, phone, business_name, profile_picture')
-          .eq('id', userId)
-          .maybeSingle();
+        if (ownerMemberError) {
+          console.error('Error checking account owner team member:', ownerMemberError);
+        }
         
-        if (ownerError || !accountOwner) {
-          return res.status(404).json({ error: 'Account owner not found' });
+        if (accountOwnerMember && accountOwnerMember.length > 0) {
+          // Account owner has a team_members entry, use that ID
+          actualTeamMemberId = accountOwnerMember[0].id;
+          isAccountOwner = true;
+          shouldCreate = false;
+        } else {
+          // Account owner doesn't have a team_members entry, need to create one
+          isAccountOwner = true;
+          shouldCreate = true;
+          
+          // Fetch account owner data from users table
+          const { data: ownerData, error: ownerError } = await supabase
+            .from('users')
+            .select('id, email, first_name, last_name, phone, business_name, profile_picture')
+            .eq('id', userId)
+            .maybeSingle();
+          
+          if (ownerError || !ownerData) {
+            return res.status(404).json({ error: 'Account owner not found' });
+          }
+          
+          accountOwner = ownerData;
         }
       } else {
         return res.status(404).json({ error: 'Team member not found' });
@@ -9520,6 +9544,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       // Check if it's an account owner
       const member = existingMember[0];
       isAccountOwner = member.role === 'account owner' || member.role === 'owner' || member.role === 'admin';
+      actualTeamMemberId = member.id;
     }
     
     // Build update/insert object
@@ -9719,8 +9744,19 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     
     if (shouldCreate) {
       // Create new team member entry for account owner
+      // Don't set id - let the database auto-generate it
       dataToSave.user_id = userId;
-      dataToSave.id = userId; // Use user id as team member id
+      
+      // Ensure required fields are set
+      if (!dataToSave.first_name && accountOwner) {
+        dataToSave.first_name = accountOwner.first_name;
+      }
+      if (!dataToSave.last_name && accountOwner) {
+        dataToSave.last_name = accountOwner.last_name;
+      }
+      if (!dataToSave.email && accountOwner) {
+        dataToSave.email = accountOwner.email;
+      }
       
       const { data: newMember, error: createError } = await supabase
         .from('team_members')
@@ -9730,53 +9766,60 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       
       if (createError) {
         console.error('Error creating account owner team member:', createError);
+        console.error('Create error details:', {
+          code: createError.code,
+          message: createError.message,
+          details: createError.details,
+          hint: createError.hint
+        });
         return res.status(500).json({ 
           error: 'Failed to create team member entry',
-          details: createError.message
+          details: createError.message,
+          code: createError.code
         });
       }
       
       res.json({ message: 'Team member settings saved successfully' });
     } else {
-      // Update existing team member
-      const { error } = await supabase
-        .from('team_members')
+      // Update existing team member using the actual team member ID
+    const { error } = await supabase
+      .from('team_members')
         .update(dataToSave)
-        .eq('id', id);
+        .eq('id', actualTeamMemberId);
+    
+    if (error) {
+      console.error('Error updating team member:', error);
+      console.error('Error details:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint
+      });
       
-      if (error) {
-        console.error('Error updating team member:', error);
-        console.error('Error details:', {
-          code: error.code,
-          message: error.message,
-          details: error.details,
-          hint: error.hint
-        });
-        
-        // Provide specific error messages based on the database error
-        let errorMessage = 'Failed to update team member';
-        let errorType = 'database_error';
-        
-        if (error.code === '42703') { // Column does not exist
+      // Provide specific error messages based on the database error
+      let errorMessage = 'Failed to update team member';
+      let errorType = 'database_error';
+      
+      if (error.code === '42703') { // Column does not exist
           errorMessage = 'Database schema error. Please contact support.';
-          errorType = 'schema_error';
-        } else if (error.code === '23505') { // Unique constraint violation
-          errorMessage = 'A team member with this information already exists.';
-          errorType = 'duplicate_entry';
-        } else if (error.code === '23502') { // Not null constraint violation
-          errorMessage = 'Required fields are missing.';
-          errorType = 'missing_fields';
-        }
-        
-        return res.status(500).json({ 
-          error: errorMessage,
-          errorType: errorType,
-          details: error.message,
-          code: error.code
-        });
+        errorType = 'schema_error';
+      } else if (error.code === '23505') { // Unique constraint violation
+        errorMessage = 'A team member with this information already exists.';
+        errorType = 'duplicate_entry';
+      } else if (error.code === '23502') { // Not null constraint violation
+        errorMessage = 'Required fields are missing.';
+        errorType = 'missing_fields';
       }
       
-      res.json({ message: 'Team member updated successfully' });
+      return res.status(500).json({ 
+        error: errorMessage,
+        errorType: errorType,
+        details: error.message,
+        code: error.code
+      });
+    }
+    
+    res.json({ message: 'Team member updated successfully' });
     }
   } catch (error) {
     console.error('Update team member error:', error);
