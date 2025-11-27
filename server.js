@@ -6912,6 +6912,66 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
     const hasRecordWithHours = existingAvailabilityWithHours && existingAvailabilityWithHours.length > 0;
     const hasAnyRecord = anyExistingRecord && anyExistingRecord.length > 0;
     
+    // For account owners, also sync to team_members.availability
+    try {
+      const { data: teamMember, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('id, role')
+        .eq('user_id', userIdNum)
+        .or('role.eq.account owner,role.eq.owner,role.eq.admin')
+        .limit(1);
+      
+      if (!teamMemberError && teamMember && teamMember.length > 0) {
+        // Convert businessHours to team member availability format
+        const workingHours = {};
+        const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+        
+        days.forEach(day => {
+          const dayHours = businessHoursJson[day];
+          if (dayHours && dayHours.enabled) {
+            // Convert 24-hour format to 12-hour format for display
+            const startTime = dayHours.start || '09:00';
+            const endTime = dayHours.end || '17:00';
+            
+            // Convert to 12-hour format
+            const [startH, startM] = startTime.split(':');
+            const [endH, endM] = endTime.split(':');
+            const startHour = parseInt(startH);
+            const endHour = parseInt(endH);
+            
+            const startPeriod = startHour >= 12 ? 'PM' : 'AM';
+            const endPeriod = endHour >= 12 ? 'PM' : 'AM';
+            const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
+            const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
+            
+            workingHours[day] = {
+              available: true,
+              hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+            };
+          } else {
+            workingHours[day] = {
+              available: false,
+              hours: ""
+            };
+          }
+        });
+        
+        const teamMemberAvailability = JSON.stringify({
+          workingHours,
+          customAvailability: []
+        });
+        
+        // Update team_members.availability
+        await supabase
+          .from('team_members')
+          .update({ availability: teamMemberAvailability })
+          .eq('id', teamMember[0].id);
+      }
+    } catch (teamMemberSyncError) {
+      console.error('Error syncing availability to team_members:', teamMemberSyncError);
+      // Don't fail the request if sync fails
+    }
+    
     if (hasRecordWithHours) {
       // Update existing record that has business_hours
       const { error: updateError } = await supabase
@@ -8999,6 +9059,137 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
           return res.status(404).json({ error: 'Team member not found' });
         }
 
+        // Fetch availability from user_availability table for account owner
+        let accountOwnerAvailability = null;
+        try {
+          const { data: userAvailability, error: availError } = await supabase
+            .from('user_availability')
+            .select('business_hours, timeslot_templates')
+            .eq('user_id', userId)
+            .not('business_hours', 'is', null)
+            .limit(1);
+          
+          if (!availError && userAvailability && userAvailability.length > 0) {
+            // Convert user_availability format to team_members availability format
+            const businessHours = userAvailability[0].business_hours;
+            if (businessHours) {
+              // Convert businessHours format to workingHours format
+              const workingHours = {
+                monday: businessHours.monday || { available: false, hours: "" },
+                tuesday: businessHours.tuesday || { available: false, hours: "" },
+                wednesday: businessHours.wednesday || { available: false, hours: "" },
+                thursday: businessHours.thursday || { available: false, hours: "" },
+                friday: businessHours.friday || { available: false, hours: "" },
+                saturday: businessHours.saturday || { available: false, hours: "" },
+                sunday: businessHours.sunday || { available: false, hours: "" }
+              };
+              
+              // Normalize to team member format
+              Object.keys(workingHours).forEach(day => {
+                const dayHours = businessHours[day];
+                if (dayHours && dayHours.enabled !== undefined) {
+                  // Convert 24-hour format to 12-hour format
+                  if (dayHours.enabled && dayHours.start && dayHours.end) {
+                    const [startH, startM] = dayHours.start.split(':');
+                    const [endH, endM] = dayHours.end.split(':');
+                    const startHour = parseInt(startH);
+                    const endHour = parseInt(endH);
+                    
+                    const startPeriod = startHour >= 12 ? 'PM' : 'AM';
+                    const endPeriod = endHour >= 12 ? 'PM' : 'AM';
+                    const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
+                    const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
+                    
+                    workingHours[day] = {
+                      available: true,
+                      hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+                    };
+                  } else {
+                    workingHours[day] = {
+                      available: false,
+                      hours: ""
+                    };
+                  }
+                } else if (dayHours && dayHours.start && dayHours.end) {
+                  // Convert 24-hour format to 12-hour format
+                  const [startH, startM] = dayHours.start.split(':');
+                  const [endH, endM] = dayHours.end.split(':');
+                  const startHour = parseInt(startH);
+                  const endHour = parseInt(endH);
+                  
+                  const startPeriod = startHour >= 12 ? 'PM' : 'AM';
+                  const endPeriod = endHour >= 12 ? 'PM' : 'AM';
+                  const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
+                  const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
+                  
+                  workingHours[day] = {
+                    available: true,
+                    hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+                  };
+                } else {
+                  workingHours[day] = {
+                    available: false,
+                    hours: ""
+                  };
+                }
+              });
+              
+              accountOwnerAvailability = JSON.stringify({
+                workingHours,
+                customAvailability: []
+              });
+            }
+          }
+        } catch (availFetchError) {
+          console.error('Error fetching user availability for account owner:', availFetchError);
+        }
+        
+        // If no availability found, create default in user_availability table
+        if (!accountOwnerAvailability) {
+          try {
+            const defaultBusinessHours = {
+              monday: { enabled: true, start: '09:00', end: '17:00' },
+              tuesday: { enabled: true, start: '09:00', end: '17:00' },
+              wednesday: { enabled: true, start: '09:00', end: '17:00' },
+              thursday: { enabled: true, start: '09:00', end: '17:00' },
+              friday: { enabled: true, start: '09:00', end: '17:00' },
+              saturday: { enabled: false, start: '09:00', end: '17:00' },
+              sunday: { enabled: false, start: '09:00', end: '17:00' }
+            };
+            
+            // Try to create default availability in user_availability table
+            const { error: createAvailError } = await supabase
+              .from('user_availability')
+              .insert({
+                user_id: userId,
+                day_of_week: 0, // Placeholder
+                start_time: '00:00:00', // Placeholder
+                end_time: '00:00:00', // Placeholder
+                is_available: true, // Placeholder
+                business_hours: defaultBusinessHours,
+                timeslot_templates: []
+              });
+            
+            if (!createAvailError) {
+              // Convert to team member format
+              accountOwnerAvailability = JSON.stringify({
+                workingHours: {
+                  monday: { available: true, hours: "9:00 AM - 5:00 PM" },
+                  tuesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+                  wednesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+                  thursday: { available: true, hours: "9:00 AM - 5:00 PM" },
+                  friday: { available: true, hours: "9:00 AM - 5:00 PM" },
+                  saturday: { available: false, hours: "" },
+                  sunday: { available: false, hours: "" }
+                },
+                customAvailability: []
+              });
+            }
+          } catch (createError) {
+            console.error('Error creating default availability:', createError);
+          }
+        }
+        
         // Create virtual team member entry for account owner
         teamMember = {
           id: accountOwner.id, // Use user id as team member id
@@ -9013,7 +9204,18 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
           profile_picture: accountOwner.profile_picture || null,
           color: '#DC2626', // Default red color
           territories: null,
-          availability: null,
+          availability: accountOwnerAvailability || JSON.stringify({
+            workingHours: {
+              monday: { available: true, hours: "9:00 AM - 5:00 PM" },
+              tuesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+              wednesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+              thursday: { available: true, hours: "9:00 AM - 5:00 PM" },
+              friday: { available: true, hours: "9:00 AM - 5:00 PM" },
+              saturday: { available: false, hours: "" },
+              sunday: { available: false, hours: "" }
+            },
+            customAvailability: []
+          }),
           permissions: null,
           location: null,
           city: null,
@@ -9364,6 +9566,99 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     
     if (availability !== undefined) {
       dataToSave.availability = typeof availability === 'string' ? availability : JSON.stringify(availability);
+      
+      // For account owners, also sync availability to user_availability table
+      if (isAccountOwner) {
+        try {
+          // Parse availability to convert from team member format to user_availability format
+          let parsedAvailability;
+          if (typeof availability === 'string') {
+            parsedAvailability = JSON.parse(availability);
+          } else {
+            parsedAvailability = availability;
+          }
+          
+          // Convert team member availability format to user_availability business_hours format
+          if (parsedAvailability.workingHours) {
+            const businessHours = {};
+            const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+            
+            days.forEach(day => {
+              const dayHours = parsedAvailability.workingHours[day];
+              if (dayHours && dayHours.available && dayHours.hours) {
+                // Parse hours string like "9:00 AM - 6:00 PM" or "09:00 - 17:00"
+                const hoursMatch = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+                if (hoursMatch) {
+                  let startHour = parseInt(hoursMatch[1]);
+                  let startMin = hoursMatch[2];
+                  let endHour = parseInt(hoursMatch[4]);
+                  let endMin = hoursMatch[5];
+                  
+                  // Convert to 24-hour format if AM/PM is present
+                  if (hoursMatch[3]) {
+                    if (hoursMatch[3].toUpperCase() === 'PM' && startHour !== 12) startHour += 12;
+                    if (hoursMatch[3].toUpperCase() === 'AM' && startHour === 12) startHour = 0;
+                  }
+                  if (hoursMatch[6]) {
+                    if (hoursMatch[6].toUpperCase() === 'PM' && endHour !== 12) endHour += 12;
+                    if (hoursMatch[6].toUpperCase() === 'AM' && endHour === 12) endHour = 0;
+                  }
+                  
+                  businessHours[day] = {
+                    enabled: true,
+                    start: `${startHour.toString().padStart(2, '0')}:${startMin}`,
+                    end: `${endHour.toString().padStart(2, '0')}:${endMin}`
+                  };
+                } else {
+                  // Default format if parsing fails
+                  businessHours[day] = {
+                    enabled: dayHours.available,
+                    start: '09:00',
+                    end: '17:00'
+                  };
+                }
+              } else {
+                businessHours[day] = {
+                  enabled: false,
+                  start: '09:00',
+                  end: '17:00'
+                };
+              }
+            });
+            
+            // Update or create user_availability record
+            const { data: existingUserAvail, error: checkAvailError } = await supabase
+              .from('user_availability')
+              .select('id')
+              .eq('user_id', userId)
+              .not('business_hours', 'is', null)
+              .limit(1);
+            
+            if (existingUserAvail && existingUserAvail.length > 0) {
+              // Update existing
+              await supabase
+                .from('user_availability')
+                .update({
+                  business_hours: businessHours,
+                  timeslot_templates: parsedAvailability.timeslotTemplates || []
+                })
+                .eq('id', existingUserAvail[0].id);
+            } else {
+              // Create new
+              await supabase
+                .from('user_availability')
+                .insert({
+                  user_id: userId,
+                  business_hours: businessHours,
+                  timeslot_templates: parsedAvailability.timeslotTemplates || []
+                });
+            }
+          }
+        } catch (syncError) {
+          console.error('Error syncing availability to user_availability:', syncError);
+          // Don't fail the request if sync fails, just log it
+        }
+      }
     }
     
     // Don't allow changing status for account owner
