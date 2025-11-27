@@ -8964,10 +8964,11 @@ app.get('/api/team-members/verify-invitation', async (req, res) => {
   }
 });
 
-app.get('/api/team-members/:id', async (req, res) => {
+app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { startDate, endDate } = req.query;
+    const userId = req.user.userId;
 
     // ✅ Fetch team member info
     const { data: teamMembers, error: teamMemberError } = await supabase
@@ -8981,26 +8982,87 @@ app.get('/api/team-members/:id', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch team member data' });
     }
 
-    if (!teamMembers || teamMembers.length === 0) {
-      return res.status(404).json({ error: 'Team member not found' });
-    }
+    let teamMember = null;
 
-    const teamMember = teamMembers[0];
+    // If not found in team_members, check if it's the account owner
+    if (!teamMembers || teamMembers.length === 0) {
+      // Check if the ID matches the user_id (account owner)
+      if (parseInt(id) === userId) {
+        // Fetch account owner from users table
+        const { data: accountOwner, error: ownerError } = await supabase
+          .from('users')
+          .select('id, email, first_name, last_name, phone, business_name, profile_picture')
+          .eq('id', userId)
+          .maybeSingle();
+
+        if (ownerError || !accountOwner) {
+          return res.status(404).json({ error: 'Team member not found' });
+        }
+
+        // Create virtual team member entry for account owner
+        teamMember = {
+          id: accountOwner.id, // Use user id as team member id
+          user_id: userId,
+          email: accountOwner.email,
+          first_name: accountOwner.first_name,
+          last_name: accountOwner.last_name,
+          phone: accountOwner.phone || null,
+          role: 'account owner',
+          status: 'active',
+          is_service_provider: true,
+          profile_picture: accountOwner.profile_picture || null,
+          color: '#DC2626', // Default red color
+          territories: null,
+          availability: null,
+          permissions: null,
+          location: null,
+          city: null,
+          state: null,
+          zip_code: null
+        };
+      } else {
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+    } else {
+      teamMember = teamMembers[0];
+    }
 
     // ✅ Fetch jobs assigned to this team member
     let jobs = [];
     try {
-      const { data: jobsResult, error: jobsError } = await supabase
-        .from('jobs')
-        .select(`
-          *,
-          customers!left(first_name, last_name, phone, address),
-          services!left(name, duration)
-        `)
-        .eq('team_member_id', id)
-        .gte('scheduled_date', startDate || '2024-01-01')
-        .lte('scheduled_date', endDate || '2030-12-31')
-        .order('scheduled_date', { ascending: true });
+      // For account owner, fetch jobs by user_id, otherwise by team_member_id
+      let jobsResult, jobsError;
+      
+      // If it's the account owner (id matches userId and not in team_members), fetch by user_id
+      if (parseInt(id) === userId && (!teamMembers || teamMembers.length === 0)) {
+        const result = await supabase
+          .from('jobs')
+          .select(`
+            *,
+            customers!left(first_name, last_name, phone, address),
+            services!left(name, duration)
+          `)
+          .eq('user_id', userId)
+          .gte('scheduled_date', startDate || '2024-01-01')
+          .lte('scheduled_date', endDate || '2030-12-31')
+          .order('scheduled_date', { ascending: true });
+        jobsResult = result.data;
+        jobsError = result.error;
+      } else {
+        const result = await supabase
+          .from('jobs')
+          .select(`
+            *,
+            customers!left(first_name, last_name, phone, address),
+            services!left(name, duration)
+          `)
+          .eq('team_member_id', id)
+          .gte('scheduled_date', startDate || '2024-01-01')
+          .lte('scheduled_date', endDate || '2030-12-31')
+          .order('scheduled_date', { ascending: true });
+        jobsResult = result.data;
+        jobsError = result.error;
+      }
 
       if (jobsError) {
         console.error('Error fetching jobs for team member:', jobsError);
@@ -9191,9 +9253,10 @@ app.post('/api/team-members', async (req, res) => {
 });
 
 
-app.put('/api/team-members/:id', async (req, res) => {
+app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user.userId;
     const { 
       firstName, 
       lastName, 
@@ -9211,151 +9274,215 @@ app.put('/api/team-members/:id', async (req, res) => {
       zipCode,
       territories,
       permissions,
-      color
+      color,
+      first_name, // Support snake_case from frontend
+      last_name,
+      is_service_provider
     } = req.body;
     
-    // Build update object with only provided fields
-    const updateData = {};
+    // Normalize field names (support both camelCase and snake_case)
+    const firstNameValue = firstName || first_name;
+    const lastNameValue = lastName || last_name;
     
-    if (firstName) {
-      updateData.first_name = firstName;
+    // Check if team member exists
+    const { data: existingMember, error: checkError } = await supabase
+      .from('team_members')
+      .select('id, user_id, role')
+      .eq('id', id)
+      .limit(1);
+    
+    let isAccountOwner = false;
+    let shouldCreate = false;
+    
+    // If not found, check if it's the account owner
+    if (!existingMember || existingMember.length === 0) {
+      if (parseInt(id) === userId) {
+        // This is the account owner trying to save their settings
+        isAccountOwner = true;
+        shouldCreate = true;
+        
+        // Fetch account owner data from users table
+        const { data: accountOwner, error: ownerError } = await supabase
+          .from('users')
+          .select('id, email, first_name, last_name, phone, business_name, profile_picture')
+          .eq('id', userId)
+          .maybeSingle();
+        
+        if (ownerError || !accountOwner) {
+          return res.status(404).json({ error: 'Account owner not found' });
+        }
+      } else {
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+    } else {
+      // Check if it's an account owner
+      const member = existingMember[0];
+      isAccountOwner = member.role === 'account owner' || member.role === 'owner' || member.role === 'admin';
     }
     
-    if (lastName) {
-      updateData.last_name = lastName;
+    // Build update/insert object
+    const dataToSave = {};
+    
+    if (firstNameValue) {
+      dataToSave.first_name = firstNameValue;
+    }
+    
+    if (lastNameValue) {
+      dataToSave.last_name = lastNameValue;
     }
     
     if (email) {
       if (!validateEmail(email)) {
         return res.status(400).json({ error: 'Invalid email format' });
       }
-      updateData.email = email;
+      dataToSave.email = email;
     }
     
     if (phone !== undefined) {
-      updateData.phone = phone;
+      dataToSave.phone = phone;
     }
     
     if (username !== undefined) {
-      updateData.username = username;
+      dataToSave.username = username;
     }
     
     if (password !== undefined) {
       const hashedPassword = await bcrypt.hash(password, 10);
-      updateData.password = hashedPassword;
+      dataToSave.password = hashedPassword;
     }
     
-    if (role !== undefined) {
-      updateData.role = role;
+    // Don't allow changing role for account owner
+    if (role !== undefined && !isAccountOwner) {
+      dataToSave.role = role;
+    } else if (shouldCreate) {
+      dataToSave.role = 'account owner';
     }
     
     if (hourlyRate !== undefined) {
-      updateData.hourly_rate = hourlyRate;
+      dataToSave.hourly_rate = hourlyRate;
     }
     
     if (availability !== undefined) {
-      updateData.availability = availability;
+      dataToSave.availability = typeof availability === 'string' ? availability : JSON.stringify(availability);
     }
     
-    if (status !== undefined) {
-      updateData.status = status;
+    // Don't allow changing status for account owner
+    if (status !== undefined && !isAccountOwner) {
+      dataToSave.status = status;
+    } else if (shouldCreate) {
+      dataToSave.status = 'active';
     }
     
     if (location !== undefined) {
-      updateData.location = location;
+      dataToSave.location = location;
     }
     
     if (city !== undefined) {
-      updateData.city = city;
+      dataToSave.city = city;
     }
     
     if (state !== undefined) {
-      updateData.state = state;
+      dataToSave.state = state;
     }
     
     if (zipCode !== undefined) {
-      updateData.zip_code = zipCode;
+      dataToSave.zip_code = zipCode;
     }
     
-    
     if (territories !== undefined) {
-      updateData.territories = territories;
+      dataToSave.territories = typeof territories === 'string' ? territories : JSON.stringify(territories);
     }
     
     if (permissions !== undefined) {
       // Ensure permissions is stored as JSON string if it's an object
       if (typeof permissions === 'object' && permissions !== null) {
-        updateData.permissions = JSON.stringify(permissions);
+        dataToSave.permissions = JSON.stringify(permissions);
       } else if (typeof permissions === 'string') {
         // Validate it's valid JSON
         try {
           JSON.parse(permissions);
-          updateData.permissions = permissions;
+          dataToSave.permissions = permissions;
         } catch (e) {
           console.error('Invalid JSON permissions, storing as empty object');
-          updateData.permissions = JSON.stringify({});
+          dataToSave.permissions = JSON.stringify({});
         }
       } else {
-        updateData.permissions = JSON.stringify({});
+        dataToSave.permissions = JSON.stringify({});
       }
     }
     
-    // Include color if provided (only if column exists)
+    // Include color if provided
     if (color !== undefined) {
-      // Check if color column exists by trying a test query first
-      try {
-        const { error: testError } = await supabase
-          .from('team_members')
-          .select('color')
-          .limit(1);
+      dataToSave.color = color;
+    }
+    
+    if (is_service_provider !== undefined) {
+      dataToSave.is_service_provider = is_service_provider;
+    } else if (shouldCreate) {
+      dataToSave.is_service_provider = true;
+    }
+    
+    if (shouldCreate) {
+      // Create new team member entry for account owner
+      dataToSave.user_id = userId;
+      dataToSave.id = userId; // Use user id as team member id
+      
+      const { data: newMember, error: createError } = await supabase
+        .from('team_members')
+        .insert(dataToSave)
+        .select()
+        .single();
+      
+      if (createError) {
+        console.error('Error creating account owner team member:', createError);
+        return res.status(500).json({ 
+          error: 'Failed to create team member entry',
+          details: createError.message
+        });
+      }
+      
+      res.json({ message: 'Team member settings saved successfully' });
+    } else {
+      // Update existing team member
+      const { error } = await supabase
+        .from('team_members')
+        .update(dataToSave)
+        .eq('id', id);
+      
+      if (error) {
+        console.error('Error updating team member:', error);
+        console.error('Error details:', {
+          code: error.code,
+          message: error.message,
+          details: error.details,
+          hint: error.hint
+        });
         
-        if (!testError) {
-          updateData.color = color;
-        } else {
+        // Provide specific error messages based on the database error
+        let errorMessage = 'Failed to update team member';
+        let errorType = 'database_error';
+        
+        if (error.code === '42703') { // Column does not exist
+          errorMessage = 'Database schema error. Please contact support.';
+          errorType = 'schema_error';
+        } else if (error.code === '23505') { // Unique constraint violation
+          errorMessage = 'A team member with this information already exists.';
+          errorType = 'duplicate_entry';
+        } else if (error.code === '23502') { // Not null constraint violation
+          errorMessage = 'Required fields are missing.';
+          errorType = 'missing_fields';
         }
-      } catch (err) {
-      }
-    }
-    
-    // Update team member
-    const { error } = await supabase
-      .from('team_members')
-      .update(updateData)
-      .eq('id', id);
-    
-    if (error) {
-      console.error('Error updating team member:', error);
-      console.error('Error details:', {
-        code: error.code,
-        message: error.message,
-        details: error.details,
-        hint: error.hint
-      });
-      
-      // Provide specific error messages based on the database error
-      let errorMessage = 'Failed to update team member';
-      let errorType = 'database_error';
-      
-      if (error.code === '42703') { // Column does not exist
-        errorMessage = 'Database schema error. The color column may not exist. Please contact support.';
-        errorType = 'schema_error';
-      } else if (error.code === '23505') { // Unique constraint violation
-        errorMessage = 'A team member with this information already exists.';
-        errorType = 'duplicate_entry';
-      } else if (error.code === '23502') { // Not null constraint violation
-        errorMessage = 'Required fields are missing.';
-        errorType = 'missing_fields';
+        
+        return res.status(500).json({ 
+          error: errorMessage,
+          errorType: errorType,
+          details: error.message,
+          code: error.code
+        });
       }
       
-      return res.status(500).json({ 
-        error: errorMessage,
-        errorType: errorType,
-        details: error.message,
-        code: error.code
-      });
+      res.json({ message: 'Team member updated successfully' });
     }
-    
-    res.json({ message: 'Team member updated successfully' });
   } catch (error) {
     console.error('Update team member error:', error);
     res.status(500).json({ error: 'Failed to update team member' });
