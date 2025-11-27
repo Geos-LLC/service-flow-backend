@@ -9440,8 +9440,37 @@ app.post('/api/team-members', async (req, res) => {
       return res.status(500).json({ error: 'Failed to create team member' });
     }
     
-    // ✅ Don’t send password back
+    // ✅ Don't send password back
     const { password: _, ...teamMemberWithoutPassword } = newTeamMember;
+    
+    // Generate invitation link
+    const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
+    
+    // Send invitation email in background without waiting
+    sendTeamMemberEmail({
+      to: email,
+      subject: 'You\'ve been invited to join Service Flow',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
+          <p>Hello ${firstName},</p>
+          <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+              Create Your Account
+            </a>
+          </div>
+          <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+          <p>Best regards,<br>The Service Flow Team</p>
+        </div>
+      `,
+      text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account. This link will expire in 7 days.`
+    }).then(() => {
+      console.log('✅ Team member invitation email sent successfully to:', email);
+    }).catch((emailError) => {
+      console.error('❌ Failed to send team member invitation email:', emailError);
+      // Don't fail the request if email fails
+    });
     
     res.status(201).json({
       message: 'Team member invited successfully',
