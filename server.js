@@ -1954,7 +1954,27 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       }
     }
       
-     
+      // Fetch status history for all jobs
+      const jobIds = (jobs || []).map(job => job.id);
+      let allStatusHistory = {};
+      
+      if (jobIds.length > 0) {
+        const { data: historyData, error: historyError } = await supabase
+          .from('job_status_history')
+          .select('*')
+          .in('job_id', jobIds)
+          .order('changed_at', { ascending: true });
+        
+        if (!historyError && historyData) {
+          // Group by job_id
+          historyData.forEach(entry => {
+            if (!allStatusHistory[entry.job_id]) {
+              allStatusHistory[entry.job_id] = [];
+            }
+            allStatusHistory[entry.job_id].push(entry);
+          });
+        }
+      }
       
       // Process jobs to add team assignments and format data
       const processedJobs = (jobs || []).map(job => {
@@ -1988,7 +2008,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           team_member_first_name: teamMember.first_name,
           team_member_last_name: teamMember.last_name,
           team_member_email: teamMember.email,
-          team_assignments: teamAssignments
+          team_assignments: teamAssignments,
+          status_history: allStatusHistory[job.id] || []
         };
       });
       
@@ -2288,6 +2309,21 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     }
     
     const job = jobs[0];
+    
+    // Fetch status history from job_status_history table
+    let statusHistory = [];
+    const { data: historyData, error: historyError } = await supabase
+      .from('job_status_history')
+      .select('*')
+      .eq('job_id', id)
+      .order('changed_at', { ascending: true });
+    
+    if (!historyError && historyData) {
+      statusHistory = historyData;
+    }
+    
+    // Add status_history to job object for backward compatibility
+    job.status_history = statusHistory;
     
    
     // Get intake answers from job_answers table
@@ -2709,6 +2745,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         service_intake_questions: processedIntakeQuestions.length > 0 ? processedIntakeQuestions : null
       };
 
+      // Note: Initial status will be inserted into job_status_history table after job creation
     
       const { data: result, error: insertError } = await supabase
         .from('jobs')
@@ -3129,6 +3166,55 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       } else {
         }
 
+      // Insert initial status into job_status_history table
+      const now = new Date().toISOString();
+      let changedBy = 'Staff';
+      
+      // Get user info for status history
+      try {
+        const { data: userData } = await supabase
+          .from('users')
+          .select('first_name, last_name, business_name')
+          .eq('id', userId)
+          .single();
+        
+        if (userData) {
+          changedBy = userData.business_name || 
+            `${userData.first_name || ''} ${userData.last_name || ''}`.trim() || 
+            'Staff';
+        }
+      } catch (userError) {
+        console.error('Error fetching user data for status history:', userError);
+      }
+      
+      // Map status to backend format
+      const statusMapping = {
+        'in_progress': 'in-progress',
+        'in-progress': 'in-progress',
+        'pending': 'pending',
+        'confirmed': 'confirmed',
+        'completed': 'completed',
+        'cancelled': 'cancelled'
+      };
+      const initialStatus = statusMapping[status] || status || 'pending';
+      
+      // Insert initial status history (always insert for initial status)
+      const { error: historyInsertError } = await supabase
+        .from('job_status_history')
+        .insert({
+          job_id: result.id,
+          status: initialStatus,
+          previous_status: null,
+          changed_by: changedBy,
+          changed_by_type: 'account_owner',
+          changed_at: now
+        });
+      
+      if (historyInsertError) {
+        console.error('Error inserting initial status history:', historyInsertError);
+        // Continue even if history insert fails
+      }
+      
       // Get the created job
       const { data: createdJob, error: fetchError } = await supabase
         .from('jobs')
@@ -3193,12 +3279,87 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
+    // Get current job to check previous status
+    const { data: currentJob, error: fetchError } = await supabase
+      .from('jobs')
+      .select('status, status_history')
+      .eq('id', id)
+      .single();
+
+    if (fetchError) {
+      console.error('Error fetching current job:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch job details' });
+    }
+
+    const previousStatus = currentJob?.status || 'pending';
+    const now = new Date().toISOString();
+    
+    // Get user info for status history
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('first_name, last_name, business_name')
+      .eq('id', userId)
+      .single();
+    
+    const changedBy = userData 
+      ? `${userData.first_name || ''} ${userData.last_name || ''}`.trim() || userData.business_name || 'Staff'
+      : 'Staff';
+    
+    // Check if this status already exists in history for this job
+    const { data: existingStatusEntry, error: checkHistoryError } = await supabase
+      .from('job_status_history')
+      .select('id')
+      .eq('job_id', id)
+      .eq('status', status)
+      .limit(1)
+      .single();
+    
+    if (checkHistoryError && checkHistoryError.code !== 'PGRST116') { // PGRST116 = no rows returned
+      console.error('Error checking status history:', checkHistoryError);
+    }
+    
+    // If status already exists, UPDATE it. Otherwise, INSERT new entry
+    if (existingStatusEntry && existingStatusEntry.id) {
+      // Update existing entry
+      const { error: historyUpdateError } = await supabase
+        .from('job_status_history')
+        .update({
+          previous_status: previousStatus,
+          changed_by: changedBy,
+          changed_by_type: 'account_owner',
+          changed_at: now
+        })
+        .eq('id', existingStatusEntry.id);
+      
+      if (historyUpdateError) {
+        console.error('Error updating status history:', historyUpdateError);
+        // Continue with status update even if history update fails
+      }
+    } else {
+      // Insert new entry
+      const { error: historyInsertError } = await supabase
+        .from('job_status_history')
+        .insert({
+          job_id: id,
+          status: status,
+          previous_status: previousStatus,
+          changed_by: changedBy,
+          changed_by_type: 'account_owner',
+          changed_at: now
+        });
+      
+      if (historyInsertError) {
+        console.error('Error inserting status history:', historyInsertError);
+        // Continue with status update even if history insert fails
+      }
+    }
+    
     // Update job status
     const { error: updateError } = await supabase
       .from('jobs')
       .update({ 
         status: status,
-        updated_at: new Date().toISOString()
+        updated_at: now
       })
       .eq('id', id)
       .eq('user_id', userId);
@@ -9328,7 +9489,39 @@ app.post('/api/team-members', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' });
     }
     
-    // ✅ Check for specific conflicts (email, phone, username)
+    // ✅ Check if email exists in users table (account owner)
+    const { data: existingUser, error: userCheckError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name')
+      .eq('email', email)
+      .limit(1);
+
+    if (userCheckError) {
+      console.error('Error checking existing user:', userCheckError);
+      return res.status(500).json({ error: 'Failed to check existing user' });
+    }
+
+    if (existingUser && existingUser.length > 0) {
+      const user = existingUser[0];
+      // Check if this user is the account owner (same user_id)
+      if (user.id === userId) {
+        return res.status(400).json({ 
+          error: 'Cannot add account owner as team member',
+          conflictType: 'account_owner',
+          field: 'email',
+          message: `This email belongs to the account owner. The account owner is automatically included in the team members list.`
+        });
+      } else {
+        return res.status(400).json({ 
+          error: 'Email already exists as a user account',
+          conflictType: 'existing_user',
+          field: 'email',
+          message: `A user account with the email "${email}" already exists. Please use a different email address.`
+        });
+      }
+    }
+
+    // ✅ Check for specific conflicts in team_members table (email, phone, username)
     const { data: existingEmail, error: emailCheckError } = await supabase
       .from('team_members')
       .select('id, email')
