@@ -3282,7 +3282,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     // Get current job to check previous status
     const { data: currentJob, error: fetchError } = await supabase
       .from('jobs')
-      .select('status, status_history')
+      .select('status')
       .eq('id', id)
       .single();
 
@@ -3306,51 +3306,81 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       : 'Staff';
     
     // Check if this status already exists in history for this job
-    const { data: existingStatusEntry, error: checkHistoryError } = await supabase
-      .from('job_status_history')
-      .select('id')
-      .eq('job_id', id)
-      .eq('status', status)
-      .limit(1)
-      .single();
+    let existingStatusEntry = null;
+    let checkHistoryError = null;
     
-    if (checkHistoryError && checkHistoryError.code !== 'PGRST116') { // PGRST116 = no rows returned
-      console.error('Error checking status history:', checkHistoryError);
+    try {
+      const { data, error } = await supabase
+        .from('job_status_history')
+        .select('id')
+        .eq('job_id', id)
+        .eq('status', status)
+        .limit(1)
+        .maybeSingle(); // Use maybeSingle() instead of single() to avoid error when no rows
+      
+      if (error && error.code !== 'PGRST116' && error.code !== '42P01') { 
+        // PGRST116 = no rows returned, 42P01 = table doesn't exist
+        console.error('Error checking status history:', error);
+        checkHistoryError = error;
+      } else if (data) {
+        existingStatusEntry = data;
+      }
+    } catch (err) {
+      // Table might not exist yet - this is okay, we'll try to insert
+      console.warn('Status history table may not exist yet:', err.message);
     }
     
     // If status already exists, UPDATE it. Otherwise, INSERT new entry
     if (existingStatusEntry && existingStatusEntry.id) {
       // Update existing entry
-      const { error: historyUpdateError } = await supabase
-        .from('job_status_history')
-        .update({
-          previous_status: previousStatus,
-          changed_by: changedBy,
-          changed_by_type: 'account_owner',
-          changed_at: now
-        })
-        .eq('id', existingStatusEntry.id);
-      
-      if (historyUpdateError) {
-        console.error('Error updating status history:', historyUpdateError);
-        // Continue with status update even if history update fails
+      try {
+        const { error: historyUpdateError } = await supabase
+          .from('job_status_history')
+          .update({
+            previous_status: previousStatus,
+            changed_by: changedBy,
+            changed_by_type: 'account_owner',
+            changed_at: now
+          })
+          .eq('id', existingStatusEntry.id);
+        
+        if (historyUpdateError) {
+          if (historyUpdateError.code === '42P01' || historyUpdateError.message?.includes('does not exist')) {
+            console.warn('⚠️ job_status_history table does not exist yet.');
+          } else {
+            console.error('Error updating status history:', historyUpdateError);
+          }
+          // Continue with status update even if history update fails
+        }
+      } catch (err) {
+        console.warn('Could not update status history (table may not exist):', err.message);
       }
     } else {
       // Insert new entry
-      const { error: historyInsertError } = await supabase
-        .from('job_status_history')
-        .insert({
-          job_id: id,
-          status: status,
-          previous_status: previousStatus,
-          changed_by: changedBy,
-          changed_by_type: 'account_owner',
-          changed_at: now
-        });
-      
-      if (historyInsertError) {
-        console.error('Error inserting status history:', historyInsertError);
-        // Continue with status update even if history insert fails
+      try {
+        const { error: historyInsertError } = await supabase
+          .from('job_status_history')
+          .insert({
+            job_id: id,
+            status: status,
+            previous_status: previousStatus,
+            changed_by: changedBy,
+            changed_by_type: 'account_owner',
+            changed_at: now
+          });
+        
+        if (historyInsertError) {
+          // If table doesn't exist (42P01), log warning but continue
+          if (historyInsertError.code === '42P01' || historyInsertError.message?.includes('does not exist')) {
+            console.warn('⚠️ job_status_history table does not exist yet. Please run the migration SQL file.');
+          } else {
+            console.error('Error inserting status history:', historyInsertError);
+          }
+          // Continue with status update even if history insert fails
+        }
+      } catch (err) {
+        console.warn('Could not insert status history (table may not exist):', err.message);
+        // Continue with status update
       }
     }
     
