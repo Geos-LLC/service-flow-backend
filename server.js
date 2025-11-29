@@ -3169,19 +3169,34 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Insert initial status into job_status_history table
       const now = new Date().toISOString();
       let changedBy = 'Staff';
+      let changedByType = 'account_owner';
       
-      // Get user info for status history
+      // Get user info for status history - check if account owner or team member
       try {
+        // First check if it's an account owner
         const { data: userData } = await supabase
           .from('users')
           .select('first_name, last_name, business_name')
           .eq('id', userId)
-          .single();
+          .maybeSingle();
         
         if (userData) {
           changedBy = userData.business_name || 
             `${userData.first_name || ''} ${userData.last_name || ''}`.trim() || 
             'Staff';
+          changedByType = 'account_owner';
+        } else {
+          // If not found in users, check if it's a team member
+          const { data: teamMemberData } = await supabase
+            .from('team_members')
+            .select('first_name, last_name')
+            .eq('id', userId)
+            .maybeSingle();
+          
+          if (teamMemberData) {
+            changedBy = `${teamMemberData.first_name || ''} ${teamMemberData.last_name || ''}`.trim() || 'Team Member';
+            changedByType = 'team_member';
+          }
         }
       } catch (userError) {
         console.error('Error fetching user data for status history:', userError);
@@ -3206,7 +3221,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           status: initialStatus,
           previous_status: null,
           changed_by: changedBy,
-          changed_by_type: 'account_owner',
+          changed_by_type: changedByType,
           changed_at: now
         });
       
@@ -3294,16 +3309,33 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     const previousStatus = currentJob?.status || 'pending';
     const now = new Date().toISOString();
     
-    // Get user info for status history
+    // Get user info for status history - check if account owner or team member
+    let changedBy = 'Staff';
+    let changedByType = 'account_owner';
+    
+    // First check if it's an account owner
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select('first_name, last_name, business_name')
       .eq('id', userId)
-      .single();
+      .maybeSingle();
     
-    const changedBy = userData 
-      ? `${userData.first_name || ''} ${userData.last_name || ''}`.trim() || userData.business_name || 'Staff'
-      : 'Staff';
+    if (userData) {
+      changedBy = `${userData.first_name || ''} ${userData.last_name || ''}`.trim() || userData.business_name || 'Staff';
+      changedByType = 'account_owner';
+    } else {
+      // If not found in users, check if it's a team member
+      const { data: teamMemberData } = await supabase
+        .from('team_members')
+        .select('first_name, last_name')
+        .eq('id', userId)
+        .maybeSingle();
+      
+      if (teamMemberData) {
+        changedBy = `${teamMemberData.first_name || ''} ${teamMemberData.last_name || ''}`.trim() || 'Team Member';
+        changedByType = 'team_member';
+      }
+    }
     
     // Check if this status already exists in history for this job
     let existingStatusEntry = null;
@@ -3339,7 +3371,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
           .update({
             previous_status: previousStatus,
             changed_by: changedBy,
-            changed_by_type: 'account_owner',
+            changed_by_type: changedByType,
             changed_at: now
           })
           .eq('id', existingStatusEntry.id);
@@ -3365,7 +3397,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
             status: status,
             previous_status: previousStatus,
             changed_by: changedBy,
-            changed_by_type: 'account_owner',
+            changed_by_type: changedByType,
             changed_at: now
           });
         
