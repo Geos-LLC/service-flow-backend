@@ -2031,6 +2031,105 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   }
 });
 
+// Recurring bookings endpoint
+app.get('/api/recurring-bookings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { status = 'active' } = req.query; // 'active' or 'canceled'
+    
+    // Build query for recurring jobs
+    let query = supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, city, state),
+        services!left(name, price, duration),
+        team_members!left(first_name, last_name, email)
+      `)
+      .eq('user_id', userId)
+      .eq('is_recurring', true);
+    
+    // Filter by status - for canceled, we check if status is cancelled
+    if (status === 'canceled') {
+      query = query.in('status', ['cancelled', 'canceled']);
+    } else {
+      // For active, exclude cancelled statuses - filter out cancelled jobs
+      // Use a different approach: get all and filter in code, or use multiple queries
+      // For now, let's get all and filter
+    }
+    
+    const { data: jobs, error } = await query.order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching recurring bookings:', error);
+      return res.status(500).json({ error: 'Failed to fetch recurring bookings' });
+    }
+    
+    // Filter by status in code if needed (for active, exclude cancelled)
+    let filteredJobs = jobs || [];
+    if (status === 'active') {
+      filteredJobs = filteredJobs.filter(job => 
+        job.status !== 'cancelled' && job.status !== 'canceled'
+      );
+    }
+    
+    // Process jobs to format for frontend
+    const recurringBookings = filteredJobs.map(job => {
+      const customer = job.customers || {};
+      const service = job.services || {};
+      const teamMember = job.team_members || {};
+      
+      // Calculate next job date based on recurring frequency
+      let nextJobDate = null;
+      let nextJobId = null;
+      
+      if (job.next_billing_date) {
+        nextJobDate = job.next_billing_date;
+      } else if (job.recurring_frequency) {
+        // Calculate next occurrence based on frequency
+        const lastDate = new Date(job.scheduled_date);
+        const frequency = job.recurring_frequency;
+        
+        // Parse frequency (e.g., "weekly", "biweekly", "monthly", "2 weeks", etc.)
+        let daysToAdd = 7; // default weekly
+        if (frequency.includes('week')) {
+          const weeks = parseInt(frequency) || 1;
+          daysToAdd = weeks * 7;
+        } else if (frequency.includes('month')) {
+          const months = parseInt(frequency) || 1;
+          lastDate.setMonth(lastDate.getMonth() + months);
+          nextJobDate = lastDate.toISOString().split('T')[0];
+        } else {
+          lastDate.setDate(lastDate.getDate() + daysToAdd);
+          nextJobDate = lastDate.toISOString().split('T')[0];
+        }
+      }
+      
+      return {
+        id: job.id,
+        customerName: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
+        customerCity: customer.city || '',
+        serviceName: service.name || job.service_name || 'Service',
+        frequency: job.recurring_frequency || 'weekly',
+        nextJobDate: nextJobDate,
+        nextJobId: nextJobId || job.id,
+        createdDate: job.created_at,
+        status: job.status === 'cancelled' || job.status === 'canceled' ? 'canceled' : 'active',
+        jobId: job.id,
+        customerId: job.customer_id,
+        serviceId: job.service_id,
+        scheduledDate: job.scheduled_date,
+        price: job.price || service.price || 0
+      };
+    });
+    
+    res.json({ recurringBookings });
+  } catch (error) {
+    console.error('Get recurring bookings error:', error);
+    res.status(500).json({ error: 'Failed to fetch recurring bookings' });
+  }
+});
+
 // OPTIONS handled by catch-all above
 
 // Jobs export endpoint - MUST come before /api/jobs/:id to avoid route conflict
