@@ -2817,6 +2817,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         payment_method: paymentMethod,
         territory: territory,
         is_recurring: recurringJob,
+        recurring_frequency: recurringFrequency,
         schedule_type: scheduleType,
         let_customer_schedule: letCustomerSchedule,
         offer_to_providers: offerToProviders,
