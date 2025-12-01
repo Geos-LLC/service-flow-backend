@@ -10668,8 +10668,6 @@ app.post('/api/team-members/register', async (req, res) => {
       });
     }
     
-    // At least one name should be provided (both are optional, but at least one is required)
-    if (!firstName && !lastName) {
     // Names are optional - no validation needed
     
     if (!email) {
