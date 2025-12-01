@@ -9653,10 +9653,12 @@ app.post('/api/team-members', async (req, res) => {
       permissions
     } = req.body;
     
-    // Validate required fields
-    if (!userId || !firstName || !lastName || !email || !username || !password) {
+    // Validate required fields - firstName and lastName are optional
+    if (!userId || !email || !username || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    
+    // Names are optional - allow empty/null values
     
     // Validate email format
     if (!validateEmail(email)) {
@@ -9778,8 +9780,8 @@ app.post('/api/team-members', async (req, res) => {
       .from('team_members')
       .insert({
         user_id: userId,
-        first_name: firstName,
-        last_name: lastName,
+        first_name: firstName || null,
+        last_name: lastName || null,
         email,
         phone: phone || null,
         username: null, // Will be set during signup
@@ -10666,15 +10668,9 @@ app.post('/api/team-members/register', async (req, res) => {
       });
     }
     
-    if (!firstName || !lastName) {
-      console.error('❌ Missing name fields:', { firstName, lastName });
-      return res.status(400).json({ 
-        error: 'First name and last name are required.',
-        errorType: 'missing_name',
-        field: firstName ? 'lastName' : 'firstName',
-        message: `Please enter a ${!firstName ? 'first' : 'last'} name.`
-      });
-    }
+    // At least one name should be provided (both are optional, but at least one is required)
+    if (!firstName && !lastName) {
+    // Names are optional - no validation needed
     
     if (!email) {
       console.error('❌ Missing email');
@@ -10759,8 +10755,8 @@ app.post('/api/team-members/register', async (req, res) => {
       .from('team_members')
       .insert({
         user_id: userId,
-        first_name: sanitizeInput(firstName),
-        last_name: sanitizeInput(lastName),
+        first_name: firstName ? sanitizeInput(firstName) : null,
+        last_name: lastName ? sanitizeInput(lastName) : null,
         email: sanitizeInput(email),
         phone: phone ? sanitizeInput(phone) : null,
         location: location ? sanitizeInput(location) : null,
