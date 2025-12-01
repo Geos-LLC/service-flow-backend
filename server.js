@@ -2105,12 +2105,15 @@ app.get('/api/recurring-bookings', authenticateToken, async (req, res) => {
         }
       }
       
+      // Debug: Log the frequency being returned
+      console.log('📊 Recurring Booking - Job ID:', job.id, 'Frequency:', job.recurring_frequency, 'Type:', typeof job.recurring_frequency);
+      
       return {
         id: job.id,
         customerName: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
         customerCity: customer.city || '',
         serviceName: service.name || job.service_name || 'Service',
-        frequency: job.recurring_frequency || 'weekly',
+        frequency: job.recurring_frequency || '', // Don't default to 'weekly', return empty string
         nextJobDate: nextJobDate,
         nextJobId: nextJobId || job.id,
         createdDate: job.created_at,
@@ -2559,7 +2562,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       customerNotes,
       tags,
       attachments,
-      recurringFrequency = 'weekly',
+      recurringFrequency = '',
       recurringEndDate,
       autoInvoice = true,
       autoReminders = true,
@@ -2817,7 +2820,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         payment_method: paymentMethod,
         territory: territory,
         is_recurring: recurringJob,
-        recurring_frequency: recurringFrequency,
+        recurring_frequency: recurringFrequency || null, // Save null if empty, not empty string
         schedule_type: scheduleType,
         let_customer_schedule: letCustomerSchedule,
         offer_to_providers: offerToProviders,
@@ -2846,12 +2849,21 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       };
 
       // Note: Initial status will be inserted into job_status_history table after job creation
+      
+      // Debug: Log what we're about to save
+      console.log('💾 Saving Job - Recurring:', recurringJob, 'Frequency to save:', recurringFrequency, 'Type:', typeof recurringFrequency, 'Raw:', JSON.stringify(recurringFrequency));
+      console.log('💾 JobData recurring_frequency field:', jobData.recurring_frequency);
     
       const { data: result, error: insertError } = await supabase
         .from('jobs')
         .insert(jobData)
         .select()
         .single();
+
+      // Debug: Log what was actually saved
+      if (result) {
+        console.log('✅ Job Created - ID:', result.id, 'Saved Frequency:', result.recurring_frequency, 'Type:', typeof result.recurring_frequency);
+      }
 
       if (insertError) {
         console.error('❌ Error creating job:', insertError);
