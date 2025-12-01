@@ -21,7 +21,8 @@ const BUCKETS = {
   PROFILE_PICTURES: 'profile-pictures',
   LOGOS: 'logos',
   HERO_IMAGES: 'hero-images',
-  FAVICONS: 'favicons'
+  FAVICONS: 'favicons',
+  JOB_ATTACHMENTS: 'job-attachments'
 };
 
 // Ensure all buckets exist

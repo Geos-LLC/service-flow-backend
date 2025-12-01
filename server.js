@@ -398,6 +398,25 @@ const upload = multer({
   }
 });
 
+// Multer configuration for job attachments (accepts all file types)
+const attachmentStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'attachment-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const attachmentUpload = multer({
+  storage: attachmentStorage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit for attachments
+  }
+  // Accept all file types for attachments
+});
+
 // CORS configuration - Simplified and more permissive for production
 const corsOptions = {
   origin: [
@@ -14836,6 +14855,58 @@ app.post('/api/upload-intake-image', authenticateToken, upload.single('image'), 
   } catch (error) {
     console.error('❌ Error uploading intake image:', error);
     res.status(500).json({ error: 'Failed to upload intake image' });
+  }
+});
+
+// Job note attachment upload endpoint
+app.post('/api/jobs/:jobId/notes/attachments', authenticateToken, attachmentUpload.array('attachments', 10), async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.userId;
+    
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    // Verify job exists and belongs to user
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .eq('user_id', userId)
+      .single();
+
+    if (jobError || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Upload files to Supabase Storage
+    const uploadedFiles = [];
+    for (const file of req.files) {
+      try {
+        // Use job-attachments bucket, fallback to service-images if not available
+        const bucket = BUCKETS.JOB_ATTACHMENTS || BUCKETS.SERVICE_IMAGES;
+        
+        const result = await uploadToStorage(file, bucket, `job-${jobId}`);
+        uploadedFiles.push({
+          filename: file.originalname,
+          url: result.imageUrl || result.fileUrl || result.url,
+          type: file.mimetype,
+          size: file.size
+        });
+      } catch (uploadError) {
+        console.error('Error uploading file:', uploadError);
+        // Continue with other files even if one fails
+      }
+    }
+
+    res.json({
+      message: 'Files uploaded successfully',
+      files: uploadedFiles
+    });
+  } catch (error) {
+    console.error('Error uploading job note attachments:', error);
+    res.status(500).json({ error: 'Failed to upload attachments' });
   }
 });
 
