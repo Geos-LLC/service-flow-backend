@@ -1059,7 +1059,8 @@ app.post('/api/auth/signin', async (req, res) => {
         firstName: user.first_name,
         lastName: user.last_name,
         businessName: user.business_name,
-        role: userRole
+        role: userRole,
+        teamMemberId: isTeamMember ? user.teamMemberId : null // Include team member ID in token
       },
       JWT_SECRET,
       { expiresIn: '1d' }
@@ -5925,8 +5926,59 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const userEmail = req.user.email;
+    const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
 
-    // Query Supabase directly - first check users table
+    // If teamMemberId exists in token, fetch team member profile instead
+    if (teamMemberId) {
+      console.log('Fetching team member profile for teamMemberId:', teamMemberId);
+      const { data: teamMember, error: teamMemberError } = await supabase
+        .from('team_members')
+        .select('id, user_id, email, first_name, last_name, phone, role, profile_picture, status, permissions')
+        .eq('id', teamMemberId)
+        .eq('status', 'active')
+        .single();
+      
+      if (teamMemberError) {
+        console.error('Error fetching team member profile:', teamMemberError);
+        return res.status(500).json({ error: 'Failed to fetch user profile' });
+      }
+      
+      if (!teamMember) {
+        return res.status(404).json({ error: 'Team member not found' });
+      }
+      
+      // Parse permissions if it's a string
+      let permissions = {};
+      if (teamMember.permissions) {
+        try {
+          permissions = typeof teamMember.permissions === 'string' 
+            ? JSON.parse(teamMember.permissions) 
+            : teamMember.permissions;
+        } catch (e) {
+          console.error('Error parsing permissions:', e);
+          permissions = {};
+        }
+      }
+      
+      const userRole = teamMember.role || 'worker';
+      
+      return res.json({
+        id: teamMember.user_id, // Account owner's user_id (for compatibility)
+        email: teamMember.email,
+        firstName: teamMember.first_name,
+        lastName: teamMember.last_name,
+        businessName: null, // Team members don't have business_name
+        phone: teamMember.phone || '',
+        emailNotifications: false, // Default for team members
+        smsNotifications: false, // Default for team members
+        profilePicture: teamMember.profile_picture,
+        role: userRole,
+        permissions: permissions,
+        teamMemberId: teamMember.id // Include team member ID
+      });
+    }
+
+    // Query Supabase directly - first check users table (for account owners)
     const { data: user, error } = await supabase
       .from('users')
       .select(`
