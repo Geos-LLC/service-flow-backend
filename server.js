@@ -6305,8 +6305,10 @@ app.put('/api/user/email', authenticateToken, async (req, res) => {
 });
 
 // Profile picture upload endpoint
-app.post('/api/user/profile-picture', authenticateToken, upload.single('profilePicture'), async (req, res) => {try {
+app.post('/api/user/profile-picture', authenticateToken, upload.single('profilePicture'), async (req, res) => {
+  try {
     const userId = req.user.userId;
+    const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -6315,15 +6317,29 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
     // Get the file URL
     const fileUrl = `http://localhost:5000/uploads/${req.file.filename}`;
     
-    // Update user's profile picture
-    const { error } = await supabase
-      .from('users')
-      .update({ profile_picture: fileUrl })
-      .eq('id', userId);
-    
-    if (error) {
-      console.error('Error updating profile picture:', error);
-      return res.status(500).json({ error: 'Failed to update profile picture' });
+    // Update profile picture - check if it's a team member or account owner
+    if (teamMemberId) {
+      // Update team member's profile picture
+      const { error } = await supabase
+        .from('team_members')
+        .update({ profile_picture: fileUrl })
+        .eq('id', teamMemberId);
+      
+      if (error) {
+        console.error('Error updating team member profile picture:', error);
+        return res.status(500).json({ error: 'Failed to update profile picture' });
+      }
+    } else {
+      // Update account owner's profile picture
+      const { error } = await supabase
+        .from('users')
+        .update({ profile_picture: fileUrl })
+        .eq('id', userId);
+      
+      if (error) {
+        console.error('Error updating profile picture:', error);
+        return res.status(500).json({ error: 'Failed to update profile picture' });
+      }
     }
     
     res.json({ 
@@ -14867,12 +14883,20 @@ app.post('/api/upload/logo', upload.single('logo'), async (req, res) => {
 });
 
 // Profile picture upload endpoint
-app.post('/api/upload/profile-picture', upload.single('profilePicture'), async (req, res) => {
+app.post('/api/upload/profile-picture', authenticateToken, upload.single('profilePicture'), async (req, res) => {
   try {
     const { userId } = req.body;
+    const { isTeamMember } = req.body;
+    const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
+    // Determine if this is a team member upload
+    const isTeamMemberUpload = isTeamMember === 'true' || !!teamMemberId;
+    
+    // Use teamMemberId from JWT if available, otherwise use userId from body
+    const idToUse = isTeamMemberUpload && teamMemberId ? teamMemberId : userId;
+    
+    if (!idToUse) {
+      return res.status(400).json({ error: 'User ID or Team Member ID is required' });
     }
 
     if (!req.file) {
@@ -14883,15 +14907,27 @@ app.post('/api/upload/profile-picture', upload.single('profilePicture'), async (
     const result = await uploadToStorage(req.file, BUCKETS.PROFILE_PICTURES, 'profiles');
     const profilePictureUrl = result.imageUrl;
 
-    // ✅ Save file info to database using Supabase
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ profile_picture: profilePictureUrl })
-      .eq('id', userId);
+    // ✅ Save file info to database - update team_members table if team member, users table if account owner
+    if (isTeamMemberUpload) {
+      const { error: updateError } = await supabase
+        .from('team_members')
+        .update({ profile_picture: profilePictureUrl })
+        .eq('id', idToUse);
 
-    if (updateError) {
-      console.error('❌ Error saving profile picture URL to database:', updateError);
-      return res.status(500).json({ error: 'Failed to save profile picture URL' });
+      if (updateError) {
+        console.error('❌ Error saving team member profile picture URL to database:', updateError);
+        return res.status(500).json({ error: 'Failed to save profile picture URL' });
+      }
+    } else {
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({ profile_picture: profilePictureUrl })
+        .eq('id', idToUse);
+
+      if (updateError) {
+        console.error('❌ Error saving profile picture URL to database:', updateError);
+        return res.status(500).json({ error: 'Failed to save profile picture URL' });
+      }
     }
 
     // ✅ Success
@@ -15014,28 +15050,39 @@ app.post('/api/jobs/:jobId/notes/attachments', authenticateToken, attachmentUplo
 });
 
 // Remove profile picture endpoint
-app.delete('/api/user/profile-picture', async (req, res) => {
+app.delete('/api/user/profile-picture', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.body;
+    const userId = req.user.userId;
+    const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
+    // Remove profile picture - check if it's a team member or account owner
+    if (teamMemberId) {
+      // Remove team member's profile picture
+      const { error } = await supabase
+        .from('team_members')
+        .update({ profile_picture: null })
+        .eq('id', teamMemberId);
+      
+      if (error) {
+        console.error('Error removing team member profile picture:', error);
+        return res.status(500).json({ error: 'Failed to remove profile picture' });
+      }
+    } else {
+      // Remove account owner's profile picture
+      const { error } = await supabase
+        .from('users')
+        .update({ profile_picture: null })
+        .eq('id', userId);
+      
+      if (error) {
+        console.error('Error removing profile picture:', error);
+        return res.status(500).json({ error: 'Failed to remove profile picture' });
+      }
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Remove profile picture URL from database
-      await connection.query(`
-        UPDATE users SET profile_picture = NULL WHERE id = ?
-      `, [userId]);
-
-      res.json({ 
-        message: 'Profile picture removed successfully'
-      });
-    } finally {
-      connection.release();
-    }
+    res.json({ 
+      message: 'Profile picture removed successfully'
+    });
   } catch (error) {
     console.error('Error removing profile picture:', error);
     res.status(500).json({ error: 'Failed to remove profile picture' });
