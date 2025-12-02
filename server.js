@@ -9832,7 +9832,7 @@ app.post('/api/team-members', async (req, res) => {
     const { password: _, ...teamMemberWithoutPassword } = newTeamMember;
     
     // Generate invitation link
-    const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
+    const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
     
     // Send invitation email in background without waiting
     // Note: Email sending failure will not prevent team member creation
@@ -10834,7 +10834,7 @@ app.post('/api/team-members/register', async (req, res) => {
     
  
     // Generate invitation link
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
     sendTeamMemberEmail({
@@ -11181,7 +11181,7 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
     }
       
       // Send new invitation email
-      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/#/team-member/signup?token=${invitationToken}`;
+      const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
       
       // Send email in background - don't fail the request if email fails
       sendTeamMemberEmail({
