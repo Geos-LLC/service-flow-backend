@@ -9286,15 +9286,30 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
     
-    // Check if account owner exists in team_members
-    const accountOwnerInTeam = teamMembers?.find(member => 
-      member.role === 'account owner' || member.role === 'owner' || member.role === 'admin' ||
-      (accountOwner && member.email === accountOwner.email)
-    );
+    // Check if account owner exists in team_members (even if filtered out)
+    // We need to check the full team_members table, not just the filtered results
+    let accountOwnerInTeam = null;
+    if (accountOwner) {
+      // Query team_members separately to check if account owner exists (without status filter)
+      const { data: allTeamMembers, error: allTeamError } = await supabase
+        .from('team_members')
+        .select('*')
+        .eq('user_id', userId)
+        .or(`role.eq.account owner,role.eq.owner,role.eq.admin,email.eq.${accountOwner.email}`);
+      
+      if (!allTeamError && allTeamMembers && allTeamMembers.length > 0) {
+        accountOwnerInTeam = allTeamMembers[0];
+      }
+    }
     
     // If account owner doesn't exist in team_members, create a virtual entry
+    // Also create virtual entry if account owner exists but was filtered out by status
     let accountOwnerEntry = null;
-    if (accountOwner && !accountOwnerInTeam) {
+    const accountOwnerInFilteredResults = teamMembers?.find(member => 
+      accountOwnerInTeam && (member.id === accountOwnerInTeam.id || member.email === accountOwner.email)
+    );
+    
+    if (accountOwner && (!accountOwnerInTeam || !accountOwnerInFilteredResults)) {
       // Get jobs assigned to the account owner (using user_id)
       const { data: ownerJobs, error: jobsError } = await supabase
         .from('jobs')
@@ -9311,18 +9326,20 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
         : 0;
       
       // Create virtual account owner entry
+      // Use data from team_members if available, otherwise from users table
+      const ownerData = accountOwnerInTeam || accountOwner;
       accountOwnerEntry = {
-        id: accountOwner.id, // Use user id as team member id
+        id: accountOwnerInTeam ? accountOwnerInTeam.id : accountOwner.id,
         user_id: userId,
-        email: accountOwner.email,
-        first_name: accountOwner.first_name,
-        last_name: accountOwner.last_name,
-        phone: accountOwner.phone || null,
+        email: ownerData.email || accountOwner.email,
+        first_name: ownerData.first_name || accountOwner.first_name,
+        last_name: ownerData.last_name || accountOwner.last_name,
+        phone: ownerData.phone || accountOwner.phone || null,
         role: 'account owner',
-        status: 'active',
-        is_service_provider: true,
-        profile_picture: accountOwner.profile_picture || null,
-        color: '#DC2626', // Default red color
+        status: accountOwnerInTeam ? (accountOwnerInTeam.status || 'active') : 'active',
+        is_service_provider: accountOwnerInTeam ? (accountOwnerInTeam.is_service_provider !== false) : true,
+        profile_picture: accountOwner.profile_picture || (accountOwnerInTeam ? accountOwnerInTeam.profile_picture : null) || null,
+        color: accountOwnerInTeam ? (accountOwnerInTeam.color || '#DC2626') : '#DC2626',
         total_jobs: totalJobs,
         completed_jobs: completedJobs,
         avg_job_value: avgJobValue,
@@ -9342,11 +9359,29 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       
       return {
         ...member,
+        profile_picture: member.profile_picture || null, // Ensure profile_picture is always included
         total_jobs: totalJobs,
         completed_jobs: completedJobs,
         avg_job_value: avgJobValue
       };
     });
+    
+    // If account owner exists in team_members, update their profile_picture from users table
+    if (accountOwnerInTeam && accountOwner) {
+      // Find the account owner in the processed results
+      const accountOwnerIndex = processedTeamMembers.findIndex(member => 
+        member.id === accountOwnerInTeam.id ||
+        member.email === accountOwner.email ||
+        (member.role === 'account owner' || member.role === 'owner' || member.role === 'admin')
+      );
+      
+      if (accountOwnerIndex !== -1) {
+        // Update profile_picture from users table if it exists
+        if (accountOwner.profile_picture) {
+          processedTeamMembers[accountOwnerIndex].profile_picture = accountOwner.profile_picture;
+        }
+      }
+    }
     
     // Add account owner entry if it doesn't exist
     if (accountOwnerEntry) {
