@@ -1750,8 +1750,9 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   
   try {
     const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId } = req.query;
+    const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
+    const userRole = req.user.role; // Get user role from JWT token
     
-  
     // Build Supabase query with joins
     let query = supabase
       .from('jobs')
@@ -1762,6 +1763,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         team_members!left(first_name, last_name, email)
       `, { count: 'exact' })
       .eq('user_id', userId);
+    
+    // 🔒 WORKER RESTRICTION: Workers can only see jobs assigned to them
+    // They cannot view unassigned jobs or jobs assigned to other team members
+    if (userRole === 'worker' && teamMemberId) {
+      // Filter to only show jobs assigned to this worker
+      query = query.eq('team_member_id', teamMemberId);
+      // Note: This automatically excludes unassigned jobs (team_member_id IS NULL)
+    }
     
     // Add status filter
     if (status) {
@@ -9998,6 +10007,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
+    const userRole = req.user.role; // Get user role from JWT token
     const { 
       firstName, 
       lastName, 
@@ -10031,6 +10041,26 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       .select('id, user_id, role')
       .eq('id', id)
       .limit(1);
+    
+    // 🔒 ROLE CHANGE PERMISSION: Only account owner or manager can change roles
+    if (role && existingMember && existingMember.length > 0) {
+      const currentRole = existingMember[0].role;
+      // If role is being changed
+      if (currentRole !== role) {
+        // Check if the current user is account owner or manager
+        const isOwnerOrManager = !userRole || userRole === 'owner' || userRole === 'account owner' || userRole === 'manager' || userRole === 'admin';
+        
+        if (!isOwnerOrManager) {
+          return res.status(403).json({ 
+            error: 'Permission denied', 
+            message: 'Only account owners and managers can change team member roles' 
+          });
+        }
+        
+        // Log role change for audit purposes
+        console.log(`Role change: Team member ${id} role changed from ${currentRole} to ${role} by user ${userId} (${userRole})`);
+      }
+    }
     
     let isAccountOwner = false;
     let shouldCreate = false;
