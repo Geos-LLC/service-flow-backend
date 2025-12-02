@@ -9581,6 +9581,15 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
       }
     } else {
       teamMember = teamMembers[0];
+      
+      // Ensure availability and permissions are included even if null
+      // This helps frontend distinguish between "no data" and "data exists but is null"
+      if (!teamMember.availability) {
+        teamMember.availability = null; // Explicitly set to null (not undefined)
+      }
+      if (!teamMember.permissions) {
+        teamMember.permissions = null; // Explicitly set to null (not undefined)
+      }
     }
 
     // ✅ Fetch jobs assigned to this team member
@@ -10955,10 +10964,16 @@ app.post('/api/team-members/logout', async (req, res) => {
 // Complete team member signup endpoint
 app.post('/api/team-members/complete-signup', async (req, res) => {
   try {
-    const { token, username, password, firstName, lastName, phone } = req.body;
+    const { token, email, username, password, firstName, lastName, phone } = req.body;
 
-    if (!token || !username || !password || !firstName || !lastName) {
+    if (!token || !email || !username || !password || !firstName || !lastName) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
     }
     
     // Verify token and get team member using Supabase
@@ -11027,10 +11042,11 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
       // Hash password
       const hashedPassword = await bcrypt.hash(password, 10);
       
-    // Update team member with signup data using Supabase
+    // Update team member with signup data using Supabase (including new email if changed)
     const { error: updateError } = await supabase
       .from('team_members')
       .update({
+        email: email, // Update email (may be different from invitation email)
         username: username,
         password: hashedPassword,
         first_name: firstName,
@@ -11048,10 +11064,10 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
       return res.status(500).json({ error: 'Failed to complete signup' });
     }
     
-    // Send activation confirmation email to team member
+    // Send activation confirmation email to team member (use new email if changed)
     try {
       await sendTeamMemberEmail({
-        to: teamMember.email,
+        to: email, // Use the new email address
         subject: 'Welcome to Service Flow - Account Activated!',
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -11106,7 +11122,7 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
                 <h3 style="color: #166534; margin-top: 0;">Team Member Details:</h3>
                 <ul style="color: #166534;">
                   <li><strong>Name:</strong> ${firstName} ${lastName}</li>
-                  <li><strong>Email:</strong> ${teamMember.email}</li>
+                  <li><strong>Email:</strong> ${email}</li>
                   <li><strong>Phone:</strong> ${phone || 'Not provided'}</li>
                   <li><strong>Role:</strong> ${teamMember.role || 'Team Member'}</li>
                   <li><strong>Status:</strong> Active</li>
