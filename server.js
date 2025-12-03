@@ -1752,7 +1752,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId } = req.query;
     const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     const userRole = req.user.role; // Get user role from JWT token
-    
+  
     // Build Supabase query with joins
     let query = supabase
       .from('jobs')
@@ -2306,10 +2306,10 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch existing jobs' });
     }
 
-    // Get all team members (or specific worker if provided)
+    // Get all team members (or specific worker if provided) WITH their availability
     let teamMembersQuery = supabase
       .from('team_members')
-      .select('id, first_name, last_name')
+      .select('id, first_name, last_name, availability')
       .eq('user_id', userId)
       .eq('status', 'active');
 
@@ -2324,14 +2324,104 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
 
-    // Helper function to check if a time slot overlaps with existing jobs
-    const isSlotAvailable = (slotStartTime, slotEndTime, workerId) => {
+    // Helper function to check if a team member is available at a specific time based on their availability settings
+    const isWorkerAvailableAtTime = (worker, slotStartTime, slotEndTime) => {
+      if (!worker.availability) {
+        // If no availability set, assume available during business hours
+        return true;
+      }
+
+      try {
+        let availabilityData = worker.availability;
+        if (typeof availabilityData === 'string') {
+          availabilityData = JSON.parse(availabilityData);
+        }
+
+        const dayOfWeek = requestedDate.getDay(); // 0 = Sunday, 6 = Saturday
+        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const dayName = dayNames[dayOfWeek];
+
+        // Check for date-specific custom availability override
+        const dateStr = date.split('T')[0]; // YYYY-MM-DD
+        let workingHours = availabilityData.workingHours || availabilityData;
+        let customAvailability = availabilityData.customAvailability || [];
+
+        // Check for date-specific override first
+        const dateOverride = customAvailability.find(item => item.date === dateStr);
+        if (dateOverride) {
+          if (dateOverride.available === false) {
+            return false; // Day is explicitly unavailable
+          }
+          if (dateOverride.hours && Array.isArray(dateOverride.hours) && dateOverride.hours.length > 0) {
+            // Check if slot falls within any of the custom hours
+            const slotStartMinutes = timeToMinutes(slotStartTime);
+            const slotEndMinutes = timeToMinutes(slotEndTime);
+            
+            return dateOverride.hours.some(hourSlot => {
+              const hourStart = timeToMinutes(hourSlot.start || hourSlot.startTime);
+              const hourEnd = timeToMinutes(hourSlot.end || hourSlot.endTime);
+              return slotStartMinutes >= hourStart && slotEndMinutes <= hourEnd;
+            });
+          }
+        }
+
+        // Check regular working hours for the day
+        const dayHours = workingHours[dayName];
+        if (!dayHours || !dayHours.enabled) {
+          return false; // Day is not enabled
+        }
+
+        // Check if slot falls within working hours
+        const slotStartMinutes = timeToMinutes(slotStartTime);
+        const slotEndMinutes = timeToMinutes(slotEndTime);
+        const dayStartMinutes = timeToMinutes(dayHours.start);
+        const dayEndMinutes = timeToMinutes(dayHours.end);
+
+        // Check if slot is within working hours
+        if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
+          return false;
+        }
+
+        // If day has time slots, check if slot falls within any time slot
+        if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
+          return dayHours.timeSlots.some(timeSlot => {
+            const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
+            const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
+            return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
+          });
+        }
+
+        return true; // Available within working hours
+      } catch (error) {
+        console.error(`Error parsing availability for worker ${worker.id}:`, error);
+        // On error, assume available (fallback to business hours)
+        return true;
+      }
+    };
+
+    // Helper function to convert time string (HH:MM or HH:MM:SS) to minutes from midnight
+    const timeToMinutes = (timeStr) => {
+      if (!timeStr) return 0;
+      const parts = timeStr.split(':');
+      const hours = parseInt(parts[0]) || 0;
+      const minutes = parseInt(parts[1]) || 0;
+      return hours * 60 + minutes;
+    };
+
+    // Helper function to check if a time slot overlaps with existing jobs AND if worker is available
+    const isSlotAvailable = (slotStartTime, slotEndTime, worker) => {
+      // First check if worker is available at this time based on their availability settings
+      if (!isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime)) {
+        return false;
+      }
+
+      // Then check for job conflicts
       const slotStart = new Date(`${date}T${slotStartTime}`);
       const slotEnd = new Date(`${date}T${slotEndTime}`);
 
       for (const job of existingJobs) {
-        // Skip if checking for specific worker and this job is assigned to different worker
-        if (workerId && job.team_member_id && job.team_member_id !== workerId) {
+        // Skip if this job is assigned to a different worker
+        if (job.team_member_id && job.team_member_id !== worker.id) {
           continue;
         }
 
@@ -2375,17 +2465,19 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       const slotEndTime = `${slotEndHour.toString().padStart(2, '0')}:${slotEndMinute.toString().padStart(2, '0')}:00`;
 
       // Count available workers for this slot
+      // IMPORTANT: Check each team member INDIVIDUALLY - if one is unavailable, others can still show slots
       let availableWorkers = 0;
       
       if (workerId) {
         // Check specific worker
-        if (isSlotAvailable(slotStartTime, slotEndTime, workerId)) {
+        const worker = teamMembers.find(w => w.id === parseInt(workerId));
+        if (worker && isSlotAvailable(slotStartTime, slotEndTime, worker)) {
           availableWorkers = 1;
         }
       } else {
-        // Count all available workers
+        // Check each team member individually - each member's availability is independent
         for (const worker of teamMembers) {
-          if (isSlotAvailable(slotStartTime, slotEndTime, worker.id)) {
+          if (isSlotAvailable(slotStartTime, slotEndTime, worker)) {
             availableWorkers++;
           }
         }
@@ -3369,8 +3461,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       if (historyInsertError) {
         console.error('Error inserting initial status history:', historyInsertError);
         // Continue even if history insert fails
-      }
-      
+        }
+
       // Get the created job
       const { data: createdJob, error: fetchError } = await supabase
         .from('jobs')
@@ -3510,8 +3602,8 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
         const { error: historyUpdateError } = await supabase
           .from('job_status_history')
           .update({
-            previous_status: previousStatus,
-            changed_by: changedBy,
+      previous_status: previousStatus,
+      changed_by: changedBy,
             changed_by_type: changedByType,
             changed_at: now
           })
@@ -3546,9 +3638,9 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
           // If table doesn't exist (42P01), log warning but continue
           if (historyInsertError.code === '42P01' || historyInsertError.message?.includes('does not exist')) {
             console.warn('⚠️ job_status_history table does not exist yet. Please run the migration SQL file.');
-          } else {
+        } else {
             console.error('Error inserting status history:', historyInsertError);
-          }
+      }
           // Continue with status update even if history insert fails
         }
       } catch (err) {
@@ -6340,14 +6432,14 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
       }
     } else {
       // Update account owner's profile picture
-      const { error } = await supabase
-        .from('users')
-        .update({ profile_picture: fileUrl })
-        .eq('id', userId);
-      
-      if (error) {
-        console.error('Error updating profile picture:', error);
-        return res.status(500).json({ error: 'Failed to update profile picture' });
+    const { error } = await supabase
+      .from('users')
+      .update({ profile_picture: fileUrl })
+      .eq('id', userId);
+    
+    if (error) {
+      console.error('Error updating profile picture:', error);
+      return res.status(500).json({ error: 'Failed to update profile picture' });
       }
     }
     
@@ -14949,14 +15041,14 @@ app.post('/api/upload/profile-picture', authenticateToken, upload.single('profil
         return res.status(500).json({ error: 'Failed to save profile picture URL' });
       }
     } else {
-      const { error: updateError } = await supabase
-        .from('users')
-        .update({ profile_picture: profilePictureUrl })
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ profile_picture: profilePictureUrl })
         .eq('id', idToUse);
 
-      if (updateError) {
-        console.error('❌ Error saving profile picture URL to database:', updateError);
-        return res.status(500).json({ error: 'Failed to save profile picture URL' });
+    if (updateError) {
+      console.error('❌ Error saving profile picture URL to database:', updateError);
+      return res.status(500).json({ error: 'Failed to save profile picture URL' });
       }
     }
 
@@ -15069,7 +15161,7 @@ app.post('/api/jobs/:jobId/notes/attachments', authenticateToken, attachmentUplo
       }
     }
 
-    res.json({
+      res.json({ 
       message: 'Files uploaded successfully',
       files: uploadedFiles
     });
@@ -15107,7 +15199,7 @@ app.delete('/api/user/profile-picture', authenticateToken, async (req, res) => {
       if (error) {
         console.error('Error removing profile picture:', error);
         return res.status(500).json({ error: 'Failed to remove profile picture' });
-      }
+    }
     }
 
     res.json({ 
