@@ -2294,9 +2294,17 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
     const slotInterval = 30; // 30 minutes between slot starts for flexibility
 
     // Get all jobs for the requested date
+    // IMPORTANT: Also fetch job_team_assignments to check all assigned team members
     const { data: existingJobs, error: jobsError } = await supabase
       .from('jobs')
-      .select('scheduled_time, duration, team_member_id, status')
+      .select(`
+        scheduled_time, 
+        duration, 
+        team_member_id, 
+        status,
+        id,
+        job_team_assignments!left(team_member_id, is_primary)
+      `)
       .eq('user_id', userId)
       .eq('scheduled_date', date)
       .not('status', 'in', '(cancelled)'); // Exclude cancelled jobs
@@ -2408,6 +2416,23 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       return hours * 60 + minutes;
     };
 
+    // Helper function to check if a job is assigned to a specific worker
+    const isJobAssignedToWorker = (job, workerId) => {
+      // Check direct assignment (team_member_id field)
+      if (job.team_member_id && parseInt(job.team_member_id) === parseInt(workerId)) {
+        return true;
+      }
+      
+      // Check job_team_assignments table (for jobs with multiple assignments)
+      if (job.job_team_assignments && Array.isArray(job.job_team_assignments)) {
+        return job.job_team_assignments.some(assignment => 
+          assignment.team_member_id && parseInt(assignment.team_member_id) === parseInt(workerId)
+        );
+      }
+      
+      return false;
+    };
+
     // Helper function to check if a time slot overlaps with existing jobs AND if worker is available
     const isSlotAvailable = (slotStartTime, slotEndTime, worker) => {
       // First check if worker is available at this time based on their availability settings
@@ -2415,25 +2440,28 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
         return false;
       }
 
-      // Then check for job conflicts
+      // Then check for job conflicts - ONLY for jobs assigned to THIS specific worker
       const slotStart = new Date(`${date}T${slotStartTime}`);
       const slotEnd = new Date(`${date}T${slotEndTime}`);
 
       for (const job of existingJobs) {
-        // Skip if this job is assigned to a different worker
-        if (job.team_member_id && job.team_member_id !== worker.id) {
-          continue;
+        // CRITICAL: Only check conflicts for jobs assigned to THIS worker
+        // If job is assigned to a different worker, skip it completely
+        // This allows multiple workers to be available at the same time
+        if (!isJobAssignedToWorker(job, worker.id)) {
+          continue; // This job is assigned to someone else, so it doesn't block this worker
         }
 
+        // This job IS assigned to this worker, so check for time overlap
         const jobStart = new Date(`${date}T${job.scheduled_time}`);
         const jobEnd = new Date(jobStart.getTime() + (job.duration || durationMinutes) * 60000);
 
         // Check for overlap
         if (slotStart < jobEnd && slotEnd > jobStart) {
-          return false;
+          return false; // This worker has a conflict
         }
       }
-      return true;
+      return true; // No conflicts for this worker
     };
 
     // Generate time slots with 30-minute intervals
