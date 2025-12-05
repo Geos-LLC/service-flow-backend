@@ -3676,7 +3676,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
         // Continue with status update
       }
     }
-    
+
     // Update job status
     const { error: updateError } = await supabase
       .from('jobs')
@@ -5028,9 +5028,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             if (isDuplicate) {
               console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
               results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
-              results.skipped++;
-              continue;
-            }
+            results.skipped++;
+            continue;
+          }
           }
           
           // Add this job to the batch tracking set (only if we're going to create it)
@@ -5071,7 +5071,24 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           internal_notes: sanitizedInternalNotes,
           contact_info: job.contactInfo || null,
           customer_notes: job.customerNotes || null,
-          scheduled_date: job.scheduledDate || job.scheduled_date,
+          // Combine scheduled date and time into scheduled_date field
+          // Format: "YYYY-MM-DD HH:MM:SS"
+          scheduled_date: (() => {
+            if (job.scheduledDate && job.scheduledTime) {
+              // Combine date and time
+              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
+              const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
+              return `${datePart} ${timePart}`;
+            } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
+              // Already combined format
+              return job.scheduledDate;
+            } else if (job.scheduledDate) {
+              // Only date provided, use default time
+              return `${job.scheduledDate} 09:00:00`;
+            } else {
+              return job.scheduled_date || null;
+            }
+          })(),
           scheduled_time: job.scheduledTime || '09:00:00',
           service_address_street: job.serviceAddressStreet || sanitizedServiceAddress,
           service_address_city: job.serviceAddressCity,
@@ -11451,25 +11468,25 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       
       // Send new invitation email
       const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
-      
+        
       // Send email in background - don't fail the request if email fails
       sendTeamMemberEmail({
-        to: teamMember.email,
+          to: teamMember.email,
         subject: 'You\'ve been invited to join Service Flow',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2563eb;">Welcome to Service Flow!</h2>
-            <p>Hello ${teamMember.first_name},</p>
+              <p>Hello ${teamMember.first_name},</p>
             <p>You've been invited to join your team on Service Flow. To get started, please click the link below to create your account:</p>
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
-                Create Your Account
-              </a>
-            </div>
-            <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${invitationLink}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">
+                  Create Your Account
+                </a>
+              </div>
+              <p>This link will expire in 7 days. If you have any questions, please contact your team administrator.</p>
             <p>Best regards,<br>The Service Flow Team</p>
-          </div>
-        `,
+            </div>
+          `,
         text: `Welcome to Service Flow! You've been invited to join your team. Please visit ${invitationLink} to create your account. This link will expire in 7 days.`
       }).then(() => {
         console.log('✅ Resend invitation email sent successfully to:', teamMember.email);
@@ -11490,10 +11507,10 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
         invitationToken: invitationToken // Include token in response for debugging if needed
       });
       
-    } catch (error) {
+  } catch (error) {
       console.error('❌ Resend invite error:', error);
-      res.status(500).json({ error: 'Failed to resend invitation' });
-    }
+    res.status(500).json({ error: 'Failed to resend invitation' });
+  }
 });
 
 // Team member dashboard endpoints
