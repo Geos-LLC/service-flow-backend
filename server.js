@@ -1812,16 +1812,24 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add team member filter
     if (teamMember) {
-      switch (teamMember) {
-        case 'assigned':
-          query = query.not('team_member_id', 'is', null);
-          break;
-        case 'unassigned':
-          query = query.is('team_member_id', null);
-          break;
-        case 'web':
-          query = query.is('team_member_id', null);
-          break;
+      // Check if teamMember is a numeric ID (not a special string)
+      const teamMemberIdNum = parseInt(teamMember);
+      if (!isNaN(teamMemberIdNum) && teamMemberIdNum > 0) {
+        // Filter by specific team member ID
+        query = query.eq('team_member_id', teamMemberIdNum);
+      } else {
+        // Handle special string values
+        switch (teamMember) {
+          case 'assigned':
+            query = query.not('team_member_id', 'is', null);
+            break;
+          case 'unassigned':
+            query = query.is('team_member_id', null);
+            break;
+          case 'web':
+            query = query.is('team_member_id', null);
+            break;
+        }
       }
     }
     
