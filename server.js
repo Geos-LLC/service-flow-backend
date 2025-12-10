@@ -16401,6 +16401,133 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
   }
 });
 
+// Record manual payment
+app.post('/api/transactions/record-payment', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, invoiceId, customerId, amount, paymentMethod, paymentDate, notes } = req.body;
+    const userId = req.user.userId;
+    
+    console.log('💳 Recording manual payment:', { jobId, invoiceId, customerId, amount, paymentMethod, paymentDate, notes, userId });
+    
+    if (!jobId || !amount || !paymentMethod) {
+      return res.status(400).json({ error: 'Missing required fields: jobId, amount, and paymentMethod are required' });
+    }
+    
+    const paymentAmount = parseFloat(amount);
+    if (isNaN(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount. Amount must be greater than 0.' });
+    }
+    
+    // Get job to find invoice if not provided
+    let finalInvoiceId = invoiceId;
+    if (!finalInvoiceId && jobId) {
+      const { data: job, error: jobError } = await supabase
+        .from('jobs')
+        .select('id, invoice_id')
+        .eq('id', jobId)
+        .single();
+      
+      if (!jobError && job?.invoice_id) {
+        finalInvoiceId = job.invoice_id;
+      } else {
+        // Try to find invoice by job_id
+        const { data: invoices, error: invoiceError } = await supabase
+          .from('invoices')
+          .select('id')
+          .eq('job_id', jobId)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        
+        if (!invoiceError && invoices && invoices.length > 0) {
+          finalInvoiceId = invoices[0].id;
+        }
+      }
+    }
+    
+    // Create transaction record
+    const transactionData = {
+      user_id: userId,
+      invoice_id: finalInvoiceId || null,
+      customer_id: customerId || null,
+      job_id: jobId,
+      amount: paymentAmount,
+      payment_intent_id: `manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      status: 'completed',
+      payment_method: paymentMethod,
+      notes: notes || null,
+      created_at: paymentDate ? new Date(paymentDate).toISOString() : new Date().toISOString()
+    };
+    
+    console.log('💳 Inserting transaction:', transactionData);
+    
+    const { data: transaction, error: transactionError } = await supabase
+      .from('transactions')
+      .insert(transactionData)
+      .select()
+      .single();
+    
+    if (transactionError) {
+      console.error('❌ Error creating transaction:', transactionError);
+      return res.status(500).json({ error: 'Failed to record payment: ' + transactionError.message });
+    }
+    
+    // Update invoice status if invoice exists
+    if (finalInvoiceId) {
+      // Check current total paid
+      const { data: allTransactions, error: txError } = await supabase
+        .from('transactions')
+        .select('amount')
+        .eq('invoice_id', finalInvoiceId)
+        .eq('status', 'completed');
+      
+      if (!txError && allTransactions) {
+        const totalPaid = allTransactions.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0);
+        
+        // Get invoice total
+        const { data: invoice, error: invError } = await supabase
+          .from('invoices')
+          .select('total_amount')
+          .eq('id', finalInvoiceId)
+          .single();
+        
+        if (!invError && invoice) {
+          const invoiceTotal = parseFloat(invoice.total_amount || 0);
+          const newStatus = totalPaid >= invoiceTotal ? 'paid' : 'partial';
+          
+          await supabase
+            .from('invoices')
+            .update({ 
+              status: newStatus,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', finalInvoiceId);
+        }
+      }
+    }
+    
+    // Update job invoice status
+    await supabase
+      .from('jobs')
+      .update({ 
+        invoice_status: 'paid',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', jobId);
+    
+    console.log('✅ Payment recorded successfully:', transaction.id);
+    
+    res.json({
+      success: true,
+      transaction: transaction,
+      message: 'Payment recorded successfully'
+    });
+    
+  } catch (error) {
+    console.error('❌ Error recording payment:', error);
+    res.status(500).json({ error: 'Failed to record payment: ' + error.message });
+  }
+});
+
 // Helper function to generate receipt HTML
 function generateReceiptHtml(invoice, paymentIntentId, amount) {
   return `
