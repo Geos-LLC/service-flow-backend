@@ -16418,16 +16418,22 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       return res.status(400).json({ error: 'Invalid amount. Amount must be greater than 0.' });
     }
     
-    // Get job to find invoice if not provided
+    // Get job to find invoice if not provided, or create one if it doesn't exist
     let finalInvoiceId = invoiceId;
     if (!finalInvoiceId && jobId) {
+      // First, get the job to find customer_id and other details
       const { data: job, error: jobError } = await supabase
         .from('jobs')
-        .select('id, invoice_id')
+        .select('id, invoice_id, customer_id, total, service_price, price')
         .eq('id', jobId)
         .single();
       
-      if (!jobError && job?.invoice_id) {
+      if (jobError || !job) {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      
+      // Check if job has an invoice_id
+      if (job.invoice_id) {
         finalInvoiceId = job.invoice_id;
       } else {
         // Try to find invoice by job_id
@@ -16440,8 +16446,49 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
         
         if (!invoiceError && invoices && invoices.length > 0) {
           finalInvoiceId = invoices[0].id;
+        } else {
+          // No invoice exists - create one
+          const invoiceAmount = parseFloat(job.total || job.service_price || job.price || paymentAmount);
+          
+          const invoiceData = {
+            user_id: userId,
+            customer_id: job.customer_id || customerId || null,
+            job_id: jobId,
+            amount: invoiceAmount,
+            tax_amount: 0,
+            total_amount: invoiceAmount,
+            due_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            status: 'draft'
+          };
+          
+          console.log('💳 Creating invoice for payment:', invoiceData);
+          
+          const { data: newInvoice, error: createInvoiceError } = await supabase
+            .from('invoices')
+            .insert(invoiceData)
+            .select()
+            .single();
+          
+          if (createInvoiceError || !newInvoice) {
+            console.error('❌ Error creating invoice:', createInvoiceError);
+            return res.status(500).json({ error: 'Failed to create invoice: ' + (createInvoiceError?.message || 'Unknown error') });
+          }
+          
+          finalInvoiceId = newInvoice.id;
+          console.log('✅ Invoice created:', finalInvoiceId);
+          
+          // Update job with invoice_id
+          await supabase
+            .from('jobs')
+            .update({ invoice_id: finalInvoiceId })
+            .eq('id', jobId);
         }
       }
+    }
+    
+    // Ensure we have an invoice_id (required by transactions table)
+    if (!finalInvoiceId) {
+      return res.status(400).json({ error: 'Invoice ID is required. Could not find or create an invoice for this job.' });
     }
     
     // Create transaction record
