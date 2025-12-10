@@ -16454,9 +16454,11 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       payment_intent_id: `manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       status: 'completed',
       payment_method: paymentMethod,
-      notes: notes || null,
       created_at: paymentDate ? new Date(paymentDate).toISOString() : new Date().toISOString()
     };
+    
+    // Note: The transactions table doesn't have a 'notes' column
+    // If notes are needed, they could be stored in a separate table or added to the schema later
     
     console.log('💳 Inserting transaction:', transactionData);
     
