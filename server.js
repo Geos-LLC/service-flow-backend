@@ -2610,6 +2610,7 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
     const isWorkerAvailableAtTime = (worker, slotStartTime, slotEndTime) => {
       if (!worker.availability) {
         // If no availability set, assume available during business hours
+        console.log(`✅ Worker ${worker.id} (${worker.first_name}): No availability set, defaulting to available`);
         return true;
       }
 
@@ -2622,9 +2623,12 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
         const dayOfWeek = requestedDate.getDay(); // 0 = Sunday, 6 = Saturday
         const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
         const dayName = dayNames[dayOfWeek];
+        
+        console.log(`🔍 Checking availability for worker ${worker.id} (${worker.first_name}) on ${dayName} at ${slotStartTime}-${slotEndTime}`);
 
         // Check for date-specific custom availability override
-        const dateStr = date.split('T')[0]; // YYYY-MM-DD
+        // Handle both "YYYY-MM-DD" and "YYYY-MM-DDTHH:MM:SS" formats
+        const dateStr = date.includes('T') ? date.split('T')[0] : date; // YYYY-MM-DD
         let workingHours = availabilityData.workingHours || availabilityData;
         let customAvailability = availabilityData.customAvailability || [];
 
@@ -2649,22 +2653,83 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
 
         // Check regular working hours for the day
         const dayHours = workingHours[dayName];
-        if (!dayHours || !dayHours.enabled) {
-          return false; // Day is not enabled
+        
+        // Handle different availability formats:
+        // Format 1: { enabled: true, start: "09:00", end: "17:00" }
+        // Format 2: { available: true, hours: "9:00 AM - 6:00 PM" }
+        // Format 3: { available: true, timeSlots: [...] }
+        
+        if (!dayHours) {
+          console.log(`❌ Worker ${worker.id}: No availability configured for ${dayName}`);
+          return false; // Day not configured
         }
+        
+        // Check if day is enabled/available
+        const isDayEnabled = dayHours.enabled !== false && dayHours.available !== false;
+        if (!isDayEnabled) {
+          console.log(`❌ Worker ${worker.id}: ${dayName} is disabled (enabled: ${dayHours.enabled}, available: ${dayHours.available})`);
+          return false; // Day is explicitly disabled
+        }
+        
+        console.log(`✅ Worker ${worker.id}: ${dayName} is enabled, checking hours...`);
 
-        // Check if slot falls within working hours
         const slotStartMinutes = timeToMinutes(slotStartTime);
         const slotEndMinutes = timeToMinutes(slotEndTime);
-        const dayStartMinutes = timeToMinutes(dayHours.start);
-        const dayEndMinutes = timeToMinutes(dayHours.end);
 
-        // Check if slot is within working hours
-        if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
-          return false;
+        // Format 1: Check if day has start/end times directly
+        if (dayHours.start && dayHours.end) {
+          const dayStartMinutes = timeToMinutes(dayHours.start);
+          const dayEndMinutes = timeToMinutes(dayHours.end);
+          
+          // Check if slot is within working hours
+          if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
+            return false;
+          }
+          
+          // If day has time slots, check if slot falls within any time slot
+          if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
+            return dayHours.timeSlots.some(timeSlot => {
+              const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
+              const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
+              return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
+            });
+          }
+          
+          return true; // Available within working hours
         }
-
-        // If day has time slots, check if slot falls within any time slot
+        
+        // Format 2: Parse hours string like "9:00 AM - 6:00 PM"
+        if (dayHours.hours && typeof dayHours.hours === 'string') {
+          const hoursMatch = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+          if (hoursMatch) {
+            let startHour = parseInt(hoursMatch[1]);
+            let startMin = hoursMatch[2];
+            let endHour = parseInt(hoursMatch[4]);
+            let endMin = hoursMatch[5];
+            
+            // Convert to 24-hour format if AM/PM is present
+            if (hoursMatch[3]) {
+              if (hoursMatch[3].toUpperCase() === 'PM' && startHour !== 12) startHour += 12;
+              if (hoursMatch[3].toUpperCase() === 'AM' && startHour === 12) startHour = 0;
+            }
+            if (hoursMatch[6]) {
+              if (hoursMatch[6].toUpperCase() === 'PM' && endHour !== 12) endHour += 12;
+              if (hoursMatch[6].toUpperCase() === 'AM' && endHour === 12) endHour = 0;
+            }
+            
+            const dayStartMinutes = startHour * 60 + parseInt(startMin);
+            const dayEndMinutes = endHour * 60 + parseInt(endMin);
+            
+            // Check if slot is within working hours
+            if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
+              return false;
+            }
+            
+            return true; // Available within working hours
+          }
+        }
+        
+        // Format 3: Check timeSlots array
         if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
           return dayHours.timeSlots.some(timeSlot => {
             const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
@@ -2672,11 +2737,23 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
             return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
           });
         }
-
-        return true; // Available within working hours
+        
+        // If day is enabled but no specific hours, assume available during business hours (9 AM - 5 PM)
+        // This handles cases where availability is set to "open" without specific hours
+        const defaultStartMinutes = 9 * 60; // 9 AM
+        const defaultEndMinutes = 17 * 60; // 5 PM
+        
+        if (slotStartMinutes >= defaultStartMinutes && slotEndMinutes <= defaultEndMinutes) {
+          return true;
+        }
+        
+        console.log(`❌ Worker ${worker.id}: Slot ${slotStartTime}-${slotEndTime} not within any available hours for ${dayName}`);
+        return false; // Not within any available hours
       } catch (error) {
-        console.error(`Error parsing availability for worker ${worker.id}:`, error);
-        // On error, assume available (fallback to business hours)
+        console.error(`❌ Error parsing availability for worker ${worker.id} (${worker.first_name}):`, error);
+        console.error(`   Availability data:`, worker.availability);
+        // On error, assume available (fallback to business hours) to avoid blocking scheduling
+        console.log(`⚠️ Worker ${worker.id}: Error parsing availability, defaulting to available`);
         return true;
       }
     };
