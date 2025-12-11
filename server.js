@@ -2882,6 +2882,432 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
   }
 });
 
+// Helper function to convert time to minutes (for job offers)
+function timeToMinutesForOffers(timeStr) {
+  if (!timeStr) return 0;
+  const parts = timeStr.split(':');
+  const hours = parseInt(parts[0]) || 0;
+  const minutes = parseInt(parts[1]) || 0;
+  return hours * 60 + minutes;
+}
+
+// Helper function to check if worker is qualified for a job
+function checkWorkerQualification(worker, job) {
+  // Check skills if job requires specific skills
+  if (job.skills && Array.isArray(job.skills) && job.skills.length > 0) {
+    let workerSkills = worker.skills || [];
+    if (typeof workerSkills === 'string') {
+      try {
+        workerSkills = JSON.parse(workerSkills);
+      } catch (e) {
+        workerSkills = [];
+      }
+    }
+    
+    // Check if worker has at least one required skill
+    const hasRequiredSkill = job.skills.some(skill => 
+      workerSkills.some(ws => {
+        const wsName = typeof ws === 'string' ? ws.toLowerCase() : ws.name?.toLowerCase();
+        const skillName = typeof skill === 'string' ? skill.toLowerCase() : skill.name?.toLowerCase();
+        return wsName === skillName;
+      })
+    );
+    
+    if (!hasRequiredSkill && job.skills.length > 0) {
+      return false;
+    }
+  }
+
+  // Check service-specific skills if service has skills_required
+  if (job.services?.skills_required) {
+    const serviceSkills = job.services.skills_required;
+    let workerSkills = worker.skills || [];
+    if (typeof workerSkills === 'string') {
+      try {
+        workerSkills = JSON.parse(workerSkills);
+      } catch (e) {
+        workerSkills = [];
+      }
+    }
+    
+    if (Array.isArray(serviceSkills) && serviceSkills.length > 0) {
+      const hasServiceSkill = serviceSkills.some(skill => 
+        workerSkills.some(ws => {
+          const wsName = typeof ws === 'string' ? ws.toLowerCase() : ws.name?.toLowerCase();
+          const skillName = typeof skill === 'string' ? skill.toLowerCase() : skill.name?.toLowerCase();
+          return wsName === skillName;
+        })
+      );
+      
+      if (!hasServiceSkill) {
+        return false;
+      }
+    }
+  }
+
+  return true; // Worker is qualified
+}
+
+// Helper function to check if worker is available at job time
+async function checkWorkerAvailabilityForOffer(worker, job) {
+  try {
+    const jobDate = new Date(job.scheduled_date);
+    const dateStr = jobDate.toISOString().split('T')[0];
+    const dayOfWeek = jobDate.getDay();
+    const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const dayName = dayNames[dayOfWeek];
+
+    // Parse worker availability
+    let availabilityData = worker.availability;
+    if (typeof availabilityData === 'string') {
+      availabilityData = JSON.parse(availabilityData);
+    }
+
+    if (!availabilityData) {
+      return true; // No availability set, assume available
+    }
+
+    // Check for date-specific override
+    const customAvailability = availabilityData.customAvailability || [];
+    const dateOverride = customAvailability.find(item => item.date === dateStr);
+    
+    if (dateOverride) {
+      if (dateOverride.available === false) {
+        return false;
+      }
+      if (dateOverride.hours && Array.isArray(dateOverride.hours) && dateOverride.hours.length > 0) {
+        const jobTime = job.scheduled_time || '09:00';
+        const jobStartMinutes = timeToMinutesForOffers(jobTime);
+        const jobDuration = job.duration || job.services?.duration || 120;
+        const jobEndMinutes = jobStartMinutes + jobDuration;
+        
+        return dateOverride.hours.some(hourSlot => {
+          const slotStart = timeToMinutesForOffers(hourSlot.start || hourSlot.startTime);
+          const slotEnd = timeToMinutesForOffers(hourSlot.end || hourSlot.endTime);
+          return jobStartMinutes >= slotStart && jobEndMinutes <= slotEnd;
+        });
+      }
+    }
+
+    // Check regular working hours
+    const workingHours = availabilityData.workingHours || availabilityData;
+    const dayHours = workingHours[dayName];
+    
+    if (!dayHours) {
+      return false;
+    }
+
+    const isDayEnabled = dayHours.enabled !== false && dayHours.available !== false;
+    if (!isDayEnabled) {
+      return false;
+    }
+
+    const jobTime = job.scheduled_time || '09:00';
+    const jobStartMinutes = timeToMinutesForOffers(jobTime);
+    const jobDuration = job.duration || job.services?.duration || 120;
+    const jobEndMinutes = jobStartMinutes + jobDuration;
+
+    // Check if job fits within working hours
+    if (dayHours.start && dayHours.end) {
+      const dayStartMinutes = timeToMinutesForOffers(dayHours.start);
+      const dayEndMinutes = timeToMinutesForOffers(dayHours.end);
+      
+      if (jobStartMinutes < dayStartMinutes || jobEndMinutes > dayEndMinutes) {
+        return false;
+      }
+    } else if (dayHours.hours) {
+      // Parse hours string
+      const hoursMatch = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+      if (hoursMatch) {
+        let startHour = parseInt(hoursMatch[1]);
+        let endHour = parseInt(hoursMatch[4]);
+        
+        if (hoursMatch[3] && hoursMatch[3].toUpperCase() === 'PM' && startHour !== 12) startHour += 12;
+        if (hoursMatch[3] && hoursMatch[3].toUpperCase() === 'AM' && startHour === 12) startHour = 0;
+        if (hoursMatch[6] && hoursMatch[6].toUpperCase() === 'PM' && endHour !== 12) endHour += 12;
+        if (hoursMatch[6] && hoursMatch[6].toUpperCase() === 'AM' && endHour === 12) endHour = 0;
+        
+        const dayStartMinutes = startHour * 60 + parseInt(hoursMatch[2]);
+        const dayEndMinutes = endHour * 60 + parseInt(hoursMatch[5]);
+        
+        if (jobStartMinutes < dayStartMinutes || jobEndMinutes > dayEndMinutes) {
+          return false;
+        }
+      }
+    }
+
+    // Check for conflicts with existing jobs assigned to this worker
+    const { data: existingJobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select('scheduled_date, scheduled_time, duration')
+      .eq('team_member_id', worker.id)
+      .eq('scheduled_date', dateStr)
+      .not('status', 'in', '(cancelled)');
+
+    if (!jobsError && existingJobs) {
+      for (const existingJob of existingJobs) {
+        const existingStart = new Date(`${dateStr}T${existingJob.scheduled_time || '09:00'}`);
+        const existingDuration = existingJob.duration || 120;
+        const existingEnd = new Date(existingStart.getTime() + existingDuration * 60000);
+        
+        const jobStart = new Date(`${dateStr}T${jobTime}`);
+        const jobEnd = new Date(jobStart.getTime() + jobDuration * 60000);
+        
+        if (jobStart < existingEnd && jobEnd > existingStart) {
+          return false; // Conflict found
+        }
+      }
+    }
+
+    return true; // Worker is available
+  } catch (error) {
+    console.error('Error checking worker availability:', error);
+    return true; // On error, assume available
+  }
+}
+
+// Get available jobs for workers (jobs with offer_to_providers = true)
+app.get('/api/jobs/available-for-workers', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const teamMemberId = req.user.teamMemberId;
+    const userRole = req.user.role;
+
+    // Only workers can access this endpoint
+    if (userRole !== 'worker' || !teamMemberId) {
+      return res.status(403).json({ error: 'Only workers can view available jobs' });
+    }
+
+    // Get worker's information
+    const { data: worker, error: workerError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, availability, skills, user_id')
+      .eq('id', teamMemberId)
+      .eq('status', 'active')
+      .single();
+
+    if (workerError || !worker) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    // Get all jobs that are:
+    // 1. Offered to providers (offer_to_providers = true)
+    // 2. Not already assigned to anyone (team_member_id IS NULL)
+    // 3. Status is pending or confirmed
+    // 4. Scheduled date is in the future
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const { data: availableJobs, error: jobsError } = await supabase
+      .from('jobs')
+      .select(`
+        *,
+        customers!left(first_name, last_name, email, phone, city, state),
+        services!left(name, price, duration, skills_required),
+        territories!left(name)
+      `)
+      .eq('offer_to_providers', true)
+      .is('team_member_id', null) // Not assigned yet
+      .in('status', ['pending', 'confirmed'])
+      .gte('scheduled_date', today.toISOString())
+      .order('scheduled_date', { ascending: true });
+
+    if (jobsError) {
+      console.error('Error fetching available jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch available jobs' });
+    }
+
+    // Get existing claims by this worker
+    const { data: existingClaims, error: claimsError } = await supabase
+      .from('job_offers')
+      .select('job_id, status')
+      .eq('team_member_id', teamMemberId)
+      .in('status', ['pending', 'claimed', 'accepted']);
+
+    const claimedJobIds = new Set((existingClaims || []).map(c => c.job_id));
+
+    // Filter and check qualifications for each job
+    const qualifiedJobs = [];
+    
+    for (const job of availableJobs || []) {
+      // Skip if already claimed by this worker
+      if (claimedJobIds.has(job.id)) {
+        continue;
+      }
+
+      // Check if worker is qualified
+      const isQualified = checkWorkerQualification(worker, job);
+      
+      // Check if worker is available at job time
+      const isAvailable = await checkWorkerAvailabilityForOffer(worker, job);
+
+      if (isQualified && isAvailable) {
+        qualifiedJobs.push({
+          ...job,
+          isQualified: true,
+          isAvailable: true
+        });
+      }
+    }
+
+    res.json({ 
+      jobs: qualifiedJobs,
+      total: qualifiedJobs.length
+    });
+  } catch (error) {
+    console.error('Error in available jobs endpoint:', error);
+    res.status(500).json({ error: 'Failed to fetch available jobs' });
+  }
+});
+
+// Claim a job (worker claims an available job)
+app.post('/api/jobs/:id/claim', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const teamMemberId = req.user.teamMemberId;
+    const userRole = req.user.role;
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    // Only workers can claim jobs
+    if (userRole !== 'worker' || !teamMemberId) {
+      return res.status(403).json({ error: 'Only workers can claim jobs' });
+    }
+
+    // Get the job
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('*, customers!left(first_name, last_name, email), services!left(name)')
+      .eq('id', id)
+      .single();
+
+    if (jobError || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Verify job is available for claiming
+    if (!job.offer_to_providers) {
+      return res.status(400).json({ error: 'This job is not offered to providers' });
+    }
+
+    if (job.team_member_id) {
+      return res.status(400).json({ error: 'This job is already assigned' });
+    }
+
+    // Check if already claimed
+    const { data: existingClaim, error: claimCheckError } = await supabase
+      .from('job_offers')
+      .select('*')
+      .eq('job_id', id)
+      .eq('team_member_id', teamMemberId)
+      .maybeSingle();
+
+    if (existingClaim && !claimCheckError) {
+      if (existingClaim.status === 'claimed' || existingClaim.status === 'accepted') {
+        return res.status(400).json({ error: 'You have already claimed this job' });
+      }
+    }
+
+    // Get worker info
+    const { data: worker, error: workerError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, email, user_id, availability, skills')
+      .eq('id', teamMemberId)
+      .single();
+
+    if (workerError || !worker) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    // Check qualifications and availability
+    const isQualified = checkWorkerQualification(worker, job);
+    if (!isQualified) {
+      return res.status(400).json({ error: 'You do not meet the qualifications for this job' });
+    }
+
+    const isAvailable = await checkWorkerAvailabilityForOffer(worker, job);
+    if (!isAvailable) {
+      return res.status(400).json({ error: 'You are not available at the scheduled time' });
+    }
+
+    // Create or update job offer claim
+    const claimData = {
+      job_id: parseInt(id),
+      team_member_id: teamMemberId,
+      status: 'claimed',
+      claimed_at: new Date().toISOString(),
+      notes: notes || null
+    };
+
+    let claimResult;
+    if (existingClaim) {
+      // Update existing claim
+      const { data, error } = await supabase
+        .from('job_offers')
+        .update(claimData)
+        .eq('id', existingClaim.id)
+        .select()
+        .single();
+      
+      claimResult = { data, error };
+    } else {
+      // Create new claim
+      const { data, error } = await supabase
+        .from('job_offers')
+        .insert(claimData)
+        .select()
+        .single();
+      
+      claimResult = { data, error };
+    }
+
+    if (claimResult.error) {
+      console.error('Error creating/updating job claim:', claimResult.error);
+      return res.status(500).json({ error: 'Failed to claim job' });
+    }
+
+    // Automatically assign the job to the worker (or wait for business owner approval)
+    // For now, we'll auto-assign. You can change this to require approval later
+    const { error: assignError } = await supabase
+      .from('jobs')
+      .update({ 
+        team_member_id: teamMemberId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (assignError) {
+      console.error('Error assigning job:', assignError);
+      // Don't fail the claim, just log the error
+    }
+
+    // Update claim status to accepted (since we auto-assigned)
+    await supabase
+      .from('job_offers')
+      .update({ 
+        status: 'accepted',
+        responded_at: new Date().toISOString()
+      })
+      .eq('id', claimResult.data.id);
+
+    // TODO: Send notification to business owner
+    // TODO: Send confirmation to worker
+
+    res.json({ 
+      success: true,
+      message: 'Job claimed successfully',
+      claim: claimResult.data,
+      job: {
+        ...job,
+        team_member_id: teamMemberId
+      }
+    });
+  } catch (error) {
+    console.error('Error claiming job:', error);
+    res.status(500).json({ error: 'Failed to claim job' });
+  }
+});
+
 app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
   // CORS handled by middleware - Windows Defender/Firewall compatible
   
