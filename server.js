@@ -4808,13 +4808,16 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     
 
     Object.keys(updateData).forEach(key => {
-     if ((fieldMappings[key] || key === 'serviceAddress') && updateData[key] !== undefined) {
+     // Check if key is in fieldMappings, or if it's a direct database field name (snake_case)
+     const dbFieldName = fieldMappings[key] || (key.includes('_') ? key : null);
+     
+     if ((fieldMappings[key] || key === 'serviceAddress' || dbFieldName) && updateData[key] !== undefined) {
         // Handle special cases
         if (key === 'scheduledDate' && updateData.scheduledTime) {
           // Simply combine date and time as-is, no timezone conversion
           updateDataToSend[fieldMappings[key]] = `${updateData[key]} ${updateData.scheduledTime}:00`;
         } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
-          updateDataToSend[fieldMappings[key]] = updateData[key];
+          updateDataToSend[fieldMappings[key] || key] = updateData[key];
         } else if (key === 'serviceAddress') {
           // Handle nested service address
           if (updateData[key]) {
@@ -4825,7 +4828,8 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
           
           }
         } else {
-          updateDataToSend[fieldMappings[key]] = updateData[key];
+          // Use mapped field name if available, otherwise use the key directly (for snake_case fields)
+          updateDataToSend[fieldMappings[key] || key] = updateData[key];
         }
       }
     });
