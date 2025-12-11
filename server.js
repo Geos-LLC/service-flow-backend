@@ -153,9 +153,180 @@ ensureBuckets().then(() => {
   console.error('❌ Error initializing Supabase Storage buckets:', error);
 });
 
+// Helper function to calculate next recurring date from frequency string
+function calculateNextRecurringDate(frequency, currentDate) {
+  if (!frequency || frequency === '' || frequency === 'never') {
+    return null;
+  }
+
+  const freq = frequency.toLowerCase().trim();
+  const baseDate = currentDate instanceof Date ? new Date(currentDate) : new Date(currentDate);
+  const nextDate = new Date(baseDate);
+
+  // Handle daily frequencies
+  if (freq === 'daily' || /^\d+\s*days?$/.test(freq)) {
+    const dayMatch = freq.match(/(\d+)\s*days?/) || (freq === 'daily' ? ['', '1'] : null);
+    const days = dayMatch ? parseInt(dayMatch[1]) : 1;
+    nextDate.setDate(nextDate.getDate() + days);
+    return nextDate;
+  }
+
+  // Handle weekly frequencies: "weekly-friday", "2 weeks-friday", etc.
+  if (freq.includes('week')) {
+    const parts = freq.split('-');
+    const weekMatch = parts[0].match(/(\d+)\s*weeks?/) || parts[0].match(/weekly/);
+    const weeks = weekMatch && weekMatch[1] ? parseInt(weekMatch[1]) : 1;
+    
+    // If day of week is specified, find the next occurrence of that day
+    if (parts.length > 1) {
+      const dayPart = parts[parts.length - 1];
+      const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+      const targetDayIndex = dayNames.findIndex(day => dayPart.includes(day));
+      
+      if (targetDayIndex !== -1) {
+        // Calculate days until next occurrence of that weekday
+        const currentDayIndex = baseDate.getDay();
+        let daysUntilNext = (targetDayIndex - currentDayIndex + 7) % 7;
+        
+        // If it's the same day, move to next week
+        if (daysUntilNext === 0) {
+          daysUntilNext = 7;
+        }
+        
+        // Add the weeks multiplier
+        nextDate.setDate(nextDate.getDate() + daysUntilNext + ((weeks - 1) * 7));
+        return nextDate;
+      }
+    }
+    
+    // No specific day, just add weeks
+    nextDate.setDate(nextDate.getDate() + (weeks * 7));
+    return nextDate;
+  }
+
+  // Handle bi-weekly (special case)
+  if (freq === 'biweekly' || freq === 'bi-weekly') {
+    // Try to preserve the weekday
+    nextDate.setDate(nextDate.getDate() + 14);
+    
+    // If weekday is specified in a format like "biweekly-friday", use that
+    const parts = freq.split('-');
+    if (parts.length > 1) {
+      const dayPart = parts[parts.length - 1];
+      const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+      const targetDayIndex = dayNames.findIndex(day => dayPart.includes(day));
+      if (targetDayIndex !== -1) {
+        const daysUntilNext = (targetDayIndex - nextDate.getDay() + 7) % 7;
+        nextDate.setDate(nextDate.getDate() + daysUntilNext);
+      }
+    }
+    
+    return nextDate;
+  }
+
+  // Handle monthly frequencies
+  if (freq.includes('month')) {
+    const parts = freq.split('-');
+    const monthMatch = parts[0].match(/(\d+)\s*months?/) || parts[0].match(/monthly/);
+    const months = monthMatch && monthMatch[1] ? parseInt(monthMatch[1]) : 1;
+    
+    // Format: monthly-day-15 or X months-day-15
+    if (parts.includes('day') && parts.length > 2) {
+      const dayValue = parseInt(parts[parts.length - 1]);
+      if (dayValue && dayValue >= 1 && dayValue <= 31) {
+        nextDate.setMonth(nextDate.getMonth() + months);
+        // Set to the specific day of month
+        const daysInMonth = new Date(nextDate.getFullYear(), nextDate.getMonth() + 1, 0).getDate();
+        nextDate.setDate(Math.min(dayValue, daysInMonth));
+        return nextDate;
+      }
+    }
+    // Format: monthly-2nd-friday or X months-2nd-friday
+    else if (parts.length > 2) {
+      const ordinalsList = ["1st", "2nd", "3rd", "4th", "last"];
+      const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+      
+      let ordinal = null;
+      let weekdayIndex = null;
+      
+      for (const part of parts) {
+        const lowerPart = part.toLowerCase();
+        if (ordinalsList.some(ord => lowerPart.includes(ord.toLowerCase()))) {
+          ordinal = ordinalsList.find(ord => lowerPart.includes(ord.toLowerCase()));
+        }
+        const dayIndex = dayNames.findIndex(day => lowerPart.includes(day));
+        if (dayIndex !== -1) {
+          weekdayIndex = dayIndex;
+        }
+      }
+      
+      if (ordinal && weekdayIndex !== null) {
+        // Move to next month
+        nextDate.setMonth(nextDate.getMonth() + months);
+        
+        // Find the nth occurrence of the weekday in that month
+        const year = nextDate.getFullYear();
+        const month = nextDate.getMonth();
+        
+        // Start from the first day of the month
+        const firstDay = new Date(year, month, 1);
+        const firstDayOfWeek = firstDay.getDay();
+        
+        // Calculate the first occurrence of the target weekday
+        let firstOccurrence = (weekdayIndex - firstDayOfWeek + 7) % 7;
+        if (firstOccurrence === 0) firstOccurrence = 7;
+        
+        let targetDate = 1 + firstOccurrence - 1;
+        
+        // Adjust for ordinal (1st, 2nd, 3rd, 4th, last)
+        if (ordinal === '1st') {
+          targetDate = 1 + firstOccurrence - 1;
+        } else if (ordinal === '2nd') {
+          targetDate = 1 + firstOccurrence - 1 + 7;
+        } else if (ordinal === '3rd') {
+          targetDate = 1 + firstOccurrence - 1 + 14;
+        } else if (ordinal === '4th') {
+          targetDate = 1 + firstOccurrence - 1 + 21;
+        } else if (ordinal === 'last') {
+          // Find the last occurrence
+          const lastDay = new Date(year, month + 1, 0);
+          const lastDayOfWeek = lastDay.getDay();
+          let lastOccurrence = lastDay.getDate() - ((lastDayOfWeek - weekdayIndex + 7) % 7);
+          if (lastOccurrence > lastDay.getDate()) {
+            lastOccurrence -= 7;
+          }
+          targetDate = lastOccurrence;
+        }
+        
+        // Validate the date is within the month
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        if (targetDate > daysInMonth) {
+          targetDate = daysInMonth;
+        }
+        
+        nextDate.setDate(targetDate);
+        return nextDate;
+      }
+    }
+    
+    // Fallback: add months and try to preserve the day of month
+    const originalDay = baseDate.getDate();
+    nextDate.setMonth(nextDate.getMonth() + months);
+    
+    // Handle month-end edge cases (e.g., Jan 31 -> Feb 28/29)
+    const daysInMonth = new Date(nextDate.getFullYear(), nextDate.getMonth() + 1, 0).getDate();
+    nextDate.setDate(Math.min(originalDay, daysInMonth));
+    
+    return nextDate;
+  }
+
+  // Default: return null if frequency is not recognized
+  return null;
+}
+
 // Cron job for recurring billing
 cron.schedule('0 9 * * *', async () => {
-  console.log('Running recurring billing check...');
+  console.log('🔄 Running recurring billing check...');
   try {
     // Get recurring jobs that need to be processed
     const { data: recurringJobs, error } = await supabase
@@ -170,19 +341,53 @@ cron.schedule('0 9 * * *', async () => {
       .eq('status', 'completed');
 
     if (error) {
-      console.error('Error fetching recurring jobs:', error);
+      console.error('❌ Error fetching recurring jobs:', error);
       return;
     }
 
+    console.log(`📋 Found ${recurringJobs?.length || 0} recurring jobs to process`);
+
     for (const job of recurringJobs || []) {
-      // Calculate new scheduled date
-      const newScheduledDate = new Date();
-      newScheduledDate.setDate(newScheduledDate.getDate() + job.recurring_frequency);
-      
-      // Create new job for recurring service
-      const { error: insertError } = await supabase
-        .from('jobs')
-        .insert({
+      try {
+        // Check if recurring end date has passed
+        if (job.recurring_end_date) {
+          const endDate = new Date(job.recurring_end_date);
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          endDate.setHours(0, 0, 0, 0);
+          
+          if (endDate < today) {
+            console.log(`⏹️ Skipping job ${job.id} - recurring end date has passed`);
+            // Mark as no longer recurring
+            await supabase
+              .from('jobs')
+              .update({ is_recurring: false })
+              .eq('id', job.id);
+            continue;
+          }
+        }
+
+        // Calculate new scheduled date using the frequency
+        const lastJobDate = new Date(job.next_billing_date || job.scheduled_date);
+        const newScheduledDate = calculateNextRecurringDate(job.recurring_frequency, lastJobDate);
+        
+        if (!newScheduledDate) {
+          console.error(`❌ Could not calculate next date for job ${job.id} with frequency: ${job.recurring_frequency}`);
+          continue;
+        }
+
+        // Preserve the time from the original job
+        if (job.scheduled_date) {
+          const originalDate = new Date(job.scheduled_date);
+          newScheduledDate.setHours(originalDate.getHours());
+          newScheduledDate.setMinutes(originalDate.getMinutes());
+          newScheduledDate.setSeconds(originalDate.getSeconds());
+        }
+        
+        console.log(`📅 Job ${job.id}: Calculating next date from ${lastJobDate.toISOString()} -> ${newScheduledDate.toISOString()}`);
+        
+        // Create new job for recurring service
+        const newJobData = {
           user_id: job.user_id,
           customer_id: job.customer_id,
           service_id: job.service_id,
@@ -190,43 +395,80 @@ cron.schedule('0 9 * * *', async () => {
           notes: job.notes,
           status: 'pending',
           is_recurring: true,
-          recurring_frequency: job.recurring_frequency
-        });
+          recurring_frequency: job.recurring_frequency,
+          recurring_end_date: job.recurring_end_date,
+          service_name: job.service_name,
+          service_price: job.service_price,
+          price: job.price,
+          total: job.total,
+          duration: job.duration,
+          estimated_duration: job.estimated_duration,
+          workers: job.workers,
+          territory_id: job.territory_id,
+          service_address_street: job.service_address_street,
+          service_address_city: job.service_address_city,
+          service_address_state: job.service_address_state,
+          service_address_zip: job.service_address_zip,
+          service_address_country: job.service_address_country,
+          service_modifiers: job.service_modifiers,
+          service_intake_questions: job.service_intake_questions
+        };
 
-      if (insertError) {
-        console.error('Error creating recurring job:', insertError);
-        continue;
+        // Calculate next billing date for the new job
+        const nextBillingDate = calculateNextRecurringDate(job.recurring_frequency, newScheduledDate);
+        if (nextBillingDate) {
+          newJobData.next_billing_date = nextBillingDate.toISOString().split('T')[0];
+        }
+
+        const { data: newJob, error: insertError } = await supabase
+          .from('jobs')
+          .insert(newJobData)
+          .select()
+          .single();
+
+        if (insertError) {
+          console.error(`❌ Error creating recurring job for job ${job.id}:`, insertError);
+          continue;
+        }
+
+        console.log(`✅ Created new recurring job ${newJob.id} for job ${job.id}`);
+
+        // Update next billing date on the original job (for tracking)
+        const updatedNextBillingDate = calculateNextRecurringDate(job.recurring_frequency, newScheduledDate);
+        if (updatedNextBillingDate) {
+          await supabase
+            .from('jobs')
+            .update({ next_billing_date: updatedNextBillingDate.toISOString().split('T')[0] })
+            .eq('id', job.id);
+        }
+        
+        // Send email notification
+        try {
+          await sendEmail({
+            to: job.customers.email,
+            subject: 'Recurring Service Scheduled',
+            html: `
+              <h2>Your recurring service has been scheduled</h2>
+              <p>Hello ${job.customers.first_name},</p>
+              <p>Your recurring ${job.services.name} service has been scheduled for ${newScheduledDate.toLocaleDateString()}.</p>
+              <p>Service: ${job.services.name}</p>
+              <p>Price: $${job.services.price}</p>
+              <p>Thank you for choosing our services!</p>
+            `
+          });
+        } catch (emailError) {
+          console.error(`⚠️ Error sending email for job ${job.id}:`, emailError);
+          // Don't fail the whole process if email fails
+        }
+      } catch (jobError) {
+        console.error(`❌ Error processing recurring job ${job.id}:`, jobError);
+        // Continue with next job
       }
-
-      // Update next billing date
-      const newNextBillingDate = new Date(job.next_billing_date);
-      newNextBillingDate.setDate(newNextBillingDate.getDate() + job.recurring_frequency);
-      
-      const { error: updateError } = await supabase
-        .from('jobs')
-        .update({ next_billing_date: newNextBillingDate.toISOString().split('T')[0] })
-        .eq('id', job.id);
-
-      if (updateError) {
-        console.error('Error updating next billing date:', updateError);
-      }
-      
-      // Send email notification
-      await sendEmail({
-        to: job.customers.email,
-        subject: 'Recurring Service Scheduled',
-        html: `
-          <h2>Your recurring service has been scheduled</h2>
-          <p>Hello ${job.customers.first_name},</p>
-          <p>Your recurring ${job.services.name} service has been scheduled for ${new Date().toLocaleDateString()}.</p>
-          <p>Service: ${job.services.name}</p>
-          <p>Price: $${job.services.price}</p>
-          <p>Thank you for choosing our services!</p>
-        `
-      });
     }
+    
+    console.log('✅ Recurring billing check completed');
   } catch (error) {
-    console.error('Recurring billing error:', error);
+    console.error('❌ Recurring billing error:', error);
   }
 });
 
@@ -2111,7 +2353,25 @@ app.get('/api/recurring-bookings', authenticateToken, async (req, res) => {
     }
     
     // Process jobs to format for frontend
-    const recurringBookings = filteredJobs.map(job => {
+    // Group jobs by recurring pattern to find the next job in each series
+    const recurringSeries = {};
+    
+    filteredJobs.forEach(job => {
+      // Create a key for the recurring series (customer + frequency)
+      const seriesKey = `${job.customer_id}_${job.recurring_frequency || 'none'}`;
+      
+      if (!recurringSeries[seriesKey]) {
+        recurringSeries[seriesKey] = [];
+      }
+      recurringSeries[seriesKey].push(job);
+    });
+    
+    // For each series, find the most recent job and calculate next date
+    const recurringBookings = Object.values(recurringSeries).map(series => {
+      // Sort by scheduled_date descending to get the most recent
+      series.sort((a, b) => new Date(b.scheduled_date) - new Date(a.scheduled_date));
+      const job = series[0]; // Most recent job in the series
+      
       const customer = job.customers || {};
       const service = job.services || {};
       const teamMember = job.team_members || {};
@@ -2120,30 +2380,36 @@ app.get('/api/recurring-bookings', authenticateToken, async (req, res) => {
       let nextJobDate = null;
       let nextJobId = null;
       
+      // Use the most recent job's scheduled_date as the base
+      const baseDate = new Date(job.scheduled_date);
+      
       if (job.next_billing_date) {
         nextJobDate = job.next_billing_date;
       } else if (job.recurring_frequency) {
-        // Calculate next occurrence based on frequency
-        const lastDate = new Date(job.scheduled_date);
-        const frequency = job.recurring_frequency;
-        
-        // Parse frequency (e.g., "weekly", "biweekly", "monthly", "2 weeks", etc.)
-        let daysToAdd = 7; // default weekly
-        if (frequency.includes('week')) {
-          const weeks = parseInt(frequency) || 1;
-          daysToAdd = weeks * 7;
-        } else if (frequency.includes('month')) {
-          const months = parseInt(frequency) || 1;
-          lastDate.setMonth(lastDate.getMonth() + months);
-          nextJobDate = lastDate.toISOString().split('T')[0];
-        } else {
-          lastDate.setDate(lastDate.getDate() + daysToAdd);
-          nextJobDate = lastDate.toISOString().split('T')[0];
+        // Use the calculateNextRecurringDate function
+        const calculatedNextDate = calculateNextRecurringDate(job.recurring_frequency, baseDate);
+        if (calculatedNextDate) {
+          nextJobDate = calculatedNextDate.toISOString().split('T')[0];
         }
       }
       
+      // Find if there's already a next job created in the series
+      // Look for a job with the same customer and frequency, scheduled after this one
+      const futureJobs = series.filter(j => {
+        const jDate = new Date(j.scheduled_date);
+        return jDate > baseDate && j.status !== 'cancelled' && j.status !== 'canceled';
+      });
+      
+      if (futureJobs.length > 0) {
+        // Sort by date ascending to get the next one
+        futureJobs.sort((a, b) => new Date(a.scheduled_date) - new Date(b.scheduled_date));
+        const nextJob = futureJobs[0];
+        nextJobDate = nextJob.scheduled_date.split('T')[0];
+        nextJobId = nextJob.id;
+      }
+      
       // Debug: Log the frequency being returned
-      console.log('📊 Recurring Booking - Job ID:', job.id, 'Frequency:', job.recurring_frequency, 'Type:', typeof job.recurring_frequency);
+      console.log('📊 Recurring Booking - Job ID:', job.id, 'Frequency:', job.recurring_frequency, 'Next Date:', nextJobDate);
       
       return {
         id: job.id,
@@ -2978,6 +3244,12 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         territory: territory,
         is_recurring: recurringJob,
         recurring_frequency: recurringFrequency || null, // Save null if empty, not empty string
+        next_billing_date: (recurringJob && recurringFrequency) ? (() => {
+          // Calculate next billing date based on frequency
+          const scheduledDate = new Date(fullScheduledDate);
+          const nextDate = calculateNextRecurringDate(recurringFrequency, scheduledDate);
+          return nextDate ? nextDate.toISOString().split('T')[0] : null;
+        })() : null,
         schedule_type: scheduleType,
         let_customer_schedule: letCustomerSchedule,
         offer_to_providers: offerToProviders,
