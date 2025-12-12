@@ -5043,16 +5043,30 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 });
 
 // Delete job endpoint
-// Delete all imported jobs
+// Delete all imported jobs (with optional date range filter)
 app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const { startDate, endDate } = req.query; // Optional date range filters
     
     // Find all jobs for the user
-    const { data: allJobs, error: fetchError } = await supabase
+    let query = supabase
       .from('jobs')
-      .select('id, tags')
+      .select('id, tags, created_at')
       .eq('user_id', userId);
+    
+    // Apply date range filter if provided
+    if (startDate) {
+      query = query.gte('created_at', startDate);
+    }
+    if (endDate) {
+      // Add one day to endDate to include the entire end date
+      const endDatePlusOne = new Date(endDate);
+      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+    }
+    
+    const { data: allJobs, error: fetchError } = await query;
     
     if (fetchError) {
       console.error('Error fetching jobs:', fetchError);
@@ -5086,33 +5100,57 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
       });
     }
     
-    // Delete related records first
-    // Delete job team assignments
-    await supabase
-      .from('job_team_assignments')
-      .delete()
-      .in('job_id', jobIds);
+    // For large batches, delete in chunks to avoid timeout
+    const BATCH_SIZE = 500;
+    let totalDeleted = 0;
+    let errors = [];
     
-    // Delete transactions related to these jobs
-    await supabase
-      .from('transactions')
-      .delete()
-      .in('job_id', jobIds);
+    for (let i = 0; i < jobIds.length; i += BATCH_SIZE) {
+      const batch = jobIds.slice(i, i + BATCH_SIZE);
+      
+      try {
+        // Delete related records first for this batch
+        // Delete job team assignments
+        await supabase
+          .from('job_team_assignments')
+          .delete()
+          .in('job_id', batch);
+        
+        // Delete transactions related to these jobs
+        await supabase
+          .from('transactions')
+          .delete()
+          .in('job_id', batch);
+        
+        // Delete the jobs
+        const { error: deleteError } = await supabase
+          .from('jobs')
+          .delete()
+          .in('id', batch);
+        
+        if (deleteError) {
+          console.error(`Error deleting batch ${i / BATCH_SIZE + 1}:`, deleteError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1}: ${deleteError.message}`);
+        } else {
+          totalDeleted += batch.length;
+        }
+      } catch (error) {
+        console.error(`Error processing batch ${i / BATCH_SIZE + 1}:`, error);
+        errors.push(`Batch ${i / BATCH_SIZE + 1}: ${error.message}`);
+      }
+    }
     
-    // Delete the jobs
-    const { error: deleteError } = await supabase
-      .from('jobs')
-      .delete()
-      .in('id', jobIds);
-    
-    if (deleteError) {
-      console.error('Error deleting imported jobs:', deleteError);
-      return res.status(500).json({ error: 'Failed to delete imported jobs' });
+    if (errors.length > 0 && totalDeleted === 0) {
+      return res.status(500).json({ 
+        error: 'Failed to delete imported jobs',
+        details: errors
+      });
     }
     
     res.json({
-      message: `Successfully deleted ${jobIds.length} imported job(s)`,
-      deleted: jobIds.length
+      message: `Successfully deleted ${totalDeleted} imported job(s)${errors.length > 0 ? ` (${errors.length} batch errors occurred)` : ''}`,
+      deleted: totalDeleted,
+      errors: errors.length > 0 ? errors : undefined
     });
   } catch (error) {
     console.error('Delete imported jobs error:', error);
@@ -5120,15 +5158,29 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
   }
 });
 
-// Get count of imported jobs
+// Get count of imported jobs (with optional date range filter)
 app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const { startDate, endDate } = req.query; // Optional date range filters
     
-    const { data: allJobs, error: fetchError } = await supabase
+    let query = supabase
       .from('jobs')
-      .select('id, tags')
+      .select('id, tags, created_at')
       .eq('user_id', userId);
+    
+    // Apply date range filter if provided
+    if (startDate) {
+      query = query.gte('created_at', startDate);
+    }
+    if (endDate) {
+      // Add one day to endDate to include the entire end date
+      const endDatePlusOne = new Date(endDate);
+      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+    }
+    
+    const { data: allJobs, error: fetchError } = await query;
     
     if (fetchError) {
       console.error('Error fetching jobs:', fetchError);
