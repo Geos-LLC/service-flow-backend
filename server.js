@@ -4730,6 +4730,67 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
 });
 
 // Update job endpoint
+// Convert one-time job to recurring
+app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { frequency, endDate } = req.body;
+    
+    if (!frequency) {
+      return res.status(400).json({ error: 'Recurring frequency is required' });
+    }
+    
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingJob) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    // Check if already recurring
+    if (existingJob.is_recurring || existingJob.recurring_job) {
+      return res.status(400).json({ error: 'Job is already set as recurring' });
+    }
+    
+    // Calculate next billing date based on frequency
+    const scheduledDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
+    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
+    
+    // Update job to be recurring
+    const { data: updatedJob, error: updateError } = await supabase
+      .from('jobs')
+      .update({
+        is_recurring: true,
+        recurring_job: true,
+        recurring_frequency: frequency,
+        recurring_end_date: endDate || null,
+        next_billing_date: nextBillingDate ? nextBillingDate.toISOString() : null
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (updateError) {
+      console.error('Error converting job to recurring:', updateError);
+      return res.status(500).json({ error: 'Failed to convert job to recurring' });
+    }
+    
+    res.json({
+      message: 'Job converted to recurring successfully',
+      job: updatedJob
+    });
+  } catch (error) {
+    console.error('Convert to recurring error:', error);
+    res.status(500).json({ error: 'Failed to convert job to recurring' });
+  }
+});
+
 app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
@@ -4982,6 +5043,123 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
 });
 
 // Delete job endpoint
+// Delete all imported jobs
+app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Find all jobs for the user
+    const { data: allJobs, error: fetchError } = await supabase
+      .from('jobs')
+      .select('id, tags')
+      .eq('user_id', userId);
+    
+    if (fetchError) {
+      console.error('Error fetching jobs:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+    
+    // Filter jobs that have "imported" in tags
+    const importedJobs = allJobs?.filter(job => {
+      if (!job.tags) return false;
+      
+      // Handle both string and array formats
+      if (typeof job.tags === 'string') {
+        return job.tags.toLowerCase().includes('imported') || job.tags.toLowerCase().includes('import');
+      }
+      
+      if (Array.isArray(job.tags)) {
+        return job.tags.some(tag => 
+          tag && (tag.toString().toLowerCase().includes('imported') || tag.toString().toLowerCase().includes('import'))
+        );
+      }
+      
+      return false;
+    }) || [];
+    
+    const jobIds = importedJobs.map(job => job.id);
+    
+    if (jobIds.length === 0) {
+      return res.json({
+        message: 'No imported jobs found to delete',
+        deleted: 0
+      });
+    }
+    
+    // Delete related records first
+    // Delete job team assignments
+    await supabase
+      .from('job_team_assignments')
+      .delete()
+      .in('job_id', jobIds);
+    
+    // Delete transactions related to these jobs
+    await supabase
+      .from('transactions')
+      .delete()
+      .in('job_id', jobIds);
+    
+    // Delete the jobs
+    const { error: deleteError } = await supabase
+      .from('jobs')
+      .delete()
+      .in('id', jobIds);
+    
+    if (deleteError) {
+      console.error('Error deleting imported jobs:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete imported jobs' });
+    }
+    
+    res.json({
+      message: `Successfully deleted ${jobIds.length} imported job(s)`,
+      deleted: jobIds.length
+    });
+  } catch (error) {
+    console.error('Delete imported jobs error:', error);
+    res.status(500).json({ error: 'Failed to delete imported jobs' });
+  }
+});
+
+// Get count of imported jobs
+app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const { data: allJobs, error: fetchError } = await supabase
+      .from('jobs')
+      .select('id, tags')
+      .eq('user_id', userId);
+    
+    if (fetchError) {
+      console.error('Error fetching jobs:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+    
+    // Filter jobs that have "imported" in tags
+    const importedJobs = allJobs?.filter(job => {
+      if (!job.tags) return false;
+      
+      // Handle both string and array formats
+      if (typeof job.tags === 'string') {
+        return job.tags.toLowerCase().includes('imported') || job.tags.toLowerCase().includes('import');
+      }
+      
+      if (Array.isArray(job.tags)) {
+        return job.tags.some(tag => 
+          tag && (tag.toString().toLowerCase().includes('imported') || tag.toString().toLowerCase().includes('import'))
+        );
+      }
+      
+      return false;
+    }) || [];
+    
+    res.json({ count: importedJobs.length });
+  } catch (error) {
+    console.error('Count imported jobs error:', error);
+    res.status(500).json({ error: 'Failed to count imported jobs' });
+  }
+});
+
 app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
@@ -6742,7 +6920,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           auto_invoice: job.autoInvoice !== false,
           auto_reminders: job.autoReminders !== false,
           recurring_end_date: job.recurringEndDate || null,
-          tags: job.tags || null,
+          tags: job.tags ? (Array.isArray(job.tags) ? [...job.tags, 'imported'] : `${job.tags},imported`) : 'imported',
           intake_question_answers: job.intakeQuestionAnswers || null,
           service_modifiers: job.serviceModifiers || null,
           service_intake_questions: job.serviceIntakeQuestions || null
