@@ -5894,6 +5894,284 @@ app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================
+// LEAD TASKS API ENDPOINTS
+// ============================================
+
+// Get all tasks for a lead
+app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { leadId } = req.params;
+    
+    // Verify lead ownership
+    const { data: lead, error: leadError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('id', leadId)
+      .eq('user_id', userId)
+      .single();
+    
+    if (leadError || !lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    const { data: tasks, error } = await supabase
+      .from('lead_tasks')
+      .select(`
+        *,
+        team_members (
+          id,
+          first_name,
+          last_name
+        )
+      `)
+      .eq('lead_id', leadId)
+      .eq('user_id', userId)
+      .order('due_date', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching tasks:', error);
+      return res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+    
+    res.json({ tasks: tasks || [] });
+  } catch (error) {
+    console.error('Get tasks error:', error);
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
+});
+
+// Get all tasks for a user (across all leads)
+app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { status, overdue } = req.query;
+    
+    let query = supabase
+      .from('lead_tasks')
+      .select(`
+        *,
+        leads (
+          id,
+          first_name,
+          last_name,
+          company
+        ),
+        team_members (
+          id,
+          first_name,
+          last_name
+        )
+      `)
+      .eq('user_id', userId);
+    
+    if (status) {
+      query = query.eq('status', status);
+    }
+    
+    if (overdue === 'true') {
+      const now = new Date().toISOString();
+      query = query.lt('due_date', now).neq('status', 'completed');
+    }
+    
+    const { data: tasks, error } = await query
+      .order('due_date', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching tasks:', error);
+      return res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+    
+    res.json({ tasks: tasks || [] });
+  } catch (error) {
+    console.error('Get all tasks error:', error);
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
+});
+
+// Create a new task for a lead
+app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { leadId } = req.params;
+    const { title, description, dueDate, priority, assignedTo } = req.body;
+    
+    if (!title || title.trim() === '') {
+      return res.status(400).json({ error: 'Task title is required' });
+    }
+    
+    // Verify lead ownership
+    const { data: lead, error: leadError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('id', leadId)
+      .eq('user_id', userId)
+      .single();
+    
+    if (leadError || !lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    // Verify assigned team member belongs to user (if assigned)
+    if (assignedTo) {
+      const { data: teamMember, error: teamError } = await supabase
+        .from('team_members')
+        .select('id')
+        .eq('id', assignedTo)
+        .eq('user_id', userId)
+        .single();
+      
+      if (teamError || !teamMember) {
+        return res.status(400).json({ error: 'Invalid team member assignment' });
+      }
+    }
+    
+    const { data: task, error } = await supabase
+      .from('lead_tasks')
+      .insert({
+        lead_id: parseInt(leadId),
+        user_id: userId,
+        title: title.trim(),
+        description: description || null,
+        due_date: dueDate || null,
+        priority: priority || 'medium',
+        assigned_to: assignedTo || null,
+        status: 'pending'
+      })
+      .select(`
+        *,
+        team_members (
+          id,
+          first_name,
+          last_name
+        )
+      `)
+      .single();
+    
+    if (error) {
+      console.error('Error creating task:', error);
+      return res.status(500).json({ error: 'Failed to create task' });
+    }
+    
+    res.status(201).json(task);
+  } catch (error) {
+    console.error('Create task error:', error);
+    res.status(500).json({ error: 'Failed to create task' });
+  }
+});
+
+// Update a task
+app.put('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { title, description, dueDate, priority, assignedTo, status } = req.body;
+    
+    // Verify task ownership
+    const { data: existingTask, error: checkError } = await supabase
+      .from('lead_tasks')
+      .select('id, status')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingTask) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    // Verify assigned team member belongs to user (if assigned)
+    if (assignedTo) {
+      const { data: teamMember, error: teamError } = await supabase
+        .from('team_members')
+        .select('id')
+        .eq('id', assignedTo)
+        .eq('user_id', userId)
+        .single();
+      
+      if (teamError || !teamMember) {
+        return res.status(400).json({ error: 'Invalid team member assignment' });
+      }
+    }
+    
+    const updateData = {};
+    if (title !== undefined) updateData.title = title.trim();
+    if (description !== undefined) updateData.description = description || null;
+    if (dueDate !== undefined) updateData.due_date = dueDate || null;
+    if (priority !== undefined) updateData.priority = priority;
+    if (assignedTo !== undefined) updateData.assigned_to = assignedTo || null;
+    if (status !== undefined) {
+      updateData.status = status;
+      // Set completed_at if status is completed
+      if (status === 'completed' && existingTask.status !== 'completed') {
+        updateData.completed_at = new Date().toISOString();
+      } else if (status !== 'completed' && existingTask.status === 'completed') {
+        updateData.completed_at = null;
+      }
+    }
+    
+    const { data: task, error } = await supabase
+      .from('lead_tasks')
+      .update(updateData)
+      .eq('id', id)
+      .select(`
+        *,
+        team_members (
+          id,
+          first_name,
+          last_name
+        )
+      `)
+      .single();
+    
+    if (error) {
+      console.error('Error updating task:', error);
+      return res.status(500).json({ error: 'Failed to update task' });
+    }
+    
+    res.json(task);
+  } catch (error) {
+    console.error('Update task error:', error);
+    res.status(500).json({ error: 'Failed to update task' });
+  }
+});
+
+// Delete a task
+app.delete('/api/leads/tasks/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    
+    // Verify task ownership
+    const { data: existingTask, error: checkError } = await supabase
+      .from('lead_tasks')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingTask) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    const { error: deleteError } = await supabase
+      .from('lead_tasks')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      return res.status(500).json({ error: 'Failed to delete task' });
+    }
+    
+    res.json({ message: 'Task deleted successfully' });
+  } catch (error) {
+    console.error('Delete task error:', error);
+    res.status(500).json({ error: 'Failed to delete task' });
+  }
+});
+
 // Convert lead to customer
 app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
   try {
