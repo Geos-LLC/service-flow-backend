@@ -5401,6 +5401,570 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================
+// LEADS PIPELINE API ENDPOINTS
+// ============================================
+
+// Get or create default pipeline for user
+app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Check if user has a default pipeline
+    let { data: pipelines, error } = await supabase
+      .from('lead_pipelines')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .limit(1);
+    
+    if (error) {
+      console.error('Error fetching pipeline:', error);
+      return res.status(500).json({ error: 'Failed to fetch pipeline' });
+    }
+    
+    let pipeline;
+    if (!pipelines || pipelines.length === 0) {
+      // Create default pipeline with default stages
+      const { data: newPipeline, error: createError } = await supabase
+        .from('lead_pipelines')
+        .insert({
+          user_id: userId,
+          name: 'Default Pipeline',
+          is_default: true
+        })
+        .select()
+        .single();
+      
+      if (createError) {
+        console.error('Error creating pipeline:', createError);
+        return res.status(500).json({ error: 'Failed to create pipeline' });
+      }
+      
+      pipeline = newPipeline;
+      
+      // Create default stages
+      const defaultStages = [
+        { name: 'New Lead', color: '#3B82F6', position: 0 },
+        { name: 'Contacted', color: '#FBBF24', position: 1 },
+        { name: 'Qualified', color: '#F97316', position: 2 },
+        { name: 'Proposal Sent', color: '#A855F7', position: 3 },
+        { name: 'Negotiation', color: '#EC4899', position: 4 },
+        { name: 'Won', color: '#10B981', position: 5 },
+        { name: 'Lost', color: '#EF4444', position: 6 }
+      ];
+      
+      const stagesToInsert = defaultStages.map(stage => ({
+        pipeline_id: pipeline.id,
+        name: stage.name,
+        color: stage.color,
+        position: stage.position
+      }));
+      
+      const { error: stagesError } = await supabase
+        .from('lead_stages')
+        .insert(stagesToInsert);
+      
+      if (stagesError) {
+        console.error('Error creating default stages:', stagesError);
+        // Continue anyway - stages can be added later
+      }
+    } else {
+      pipeline = pipelines[0];
+    }
+    
+    // Fetch stages for this pipeline
+    const { data: stages, error: stagesError } = await supabase
+      .from('lead_stages')
+      .select('*')
+      .eq('pipeline_id', pipeline.id)
+      .order('position', { ascending: true });
+    
+    if (stagesError) {
+      console.error('Error fetching stages:', stagesError);
+      return res.status(500).json({ error: 'Failed to fetch stages' });
+    }
+    
+    res.json({
+      ...pipeline,
+      stages: stages || []
+    });
+  } catch (error) {
+    console.error('Get pipeline error:', error);
+    res.status(500).json({ error: 'Failed to fetch pipeline' });
+  }
+});
+
+// Update pipeline stages (reorder, add, update, delete)
+app.put('/api/leads/pipeline/stages', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { stages } = req.body; // Array of stage objects with id, name, color, position
+    
+    if (!Array.isArray(stages)) {
+      return res.status(400).json({ error: 'Stages must be an array' });
+    }
+    
+    // Get user's default pipeline
+    const { data: pipelines, error: pipelineError } = await supabase
+      .from('lead_pipelines')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('is_default', true)
+      .limit(1)
+      .single();
+    
+    if (pipelineError || !pipelines) {
+      return res.status(404).json({ error: 'Pipeline not found' });
+    }
+    
+    const pipelineId = pipelines.id;
+    
+    // Update existing stages and create new ones
+    for (const stage of stages) {
+      if (stage.id) {
+        // Update existing stage
+        const { error: updateError } = await supabase
+          .from('lead_stages')
+          .update({
+            name: stage.name,
+            color: stage.color,
+            position: stage.position
+          })
+          .eq('id', stage.id)
+          .eq('pipeline_id', pipelineId);
+        
+        if (updateError) {
+          console.error('Error updating stage:', updateError);
+        }
+      } else {
+        // Create new stage
+        const { error: insertError } = await supabase
+          .from('lead_stages')
+          .insert({
+            pipeline_id: pipelineId,
+            name: stage.name,
+            color: stage.color,
+            position: stage.position
+          });
+        
+        if (insertError) {
+          console.error('Error creating stage:', insertError);
+        }
+      }
+    }
+    
+    // Fetch updated stages
+    const { data: updatedStages, error: fetchError } = await supabase
+      .from('lead_stages')
+      .select('*')
+      .eq('pipeline_id', pipelineId)
+      .order('position', { ascending: true });
+    
+    if (fetchError) {
+      return res.status(500).json({ error: 'Failed to fetch updated stages' });
+    }
+    
+    res.json({ stages: updatedStages });
+  } catch (error) {
+    console.error('Update stages error:', error);
+    res.status(500).json({ error: 'Failed to update stages' });
+  }
+});
+
+// Delete a stage
+app.delete('/api/leads/pipeline/stages/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    
+    // Verify pipeline ownership
+    const { data: stage, error: stageError } = await supabase
+      .from('lead_stages')
+      .select('pipeline_id, lead_pipelines!inner(user_id)')
+      .eq('id', id)
+      .single();
+    
+    if (stageError || !stage) {
+      return res.status(404).json({ error: 'Stage not found' });
+    }
+    
+    if (stage.lead_pipelines.user_id !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    // Check if stage has leads
+    const { data: leads, error: leadsError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('stage_id', id)
+      .limit(1);
+    
+    if (leadsError) {
+      return res.status(500).json({ error: 'Failed to check leads' });
+    }
+    
+    if (leads && leads.length > 0) {
+      return res.status(400).json({ error: 'Cannot delete stage with leads. Move leads first.' });
+    }
+    
+    // Delete stage
+    const { error: deleteError } = await supabase
+      .from('lead_stages')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      return res.status(500).json({ error: 'Failed to delete stage' });
+    }
+    
+    res.json({ message: 'Stage deleted successfully' });
+  } catch (error) {
+    console.error('Delete stage error:', error);
+    res.status(500).json({ error: 'Failed to delete stage' });
+  }
+});
+
+// Get all leads for a user
+app.get('/api/leads', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const { data: leads, error } = await supabase
+      .from('leads')
+      .select(`
+        *,
+        lead_stages (*),
+        lead_pipelines (*)
+      `)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching leads:', error);
+      return res.status(500).json({ error: 'Failed to fetch leads' });
+    }
+    
+    res.json({ leads: leads || [] });
+  } catch (error) {
+    console.error('Get leads error:', error);
+    res.status(500).json({ error: 'Failed to fetch leads' });
+  }
+});
+
+// Get a single lead
+app.get('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    
+    const { data: leads, error } = await supabase
+      .from('leads')
+      .select(`
+        *,
+        lead_stages (*),
+        lead_pipelines (*),
+        customers (id, first_name, last_name, email)
+      `)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (error) {
+      console.error('Error fetching lead:', error);
+      return res.status(500).json({ error: 'Failed to fetch lead' });
+    }
+    
+    if (!leads) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    res.json(leads);
+  } catch (error) {
+    console.error('Get lead error:', error);
+    res.status(500).json({ error: 'Failed to fetch lead' });
+  }
+});
+
+// Create a new lead
+app.post('/api/leads', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { firstName, lastName, email, phone, company, source, notes, value, stageId, pipelineId } = req.body;
+    
+    // Get default pipeline if not provided
+    let finalPipelineId = pipelineId;
+    if (!finalPipelineId) {
+      const { data: pipelines, error: pipelineError } = await supabase
+        .from('lead_pipelines')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('is_default', true)
+        .limit(1)
+        .single();
+      
+      if (pipelineError || !pipelines) {
+        return res.status(404).json({ error: 'Default pipeline not found' });
+      }
+      finalPipelineId = pipelines.id;
+    }
+    
+    // Get first stage if stageId not provided
+    let finalStageId = stageId;
+    if (!finalStageId) {
+      const { data: stages, error: stagesError } = await supabase
+        .from('lead_stages')
+        .select('id')
+        .eq('pipeline_id', finalPipelineId)
+        .order('position', { ascending: true })
+        .limit(1)
+        .single();
+      
+      if (stagesError || !stages) {
+        return res.status(404).json({ error: 'No stages found in pipeline' });
+      }
+      finalStageId = stages.id;
+    }
+    
+    const { data: lead, error } = await supabase
+      .from('leads')
+      .insert({
+        user_id: userId,
+        pipeline_id: finalPipelineId,
+        stage_id: finalStageId,
+        first_name: firstName,
+        last_name: lastName,
+        email: email,
+        phone: phone,
+        company: company,
+        source: source,
+        notes: notes,
+        value: value
+      })
+      .select(`
+        *,
+        lead_stages (*),
+        lead_pipelines (*)
+      `)
+      .single();
+    
+    if (error) {
+      console.error('Error creating lead:', error);
+      return res.status(500).json({ error: 'Failed to create lead' });
+    }
+    
+    res.status(201).json(lead);
+  } catch (error) {
+    console.error('Create lead error:', error);
+    res.status(500).json({ error: 'Failed to create lead' });
+  }
+});
+
+// Update a lead
+app.put('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { firstName, lastName, email, phone, company, source, notes, value, stageId } = req.body;
+    
+    // Verify ownership
+    const { data: existingLead, error: checkError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingLead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    const updateData = {};
+    if (firstName !== undefined) updateData.first_name = firstName;
+    if (lastName !== undefined) updateData.last_name = lastName;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (company !== undefined) updateData.company = company;
+    if (source !== undefined) updateData.source = source;
+    if (notes !== undefined) updateData.notes = notes;
+    if (value !== undefined) updateData.value = value;
+    if (stageId !== undefined) updateData.stage_id = stageId;
+    
+    const { data: lead, error } = await supabase
+      .from('leads')
+      .update(updateData)
+      .eq('id', id)
+      .select(`
+        *,
+        lead_stages (*),
+        lead_pipelines (*)
+      `)
+      .single();
+    
+    if (error) {
+      console.error('Error updating lead:', error);
+      return res.status(500).json({ error: 'Failed to update lead' });
+    }
+    
+    res.json(lead);
+  } catch (error) {
+    console.error('Update lead error:', error);
+    res.status(500).json({ error: 'Failed to update lead' });
+  }
+});
+
+// Delete a lead
+app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    
+    // Verify ownership
+    const { data: existingLead, error: checkError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingLead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    const { error: deleteError } = await supabase
+      .from('leads')
+      .delete()
+      .eq('id', id);
+    
+    if (deleteError) {
+      return res.status(500).json({ error: 'Failed to delete lead' });
+    }
+    
+    res.json({ message: 'Lead deleted successfully' });
+  } catch (error) {
+    console.error('Delete lead error:', error);
+    res.status(500).json({ error: 'Failed to delete lead' });
+  }
+});
+
+// Move lead to different stage (for drag and drop)
+app.put('/api/leads/:id/move', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { stageId } = req.body;
+    
+    if (!stageId) {
+      return res.status(400).json({ error: 'Stage ID is required' });
+    }
+    
+    // Verify ownership
+    const { data: existingLead, error: checkError } = await supabase
+      .from('leads')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingLead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    // Update stage
+    const { data: lead, error } = await supabase
+      .from('leads')
+      .update({ stage_id: stageId })
+      .eq('id', id)
+      .select(`
+        *,
+        lead_stages (*),
+        lead_pipelines (*)
+      `)
+      .single();
+    
+    if (error) {
+      console.error('Error moving lead:', error);
+      return res.status(500).json({ error: 'Failed to move lead' });
+    }
+    
+    res.json(lead);
+  } catch (error) {
+    console.error('Move lead error:', error);
+    res.status(500).json({ error: 'Failed to move lead' });
+  }
+});
+
+// Convert lead to customer
+app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    
+    // Get lead details
+    const { data: lead, error: leadError } = await supabase
+      .from('leads')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (leadError || !lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    // Check if already converted
+    if (lead.converted_customer_id) {
+      return res.status(400).json({ error: 'Lead already converted' });
+    }
+    
+    // Create customer from lead
+    const { data: customer, error: customerError } = await supabase
+      .from('customers')
+      .insert({
+        user_id: userId,
+        first_name: lead.first_name,
+        last_name: lead.last_name,
+        email: lead.email,
+        phone: lead.phone,
+        notes: lead.notes || `Converted from lead: ${lead.source || 'Unknown source'}`
+      })
+      .select()
+      .single();
+    
+    if (customerError) {
+      console.error('Error creating customer:', customerError);
+      return res.status(500).json({ error: 'Failed to create customer' });
+    }
+    
+    // Update lead with converted customer ID
+    const { error: updateError } = await supabase
+      .from('leads')
+      .update({
+        converted_customer_id: customer.id,
+        converted_at: new Date().toISOString()
+      })
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('Error updating lead:', updateError);
+      // Customer was created, so continue
+    }
+    
+    res.json({
+      message: 'Lead converted to customer successfully',
+      customer: customer,
+      lead: {
+        ...lead,
+        converted_customer_id: customer.id,
+        converted_at: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Convert lead error:', error);
+    res.status(500).json({ error: 'Failed to convert lead' });
+  }
+});
+
 app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
