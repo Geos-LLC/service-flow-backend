@@ -12643,6 +12643,270 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
   }
 });
 
+// Time tracking endpoints for salary calculation
+// Record job start time
+app.post('/api/jobs/:id/start-time', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { startTime } = req.body;
+
+    // Verify job belongs to user and get job details
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id, team_member_id, status')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (jobError || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Update job with start time
+    const startTimeValue = startTime || new Date().toISOString();
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({ 
+        start_time: startTimeValue,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('Error updating start time:', updateError);
+      return res.status(500).json({ error: 'Failed to record start time' });
+    }
+
+    res.json({ message: 'Start time recorded successfully', startTime: startTimeValue });
+  } catch (error) {
+    console.error('Record start time error:', error);
+    res.status(500).json({ error: 'Failed to record start time' });
+  }
+});
+
+// Record job end time and calculate hours worked
+app.post('/api/jobs/:id/end-time', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { endTime } = req.body;
+
+    // Verify job belongs to user and get job details
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id, team_member_id, start_time')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (jobError || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (!job.start_time) {
+      return res.status(400).json({ error: 'Start time must be recorded before end time' });
+    }
+
+    // Calculate hours worked
+    const endTimeValue = endTime || new Date().toISOString();
+    const startTime = new Date(job.start_time);
+    const endTimeDate = new Date(endTimeValue);
+    const hoursWorked = (endTimeDate - startTime) / (1000 * 60 * 60); // Convert to hours
+
+    // Update job with end time and hours worked
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({ 
+        end_time: endTimeValue,
+        hours_worked: hoursWorked.toFixed(2),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('Error updating end time:', updateError);
+      return res.status(500).json({ error: 'Failed to record end time' });
+    }
+
+    res.json({ 
+      message: 'End time recorded successfully', 
+      endTime: endTimeValue,
+      hoursWorked: parseFloat(hoursWorked.toFixed(2))
+    });
+  } catch (error) {
+    console.error('Record end time error:', error);
+    res.status(500).json({ error: 'Failed to record end time' });
+  }
+});
+
+// Get salary calculation for a team member
+app.get('/api/team-members/:id/salary', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
+
+    // Verify team member belongs to user
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, user_id, hourly_rate, first_name, last_name')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (memberError || !teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+
+    if (!teamMember.hourly_rate) {
+      return res.json({
+        teamMember: {
+          id: teamMember.id,
+          name: `${teamMember.first_name} ${teamMember.last_name}`,
+          hourlyRate: null
+        },
+        jobs: [],
+        totalHours: 0,
+        totalSalary: 0,
+        message: 'Hourly rate not set for this team member'
+      });
+    }
+
+    // Build query for jobs
+    let jobsQuery = supabase
+      .from('jobs')
+      .select('id, scheduled_date, start_time, end_time, hours_worked, total, status, service_name')
+      .eq('team_member_id', id)
+      .eq('user_id', userId)
+      .not('start_time', 'is', null)
+      .not('end_time', 'is', null);
+
+    if (startDate) {
+      jobsQuery = jobsQuery.gte('scheduled_date', startDate);
+    }
+    if (endDate) {
+      jobsQuery = jobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
+    }
+
+    const { data: jobs, error: jobsError } = await jobsQuery;
+
+    if (jobsError) {
+      console.error('Error fetching jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Calculate totals
+    let totalHours = 0;
+    const jobsWithSalary = (jobs || []).map(job => {
+      const hours = parseFloat(job.hours_worked) || 0;
+      const salary = hours * parseFloat(teamMember.hourly_rate);
+      totalHours += hours;
+      return {
+        ...job,
+        hoursWorked: hours,
+        salary: parseFloat(salary.toFixed(2))
+      };
+    });
+
+    const totalSalary = totalHours * parseFloat(teamMember.hourly_rate);
+
+    res.json({
+      teamMember: {
+        id: teamMember.id,
+        name: `${teamMember.first_name} ${teamMember.last_name}`,
+        hourlyRate: parseFloat(teamMember.hourly_rate)
+      },
+      jobs: jobsWithSalary,
+      totalHours: parseFloat(totalHours.toFixed(2)),
+      totalSalary: parseFloat(totalSalary.toFixed(2)),
+      jobCount: jobsWithSalary.length
+    });
+  } catch (error) {
+    console.error('Get salary error:', error);
+    res.status(500).json({ error: 'Failed to calculate salary' });
+  }
+});
+
+// Get payroll summary for all team members
+app.get('/api/payroll', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
+
+    // Get all team members with hourly rates
+    const { data: teamMembers, error: membersError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, hourly_rate')
+      .eq('user_id', userId)
+      .not('hourly_rate', 'is', null);
+
+    if (membersError) {
+      console.error('Error fetching team members:', membersError);
+      return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    const payrollData = await Promise.all(
+      (teamMembers || []).map(async (member) => {
+        // Get jobs for this team member
+        let jobsQuery = supabase
+          .from('jobs')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, total, status')
+          .eq('team_member_id', member.id)
+          .eq('user_id', userId)
+          .not('start_time', 'is', null)
+          .not('end_time', 'is', null);
+
+        if (startDate) {
+          jobsQuery = jobsQuery.gte('scheduled_date', startDate);
+        }
+        if (endDate) {
+          jobsQuery = jobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
+        }
+
+        const { data: jobs } = await jobsQuery;
+
+        let totalHours = 0;
+        (jobs || []).forEach(job => {
+          totalHours += parseFloat(job.hours_worked) || 0;
+        });
+
+        const totalSalary = totalHours * parseFloat(member.hourly_rate);
+
+        return {
+          teamMember: {
+            id: member.id,
+            name: `${member.first_name} ${member.last_name}`,
+            hourlyRate: parseFloat(member.hourly_rate)
+          },
+          jobCount: (jobs || []).length,
+          totalHours: parseFloat(totalHours.toFixed(2)),
+          totalSalary: parseFloat(totalSalary.toFixed(2))
+        };
+      })
+    );
+
+    const grandTotal = payrollData.reduce((sum, item) => sum + item.totalSalary, 0);
+    const grandTotalHours = payrollData.reduce((sum, item) => sum + item.totalHours, 0);
+
+    res.json({
+      period: {
+        startDate: startDate || null,
+        endDate: endDate || null
+      },
+      teamMembers: payrollData,
+      summary: {
+        totalTeamMembers: payrollData.length,
+        totalHours: parseFloat(grandTotalHours.toFixed(2)),
+        totalSalary: parseFloat(grandTotal.toFixed(2))
+      }
+    });
+  } catch (error) {
+    console.error('Get payroll error:', error);
+    res.status(500).json({ error: 'Failed to fetch payroll data' });
+  }
+});
+
 app.put('/api/team-members/:id/availability', async (req, res) => {
   try {
     const { id } = req.params;
