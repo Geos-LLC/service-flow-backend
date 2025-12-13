@@ -1991,7 +1991,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
   try {
-    const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId } = req.query;
+    const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring } = req.query;
     const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     const userRole = req.user.role; // Get user role from JWT token
   
@@ -2051,6 +2051,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     if (territoryId) {
       query = query.eq('territory_id', territoryId);
     }
+    
+    // Add recurring filter
+    if (recurring === 'true' || recurring === 'recurring') {
+      query = query.eq('is_recurring', true);
+    } else if (recurring === 'false' || recurring === 'one-time') {
+      query = query.or('is_recurring.is.null,is_recurring.eq.false');
+    }
+    // If recurring is not provided or is 'all', show all jobs
     
     // Add team member filter
     if (teamMember) {
