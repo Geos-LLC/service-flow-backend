@@ -12636,26 +12636,80 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     }
     
     // Get scheduled jobs for the date range from Supabase
-    // Try direct team_member_id first, then fall back to job_team_assignments if needed
-    let jobsQuery = supabase
+    // Jobs are linked to team members through job_team_assignments table
+    // Query through job_team_assignments to get jobs assigned to this team member
+    let assignmentsQuery = supabase
+      .from('job_team_assignments')
+      .select(`
+        jobs!inner(
+          id,
+          scheduled_date,
+          duration,
+          status
+        )
+      `)
+      .eq('team_member_id', id);
+    
+    const { data: assignments, error: assignmentsError } = await assignmentsQuery;
+    
+    // Extract jobs from assignments and filter by status
+    let scheduledJobs = [];
+    if (assignments && !assignmentsError) {
+      scheduledJobs = assignments
+        .map(assignment => assignment.jobs)
+        .filter(job => job && ['pending', 'confirmed', 'in-progress'].includes(job.status));
+    } else if (assignmentsError) {
+      console.error('Error fetching job assignments:', assignmentsError);
+      // Continue to check direct jobs even if assignments fail
+    }
+    
+    // Also check for jobs with direct team_member_id (backward compatibility)
+    // Some jobs might still have team_member_id directly in the jobs table
+    let directJobsQuery = supabase
       .from('jobs')
       .select('scheduled_date, duration, id, status')
       .eq('team_member_id', id)
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
+    const { data: directJobs, error: directJobsError } = await directJobsQuery;
+    
+    // Merge both results and remove duplicates by job ID
+    const allJobsMap = new Map();
+    
+    // Add jobs from assignments
+    scheduledJobs.forEach(job => {
+      if (job && job.id) {
+        allJobsMap.set(job.id, job);
+      }
+    });
+    
+    // Add jobs from direct team_member_id (if any)
+    if (directJobs && !directJobsError) {
+      directJobs.forEach(job => {
+        if (job && job.id && !allJobsMap.has(job.id)) {
+          allJobsMap.set(job.id, job);
+        }
+      });
+    }
+    
+    // Convert map to array
+    let allJobs = Array.from(allJobsMap.values());
+    
+    // Filter by date range if provided
     if (startDate && endDate) {
-      // Parse dates and create date range filter
       const start = new Date(startDate);
       start.setHours(0, 0, 0, 0);
       const end = new Date(endDate);
       end.setHours(23, 59, 59, 999);
       
-      jobsQuery = jobsQuery
-        .gte('scheduled_date', start.toISOString())
-        .lte('scheduled_date', end.toISOString());
+      allJobs = allJobs.filter(job => {
+        if (!job.scheduled_date) return false;
+        const jobDate = new Date(job.scheduled_date);
+        return jobDate >= start && jobDate <= end;
+      });
     }
     
-    const { data: scheduledJobs, error: jobsError } = await jobsQuery;
+    const jobsError = assignmentsError || directJobsError;
     
     if (jobsError) {
       console.error('Error fetching scheduled jobs:', jobsError);
@@ -12668,7 +12722,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     
     res.json({
       availability: availability,
-      scheduledJobs: scheduledJobs || []
+      scheduledJobs: allJobs || []
     });
   } catch (error) {
     console.error('Get team member availability error:', error);
