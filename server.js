@@ -360,7 +360,7 @@ cron.schedule('0 9 * * *', async () => {
             console.log(`⏹️ Skipping job ${job.id} - recurring end date has passed`);
             // Mark as no longer recurring
             await supabase
-              .from('jobs')
+        .from('jobs')
               .update({ is_recurring: false })
               .eq('id', job.id);
             continue;
@@ -426,36 +426,36 @@ cron.schedule('0 9 * * *', async () => {
           .select()
           .single();
 
-        if (insertError) {
+      if (insertError) {
           console.error(`❌ Error creating recurring job for job ${job.id}:`, insertError);
-          continue;
-        }
+        continue;
+      }
 
         console.log(`✅ Created new recurring job ${newJob.id} for job ${job.id}`);
-
+      
         // Update next billing date on the original job (for tracking)
         const updatedNextBillingDate = calculateNextRecurringDate(job.recurring_frequency, newScheduledDate);
         if (updatedNextBillingDate) {
           await supabase
-            .from('jobs')
+        .from('jobs')
             .update({ next_billing_date: updatedNextBillingDate.toISOString().split('T')[0] })
-            .eq('id', job.id);
-        }
-        
-        // Send email notification
+        .eq('id', job.id);
+      }
+      
+      // Send email notification
         try {
-          await sendEmail({
-            to: job.customers.email,
-            subject: 'Recurring Service Scheduled',
-            html: `
-              <h2>Your recurring service has been scheduled</h2>
-              <p>Hello ${job.customers.first_name},</p>
+      await sendEmail({
+        to: job.customers.email,
+        subject: 'Recurring Service Scheduled',
+        html: `
+          <h2>Your recurring service has been scheduled</h2>
+          <p>Hello ${job.customers.first_name},</p>
               <p>Your recurring ${job.services.name} service has been scheduled for ${newScheduledDate.toLocaleDateString()}.</p>
-              <p>Service: ${job.services.name}</p>
-              <p>Price: $${job.services.price}</p>
-              <p>Thank you for choosing our services!</p>
-            `
-          });
+          <p>Service: ${job.services.name}</p>
+          <p>Price: $${job.services.price}</p>
+          <p>Thank you for choosing our services!</p>
+        `
+      });
         } catch (emailError) {
           console.error(`⚠️ Error sending email for job ${job.id}:`, emailError);
           // Don't fail the whole process if email fails
@@ -2671,7 +2671,7 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
           console.log(`❌ Worker ${worker.id}: No availability configured for ${dayName}`);
           return false; // Day not configured
         }
-        
+
         // Check if day is enabled/available
         const isDayEnabled = dayHours.enabled !== false && dayHours.available !== false;
         if (!isDayEnabled) {
@@ -2686,24 +2686,24 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
 
         // Format 1: Check if day has start/end times directly
         if (dayHours.start && dayHours.end) {
-          const dayStartMinutes = timeToMinutes(dayHours.start);
-          const dayEndMinutes = timeToMinutes(dayHours.end);
-          
-          // Check if slot is within working hours
-          if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
-            return false;
-          }
-          
-          // If day has time slots, check if slot falls within any time slot
-          if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
-            return dayHours.timeSlots.some(timeSlot => {
-              const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
-              const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
-              return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
-            });
-          }
-          
-          return true; // Available within working hours
+        const dayStartMinutes = timeToMinutes(dayHours.start);
+        const dayEndMinutes = timeToMinutes(dayHours.end);
+
+        // Check if slot is within working hours
+        if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
+          return false;
+        }
+
+        // If day has time slots, check if slot falls within any time slot
+        if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
+          return dayHours.timeSlots.some(timeSlot => {
+            const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
+            const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
+            return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
+          });
+        }
+
+        return true; // Available within working hours
         }
         
         // Format 2: Parse hours string like "9:00 AM - 6:00 PM"
@@ -12603,40 +12603,73 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
   try {
     const { id } = req.params;
     const { startDate, endDate } = req.query;
-    const connection = await pool.getConnection();
     
-    try {
-      const [teamMember] = await connection.query(
-        'SELECT availability FROM team_members WHERE id = ?',
-        [id]
-      );
-      
-      if (teamMember.length === 0) {
-        return res.status(404).json({ error: 'Team member not found' });
-      }
-      
-      // Get scheduled jobs for the date range
-      let jobsQuery = `
-        SELECT scheduled_date, duration 
-        FROM jobs 
-        WHERE team_member_id = ? AND status IN ("pending", "confirmed", "in-progress")
-      `;
-      let jobsParams = [id];
-      
-      if (startDate && endDate) {
-        jobsQuery += ' AND DATE(scheduled_date) BETWEEN ? AND ?';
-        jobsParams.push(startDate, endDate);
-      }
-      
-      const [scheduledJobs] = await connection.query(jobsQuery, jobsParams);
-      
-      res.json({
-        availability: teamMember[0].availability ? JSON.parse(teamMember[0].availability) : null,
-        scheduledJobs
-      });
-    } finally {
-      connection.release();
+    // Fetch team member availability from Supabase
+    const { data: teamMember, error: teamMemberError } = await supabase
+      .from('team_members')
+      .select('availability')
+      .eq('id', id)
+      .maybeSingle();
+    
+    if (teamMemberError) {
+      console.error('Error fetching team member:', teamMemberError);
+      return res.status(500).json({ error: 'Failed to fetch team member availability' });
     }
+    
+    if (!teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    // Parse availability if it's a string
+    let availability = null;
+    if (teamMember.availability) {
+      if (typeof teamMember.availability === 'string') {
+        try {
+          availability = JSON.parse(teamMember.availability);
+        } catch (e) {
+          console.error('Error parsing availability:', e);
+          availability = teamMember.availability;
+        }
+      } else {
+        availability = teamMember.availability;
+      }
+    }
+    
+    // Get scheduled jobs for the date range from Supabase
+    // Try direct team_member_id first, then fall back to job_team_assignments if needed
+    let jobsQuery = supabase
+      .from('jobs')
+      .select('scheduled_date, duration, id, status')
+      .eq('team_member_id', id)
+      .in('status', ['pending', 'confirmed', 'in-progress']);
+    
+    if (startDate && endDate) {
+      // Parse dates and create date range filter
+      const start = new Date(startDate);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(endDate);
+      end.setHours(23, 59, 59, 999);
+      
+      jobsQuery = jobsQuery
+        .gte('scheduled_date', start.toISOString())
+        .lte('scheduled_date', end.toISOString());
+    }
+    
+    const { data: scheduledJobs, error: jobsError } = await jobsQuery;
+    
+    if (jobsError) {
+      console.error('Error fetching scheduled jobs:', jobsError);
+      // Continue even if jobs fail - return availability only
+      return res.json({
+        availability: availability,
+        scheduledJobs: []
+      });
+    }
+    
+    res.json({
+      availability: availability,
+      scheduledJobs: scheduledJobs || []
+    });
   } catch (error) {
     console.error('Get team member availability error:', error);
     res.status(500).json({ error: 'Failed to fetch team member availability' });
@@ -12834,12 +12867,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
 
-    // Get all team members with hourly rates
+    // Get all team members (including those without hourly rates)
     const { data: teamMembers, error: membersError } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, hourly_rate')
+      .select('id, first_name, last_name, hourly_rate, status')
       .eq('user_id', userId)
-      .not('hourly_rate', 'is', null);
+      .eq('status', 'active'); // Only show active team members
 
     if (membersError) {
       console.error('Error fetching team members:', membersError);
@@ -12871,17 +12904,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalHours += parseFloat(job.hours_worked) || 0;
         });
 
-        const totalSalary = totalHours * parseFloat(member.hourly_rate);
+        // Calculate salary - if no hourly rate, salary is 0
+        const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
+        const totalSalary = totalHours * hourlyRate;
 
         return {
           teamMember: {
             id: member.id,
             name: `${member.first_name} ${member.last_name}`,
-            hourlyRate: parseFloat(member.hourly_rate)
+            hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null // null if not set
           },
           jobCount: (jobs || []).length,
           totalHours: parseFloat(totalHours.toFixed(2)),
-          totalSalary: parseFloat(totalSalary.toFixed(2))
+          totalSalary: parseFloat(totalSalary.toFixed(2)),
+          hasHourlyRate: !!member.hourly_rate
         };
       })
     );
@@ -12911,18 +12947,24 @@ app.put('/api/team-members/:id/availability', async (req, res) => {
   try {
     const { id } = req.params;
     const { availability } = req.body;
-    const connection = await pool.getConnection();
     
-    try {
-      await connection.query(
-        'UPDATE team_members SET availability = ?, updated_at = NOW() WHERE id = ?',
-        [JSON.stringify(availability), id]
-      );
-      
-      res.json({ message: 'Team member availability updated successfully' });
-    } finally {
-      connection.release();
+    // Update team member availability in Supabase
+    const availabilityJson = typeof availability === 'string' ? availability : JSON.stringify(availability);
+    
+    const { error: updateError } = await supabase
+      .from('team_members')
+      .update({ 
+        availability: availabilityJson,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+    
+    if (updateError) {
+      console.error('Error updating team member availability:', updateError);
+      return res.status(500).json({ error: 'Failed to update team member availability' });
     }
+    
+    res.json({ message: 'Team member availability updated successfully' });
   } catch (error) {
     console.error('Update team member availability error:', error);
     res.status(500).json({ error: 'Failed to update team member availability' });
