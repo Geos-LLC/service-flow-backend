@@ -5057,32 +5057,51 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query; // Optional date range filters
     
-    // Find all jobs for the user
-    let query = supabase
-      .from('jobs')
-      .select('id, tags, created_at')
-      .eq('user_id', userId);
+    // Supabase has a max limit of 1000 per query, so we need to paginate through all pages
+    const pageSize = 1000;
+    let allJobs = [];
+    let currentPage = 0;
+    let hasMore = true;
     
-    // Apply date range filter if provided
-    if (startDate) {
-      query = query.gte('created_at', startDate);
-    }
-    if (endDate) {
-      // Add one day to endDate to include the entire end date
-      const endDatePlusOne = new Date(endDate);
-      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
-    }
-    
-    const { data: allJobs, error: fetchError } = await query;
-    
-    if (fetchError) {
-      console.error('Error fetching jobs:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    // Fetch all jobs in batches
+    while (hasMore) {
+      const offset = currentPage * pageSize;
+      
+      let query = supabase
+        .from('jobs')
+        .select('id, tags, created_at')
+        .eq('user_id', userId)
+        .range(offset, offset + pageSize - 1);
+      
+      // Apply date range filter if provided
+      if (startDate) {
+        query = query.gte('created_at', startDate);
+      }
+      if (endDate) {
+        // Add one day to endDate to include the entire end date
+        const endDatePlusOne = new Date(endDate);
+        endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+        query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+      }
+      
+      const { data: batchJobs, error: fetchError } = await query;
+      
+      if (fetchError) {
+        console.error('Error fetching jobs:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch jobs' });
+      }
+      
+      if (batchJobs && batchJobs.length > 0) {
+        allJobs = allJobs.concat(batchJobs);
+        hasMore = batchJobs.length === pageSize;
+        currentPage++;
+      } else {
+        hasMore = false;
+      }
     }
     
     // Filter jobs that have "imported" in tags
-    const importedJobs = allJobs?.filter(job => {
+    const importedJobs = allJobs.filter(job => {
       if (!job.tags) return false;
       
       // Handle both string and array formats
@@ -5097,7 +5116,7 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
       }
       
       return false;
-    }) || [];
+    });
     
     const jobIds = importedJobs.map(job => job.id);
     
@@ -5172,31 +5191,51 @@ app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query; // Optional date range filters
     
-    let query = supabase
-      .from('jobs')
-      .select('id, tags, created_at')
-      .eq('user_id', userId);
+    // Supabase has a max limit of 1000 per query, so we need to paginate through all pages
+    const pageSize = 1000;
+    let allJobs = [];
+    let currentPage = 0;
+    let hasMore = true;
     
-    // Apply date range filter if provided
-    if (startDate) {
-      query = query.gte('created_at', startDate);
-    }
-    if (endDate) {
-      // Add one day to endDate to include the entire end date
-      const endDatePlusOne = new Date(endDate);
-      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
-    }
-    
-    const { data: allJobs, error: fetchError } = await query;
-    
-    if (fetchError) {
-      console.error('Error fetching jobs:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    // Fetch all jobs in batches
+    while (hasMore) {
+      const offset = currentPage * pageSize;
+      
+      let query = supabase
+        .from('jobs')
+        .select('id, tags, created_at')
+        .eq('user_id', userId)
+        .range(offset, offset + pageSize - 1);
+      
+      // Apply date range filter if provided
+      if (startDate) {
+        query = query.gte('created_at', startDate);
+      }
+      if (endDate) {
+        // Add one day to endDate to include the entire end date
+        const endDatePlusOne = new Date(endDate);
+        endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+        query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+      }
+      
+      const { data: batchJobs, error: fetchError } = await query;
+      
+      if (fetchError) {
+        console.error('Error fetching jobs:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch jobs' });
+      }
+      
+      if (batchJobs && batchJobs.length > 0) {
+        allJobs = allJobs.concat(batchJobs);
+        hasMore = batchJobs.length === pageSize;
+        currentPage++;
+      } else {
+        hasMore = false;
+      }
     }
     
     // Filter jobs that have "imported" in tags
-    const importedJobs = allJobs?.filter(job => {
+    const importedJobs = allJobs.filter(job => {
       if (!job.tags) return false;
       
       // Handle both string and array formats
@@ -5211,7 +5250,7 @@ app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
       }
       
       return false;
-    }) || [];
+    });
     
     res.json({ count: importedJobs.length });
   } catch (error) {
