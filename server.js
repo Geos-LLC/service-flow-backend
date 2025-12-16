@@ -12060,6 +12060,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       password,
       role, 
       hourlyRate,
+      commissionPercentage,
       availability,
       status,
       location,
@@ -12071,7 +12072,9 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       color,
       first_name, // Support snake_case from frontend
       last_name,
-      is_service_provider
+      is_service_provider,
+      hourly_rate, // Support snake_case from frontend
+      commission_percentage // Support snake_case from frontend
     } = req.body;
     
     // Normalize field names (support both camelCase and snake_case)
@@ -12197,8 +12200,16 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       dataToSave.role = 'account owner';
     }
     
-    if (hourlyRate !== undefined) {
-      dataToSave.hourly_rate = hourlyRate;
+    // Normalize hourly rate (support both camelCase and snake_case)
+    const hourlyRateValue = hourlyRate !== undefined ? hourlyRate : hourly_rate;
+    if (hourlyRateValue !== undefined) {
+      dataToSave.hourly_rate = hourlyRateValue;
+    }
+    
+    // Normalize commission percentage (support both camelCase and snake_case)
+    const commissionPercentageValue = commissionPercentage !== undefined ? commissionPercentage : commission_percentage;
+    if (commissionPercentageValue !== undefined) {
+      dataToSave.commission_percentage = commissionPercentageValue;
     }
     
     if (availability !== undefined) {
@@ -13300,18 +13311,45 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         const jobs = allJobs;
         
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
+        if (jobs.length > 0) {
+          console.log(`[Payroll] Sample job data:`, {
+            id: jobs[0].id,
+            hasStartTime: !!jobs[0].start_time,
+            hasEndTime: !!jobs[0].end_time,
+            hoursWorked: jobs[0].hours_worked,
+            total: jobs[0].total,
+            totalAmount: jobs[0].total_amount,
+            invoiceAmount: jobs[0].invoice_amount,
+            price: jobs[0].price
+          });
+        }
 
         // Calculate hourly-based salary
         let totalHours = 0;
         let hourlySalary = 0;
         const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
         
-        // Filter jobs with time tracking for hourly calculation
-        const jobsWithTimeTracking = (jobs || []).filter(job => 
-          job.start_time && job.end_time
-        );
+        console.log(`[Payroll] Member ${member.id}: Hourly rate = ${hourlyRate}`);
         
-        console.log(`[Payroll] Member ${member.id}: ${jobsWithTimeTracking.length} jobs with time tracking`);
+        // Filter jobs with time tracking for hourly calculation
+        const jobsWithTimeTracking = (jobs || []).filter(job => {
+          const hasTimeTracking = job.start_time && job.end_time;
+          const hasHoursWorked = job.hours_worked && parseFloat(job.hours_worked) > 0;
+          return hasTimeTracking || hasHoursWorked;
+        });
+        
+        console.log(`[Payroll] Member ${member.id}: ${jobsWithTimeTracking.length} jobs with time tracking out of ${jobs.length} total jobs`);
+        
+        if (jobsWithTimeTracking.length === 0 && jobs.length > 0) {
+          console.log(`[Payroll] WARNING: Member ${member.id} has ${jobs.length} jobs but none have time tracking data!`);
+          jobs.forEach(job => {
+            console.log(`[Payroll] Job ${job.id} time tracking:`, {
+              start_time: job.start_time,
+              end_time: job.end_time,
+              hours_worked: job.hours_worked
+            });
+          });
+        }
         
         jobsWithTimeTracking.forEach(job => {
           // Use hours_worked if available, otherwise calculate from start_time and end_time
@@ -13321,19 +13359,26 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           if (hours === 0 && job.start_time && job.end_time) {
             const start = new Date(job.start_time);
             const end = new Date(job.end_time);
-            hours = (end - start) / (1000 * 60 * 60); // Convert milliseconds to hours
+            const diffMs = end - start;
+            if (diffMs > 0) {
+              hours = diffMs / (1000 * 60 * 60); // Convert milliseconds to hours
+            }
           }
           
-          totalHours += hours;
-          console.log(`[Payroll] Job ${job.id}: ${hours.toFixed(2)} hours`);
+          if (hours > 0) {
+            totalHours += hours;
+            console.log(`[Payroll] Job ${job.id}: ${hours.toFixed(2)} hours`);
+          }
         });
         
         hourlySalary = totalHours * hourlyRate;
-        console.log(`[Payroll] Member ${member.id}: Total hours = ${totalHours.toFixed(2)}, Hourly salary = ${hourlySalary.toFixed(2)}`);
+        console.log(`[Payroll] Member ${member.id}: Total hours = ${totalHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
         let commissionSalary = 0;
         const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
+        
+        console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%`);
         
         // Filter jobs with revenue for commission calculation
         // Check multiple fields: total, total_amount, invoice_amount, price
@@ -13345,7 +13390,19 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           return revenue > 0;
         });
         
-        console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue, commission % = ${commissionPercentage}`);
+        console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue out of ${jobs.length} total jobs`);
+        
+        if (jobsWithRevenue.length === 0 && jobs.length > 0) {
+          console.log(`[Payroll] WARNING: Member ${member.id} has ${jobs.length} jobs but none have revenue data!`);
+          jobs.forEach(job => {
+            console.log(`[Payroll] Job ${job.id} revenue fields:`, {
+              total: job.total,
+              total_amount: job.total_amount,
+              invoice_amount: job.invoice_amount,
+              price: job.price
+            });
+          });
+        }
         
         jobsWithRevenue.forEach(job => {
           // Use the first available revenue field
@@ -13355,10 +13412,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                           parseFloat(job.price) || 0;
           const commission = jobTotal * (commissionPercentage / 100);
           commissionSalary += commission;
-          console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue = $${commission.toFixed(2)} commission`);
+          console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
         });
         
         console.log(`[Payroll] Member ${member.id}: Total commission = $${commissionSalary.toFixed(2)}`);
+        
+        // Final summary for this member
+        console.log(`[Payroll] === Member ${member.id} (${member.first_name}) Summary ===`);
+        console.log(`[Payroll] Jobs: ${jobs.length}`);
+        console.log(`[Payroll] Jobs with time tracking: ${jobsWithTimeTracking.length}`);
+        console.log(`[Payroll] Jobs with revenue: ${jobsWithRevenue.length}`);
+        console.log(`[Payroll] Hourly rate: ${hourlyRate ? `$${hourlyRate}/hr` : 'Not set'}`);
+        console.log(`[Payroll] Commission %: ${commissionPercentage ? `${commissionPercentage}%` : 'Not set'}`);
+        console.log(`[Payroll] Total hours: ${totalHours.toFixed(2)}`);
+        console.log(`[Payroll] Hourly salary: $${hourlySalary.toFixed(2)}`);
+        console.log(`[Payroll] Commission: $${commissionSalary.toFixed(2)}`);
+        console.log(`[Payroll] Total salary: $${(hourlySalary + commissionSalary).toFixed(2)}`);
+        console.log(`[Payroll] ==========================================`);
 
         // Total salary is sum of hourly + commission (hybrid model)
         const totalSalary = hourlySalary + commissionSalary;
