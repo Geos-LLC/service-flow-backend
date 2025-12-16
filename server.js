@@ -13536,6 +13536,204 @@ app.put('/api/team-members/:id/availability', async (req, res) => {
   }
 });
 
+// ==================== Staff Location Tracking Endpoints ====================
+
+// Record staff location (POST /api/staff-locations)
+app.post('/api/staff-locations', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, latitude, longitude, address, accuracy, source = 'manual', jobId } = req.body;
+
+    // Validate required fields
+    if (!teamMemberId || latitude === undefined || longitude === undefined) {
+      return res.status(400).json({ error: 'teamMemberId, latitude, and longitude are required' });
+    }
+
+    // Verify team member belongs to user
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, user_id, location_sharing_enabled')
+      .eq('id', teamMemberId)
+      .eq('user_id', userId)
+      .single();
+
+    if (memberError || !teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+
+    // Check if location sharing is enabled (for feature #10)
+    if (teamMember.location_sharing_enabled === false) {
+      return res.status(403).json({ error: 'Location sharing is disabled for this team member' });
+    }
+
+    // Insert location record
+    const { data: location, error: locationError } = await supabase
+      .from('staff_locations')
+      .insert({
+        team_member_id: teamMemberId,
+        user_id: userId,
+        latitude: parseFloat(latitude),
+        longitude: parseFloat(longitude),
+        address: address || null,
+        accuracy: accuracy ? parseFloat(accuracy) : null,
+        source: source,
+        job_id: jobId || null,
+        recorded_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (locationError) {
+      console.error('Error recording staff location:', locationError);
+      return res.status(500).json({ error: 'Failed to record staff location' });
+    }
+
+    res.json({ 
+      message: 'Location recorded successfully',
+      location: location
+    });
+  } catch (error) {
+    console.error('Record staff location error:', error);
+    res.status(500).json({ error: 'Failed to record staff location' });
+  }
+});
+
+// Get current staff locations (GET /api/staff-locations)
+app.get('/api/staff-locations', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId } = req.query;
+
+    // Build query - get latest location for each team member
+    let query = supabase
+      .from('staff_locations')
+      .select(`
+        id,
+        team_member_id,
+        latitude,
+        longitude,
+        address,
+        accuracy,
+        source,
+        job_id,
+        recorded_at,
+        team_members!inner(
+          id,
+          first_name,
+          last_name,
+          profile_picture,
+          location_sharing_enabled,
+          user_id
+        ),
+        jobs(
+          id,
+          service_name,
+          scheduled_date
+        )
+      `)
+      .eq('team_members.user_id', userId)
+      .eq('team_members.location_sharing_enabled', true) // Only show if sharing is enabled
+      .order('recorded_at', { ascending: false });
+
+    // Filter by team member if provided
+    if (teamMemberId) {
+      query = query.eq('team_member_id', teamMemberId);
+    }
+
+    const { data: locations, error: locationsError } = await query;
+
+    if (locationsError) {
+      console.error('Error fetching staff locations:', locationsError);
+      return res.status(500).json({ error: 'Failed to fetch staff locations' });
+    }
+
+    // Get the most recent location for each team member
+    const latestLocations = {};
+    (locations || []).forEach(location => {
+      const memberId = location.team_member_id;
+      if (!latestLocations[memberId] || 
+          new Date(location.recorded_at) > new Date(latestLocations[memberId].recorded_at)) {
+        latestLocations[memberId] = location;
+      }
+    });
+
+    res.json({
+      locations: Object.values(latestLocations),
+      count: Object.keys(latestLocations).length
+    });
+  } catch (error) {
+    console.error('Get staff locations error:', error);
+    res.status(500).json({ error: 'Failed to fetch staff locations' });
+  }
+});
+
+// Get location history for a team member (GET /api/staff-locations/:teamMemberId/history)
+app.get('/api/staff-locations/:teamMemberId/history', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId } = req.params;
+    const { startDate, endDate, limit = 100 } = req.query;
+
+    // Verify team member belongs to user
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, user_id')
+      .eq('id', teamMemberId)
+      .eq('user_id', userId)
+      .single();
+
+    if (memberError || !teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+
+    // Build query
+    let query = supabase
+      .from('staff_locations')
+      .select(`
+        id,
+        latitude,
+        longitude,
+        address,
+        accuracy,
+        source,
+        job_id,
+        recorded_at,
+        jobs(
+          id,
+          service_name,
+          scheduled_date
+        )
+      `)
+      .eq('team_member_id', teamMemberId)
+      .order('recorded_at', { ascending: false })
+      .limit(parseInt(limit));
+
+    // Filter by date range if provided
+    if (startDate) {
+      query = query.gte('recorded_at', startDate);
+    }
+    if (endDate) {
+      query = query.lte('recorded_at', `${endDate} 23:59:59`);
+    }
+
+    const { data: locations, error: locationsError } = await query;
+
+    if (locationsError) {
+      console.error('Error fetching location history:', locationsError);
+      return res.status(500).json({ error: 'Failed to fetch location history' });
+    }
+
+    res.json({
+      teamMemberId: parseInt(teamMemberId),
+      locations: locations || [],
+      count: (locations || []).length
+    });
+  } catch (error) {
+    console.error('Get location history error:', error);
+    res.status(500).json({ error: 'Failed to fetch location history' });
+  }
+});
+
 // Team member authentication endpoints
 app.post('/api/team-members/login', async (req, res) => {
   try {
