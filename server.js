@@ -13197,10 +13197,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
 
-    // Get all team members (including those without hourly rates)
+    // Get all team members (including those without hourly rates or commission)
     const { data: teamMembers, error: membersError } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, hourly_rate, status')
+      .select('id, first_name, last_name, hourly_rate, commission_percentage, status')
       .eq('user_id', userId)
       .eq('status', 'active'); // Only show active team members
 
@@ -13212,13 +13212,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const payrollData = await Promise.all(
       (teamMembers || []).map(async (member) => {
         // Get jobs for this team member
+        // For hourly calculation: need jobs with start_time and end_time
+        // For commission calculation: need jobs with total (revenue)
         let jobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, total, status')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, total, status, service_name')
           .eq('team_member_id', member.id)
-          .eq('user_id', userId)
-          .not('start_time', 'is', null)
-          .not('end_time', 'is', null);
+          .eq('user_id', userId);
 
         if (startDate) {
           jobsQuery = jobsQuery.gte('scheduled_date', startDate);
@@ -13229,31 +13229,70 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
         const { data: jobs } = await jobsQuery;
 
+        // Calculate hourly-based salary
         let totalHours = 0;
-        (jobs || []).forEach(job => {
-          totalHours += parseFloat(job.hours_worked) || 0;
+        let hourlySalary = 0;
+        const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
+        
+        // Filter jobs with time tracking for hourly calculation
+        const jobsWithTimeTracking = (jobs || []).filter(job => 
+          job.start_time && job.end_time
+        );
+        
+        jobsWithTimeTracking.forEach(job => {
+          const hours = parseFloat(job.hours_worked) || 0;
+          totalHours += hours;
+        });
+        
+        hourlySalary = totalHours * hourlyRate;
+
+        // Calculate commission-based salary
+        let commissionSalary = 0;
+        const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
+        
+        // Filter jobs with revenue for commission calculation
+        const jobsWithRevenue = (jobs || []).filter(job => 
+          job.total && parseFloat(job.total) > 0
+        );
+        
+        jobsWithRevenue.forEach(job => {
+          const jobTotal = parseFloat(job.total) || 0;
+          const commission = jobTotal * (commissionPercentage / 100);
+          commissionSalary += commission;
         });
 
-        // Calculate salary - if no hourly rate, salary is 0
-        const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
-        const totalSalary = totalHours * hourlyRate;
+        // Total salary is sum of hourly + commission (hybrid model)
+        const totalSalary = hourlySalary + commissionSalary;
 
         return {
           teamMember: {
             id: member.id,
             name: `${member.first_name} ${member.last_name}`,
-            hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null // null if not set
+            hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
+            commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null
           },
           jobCount: (jobs || []).length,
           totalHours: parseFloat(totalHours.toFixed(2)),
+          hourlySalary: parseFloat(hourlySalary.toFixed(2)),
+          commissionSalary: parseFloat(commissionSalary.toFixed(2)),
           totalSalary: parseFloat(totalSalary.toFixed(2)),
-          hasHourlyRate: !!member.hourly_rate
+          hasHourlyRate: !!member.hourly_rate,
+          hasCommission: !!member.commission_percentage,
+          paymentMethod: member.hourly_rate && member.commission_percentage 
+            ? 'hybrid' 
+            : member.hourly_rate 
+              ? 'hourly' 
+              : member.commission_percentage 
+                ? 'commission' 
+                : 'none'
         };
       })
     );
 
     const grandTotal = payrollData.reduce((sum, item) => sum + item.totalSalary, 0);
     const grandTotalHours = payrollData.reduce((sum, item) => sum + item.totalHours, 0);
+    const grandTotalHourlySalary = payrollData.reduce((sum, item) => sum + item.hourlySalary, 0);
+    const grandTotalCommission = payrollData.reduce((sum, item) => sum + item.commissionSalary, 0);
 
     res.json({
       period: {
@@ -13264,6 +13303,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       summary: {
         totalTeamMembers: payrollData.length,
         totalHours: parseFloat(grandTotalHours.toFixed(2)),
+        totalHourlySalary: parseFloat(grandTotalHourlySalary.toFixed(2)),
+        totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2))
       }
     });
