@@ -13222,6 +13222,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     const payrollData = await Promise.all(
       (teamMembers || []).map(async (member) => {
+        try {
         // Get jobs for this team member
         // Check both direct team_member_id and job_team_assignments table
         let allJobs = [];
@@ -13417,8 +13418,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         
         // Final summary for this member
         console.log(`[Payroll] === Member ${member.id} (${member.first_name}) Summary ===`);
-        console.log(`[Payroll] Jobs: ${jobs.length}`);
-        console.log(`[Payroll] Jobs with time tracking: ${jobsWithTimeTracking.length}`);
+        console.log(`[Payroll] Total jobs: ${jobs.length}`);
         console.log(`[Payroll] Jobs with revenue: ${jobsWithRevenue.length}`);
         console.log(`[Payroll] Hourly rate: ${hourlyRate ? `$${hourlyRate}/hr` : 'Not set'}`);
         console.log(`[Payroll] Commission %: ${commissionPercentage ? `${commissionPercentage}%` : 'Not set'}`);
@@ -13453,13 +13453,40 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                 ? 'commission' 
                 : 'none'
         };
+        } catch (memberError) {
+          console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
+          // Return default values for this member so the rest of the payroll can still be calculated
+          return {
+            teamMember: {
+              id: member.id,
+              name: `${member.first_name} ${member.last_name}`,
+              hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
+              commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null
+            },
+            jobCount: 0,
+            totalHours: 0,
+            hourlySalary: 0,
+            commissionSalary: 0,
+            totalSalary: 0,
+            hasHourlyRate: !!member.hourly_rate,
+            hasCommission: !!member.commission_percentage,
+            paymentMethod: member.hourly_rate && member.commission_percentage 
+              ? 'hybrid' 
+              : member.hourly_rate 
+                ? 'hourly' 
+                : member.commission_percentage 
+                  ? 'commission' 
+                  : 'none',
+            error: `Failed to calculate payroll for this member: ${memberError.message}`
+          };
+        }
       })
     );
 
-    const grandTotal = payrollData.reduce((sum, item) => sum + item.totalSalary, 0);
-    const grandTotalHours = payrollData.reduce((sum, item) => sum + item.totalHours, 0);
-    const grandTotalHourlySalary = payrollData.reduce((sum, item) => sum + item.hourlySalary, 0);
-    const grandTotalCommission = payrollData.reduce((sum, item) => sum + item.commissionSalary, 0);
+    const grandTotal = (payrollData || []).reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
+    const grandTotalHours = (payrollData || []).reduce((sum, item) => sum + (item?.totalHours || 0), 0);
+    const grandTotalHourlySalary = (payrollData || []).reduce((sum, item) => sum + (item?.hourlySalary || 0), 0);
+    const grandTotalCommission = (payrollData || []).reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
 
     res.json({
       period: {
