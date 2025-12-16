@@ -5067,28 +5067,28 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
     while (hasMore) {
       const offset = currentPage * pageSize;
       
-      let query = supabase
-        .from('jobs')
-        .select('id, tags, created_at')
+    let query = supabase
+      .from('jobs')
+      .select('id, tags, created_at')
         .eq('user_id', userId)
         .range(offset, offset + pageSize - 1);
-      
-      // Apply date range filter if provided
-      if (startDate) {
-        query = query.gte('created_at', startDate);
-      }
-      if (endDate) {
-        // Add one day to endDate to include the entire end date
-        const endDatePlusOne = new Date(endDate);
-        endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-        query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
-      }
-      
+    
+    // Apply date range filter if provided
+    if (startDate) {
+      query = query.gte('created_at', startDate);
+    }
+    if (endDate) {
+      // Add one day to endDate to include the entire end date
+      const endDatePlusOne = new Date(endDate);
+      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+    }
+    
       const { data: batchJobs, error: fetchError } = await query;
-      
-      if (fetchError) {
-        console.error('Error fetching jobs:', fetchError);
-        return res.status(500).json({ error: 'Failed to fetch jobs' });
+    
+    if (fetchError) {
+      console.error('Error fetching jobs:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
       }
       
       if (batchJobs && batchJobs.length > 0) {
@@ -5200,29 +5200,29 @@ app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
     // Fetch all jobs in batches
     while (hasMore) {
       const offset = currentPage * pageSize;
-      
-      let query = supabase
-        .from('jobs')
-        .select('id, tags, created_at')
+    
+    let query = supabase
+      .from('jobs')
+      .select('id, tags, created_at')
         .eq('user_id', userId)
         .range(offset, offset + pageSize - 1);
-      
-      // Apply date range filter if provided
-      if (startDate) {
-        query = query.gte('created_at', startDate);
-      }
-      if (endDate) {
-        // Add one day to endDate to include the entire end date
-        const endDatePlusOne = new Date(endDate);
-        endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
-        query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
-      }
-      
+    
+    // Apply date range filter if provided
+    if (startDate) {
+      query = query.gte('created_at', startDate);
+    }
+    if (endDate) {
+      // Add one day to endDate to include the entire end date
+      const endDatePlusOne = new Date(endDate);
+      endDatePlusOne.setDate(endDatePlusOne.getDate() + 1);
+      query = query.lt('created_at', endDatePlusOne.toISOString().split('T')[0]);
+    }
+    
       const { data: batchJobs, error: fetchError } = await query;
-      
-      if (fetchError) {
-        console.error('Error fetching jobs:', fetchError);
-        return res.status(500).json({ error: 'Failed to fetch jobs' });
+    
+    if (fetchError) {
+      console.error('Error fetching jobs:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
       }
       
       if (batchJobs && batchJobs.length > 0) {
@@ -12683,8 +12683,10 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
         jobs!inner(
           id,
           scheduled_date,
+          scheduled_time,
           duration,
-          status
+          status,
+          service_name
         )
       `)
       .eq('team_member_id', id);
@@ -12706,7 +12708,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     // Some jobs might still have team_member_id directly in the jobs table
     let directJobsQuery = supabase
       .from('jobs')
-      .select('scheduled_date, duration, id, status')
+      .select('scheduled_date, scheduled_time, duration, id, status, service_name')
       .eq('team_member_id', id)
       .in('status', ['pending', 'confirmed', 'in-progress']);
     
@@ -12750,18 +12752,205 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     
     const jobsError = assignmentsError || directJobsError;
     
+    // Helper function to convert time string to minutes since midnight
+    const timeToMinutes = (timeStr) => {
+      if (!timeStr) return 0;
+      if (typeof timeStr === 'string' && timeStr.includes(':')) {
+        const [hours, minutes] = timeStr.split(':').map(Number);
+        return (hours || 0) * 60 + (minutes || 0);
+      }
+      return 0;
+    };
+    
+    // Helper function to convert minutes to time string
+    const minutesToTime = (minutes) => {
+      const hours = Math.floor(minutes / 60);
+      const mins = minutes % 60;
+      return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
+    };
+    
+    // Calculate remaining availability for each day
+    const calculateRemainingAvailability = (baseHours, jobsForDay) => {
+      if (!baseHours || baseHours.length === 0) return [];
+      if (!jobsForDay || jobsForDay.length === 0) return baseHours;
+      
+      // Convert base hours to time ranges in minutes
+      const baseRanges = baseHours.map(slot => ({
+        start: timeToMinutes(slot.start || slot.startTime),
+        end: timeToMinutes(slot.end || slot.endTime)
+      }));
+      
+      // Convert assigned jobs to time ranges in minutes
+      const jobRanges = jobsForDay.map(job => {
+        // Extract time from scheduled_time or scheduled_date
+        let jobTime = '09:00'; // Default
+        if (job.scheduled_time) {
+          // scheduled_time might be "09:00" or "09:00:00"
+          jobTime = job.scheduled_time.includes(':') 
+            ? job.scheduled_time.split(':').slice(0, 2).join(':') 
+            : job.scheduled_time;
+        } else if (job.scheduled_date) {
+          // Extract time from scheduled_date (format: "2025-10-07 09:00:00" or ISO string)
+          const dateStr = job.scheduled_date.toString();
+          const timeMatch = dateStr.match(/(\d{1,2}):(\d{2})/);
+          if (timeMatch) {
+            jobTime = `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]}`;
+          }
+        }
+        
+        const jobStartMinutes = timeToMinutes(jobTime);
+        const duration = job.duration || 60; // Default 60 minutes
+        return {
+          start: jobStartMinutes,
+          end: jobStartMinutes + duration
+        };
+      });
+      
+      // Calculate remaining slots
+      const remainingRanges = [];
+      
+      baseRanges.forEach(baseRange => {
+        let currentStart = baseRange.start;
+        
+        // Sort job ranges by start time for this day
+        const dayJobs = jobRanges
+          .filter(job => job.start >= baseRange.start && job.end <= baseRange.end)
+          .sort((a, b) => a.start - b.start);
+        
+        dayJobs.forEach(jobRange => {
+          // If there's a gap before this job, add it as available
+          if (currentStart < jobRange.start) {
+            remainingRanges.push({
+              start: currentStart,
+              end: jobRange.start
+            });
+          }
+          // Move current start to after this job
+          currentStart = Math.max(currentStart, jobRange.end);
+        });
+        
+        // If there's remaining time after all jobs, add it
+        if (currentStart < baseRange.end) {
+          remainingRanges.push({
+            start: currentStart,
+            end: baseRange.end
+          });
+        }
+      });
+      
+      // Convert back to time strings and filter out slots less than 15 minutes
+      return remainingRanges
+        .filter(range => range.end - range.start >= 15) // Minimum 15-minute slots
+        .map(range => ({
+          start: minutesToTime(range.start),
+          end: minutesToTime(range.end)
+        }));
+    };
+    
+    // Process availability by date if date range is provided
+    let dailyAvailability = {};
+    let dailyRemainingAvailability = {};
+    
+    if (startDate && endDate && availability) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+      
+      const workingHours = availability.workingHours || availability || {};
+      const customAvailability = availability.customAvailability || [];
+      
+      // Process each day in the range
+      const currentDate = new Date(start);
+      while (currentDate <= end) {
+        const dateStr = currentDate.toISOString().split('T')[0];
+        const dayOfWeek = currentDate.getDay();
+        const dayName = dayNames[dayOfWeek];
+        
+        // Check for custom availability override
+        const dateOverride = customAvailability.find(item => item.date === dateStr);
+        
+        let baseHours = [];
+        let isAvailable = false;
+        
+        if (dateOverride) {
+          if (dateOverride.available === false) {
+            isAvailable = false;
+          } else if (dateOverride.hours) {
+            isAvailable = true;
+            baseHours = Array.isArray(dateOverride.hours) 
+              ? dateOverride.hours 
+              : [dateOverride.hours];
+          }
+        } else {
+          // Use working hours for the day
+          const dayWorkingHours = workingHours[dayName];
+          if (dayWorkingHours && dayWorkingHours.available !== false) {
+            isAvailable = true;
+            if (dayWorkingHours.timeSlots && dayWorkingHours.timeSlots.length > 0) {
+              baseHours = dayWorkingHours.timeSlots.map(slot => ({
+                start: slot.start,
+                end: slot.end
+              }));
+            } else if (dayWorkingHours.hours) {
+              // Parse hours string like "9:00 AM - 5:00 PM"
+              const hoursMatch = dayWorkingHours.hours.match(/(\d+):(\d+)\s*(AM|PM)\s*-\s*(\d+):(\d+)\s*(AM|PM)/);
+              if (hoursMatch) {
+                const convertTo24Hour = (hour, minute, ampm) => {
+                  let h = parseInt(hour);
+                  if (ampm === 'PM' && h !== 12) h += 12;
+                  if (ampm === 'AM' && h === 12) h = 0;
+                  return `${h.toString().padStart(2, '0')}:${minute.padStart(2, '0')}`;
+                };
+                baseHours = [{
+                  start: convertTo24Hour(hoursMatch[1], hoursMatch[2], hoursMatch[3]),
+                  end: convertTo24Hour(hoursMatch[4], hoursMatch[5], hoursMatch[6])
+                }];
+              }
+            }
+          }
+        }
+        
+        // Store base availability
+        dailyAvailability[dateStr] = {
+          available: isAvailable,
+          hours: baseHours
+        };
+        
+        // Get jobs for this day
+        const jobsForDay = allJobs.filter(job => {
+          if (!job.scheduled_date) return false;
+          const jobDate = new Date(job.scheduled_date);
+          return jobDate.toISOString().split('T')[0] === dateStr;
+        });
+        
+        // Calculate remaining availability
+        if (isAvailable && baseHours.length > 0) {
+          dailyRemainingAvailability[dateStr] = calculateRemainingAvailability(baseHours, jobsForDay);
+        } else {
+          dailyRemainingAvailability[dateStr] = [];
+        }
+        
+        // Move to next day
+        currentDate.setDate(currentDate.getDate() + 1);
+      }
+    }
+    
     if (jobsError) {
       console.error('Error fetching scheduled jobs:', jobsError);
       // Continue even if jobs fail - return availability only
       return res.json({
         availability: availability,
-        scheduledJobs: []
+        scheduledJobs: [],
+        baseAvailability: dailyAvailability,
+        remainingAvailability: dailyRemainingAvailability
       });
     }
     
     res.json({
       availability: availability,
-      scheduledJobs: allJobs || []
+      scheduledJobs: allJobs || [],
+      baseAvailability: dailyAvailability,
+      remainingAvailability: dailyRemainingAvailability
     });
   } catch (error) {
     console.error('Get team member availability error:', error);
