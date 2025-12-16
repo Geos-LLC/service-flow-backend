@@ -13229,7 +13229,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, total, total_amount, invoice_amount, price, status, service_name')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -13258,6 +13258,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               start_time,
               end_time,
               hours_worked,
+              duration,
+              estimated_duration,
               total,
               total_amount,
               invoice_amount,
@@ -13331,43 +13333,39 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         
         console.log(`[Payroll] Member ${member.id}: Hourly rate = ${hourlyRate}`);
         
-        // Filter jobs with time tracking for hourly calculation
-        const jobsWithTimeTracking = (jobs || []).filter(job => {
-          const hasTimeTracking = job.start_time && job.end_time;
-          const hasHoursWorked = job.hours_worked && parseFloat(job.hours_worked) > 0;
-          return hasTimeTracking || hasHoursWorked;
-        });
-        
-        console.log(`[Payroll] Member ${member.id}: ${jobsWithTimeTracking.length} jobs with time tracking out of ${jobs.length} total jobs`);
-        
-        if (jobsWithTimeTracking.length === 0 && jobs.length > 0) {
-          console.log(`[Payroll] WARNING: Member ${member.id} has ${jobs.length} jobs but none have time tracking data!`);
-          jobs.forEach(job => {
-            console.log(`[Payroll] Job ${job.id} time tracking:`, {
-              start_time: job.start_time,
-              end_time: job.end_time,
-              hours_worked: job.hours_worked
-            });
-          });
-        }
-        
-        jobsWithTimeTracking.forEach(job => {
-          // Use hours_worked if available, otherwise calculate from start_time and end_time
-          let hours = parseFloat(job.hours_worked) || 0;
+        // Calculate hours for ALL jobs (not just those with time tracking)
+        // Priority: hours_worked > (start_time/end_time calculation) > duration/estimated_duration
+        (jobs || []).forEach(job => {
+          let hours = 0;
           
-          // If hours_worked is 0 or not set, calculate from start_time and end_time
-          if (hours === 0 && job.start_time && job.end_time) {
+          // Priority 1: Use hours_worked if available and > 0
+          if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
+            hours = parseFloat(job.hours_worked);
+            console.log(`[Payroll] Job ${job.id}: Using hours_worked = ${hours.toFixed(2)} hours`);
+          }
+          // Priority 2: Calculate from start_time and end_time if available
+          else if (job.start_time && job.end_time) {
             const start = new Date(job.start_time);
             const end = new Date(job.end_time);
             const diffMs = end - start;
             if (diffMs > 0) {
               hours = diffMs / (1000 * 60 * 60); // Convert milliseconds to hours
+              console.log(`[Payroll] Job ${job.id}: Calculated from start_time/end_time = ${hours.toFixed(2)} hours`);
+            }
+          }
+          // Priority 3: Fallback to duration or estimated_duration (convert minutes to hours)
+          else {
+            const durationMinutes = job.duration || job.estimated_duration || 0;
+            if (durationMinutes > 0) {
+              hours = durationMinutes / 60; // Convert minutes to hours
+              console.log(`[Payroll] Job ${job.id}: Using duration fallback = ${durationMinutes} minutes (${hours.toFixed(2)} hours)`);
+            } else {
+              console.log(`[Payroll] Job ${job.id}: No time data available (no hours_worked, start_time/end_time, or duration)`);
             }
           }
           
           if (hours > 0) {
             totalHours += hours;
-            console.log(`[Payroll] Job ${job.id}: ${hours.toFixed(2)} hours`);
           }
         });
         
