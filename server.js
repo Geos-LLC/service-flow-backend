@@ -12851,7 +12851,24 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     let dailyAvailability = {};
     let dailyRemainingAvailability = {};
     
-    if (startDate && endDate && availability) {
+    // Always process availability if we have a date range, even if availability is null/empty
+    // This ensures we return empty availability data rather than nothing
+    if (startDate && endDate) {
+      if (!availability) {
+        // If no availability set, return empty data for all days
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        const currentDate = new Date(start);
+        while (currentDate <= end) {
+          const dateStr = currentDate.toISOString().split('T')[0];
+          dailyAvailability[dateStr] = {
+            available: false,
+            hours: []
+          };
+          dailyRemainingAvailability[dateStr] = [];
+          currentDate.setDate(currentDate.getDate() + 1);
+        }
+      } else {
       const start = new Date(startDate);
       const end = new Date(endDate);
       const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -12884,29 +12901,50 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
         } else {
           // Use working hours for the day
           const dayWorkingHours = workingHours[dayName];
-          if (dayWorkingHours && dayWorkingHours.available !== false) {
-            isAvailable = true;
-            if (dayWorkingHours.timeSlots && dayWorkingHours.timeSlots.length > 0) {
-              baseHours = dayWorkingHours.timeSlots.map(slot => ({
-                start: slot.start,
-                end: slot.end
-              }));
-            } else if (dayWorkingHours.hours) {
-              // Parse hours string like "9:00 AM - 5:00 PM"
-              const hoursMatch = dayWorkingHours.hours.match(/(\d+):(\d+)\s*(AM|PM)\s*-\s*(\d+):(\d+)\s*(AM|PM)/);
-              if (hoursMatch) {
-                const convertTo24Hour = (hour, minute, ampm) => {
-                  let h = parseInt(hour);
-                  if (ampm === 'PM' && h !== 12) h += 12;
-                  if (ampm === 'AM' && h === 12) h = 0;
-                  return `${h.toString().padStart(2, '0')}:${minute.padStart(2, '0')}`;
-                };
-                baseHours = [{
-                  start: convertTo24Hour(hoursMatch[1], hoursMatch[2], hoursMatch[3]),
-                  end: convertTo24Hour(hoursMatch[4], hoursMatch[5], hoursMatch[6])
-                }];
+          if (dayWorkingHours) {
+            // Check if day is available - available can be true, undefined (defaults to available), or false
+            const isDayAvailable = dayWorkingHours.available !== false && 
+                                  (dayWorkingHours.available === true || dayWorkingHours.available === undefined);
+            
+            if (isDayAvailable) {
+              isAvailable = true;
+              if (dayWorkingHours.timeSlots && dayWorkingHours.timeSlots.length > 0) {
+                baseHours = dayWorkingHours.timeSlots.map(slot => ({
+                  start: slot.start,
+                  end: slot.end
+                }));
+              } else if (dayWorkingHours.hours) {
+                // Parse hours string like "9:00 AM - 5:00 PM" or "9:00 AM - 6:00 PM"
+                const hoursStr = dayWorkingHours.hours.toString().trim();
+                // Try with spaces first: "9:00 AM - 6:00 PM"
+                let hoursMatch = hoursStr.match(/(\d+):(\d+)\s*(AM|PM)\s*-\s*(\d+):(\d+)\s*(AM|PM)/);
+                
+                // If no match, try without spaces: "9:00AM-6:00PM"
+                if (!hoursMatch) {
+                  hoursMatch = hoursStr.match(/(\d+):(\d+)(AM|PM)-(\d+):(\d+)(AM|PM)/);
+                }
+                
+                if (hoursMatch) {
+                  const convertTo24Hour = (hour, minute, ampm) => {
+                    let h = parseInt(hour);
+                    if (ampm === 'PM' && h !== 12) h += 12;
+                    if (ampm === 'AM' && h === 12) h = 0;
+                    return `${h.toString().padStart(2, '0')}:${minute.padStart(2, '0')}`;
+                  };
+                  baseHours = [{
+                    start: convertTo24Hour(hoursMatch[1], hoursMatch[2], hoursMatch[3]),
+                    end: convertTo24Hour(hoursMatch[4], hoursMatch[5], hoursMatch[6])
+                  }];
+                } else {
+                  console.warn(`[Backend] Could not parse hours string for ${dayName}: "${hoursStr}"`);
+                }
               }
+            } else {
+              isAvailable = false;
             }
+          } else {
+            // No working hours defined for this day
+            isAvailable = false;
           }
         }
         
@@ -12933,7 +12971,17 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
         // Move to next day
         currentDate.setDate(currentDate.getDate() + 1);
       }
+      }
     }
+    
+    // Debug logging
+    console.log(`[Backend] Team member ${id} availability response:`, {
+      hasAvailability: !!availability,
+      dailyAvailabilityCount: Object.keys(dailyAvailability).length,
+      dailyRemainingCount: Object.keys(dailyRemainingAvailability).length,
+      sampleDate: Object.keys(dailyAvailability)[0],
+      sampleData: Object.keys(dailyAvailability).length > 0 ? dailyAvailability[Object.keys(dailyAvailability)[0]] : null
+    });
     
     if (jobsError) {
       console.error('Error fetching scheduled jobs:', jobsError);
