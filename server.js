@@ -13212,22 +13212,94 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const payrollData = await Promise.all(
       (teamMembers || []).map(async (member) => {
         // Get jobs for this team member
-        // For hourly calculation: need jobs with start_time and end_time
-        // For commission calculation: need jobs with total (revenue)
-        let jobsQuery = supabase
+        // Check both direct team_member_id and job_team_assignments table
+        let allJobs = [];
+        
+        // Method 1: Get jobs with direct team_member_id
+        let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, total, status, service_name')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, total, total_amount, invoice_amount, price, status, service_name')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
         if (startDate) {
-          jobsQuery = jobsQuery.gte('scheduled_date', startDate);
+          directJobsQuery = directJobsQuery.gte('scheduled_date', startDate);
         }
         if (endDate) {
-          jobsQuery = jobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
+          directJobsQuery = directJobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
         }
 
-        const { data: jobs } = await jobsQuery;
+        const { data: directJobs, error: directJobsError } = await directJobsQuery;
+        
+        if (directJobsError) {
+          console.error(`Error fetching direct jobs for member ${member.id}:`, directJobsError);
+        } else {
+          allJobs = [...(directJobs || [])];
+        }
+        
+        // Method 2: Get jobs from job_team_assignments table
+        let assignmentsQuery = supabase
+          .from('job_team_assignments')
+          .select(`
+            jobs!inner(
+              id,
+              scheduled_date,
+              start_time,
+              end_time,
+              hours_worked,
+              total,
+              total_amount,
+              invoice_amount,
+              price,
+              status,
+              service_name,
+              user_id
+            )
+          `)
+          .eq('team_member_id', member.id);
+
+        if (startDate || endDate) {
+          // We'll filter by date after getting the jobs
+        }
+
+        const { data: assignments, error: assignmentsError } = await assignmentsQuery;
+        
+        if (assignmentsError) {
+          console.error(`Error fetching assigned jobs for member ${member.id}:`, assignmentsError);
+        } else if (assignments) {
+          // Extract jobs from assignments and filter by user_id and date
+          const assignedJobs = assignments
+            .map(assignment => assignment.jobs)
+            .filter(job => {
+              if (!job) return false;
+              if (job.user_id !== userId) return false;
+              
+              // Filter by date range if provided
+              if (startDate || endDate) {
+                const jobDate = new Date(job.scheduled_date);
+                if (startDate && jobDate < new Date(startDate)) return false;
+                if (endDate) {
+                  const endDateObj = new Date(endDate);
+                  endDateObj.setHours(23, 59, 59, 999);
+                  if (jobDate > endDateObj) return false;
+                }
+              }
+              
+              return true;
+            });
+          
+          // Merge with direct jobs, avoiding duplicates
+          const existingJobIds = new Set(allJobs.map(j => j.id));
+          assignedJobs.forEach(job => {
+            if (!existingJobIds.has(job.id)) {
+              allJobs.push(job);
+            }
+          });
+        }
+        
+        const jobs = allJobs;
+        
+        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
 
         // Calculate hourly-based salary
         let totalHours = 0;
@@ -13239,27 +13311,54 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           job.start_time && job.end_time
         );
         
+        console.log(`[Payroll] Member ${member.id}: ${jobsWithTimeTracking.length} jobs with time tracking`);
+        
         jobsWithTimeTracking.forEach(job => {
-          const hours = parseFloat(job.hours_worked) || 0;
+          // Use hours_worked if available, otherwise calculate from start_time and end_time
+          let hours = parseFloat(job.hours_worked) || 0;
+          
+          // If hours_worked is 0 or not set, calculate from start_time and end_time
+          if (hours === 0 && job.start_time && job.end_time) {
+            const start = new Date(job.start_time);
+            const end = new Date(job.end_time);
+            hours = (end - start) / (1000 * 60 * 60); // Convert milliseconds to hours
+          }
+          
           totalHours += hours;
+          console.log(`[Payroll] Job ${job.id}: ${hours.toFixed(2)} hours`);
         });
         
         hourlySalary = totalHours * hourlyRate;
+        console.log(`[Payroll] Member ${member.id}: Total hours = ${totalHours.toFixed(2)}, Hourly salary = ${hourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
         let commissionSalary = 0;
         const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
         
         // Filter jobs with revenue for commission calculation
-        const jobsWithRevenue = (jobs || []).filter(job => 
-          job.total && parseFloat(job.total) > 0
-        );
+        // Check multiple fields: total, total_amount, invoice_amount, price
+        const jobsWithRevenue = (jobs || []).filter(job => {
+          const revenue = parseFloat(job.total) || 
+                         parseFloat(job.total_amount) || 
+                         parseFloat(job.invoice_amount) || 
+                         parseFloat(job.price) || 0;
+          return revenue > 0;
+        });
+        
+        console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue, commission % = ${commissionPercentage}`);
         
         jobsWithRevenue.forEach(job => {
-          const jobTotal = parseFloat(job.total) || 0;
+          // Use the first available revenue field
+          const jobTotal = parseFloat(job.total) || 
+                          parseFloat(job.total_amount) || 
+                          parseFloat(job.invoice_amount) || 
+                          parseFloat(job.price) || 0;
           const commission = jobTotal * (commissionPercentage / 100);
           commissionSalary += commission;
+          console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue = $${commission.toFixed(2)} commission`);
         });
+        
+        console.log(`[Payroll] Member ${member.id}: Total commission = $${commissionSalary.toFixed(2)}`);
 
         // Total salary is sum of hourly + commission (hybrid model)
         const totalSalary = hourlySalary + commissionSalary;
