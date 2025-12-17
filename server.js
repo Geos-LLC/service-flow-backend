@@ -10742,6 +10742,185 @@ app.get('/api/analytics/customer-insights', async (req, res) => {
   }
 });
 
+// Get conversion analytics (Leads to Customers)
+app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, groupBy = 'day' } = req.query;
+
+    // Get all leads for this user
+    let leadsQuery = supabase
+      .from('leads')
+      .select('id, source, stage_id, converted_customer_id, converted_at, created_at, value')
+      .eq('user_id', userId);
+
+    if (startDate) {
+      leadsQuery = leadsQuery.gte('created_at', startDate);
+    }
+    if (endDate) {
+      leadsQuery = leadsQuery.lte('created_at', `${endDate} 23:59:59`);
+    }
+
+    const { data: allLeads, error: leadsError } = await leadsQuery;
+
+    if (leadsError) {
+      console.error('Error fetching leads:', leadsError);
+      return res.status(500).json({ error: 'Failed to fetch leads' });
+    }
+
+    // Get all pipelines for this user
+    const { data: pipelines, error: pipelinesError } = await supabase
+      .from('lead_pipelines')
+      .select('id')
+      .eq('user_id', userId);
+
+    const pipelineIds = (pipelines || []).map(p => p.id);
+
+    // Get all stages for context
+    let stagesQuery = supabase
+      .from('lead_stages')
+      .select('id, name, position');
+    
+    if (pipelineIds.length > 0) {
+      stagesQuery = stagesQuery.in('pipeline_id', pipelineIds);
+    }
+
+    const { data: stages, error: stagesError } = await stagesQuery;
+
+    const stageMap = {};
+    (stages || []).forEach(stage => {
+      stageMap[stage.id] = stage;
+    });
+
+    // Calculate conversion metrics
+    const totalLeads = (allLeads || []).length;
+    const convertedLeads = (allLeads || []).filter(lead => lead.converted_customer_id).length;
+    const conversionRate = totalLeads > 0 ? (convertedLeads / totalLeads * 100) : 0;
+
+    // Conversion by source
+    const conversionBySource = {};
+    (allLeads || []).forEach(lead => {
+      const source = lead.source || 'Unknown';
+      if (!conversionBySource[source]) {
+        conversionBySource[source] = {
+          total: 0,
+          converted: 0,
+          conversionRate: 0,
+          totalValue: 0,
+          convertedValue: 0
+        };
+      }
+      conversionBySource[source].total++;
+      if (lead.converted_customer_id) {
+        conversionBySource[source].converted++;
+        conversionBySource[source].convertedValue += parseFloat(lead.value || 0);
+      }
+      conversionBySource[source].totalValue += parseFloat(lead.value || 0);
+      conversionBySource[source].conversionRate = conversionBySource[source].total > 0 
+        ? (conversionBySource[source].converted / conversionBySource[source].total * 100) 
+        : 0;
+    });
+
+    // Conversion by stage
+    const conversionByStage = {};
+    (allLeads || []).forEach(lead => {
+      const stageId = lead.stage_id;
+      const stageName = stageMap[stageId]?.name || `Stage ${stageId}`;
+      if (!conversionByStage[stageName]) {
+        conversionByStage[stageName] = {
+          total: 0,
+          converted: 0,
+          conversionRate: 0
+        };
+      }
+      conversionByStage[stageName].total++;
+      if (lead.converted_customer_id) {
+        conversionByStage[stageName].converted++;
+      }
+      conversionByStage[stageName].conversionRate = conversionByStage[stageName].total > 0
+        ? (conversionByStage[stageName].converted / conversionByStage[stageName].total * 100)
+        : 0;
+    });
+
+    // Time series data for conversion trends
+    const timeSeriesData = {};
+    (allLeads || []).forEach(lead => {
+      if (!lead.created_at) return;
+      
+      let dateKey = lead.created_at.split('T')[0]; // Get YYYY-MM-DD
+
+      if (groupBy === 'week') {
+        const date = new Date(lead.created_at);
+        const weekStart = new Date(date);
+        weekStart.setDate(date.getDate() - date.getDay());
+        dateKey = weekStart.toISOString().split('T')[0];
+      } else if (groupBy === 'month') {
+        dateKey = lead.created_at.substring(0, 7); // YYYY-MM
+      }
+
+      if (!timeSeriesData[dateKey]) {
+        timeSeriesData[dateKey] = {
+          date: dateKey,
+          totalLeads: 0,
+          convertedLeads: 0,
+          conversionRate: 0
+        };
+      }
+
+      timeSeriesData[dateKey].totalLeads++;
+      if (lead.converted_customer_id) {
+        timeSeriesData[dateKey].convertedLeads++;
+      }
+      timeSeriesData[dateKey].conversionRate = timeSeriesData[dateKey].totalLeads > 0
+        ? (timeSeriesData[dateKey].convertedLeads / timeSeriesData[dateKey].totalLeads * 100)
+        : 0;
+    });
+
+    // Convert time series to array and sort
+    const timeSeries = Object.values(timeSeriesData).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Calculate average time to conversion
+    const convertedLeadsWithTime = (allLeads || []).filter(lead => 
+      lead.converted_customer_id && lead.converted_at && lead.created_at
+    );
+    
+    let avgTimeToConversion = 0;
+    if (convertedLeadsWithTime.length > 0) {
+      const totalDays = convertedLeadsWithTime.reduce((sum, lead) => {
+        const created = new Date(lead.created_at);
+        const converted = new Date(lead.converted_at);
+        const days = (converted - created) / (1000 * 60 * 60 * 24);
+        return sum + days;
+      }, 0);
+      avgTimeToConversion = totalDays / convertedLeadsWithTime.length;
+    }
+
+    // Total lead value
+    const totalLeadValue = (allLeads || []).reduce((sum, lead) => 
+      sum + parseFloat(lead.value || 0), 0
+    );
+    const convertedLeadValue = (allLeads || []).filter(lead => lead.converted_customer_id)
+      .reduce((sum, lead) => sum + parseFloat(lead.value || 0), 0);
+
+    res.json({
+      summary: {
+        totalLeads,
+        convertedLeads,
+        conversionRate: parseFloat(conversionRate.toFixed(2)),
+        avgTimeToConversion: parseFloat(avgTimeToConversion.toFixed(1)),
+        totalLeadValue: parseFloat(totalLeadValue.toFixed(2)),
+        convertedLeadValue: parseFloat(convertedLeadValue.toFixed(2))
+      },
+      bySource: conversionBySource,
+      byStage: conversionByStage,
+      timeSeries
+    });
+  } catch (error) {
+    console.error('Get conversion analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversion analytics' });
+  }
+});
+
 app.get('/api/analytics/service-performance', async (req, res) => {
   try {
     const { userId, startDate, endDate } = req.query;
