@@ -10742,6 +10742,206 @@ app.get('/api/analytics/customer-insights', async (req, res) => {
   }
 });
 
+// Get recurring conversion analytics (Customers to Recurring)
+app.get('/api/analytics/recurring-conversion', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, groupBy = 'day' } = req.query;
+
+    // Get all customers
+    const { data: allCustomers, error: customersError } = await supabase
+      .from('customers')
+      .select('id, first_name, last_name, created_at')
+      .eq('user_id', userId);
+
+    if (customersError) {
+      console.error('Error fetching customers:', customersError);
+      return res.status(500).json({ error: 'Failed to fetch customers' });
+    }
+
+    // Get all jobs for these customers
+    let jobsQuery = supabase
+      .from('jobs')
+      .select('id, customer_id, is_recurring, recurring_frequency, scheduled_date, total, total_amount, invoice_amount, price, created_at')
+      .eq('user_id', userId)
+      .in('customer_id', (allCustomers || []).map(c => c.id));
+
+    if (startDate) {
+      jobsQuery = jobsQuery.gte('created_at', startDate);
+    }
+    if (endDate) {
+      jobsQuery = jobsQuery.lte('created_at', `${endDate} 23:59:59`);
+    }
+
+    const { data: allJobs, error: jobsError } = await jobsQuery;
+
+    if (jobsError) {
+      console.error('Error fetching jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Analyze customers
+    const customerAnalysis = {};
+    (allCustomers || []).forEach(customer => {
+      customerAnalysis[customer.id] = {
+        customerId: customer.id,
+        name: `${customer.first_name} ${customer.last_name}`,
+        createdAt: customer.created_at,
+        hasOneTimeJobs: false,
+        hasRecurringJobs: false,
+        firstOneTimeJobDate: null,
+        firstRecurringJobDate: null,
+        oneTimeJobCount: 0,
+        recurringJobCount: 0,
+        oneTimeRevenue: 0,
+        recurringRevenue: 0,
+        convertedToRecurring: false,
+        conversionDate: null,
+        daysToConvert: null
+      };
+    });
+
+    // Process jobs
+    (allJobs || []).forEach(job => {
+      const analysis = customerAnalysis[job.customer_id];
+      if (!analysis) return;
+
+      const isRecurring = job.is_recurring === true || job.is_recurring === 1;
+      const jobDate = new Date(job.created_at || job.scheduled_date);
+      const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0);
+
+      if (isRecurring) {
+        analysis.hasRecurringJobs = true;
+        analysis.recurringJobCount++;
+        analysis.recurringRevenue += revenue;
+        
+        if (!analysis.firstRecurringJobDate || jobDate < new Date(analysis.firstRecurringJobDate)) {
+          analysis.firstRecurringJobDate = job.created_at || job.scheduled_date;
+        }
+      } else {
+        analysis.hasOneTimeJobs = true;
+        analysis.oneTimeJobCount++;
+        analysis.oneTimeRevenue += revenue;
+        
+        if (!analysis.firstOneTimeJobDate || jobDate < new Date(analysis.firstOneTimeJobDate)) {
+          analysis.firstOneTimeJobDate = job.created_at || job.scheduled_date;
+        }
+      }
+    });
+
+    // Determine conversions
+    Object.values(customerAnalysis).forEach(analysis => {
+      if (analysis.hasOneTimeJobs && analysis.hasRecurringJobs) {
+        // Customer converted from one-time to recurring
+        analysis.convertedToRecurring = true;
+        analysis.conversionDate = analysis.firstRecurringJobDate;
+        
+        if (analysis.firstOneTimeJobDate && analysis.firstRecurringJobDate) {
+          const oneTimeDate = new Date(analysis.firstOneTimeJobDate);
+          const recurringDate = new Date(analysis.firstRecurringJobDate);
+          analysis.daysToConvert = Math.floor((recurringDate - oneTimeDate) / (1000 * 60 * 60 * 24));
+        }
+      }
+    });
+
+    // Calculate summary metrics
+    const totalCustomers = Object.keys(customerAnalysis).length;
+    const oneTimeOnlyCustomers = Object.values(customerAnalysis).filter(c => c.hasOneTimeJobs && !c.hasRecurringJobs).length;
+    const recurringOnlyCustomers = Object.values(customerAnalysis).filter(c => !c.hasOneTimeJobs && c.hasRecurringJobs).length;
+    const convertedCustomers = Object.values(customerAnalysis).filter(c => c.convertedToRecurring).length;
+    const customersWithOneTimeJobs = Object.values(customerAnalysis).filter(c => c.hasOneTimeJobs).length;
+    const conversionRate = customersWithOneTimeJobs > 0 ? (convertedCustomers / customersWithOneTimeJobs * 100) : 0;
+
+    // Calculate average time to convert
+    const convertedCustomersWithTime = Object.values(customerAnalysis).filter(c => c.convertedToRecurring && c.daysToConvert !== null);
+    const avgDaysToConvert = convertedCustomersWithTime.length > 0
+      ? convertedCustomersWithTime.reduce((sum, c) => sum + c.daysToConvert, 0) / convertedCustomersWithTime.length
+      : 0;
+
+    // Revenue analysis
+    const totalOneTimeRevenue = Object.values(customerAnalysis).reduce((sum, c) => sum + c.oneTimeRevenue, 0);
+    const totalRecurringRevenue = Object.values(customerAnalysis).reduce((sum, c) => sum + c.recurringRevenue, 0);
+    const convertedCustomerRevenue = Object.values(customerAnalysis)
+      .filter(c => c.convertedToRecurring)
+      .reduce((sum, c) => sum + c.recurringRevenue, 0);
+
+    // Time series data
+    const timeSeriesData = {};
+    Object.values(customerAnalysis).forEach(analysis => {
+      if (analysis.convertedToRecurring && analysis.conversionDate) {
+        let dateKey = analysis.conversionDate.split('T')[0];
+
+        if (groupBy === 'week') {
+          const date = new Date(analysis.conversionDate);
+          const weekStart = new Date(date);
+          weekStart.setDate(date.getDate() - date.getDay());
+          dateKey = weekStart.toISOString().split('T')[0];
+        } else if (groupBy === 'month') {
+          dateKey = analysis.conversionDate.substring(0, 7);
+        }
+
+        if (!timeSeriesData[dateKey]) {
+          timeSeriesData[dateKey] = {
+            date: dateKey,
+            conversions: 0,
+            revenue: 0
+          };
+        }
+
+        timeSeriesData[dateKey].conversions++;
+        timeSeriesData[dateKey].revenue += analysis.recurringRevenue;
+      }
+    });
+
+    const timeSeries = Object.values(timeSeriesData).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Breakdown by recurring frequency
+    const frequencyBreakdown = {};
+    (allJobs || []).forEach(job => {
+      if (job.is_recurring && job.recurring_frequency) {
+        const freq = job.recurring_frequency;
+        if (!frequencyBreakdown[freq]) {
+          frequencyBreakdown[freq] = {
+            frequency: freq,
+            customerCount: new Set(),
+            jobCount: 0,
+            revenue: 0
+          };
+        }
+        frequencyBreakdown[freq].customerCount.add(job.customer_id);
+        frequencyBreakdown[freq].jobCount++;
+        frequencyBreakdown[freq].revenue += parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0);
+      }
+    });
+
+    // Convert Sets to counts
+    Object.keys(frequencyBreakdown).forEach(freq => {
+      frequencyBreakdown[freq].customerCount = frequencyBreakdown[freq].customerCount.size;
+    });
+
+    res.json({
+      summary: {
+        totalCustomers,
+        oneTimeOnlyCustomers,
+        recurringOnlyCustomers,
+        convertedCustomers,
+        customersWithOneTimeJobs,
+        conversionRate: parseFloat(conversionRate.toFixed(2)),
+        avgDaysToConvert: parseFloat(avgDaysToConvert.toFixed(1)),
+        totalOneTimeRevenue: parseFloat(totalOneTimeRevenue.toFixed(2)),
+        totalRecurringRevenue: parseFloat(totalRecurringRevenue.toFixed(2)),
+        convertedCustomerRevenue: parseFloat(convertedCustomerRevenue.toFixed(2))
+      },
+      byFrequency: frequencyBreakdown,
+      timeSeries,
+      customerBreakdown: Object.values(customerAnalysis).filter(c => c.hasOneTimeJobs || c.hasRecurringJobs)
+    });
+  } catch (error) {
+    console.error('Get recurring conversion analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch recurring conversion analytics' });
+  }
+});
+
 // Get conversion analytics (Leads to Customers)
 app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
   try {
