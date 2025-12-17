@@ -13770,12 +13770,19 @@ app.get('/api/user/staff-locations-setting', authenticateToken, async (req, res)
     
     const { data: user, error } = await supabase
       .from('users')
-      .select('staff_locations_enabled')
+      .select('staff_locations_enabled, role')
       .eq('id', userId)
       .single();
     
     if (error) {
       console.error('Error fetching staff locations setting:', error);
+      // If column doesn't exist yet, return default (enabled)
+      if (error.code === '42703' || error.message?.includes('column') || error.message?.includes('does not exist')) {
+        console.log('Column staff_locations_enabled does not exist yet, returning default (enabled)');
+        return res.json({ 
+          staff_locations_enabled: true // Default to enabled
+        });
+      }
       return res.status(500).json({ error: 'Failed to fetch setting' });
     }
     
@@ -13819,6 +13826,12 @@ app.put('/api/user/staff-locations-setting', authenticateToken, async (req, res)
     
     if (updateError) {
       console.error('Error updating staff locations setting:', updateError);
+      // If column doesn't exist yet, return helpful error
+      if (updateError.code === '42703' || updateError.message?.includes('column') || updateError.message?.includes('does not exist')) {
+        return res.status(400).json({ 
+          error: 'Database column not found. Please run the migration: server/staff-locations-global-hide-migration.sql'
+        });
+      }
       return res.status(500).json({ error: 'Failed to update setting' });
     }
     
