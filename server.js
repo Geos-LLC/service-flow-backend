@@ -13673,6 +13673,251 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
   }
 });
 
+// Get salary analytics with time-series data
+app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, groupBy = 'day' } = req.query;
+
+    // Calculate date range
+    let dateFilter = {};
+    if (startDate) {
+      dateFilter.gte = startDate;
+    }
+    if (endDate) {
+      dateFilter.lte = `${endDate} 23:59:59`;
+    }
+
+    // Get all active team members
+    const { data: teamMembers, error: membersError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, hourly_rate, commission_percentage, status')
+      .eq('user_id', userId)
+      .eq('status', 'active');
+
+    if (membersError) {
+      console.error('Error fetching team members:', membersError);
+      return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    // Get all jobs in the date range
+    let jobsQuery = supabase
+      .from('jobs')
+      .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, team_member_id')
+      .eq('user_id', userId);
+
+    if (startDate) {
+      jobsQuery = jobsQuery.gte('scheduled_date', startDate);
+    }
+    if (endDate) {
+      jobsQuery = jobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
+    }
+
+    const { data: allJobs, error: jobsError } = await jobsQuery;
+
+    if (jobsError) {
+      console.error('Error fetching jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Also get jobs from job_team_assignments
+    let assignmentsQuery = supabase
+      .from('job_team_assignments')
+      .select(`
+        team_member_id,
+        jobs!inner(
+          id,
+          scheduled_date,
+          start_time,
+          end_time,
+          hours_worked,
+          duration,
+          estimated_duration,
+          total,
+          total_amount,
+          invoice_amount,
+          price,
+          status,
+          user_id
+        )
+      `);
+
+    if (startDate || endDate) {
+      // Filter will be applied after fetching
+    }
+
+    const { data: assignments, error: assignmentsError } = await assignmentsQuery;
+
+    // Combine jobs from both sources
+    const jobsByMember = {};
+    const memberMap = {};
+
+    (teamMembers || []).forEach(member => {
+      memberMap[member.id] = member;
+      jobsByMember[member.id] = [];
+    });
+
+    // Add direct jobs
+    (allJobs || []).forEach(job => {
+      if (job.team_member_id && jobsByMember[job.team_member_id]) {
+        jobsByMember[job.team_member_id].push(job);
+      }
+    });
+
+    // Add jobs from assignments
+    (assignments || []).forEach(assignment => {
+      const job = assignment.jobs;
+      const memberId = assignment.team_member_id;
+      if (job && job.user_id === userId && jobsByMember[memberId]) {
+        // Check if job is already added (avoid duplicates)
+        if (!jobsByMember[memberId].find(j => j.id === job.id)) {
+          jobsByMember[memberId].push(job);
+        }
+      }
+    });
+
+    // Filter jobs by date range if needed
+    if (startDate || endDate) {
+      Object.keys(jobsByMember).forEach(memberId => {
+        jobsByMember[memberId] = jobsByMember[memberId].filter(job => {
+          if (!job.scheduled_date) return false;
+          const jobDate = new Date(job.scheduled_date);
+          if (startDate && jobDate < new Date(startDate)) return false;
+          if (endDate && jobDate > new Date(`${endDate} 23:59:59`)) return false;
+          return true;
+        });
+      });
+    }
+
+    // Calculate payroll for each member and group by date
+    const timeSeriesData = {};
+    const memberBreakdown = [];
+
+    Object.keys(jobsByMember).forEach(memberId => {
+      const member = memberMap[memberId];
+      const jobs = jobsByMember[memberId];
+
+      let totalHours = 0;
+      let totalHourlySalary = 0;
+      let totalCommission = 0;
+      let hourlyJobs = 0;
+      let commissionJobs = 0;
+
+      jobs.forEach(job => {
+        // Calculate hours
+        let hours = 0;
+        if (job.hours_worked && job.hours_worked > 0) {
+          hours = parseFloat(job.hours_worked);
+        } else if (job.start_time && job.end_time) {
+          const start = new Date(`${job.scheduled_date} ${job.start_time}`);
+          const end = new Date(`${job.scheduled_date} ${job.end_time}`);
+          hours = (end - start) / (1000 * 60 * 60);
+        } else if (job.duration) {
+          hours = parseFloat(job.duration) / 60;
+        } else if (job.estimated_duration) {
+          hours = parseFloat(job.estimated_duration) / 60;
+        }
+
+        // Get revenue
+        const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0);
+
+        // Calculate hourly salary
+        if (member.hourly_rate && hours > 0) {
+          const hourlySalary = hours * parseFloat(member.hourly_rate);
+          totalHourlySalary += hourlySalary;
+          totalHours += hours;
+          hourlyJobs++;
+        }
+
+        // Calculate commission
+        if (member.commission_percentage && revenue > 0) {
+          const commission = revenue * (parseFloat(member.commission_percentage) / 100);
+          totalCommission += commission;
+          commissionJobs++;
+        }
+
+        // Group by date for time series
+        if (job.scheduled_date) {
+          let dateKey = job.scheduled_date.split('T')[0]; // Get YYYY-MM-DD
+
+          if (groupBy === 'week') {
+            const date = new Date(job.scheduled_date);
+            const weekStart = new Date(date);
+            weekStart.setDate(date.getDate() - date.getDay());
+            dateKey = weekStart.toISOString().split('T')[0];
+          } else if (groupBy === 'month') {
+            dateKey = job.scheduled_date.substring(0, 7); // YYYY-MM
+          }
+
+          if (!timeSeriesData[dateKey]) {
+            timeSeriesData[dateKey] = {
+              date: dateKey,
+              totalPayroll: 0,
+              hourlyPayroll: 0,
+              commissionPayroll: 0,
+              memberCount: 0
+            };
+          }
+
+          // Add to time series
+          if (member.hourly_rate && hours > 0) {
+            const hourlySalary = hours * parseFloat(member.hourly_rate);
+            timeSeriesData[dateKey].hourlyPayroll += hourlySalary;
+            timeSeriesData[dateKey].totalPayroll += hourlySalary;
+          }
+          if (member.commission_percentage && revenue > 0) {
+            const commission = revenue * (parseFloat(member.commission_percentage) / 100);
+            timeSeriesData[dateKey].commissionPayroll += commission;
+            timeSeriesData[dateKey].totalPayroll += commission;
+          }
+        }
+      });
+
+      memberBreakdown.push({
+        memberId: member.id,
+        name: `${member.first_name} ${member.last_name}`,
+        hourlyRate: member.hourly_rate || 0,
+        commissionPercentage: member.commission_percentage || 0,
+        totalHours: parseFloat(totalHours.toFixed(2)),
+        totalHourlySalary: parseFloat(totalHourlySalary.toFixed(2)),
+        totalCommission: parseFloat(totalCommission.toFixed(2)),
+        totalSalary: parseFloat((totalHourlySalary + totalCommission).toFixed(2)),
+        jobCount: jobs.length,
+        hourlyJobs,
+        commissionJobs,
+        paymentMethod: member.hourly_rate && member.commission_percentage ? 'hybrid' :
+                      member.hourly_rate ? 'hourly' :
+                      member.commission_percentage ? 'commission' : 'none'
+      });
+    });
+
+    // Convert time series to array and sort
+    const timeSeries = Object.values(timeSeriesData).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Calculate summary
+    const totalPayroll = memberBreakdown.reduce((sum, m) => sum + m.totalSalary, 0);
+    const totalHourlyPayroll = memberBreakdown.reduce((sum, m) => sum + m.totalHourlySalary, 0);
+    const totalCommissionPayroll = memberBreakdown.reduce((sum, m) => sum + m.totalCommission, 0);
+
+    res.json({
+      timeSeries,
+      memberBreakdown,
+      summary: {
+        totalPayroll: parseFloat(totalPayroll.toFixed(2)),
+        totalHourlyPayroll: parseFloat(totalHourlyPayroll.toFixed(2)),
+        totalCommissionPayroll: parseFloat(totalCommissionPayroll.toFixed(2)),
+        memberCount: memberBreakdown.length,
+        hourlyOnlyCount: memberBreakdown.filter(m => m.paymentMethod === 'hourly').length,
+        commissionOnlyCount: memberBreakdown.filter(m => m.paymentMethod === 'commission').length,
+        hybridCount: memberBreakdown.filter(m => m.paymentMethod === 'hybrid').length
+      }
+    });
+  } catch (error) {
+    console.error('Get salary analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch salary analytics' });
+  }
+});
+
 app.put('/api/team-members/:id/availability', async (req, res) => {
   try {
     const { id } = req.params;
