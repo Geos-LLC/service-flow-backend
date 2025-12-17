@@ -809,6 +809,7 @@ const publicRoutes = [
   '/api/user/profile-picture',
   '/api/user/billing',
   '/api/user/payment-settings',
+  '/api/user/staff-locations-setting',
   '/api/user/payment-methods',
   '/api/user/payment-methods/:id',
   '/api/user/payment-processor/setup',
@@ -860,6 +861,7 @@ app.options('/api/user/email', (req, res) => res.status(204).send());
 app.options('/api/user/profile-picture', (req, res) => res.status(204).send());
 app.options('/api/user/billing', (req, res) => res.status(204).send());
 app.options('/api/user/payment-settings', (req, res) => res.status(204).send());
+app.options('/api/user/staff-locations-setting', (req, res) => res.status(204).send());
 app.options('/api/user/payment-methods', (req, res) => res.status(204).send());
 app.options('/api/user/payment-methods/:id', (req, res) => res.status(204).send());
 app.options('/api/user/payment-processor/setup', (req, res) => res.status(204).send());
@@ -4796,6 +4798,169 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
   } catch (error) {
     console.error('Convert to recurring error:', error);
     res.status(500).json({ error: 'Failed to convert job to recurring' });
+  }
+});
+
+// Duplicate job endpoint
+app.post('/api/jobs/:id/duplicate', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { isRecurring, frequency, endDate, monthsAhead = 3 } = req.body;
+    
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (checkError || !existingJob) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    // Helper function to calculate next date based on frequency
+    const calculateNextDate = (freq, fromDate) => {
+      const date = new Date(fromDate);
+      switch (freq) {
+        case 'daily':
+          date.setDate(date.getDate() + 1);
+          break;
+        case 'weekly':
+          date.setDate(date.getDate() + 7);
+          break;
+        case 'biweekly':
+          date.setDate(date.getDate() + 14);
+          break;
+        case 'monthly':
+          date.setMonth(date.getMonth() + 1);
+          break;
+        case 'quarterly':
+          date.setMonth(date.getMonth() + 3);
+          break;
+        default:
+          date.setDate(date.getDate() + 7); // Default to weekly
+      }
+      return date;
+    };
+    
+    // Create duplicate job data (excluding id and timestamps)
+    const duplicateJobData = {
+      user_id: existingJob.user_id,
+      customer_id: existingJob.customer_id,
+      service_id: existingJob.service_id,
+      team_member_id: existingJob.team_member_id,
+      scheduled_date: existingJob.scheduled_date,
+      notes: existingJob.notes,
+      status: 'pending', // New job starts as pending
+      duration: existingJob.duration,
+      estimated_duration: existingJob.estimated_duration,
+      workers_needed: existingJob.workers_needed || existingJob.workers,
+      skills_required: existingJob.skills_required,
+      price: existingJob.price,
+      service_price: existingJob.service_price,
+      discount: existingJob.discount || 0,
+      additional_fees: existingJob.additional_fees || 0,
+      taxes: existingJob.taxes || 0,
+      total: existingJob.total || existingJob.total_amount,
+      total_amount: existingJob.total_amount || existingJob.total,
+      payment_method: existingJob.payment_method,
+      territory_id: existingJob.territory_id,
+      service_address_street: existingJob.service_address_street,
+      service_address_city: existingJob.service_address_city,
+      service_address_state: existingJob.service_address_state,
+      service_address_zip: existingJob.service_address_zip,
+      service_address_country: existingJob.service_address_country,
+      service_address_unit: existingJob.service_address_unit,
+      service_name: existingJob.service_name,
+      service_modifiers: existingJob.service_modifiers,
+      service_intake_questions: existingJob.service_intake_questions,
+      invoice_status: 'draft',
+      payment_status: 'pending',
+      is_recurring: isRecurring || false,
+      recurring_frequency: isRecurring ? frequency : null,
+      recurring_end_date: isRecurring && endDate ? endDate : null,
+      offer_to_providers: existingJob.offer_to_providers || false
+    };
+    
+    // Calculate next billing date if recurring
+    if (isRecurring && frequency) {
+      const scheduledDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
+      const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
+      if (nextBillingDate) {
+        duplicateJobData.next_billing_date = nextBillingDate.toISOString().split('T')[0];
+      }
+    }
+    
+    // Create the first duplicate job
+    const { data: newJob, error: insertError } = await supabase
+      .from('jobs')
+      .insert(duplicateJobData)
+      .select()
+      .single();
+    
+    if (insertError) {
+      console.error('Error creating duplicate job:', insertError);
+      return res.status(500).json({ error: 'Failed to duplicate job' });
+    }
+    
+    // If recurring, create jobs lazily (a few months ahead)
+    if (isRecurring && frequency) {
+      const jobsToCreate = [];
+      const startDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
+      const endDateObj = endDate ? new Date(endDate) : null;
+      const monthsAheadDate = new Date(startDate);
+      monthsAheadDate.setMonth(monthsAheadDate.getMonth() + monthsAhead);
+      const createUntil = endDateObj && endDateObj < monthsAheadDate ? endDateObj : monthsAheadDate;
+      
+      let currentDate = calculateNextDate(frequency, startDate);
+      let jobCount = 0;
+      const maxJobs = 100; // Safety limit
+      
+      while (currentDate <= createUntil && jobCount < maxJobs) {
+        // Skip if past end date
+        if (endDateObj && currentDate > endDateObj) {
+          break;
+        }
+        
+        const recurringJobData = {
+          ...duplicateJobData,
+          scheduled_date: currentDate.toISOString(),
+          next_billing_date: calculateNextRecurringDate(frequency, currentDate)?.toISOString().split('T')[0] || null
+        };
+        
+        jobsToCreate.push(recurringJobData);
+        currentDate = calculateNextDate(frequency, currentDate);
+        jobCount++;
+      }
+      
+      // Insert all recurring jobs
+      if (jobsToCreate.length > 0) {
+        const { data: createdJobs, error: bulkInsertError } = await supabase
+          .from('jobs')
+          .insert(jobsToCreate)
+          .select();
+        
+        if (bulkInsertError) {
+          console.error('Error creating recurring jobs:', bulkInsertError);
+          // Don't fail the request, just log the error
+        } else {
+          console.log(`✅ Created ${createdJobs?.length || 0} recurring jobs`);
+        }
+      }
+    }
+    
+    res.json({
+      message: isRecurring 
+        ? `Job duplicated and set as recurring. Created jobs ${monthsAhead} months ahead.` 
+        : 'Job duplicated successfully',
+      job: newJob,
+      isRecurring: isRecurring
+    });
+  } catch (error) {
+    console.error('Duplicate job error:', error);
+    res.status(500).json({ error: 'Failed to duplicate job' });
   }
 });
 
@@ -13598,11 +13763,100 @@ app.post('/api/staff-locations', authenticateToken, async (req, res) => {
   }
 });
 
+// Get/Update global staff locations setting (admin only)
+app.get('/api/user/staff-locations-setting', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('staff_locations_enabled')
+      .eq('id', userId)
+      .single();
+    
+    if (error) {
+      console.error('Error fetching staff locations setting:', error);
+      return res.status(500).json({ error: 'Failed to fetch setting' });
+    }
+    
+    res.json({ 
+      staff_locations_enabled: user?.staff_locations_enabled !== false // Default to true
+    });
+  } catch (error) {
+    console.error('Get staff locations setting error:', error);
+    res.status(500).json({ error: 'Failed to fetch setting' });
+  }
+});
+
+app.put('/api/user/staff-locations-setting', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { staff_locations_enabled } = req.body;
+    
+    // Check if user is account owner/admin
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', userId)
+      .single();
+    
+    if (userError || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Only account owners can change this setting
+    const normalizedRole = (user.role || '').toLowerCase();
+    if (normalizedRole !== 'owner' && normalizedRole !== 'account owner' && normalizedRole !== 'admin') {
+      return res.status(403).json({ error: 'Only account owners can change this setting' });
+    }
+    
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update({ staff_locations_enabled: staff_locations_enabled !== false })
+      .eq('id', userId)
+      .select()
+      .single();
+    
+    if (updateError) {
+      console.error('Error updating staff locations setting:', updateError);
+      return res.status(500).json({ error: 'Failed to update setting' });
+    }
+    
+    res.json({ 
+      message: 'Setting updated successfully',
+      staff_locations_enabled: updatedUser.staff_locations_enabled
+    });
+  } catch (error) {
+    console.error('Update staff locations setting error:', error);
+    res.status(500).json({ error: 'Failed to update setting' });
+  }
+});
+
 // Get current staff locations (GET /api/staff-locations)
 app.get('/api/staff-locations', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { teamMemberId } = req.query;
+
+    // Check global setting first
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('staff_locations_enabled')
+      .eq('id', userId)
+      .single();
+    
+    if (userError || !user) {
+      return res.status(500).json({ error: 'Failed to check settings' });
+    }
+    
+    // If globally disabled, return empty
+    if (user.staff_locations_enabled === false) {
+      return res.json({
+        locations: [],
+        count: 0,
+        globallyHidden: true
+      });
+    }
 
     // Build query - get latest location for each team member
     let query = supabase
