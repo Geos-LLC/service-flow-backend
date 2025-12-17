@@ -13770,7 +13770,7 @@ app.get('/api/user/staff-locations-setting', authenticateToken, async (req, res)
     
     const { data: user, error } = await supabase
       .from('users')
-      .select('staff_locations_enabled, role')
+      .select('staff_locations_enabled')
       .eq('id', userId)
       .single();
     
@@ -13800,28 +13800,12 @@ app.put('/api/user/staff-locations-setting', authenticateToken, async (req, res)
     const userId = req.user.userId;
     const { staff_locations_enabled } = req.body;
     
-    // Check if user is account owner/admin
-    const { data: user, error: userError } = await supabase
-      .from('users')
-      .select('role')
-      .eq('id', userId)
-      .single();
-    
-    if (userError || !user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Only account owners can change this setting
-    const normalizedRole = (user.role || '').toLowerCase();
-    if (normalizedRole !== 'owner' && normalizedRole !== 'account owner' && normalizedRole !== 'admin') {
-      return res.status(403).json({ error: 'Only account owners can change this setting' });
-    }
-    
+    // Update the setting for this user's account (no role check needed)
     const { data: updatedUser, error: updateError } = await supabase
       .from('users')
       .update({ staff_locations_enabled: staff_locations_enabled !== false })
       .eq('id', userId)
-      .select()
+      .select('staff_locations_enabled')
       .single();
     
     if (updateError) {
@@ -13837,7 +13821,7 @@ app.put('/api/user/staff-locations-setting', authenticateToken, async (req, res)
     
     res.json({ 
       message: 'Setting updated successfully',
-      staff_locations_enabled: updatedUser.staff_locations_enabled
+      staff_locations_enabled: updatedUser?.staff_locations_enabled !== false
     });
   } catch (error) {
     console.error('Update staff locations setting error:', error);
