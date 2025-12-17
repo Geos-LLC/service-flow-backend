@@ -10742,6 +10742,183 @@ app.get('/api/analytics/customer-insights', async (req, res) => {
   }
 });
 
+// Get lost customers analytics
+app.get('/api/analytics/lost-customers', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, groupBy = 'day', inactiveDays = 90 } = req.query;
+
+    const inactiveDaysThreshold = parseInt(inactiveDays) || 90;
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - inactiveDaysThreshold);
+    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+
+    // Get all customers
+    const { data: allCustomers, error: customersError } = await supabase
+      .from('customers')
+      .select('id, first_name, last_name, email, phone, created_at, status')
+      .eq('user_id', userId);
+
+    if (customersError) {
+      console.error('Error fetching customers:', customersError);
+      return res.status(500).json({ error: 'Failed to fetch customers' });
+    }
+
+    // Get all jobs for these customers
+    let jobsQuery = supabase
+      .from('jobs')
+      .select('id, customer_id, scheduled_date, created_at, status, total, total_amount, invoice_amount, price')
+      .eq('user_id', userId)
+      .in('customer_id', (allCustomers || []).map(c => c.id));
+
+    if (startDate) {
+      jobsQuery = jobsQuery.gte('created_at', startDate);
+    }
+    if (endDate) {
+      jobsQuery = jobsQuery.lte('created_at', `${endDate} 23:59:59`);
+    }
+
+    const { data: allJobs, error: jobsError } = await jobsQuery;
+
+    if (jobsError) {
+      console.error('Error fetching jobs:', jobsError);
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Analyze customers
+    const customerAnalysis = {};
+    (allCustomers || []).forEach(customer => {
+      customerAnalysis[customer.id] = {
+        customerId: customer.id,
+        name: `${customer.first_name} ${customer.last_name}`,
+        email: customer.email,
+        phone: customer.phone,
+        createdAt: customer.created_at,
+        status: customer.status,
+        totalJobs: 0,
+        lastJobDate: null,
+        lastJobId: null,
+        totalRevenue: 0,
+        isLost: false,
+        daysSinceLastJob: null,
+        wasActive: false
+      };
+    });
+
+    // Process jobs
+    (allJobs || []).forEach(job => {
+      const analysis = customerAnalysis[job.customer_id];
+      if (!analysis) return;
+
+      analysis.totalJobs++;
+      analysis.wasActive = true;
+      
+      const jobDate = new Date(job.scheduled_date || job.created_at);
+      const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0);
+      analysis.totalRevenue += revenue;
+
+      if (!analysis.lastJobDate || jobDate > new Date(analysis.lastJobDate)) {
+        analysis.lastJobDate = job.scheduled_date || job.created_at;
+        analysis.lastJobId = job.id;
+      }
+    });
+
+    // Identify lost customers
+    const now = new Date();
+    Object.values(customerAnalysis).forEach(analysis => {
+      if (analysis.lastJobDate) {
+        const lastJobDate = new Date(analysis.lastJobDate);
+        analysis.daysSinceLastJob = Math.floor((now - lastJobDate) / (1000 * 60 * 60 * 24));
+        
+        // Customer is lost if they had jobs before but haven't had any in the threshold period
+        if (analysis.wasActive && analysis.daysSinceLastJob >= inactiveDaysThreshold) {
+          analysis.isLost = true;
+        }
+      } else if (analysis.wasActive) {
+        // Customer was created but never had a job (edge case)
+        const createdDate = new Date(analysis.createdAt);
+        const daysSinceCreated = Math.floor((now - createdDate) / (1000 * 60 * 60 * 24));
+        if (daysSinceCreated >= inactiveDaysThreshold) {
+          analysis.isLost = true;
+          analysis.daysSinceLastJob = daysSinceCreated;
+        }
+      }
+    });
+
+    // Calculate summary metrics
+    const totalCustomers = Object.keys(customerAnalysis).length;
+    const activeCustomers = Object.values(customerAnalysis).filter(c => c.wasActive && !c.isLost).length;
+    const lostCustomers = Object.values(customerAnalysis).filter(c => c.isLost).length;
+    const neverActiveCustomers = Object.values(customerAnalysis).filter(c => !c.wasActive).length;
+    const churnRate = activeCustomers + lostCustomers > 0 ? (lostCustomers / (activeCustomers + lostCustomers) * 100) : 0;
+
+    // Revenue lost from churn
+    const lostRevenue = Object.values(customerAnalysis)
+      .filter(c => c.isLost)
+      .reduce((sum, c) => sum + c.totalRevenue, 0);
+
+    // Average days since last job for lost customers
+    const lostCustomersWithData = Object.values(customerAnalysis).filter(c => c.isLost && c.daysSinceLastJob !== null);
+    const avgDaysSinceLastJob = lostCustomersWithData.length > 0
+      ? lostCustomersWithData.reduce((sum, c) => sum + c.daysSinceLastJob, 0) / lostCustomersWithData.length
+      : 0;
+
+    // Time series data for churn trends
+    const timeSeriesData = {};
+    Object.values(customerAnalysis).forEach(analysis => {
+      if (analysis.isLost && analysis.lastJobDate) {
+        let dateKey = analysis.lastJobDate.split('T')[0];
+
+        if (groupBy === 'week') {
+          const date = new Date(analysis.lastJobDate);
+          const weekStart = new Date(date);
+          weekStart.setDate(date.getDate() - date.getDay());
+          dateKey = weekStart.toISOString().split('T')[0];
+        } else if (groupBy === 'month') {
+          dateKey = analysis.lastJobDate.substring(0, 7);
+        }
+
+        if (!timeSeriesData[dateKey]) {
+          timeSeriesData[dateKey] = {
+            date: dateKey,
+            lostCustomers: 0,
+            lostRevenue: 0
+          };
+        }
+
+        timeSeriesData[dateKey].lostCustomers++;
+        timeSeriesData[dateKey].lostRevenue += analysis.totalRevenue;
+      }
+    });
+
+    const timeSeries = Object.values(timeSeriesData).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Lost customers list (sorted by days since last job)
+    const lostCustomersList = Object.values(customerAnalysis)
+      .filter(c => c.isLost)
+      .sort((a, b) => (b.daysSinceLastJob || 0) - (a.daysSinceLastJob || 0))
+      .slice(0, 50); // Limit to top 50
+
+    res.json({
+      summary: {
+        totalCustomers,
+        activeCustomers,
+        lostCustomers,
+        neverActiveCustomers,
+        churnRate: parseFloat(churnRate.toFixed(2)),
+        lostRevenue: parseFloat(lostRevenue.toFixed(2)),
+        avgDaysSinceLastJob: parseFloat(avgDaysSinceLastJob.toFixed(1)),
+        inactiveDaysThreshold
+      },
+      timeSeries,
+      lostCustomersList
+    });
+  } catch (error) {
+    console.error('Get lost customers analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch lost customers analytics' });
+  }
+});
+
 // Get recurring conversion analytics (Customers to Recurring)
 app.get('/api/analytics/recurring-conversion', authenticateToken, async (req, res) => {
   try {
