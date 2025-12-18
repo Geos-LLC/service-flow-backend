@@ -24128,23 +24128,25 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       .single();
 
     if (error) {
-      // If column doesn't exist, return defaults
+      // If column doesn't exist, return defaults with migration notice
       if (error.code === '42703' || error.message?.includes('does not exist')) {
         console.log('Calendar settings columns not found, returning defaults');
         return res.json({
           enabled: false,
           calendarId: 'primary',
-          connected: false
+          connected: false,
+          migrationRequired: true
         });
       }
       console.error('Error fetching calendar settings:', error);
-      return res.status(500).json({ error: 'Failed to fetch calendar settings' });
+      return res.status(500).json({ error: 'Failed to fetch calendar settings: ' + error.message });
     }
 
     res.json({
-      enabled: userData?.google_calendar_enabled || false,
+      enabled: userData?.google_calendar_enabled !== undefined ? userData.google_calendar_enabled : false,
       calendarId: userData?.google_calendar_id || 'primary',
-      connected: !!userData?.google_access_token
+      connected: !!userData?.google_access_token,
+      migrationRequired: false
     });
   } catch (error) {
     console.error('Get calendar settings error:', error);
@@ -24152,7 +24154,8 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
     res.json({
       enabled: false,
       calendarId: 'primary',
-      connected: false
+      connected: false,
+      migrationRequired: true
     });
   }
 });
@@ -24162,6 +24165,21 @@ app.put('/api/calendar/settings', authenticateToken, async (req, res) => {
   try {
     const { enabled, calendarId } = req.body;
 
+    // First, check if columns exist by trying to select them
+    const { error: checkError } = await supabase
+      .from('users')
+      .select('google_calendar_enabled')
+      .eq('id', req.user.userId)
+      .limit(1);
+
+    if (checkError && (checkError.code === '42703' || checkError.message?.includes('does not exist'))) {
+      console.error('Calendar settings columns not found. Migration required.');
+      return res.status(400).json({ 
+        error: 'Database migration required. Please run the migration SQL file (google-calendar-sync-migration.sql) to enable calendar sync settings.',
+        migrationRequired: true
+      });
+    }
+
     const updateData = {};
     if (enabled !== undefined) {
       updateData.google_calendar_enabled = enabled;
@@ -24170,25 +24188,28 @@ app.put('/api/calendar/settings', authenticateToken, async (req, res) => {
       updateData.google_calendar_id = calendarId;
     }
 
-    const { error } = await supabase
+    const { data: updatedData, error } = await supabase
       .from('users')
       .update(updateData)
-      .eq('id', req.user.userId);
+      .eq('id', req.user.userId)
+      .select('google_calendar_enabled, google_calendar_id')
+      .single();
 
     if (error) {
-      // If column doesn't exist, inform user to run migration
-      if (error.code === '42703' || error.message?.includes('does not exist')) {
-        console.error('Calendar settings columns not found. Please run migration:', error);
-        return res.status(400).json({ 
-          error: 'Calendar settings columns not found. Please run the database migration first.',
-          migrationRequired: true
-        });
-      }
       console.error('Error updating calendar settings:', error);
-      return res.status(500).json({ error: 'Failed to update calendar settings' });
+      return res.status(500).json({ error: 'Failed to update calendar settings: ' + error.message });
     }
 
-    res.json({ success: true, message: 'Calendar settings updated' });
+    console.log('✅ Calendar settings updated:', updatedData);
+
+    res.json({ 
+      success: true, 
+      message: 'Calendar settings updated',
+      settings: {
+        enabled: updatedData?.google_calendar_enabled || false,
+        calendarId: updatedData?.google_calendar_id || 'primary'
+      }
+    });
   } catch (error) {
     console.error('Update calendar settings error:', error);
     res.status(500).json({ error: 'Failed to update calendar settings' });
