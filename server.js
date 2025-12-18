@@ -3813,19 +3813,29 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to create job', details: insertError.message });
       }
       
-            // Verify customer exists and get customer data
-            if (result.customer_id) {
-              const { data: customerData, error: customerError } = await supabase
-                .from('customers')
-                .select('id, first_name, last_name, email, phone')
-                .eq('id', result.customer_id)
-                .single();
-              
-              if (customerError) {
-                console.error('🔄 Error fetching customer data:', customerError);
-              } else {
-               }
-            }
+      // Verify customer exists and get customer data
+      let customerData = null;
+      if (result.customer_id) {
+        const { data: customer, error: customerError } = await supabase
+          .from('customers')
+          .select('id, first_name, last_name, email, phone')
+          .eq('id', result.customer_id)
+          .single();
+        
+        if (!customerError) {
+          customerData = customer;
+        }
+      }
+
+      // Auto-sync to Google Calendar if enabled
+      if (result.scheduled_date && result.scheduled_time) {
+        try {
+          await syncJobToCalendar(result.id, userId, result, customerData);
+        } catch (calendarError) {
+          console.error('⚠️ Calendar sync failed (non-blocking):', calendarError);
+          // Don't fail job creation if calendar sync fails
+        }
+      }
       
       // Send automatic confirmation if customer has email
       if (result.customer_id) {
@@ -5203,6 +5213,18 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     if (fetchError) {
       console.error('Error fetching updated job:', fetchError);
       return res.status(500).json({ error: 'Failed to fetch updated job' });
+    }
+
+    // Auto-sync to Google Calendar if enabled and job has date/time
+    if (updatedJob && updatedJob[0] && (updatedJob[0].scheduled_date || updateDataToSend.scheduled_date)) {
+      try {
+        const job = updatedJob[0];
+        const customerData = job.customers ? job.customers : null;
+        await syncJobToCalendar(id, userId, job, customerData);
+      } catch (calendarError) {
+        console.error('⚠️ Calendar sync failed (non-blocking):', calendarError);
+        // Don't fail job update if calendar sync fails
+      }
     }
 
     res.json({
@@ -7330,6 +7352,249 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to import customers' });
   }
 });
+
+// Booking Koala import endpoint
+app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { customers, jobs, importSettings } = req.body;
+
+    const settings = importSettings || { updateExisting: false, skipDuplicates: true };
+    const results = {
+      customers: { imported: 0, skipped: 0, errors: [] },
+      jobs: { imported: 0, skipped: 0, errors: [] }
+    };
+
+    // Import customers if provided
+    if (customers && Array.isArray(customers) && customers.length > 0) {
+      for (let i = 0; i < customers.length; i++) {
+        const customer = customers[i];
+        
+        try {
+          // Map Booking Koala fields to ZenBooker fields
+          const mappedCustomer = {
+            user_id: userId,
+            first_name: customer.firstName || customer['First Name'] || customer.first_name || '',
+            last_name: customer.lastName || customer['Last Name'] || customer.last_name || '',
+            email: customer.email || customer.Email || customer.email_address || null,
+            phone: customer.phone || customer.Phone || customer.phone_number || customer.mobile || null,
+            address: customer.address || customer.Address || customer.street_address || null,
+            city: customer.city || customer.City || null,
+            state: customer.state || customer.State || customer.state_province || null,
+            zip_code: customer.zipCode || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
+            notes: customer.notes || customer.Notes || customer.comments || null,
+            status: 'active'
+          };
+
+          // Validate required fields
+          if (!mappedCustomer.first_name || !mappedCustomer.last_name) {
+            results.customers.errors.push(`Row ${i + 1}: First name and last name are required`);
+            continue;
+          }
+
+          // Check for duplicates if skipDuplicates is enabled
+          if (settings.skipDuplicates && mappedCustomer.email) {
+            const { data: existing } = await supabase
+              .from('customers')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('email', mappedCustomer.email.toLowerCase().trim())
+              .single();
+
+            if (existing) {
+              if (settings.updateExisting) {
+                // Update existing customer
+                const { error: updateError } = await supabase
+                  .from('customers')
+                  .update(mappedCustomer)
+                  .eq('id', existing.id);
+
+                if (updateError) {
+                  results.customers.errors.push(`Row ${i + 1}: ${updateError.message}`);
+                } else {
+                  results.customers.imported++;
+                }
+              } else {
+                results.customers.skipped++;
+              }
+              continue;
+            }
+          }
+
+          // Insert new customer
+          const { data: newCustomer, error: insertError } = await supabase
+            .from('customers')
+            .insert(mappedCustomer)
+            .select()
+            .single();
+
+          if (insertError) {
+            results.customers.errors.push(`Row ${i + 1}: ${insertError.message}`);
+          } else {
+            results.customers.imported++;
+          }
+        } catch (error) {
+          results.customers.errors.push(`Row ${i + 1}: ${error.message}`);
+        }
+      }
+    }
+
+    // Import jobs if provided
+    if (jobs && Array.isArray(jobs) && jobs.length > 0) {
+      // First, get all customers to map by email/name
+      const { data: allCustomers } = await supabase
+        .from('customers')
+        .select('id, email, first_name, last_name')
+        .eq('user_id', userId);
+
+      const customerMap = {};
+      (allCustomers || []).forEach(c => {
+        if (c.email) customerMap[c.email.toLowerCase()] = c.id;
+        const nameKey = `${c.first_name} ${c.last_name}`.toLowerCase();
+        customerMap[nameKey] = c.id;
+      });
+
+      for (let i = 0; i < jobs.length; i++) {
+        const job = jobs[i];
+        
+        try {
+          // Map Booking Koala fields to ZenBooker fields
+          // Find customer by email or name
+          let customerId = null;
+          if (job.customerEmail || job['Customer Email'] || job.customer_email) {
+            const email = (job.customerEmail || job['Customer Email'] || job.customer_email).toLowerCase();
+            customerId = customerMap[email];
+          }
+          
+          if (!customerId && (job.customerName || job['Customer Name'] || job.customer_name)) {
+            const name = (job.customerName || job['Customer Name'] || job.customer_name).toLowerCase();
+            customerId = customerMap[name];
+          }
+
+          if (!customerId) {
+            results.jobs.errors.push(`Row ${i + 1}: Customer not found`);
+            continue;
+          }
+
+          // Parse date/time
+          let scheduledDate = null;
+          let scheduledTime = '09:00:00';
+          
+          if (job.scheduledDate || job['Scheduled Date'] || job.scheduled_date) {
+            const dateStr = job.scheduledDate || job['Scheduled Date'] || job.scheduled_date;
+            const dateObj = new Date(dateStr);
+            if (!isNaN(dateObj.getTime())) {
+              scheduledDate = dateObj.toISOString();
+              // Extract time if available
+              if (job.scheduledTime || job['Scheduled Time'] || job.scheduled_time) {
+                const timeStr = job.scheduledTime || job['Scheduled Time'] || job.scheduled_time;
+                scheduledTime = parseTime(timeStr);
+              }
+            }
+          }
+
+          const mappedJob = {
+            user_id: userId,
+            customer_id: customerId,
+            service_name: job.serviceName || job['Service Name'] || job.service_name || job.service || 'Imported Service',
+            scheduled_date: scheduledDate || new Date().toISOString(),
+            scheduled_time: scheduledTime,
+            status: job.status || job.Status || 'pending',
+            notes: job.notes || job.Notes || job.description || job.Description || null,
+            price: parseFloat(job.price || job.Price || job.total || job.Total || job.amount || job.Amount || 0),
+            total: parseFloat(job.total || job.Total || job.price || job.Price || job.amount || job.Amount || 0),
+            service_address_street: job.address || job.Address || job.street_address || null,
+            service_address_city: job.city || job.City || null,
+            service_address_state: job.state || job.State || null,
+            service_address_zip: job.zipCode || job['Zip Code'] || job.zip_code || job.postal_code || null,
+            estimated_duration: parseInt(job.duration || job.Duration || job.estimated_duration || 60),
+            is_recurring: job.isRecurring || job['Is Recurring'] || job.is_recurring || false,
+            recurring_frequency: job.recurringFrequency || job['Recurring Frequency'] || job.recurring_frequency || null
+          };
+
+          // Check for duplicates if skipDuplicates is enabled
+          if (settings.skipDuplicates) {
+            const { data: existing } = await supabase
+              .from('jobs')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('customer_id', customerId)
+              .eq('scheduled_date', scheduledDate)
+              .eq('service_name', mappedJob.service_name)
+              .single();
+
+            if (existing) {
+              if (settings.updateExisting) {
+                const { error: updateError } = await supabase
+                  .from('jobs')
+                  .update(mappedJob)
+                  .eq('id', existing.id);
+
+                if (updateError) {
+                  results.jobs.errors.push(`Row ${i + 1}: ${updateError.message}`);
+                } else {
+                  results.jobs.imported++;
+                }
+              } else {
+                results.jobs.skipped++;
+              }
+              continue;
+            }
+          }
+
+          // Insert new job
+          const { data: newJob, error: insertError } = await supabase
+            .from('jobs')
+            .insert(mappedJob)
+            .select()
+            .single();
+
+          if (insertError) {
+            results.jobs.errors.push(`Row ${i + 1}: ${insertError.message}`);
+          } else {
+            results.jobs.imported++;
+          }
+        } catch (error) {
+          results.jobs.errors.push(`Row ${i + 1}: ${error.message}`);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Import completed',
+      results
+    });
+  } catch (error) {
+    console.error('Booking Koala import error:', error);
+    res.status(500).json({ error: 'Failed to import Booking Koala data' });
+  }
+});
+
+// Helper function to parse time string
+function parseTime(timeStr) {
+  if (!timeStr) return '09:00:00';
+  
+  // Handle formats like "9:00 AM", "09:00", "9:00:00 PM"
+  const timeMatch = timeStr.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|AM|PM)?/i);
+  if (timeMatch) {
+    let hours = parseInt(timeMatch[1]);
+    const minutes = timeMatch[2];
+    const ampm = timeMatch[4];
+    
+    if (ampm) {
+      if (ampm.toUpperCase() === 'PM' && hours !== 12) {
+        hours += 12;
+      } else if (ampm.toUpperCase() === 'AM' && hours === 12) {
+        hours = 0;
+      }
+    }
+    
+    return `${hours.toString().padStart(2, '0')}:${minutes}:00`;
+  }
+  
+  return '09:00:00';
+}
 
 // Team members endpoints
 app.get('/api/team', async (req, res) => {
@@ -23676,27 +23941,21 @@ app.post('/api/sms/payment-reminder', authenticateToken, async (req, res) => {
   }
 });
 
-// Google Calendar endpoints
-app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
+// Helper function to sync job to Google Calendar
+async function syncJobToCalendar(jobId, userId, jobData, customerData) {
   try {
-    const { jobId, customerName, serviceName, scheduledDate, scheduledTime, duration, address } = req.body;
-    
-    if (!jobId || !customerName || !serviceName || !scheduledDate || !scheduledTime) {
-      return res.status(400).json({ error: 'Missing required job details' });
-    }
-
-    // Get user's Google access token (you'll need to store this when they authenticate)
+    // Check if user has Google Calendar enabled
     const { data: userData, error: userError } = await supabase
       .from('users')
-      .select('google_access_token, google_refresh_token')
-      .eq('id', req.user.userId)
+      .select('google_access_token, google_refresh_token, google_calendar_enabled, google_calendar_id')
+      .eq('id', userId)
       .single();
 
-    if (userError || !userData?.google_access_token) {
-      return res.status(400).json({ error: 'Google Calendar not connected. Please connect your Google account.' });
+    if (userError || !userData?.google_access_token || !userData?.google_calendar_enabled) {
+      return null; // Calendar not connected or disabled
     }
 
-    // Create OAuth2 client with user's tokens
+    // Create OAuth2 client
     const oauth2Client = new OAuth2Client(
       GOOGLE_CLIENT_ID,
       GOOGLE_CLIENT_SECRET,
@@ -23708,23 +23967,40 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
       refresh_token: userData.google_refresh_token
     });
 
-    // Create calendar event
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    const calendarId = userData.google_calendar_id || 'primary';
+
+    // Get existing calendar event ID if job was previously synced
+    const { data: existingJob } = await supabase
+      .from('jobs')
+      .select('google_calendar_event_id')
+      .eq('id', jobId)
+      .single();
+
+    const customerName = customerData 
+      ? `${customerData.first_name || ''} ${customerData.last_name || ''}`.trim()
+      : jobData.customer_name || 'Unknown Customer';
     
+    const serviceName = jobData.service_name || 'Service';
+    const scheduledDate = jobData.scheduled_date || jobData.scheduledDate;
+    const scheduledTime = jobData.scheduled_time || jobData.scheduledTime || '09:00:00';
+    const duration = jobData.duration || jobData.estimated_duration || 60;
+    const address = jobData.service_address_street || jobData.address || '';
+
+    const startDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
+    const endDateTime = new Date(startDateTime.getTime() + duration * 60000);
+
     const event = {
       summary: `${serviceName} - ${customerName}`,
-      description: `Job ID: ${jobId}\nCustomer: ${customerName}\nService: ${serviceName}\nAddress: ${address || 'Not specified'}`,
+      description: `Job ID: ${jobId}\nCustomer: ${customerName}\nService: ${serviceName}\nAddress: ${address || 'Not specified'}\nStatus: ${jobData.status || 'pending'}`,
       start: {
-        dateTime: new Date(`${scheduledDate}T${scheduledTime}:00`).toISOString(),
-        timeZone: 'America/New_York', // You can make this configurable
+        dateTime: startDateTime.toISOString(),
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
       },
       end: {
-        dateTime: new Date(new Date(`${scheduledDate}T${scheduledTime}:00`).getTime() + (duration || 60) * 60000).toISOString(),
-        timeZone: 'America/New_York',
+        dateTime: endDateTime.toISOString(),
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
       },
-      attendees: [
-        { email: req.user.email, responseStatus: 'accepted' }
-      ],
       reminders: {
         useDefault: false,
         overrides: [
@@ -23734,23 +24010,148 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
       },
     };
 
-    const response = await calendar.events.insert({
-      calendarId: 'primary',
-      resource: event,
-    });
+    let eventId;
+    let eventLink;
 
-    console.log('📅 Calendar event created:', response.data.id);
+    if (existingJob?.google_calendar_event_id) {
+      // Update existing event
+      try {
+        const response = await calendar.events.update({
+          calendarId: calendarId,
+          eventId: existingJob.google_calendar_event_id,
+          resource: event,
+        });
+        eventId = response.data.id;
+        eventLink = response.data.htmlLink;
+        console.log('📅 Calendar event updated:', eventId);
+      } catch (updateError) {
+        // If update fails (event deleted), create new one
+        if (updateError.code === 404) {
+          const response = await calendar.events.insert({
+            calendarId: calendarId,
+            resource: event,
+          });
+          eventId = response.data.id;
+          eventLink = response.data.htmlLink;
+          console.log('📅 Calendar event created (previous deleted):', eventId);
+        } else {
+          throw updateError;
+        }
+      }
+    } else {
+      // Create new event
+      const response = await calendar.events.insert({
+        calendarId: calendarId,
+        resource: event,
+      });
+      eventId = response.data.id;
+      eventLink = response.data.htmlLink;
+      console.log('📅 Calendar event created:', eventId);
+    }
+
+    // Update job with calendar event ID
+    await supabase
+      .from('jobs')
+      .update({ google_calendar_event_id: eventId })
+      .eq('id', jobId);
+
+    return { eventId, eventLink };
+  } catch (error) {
+    console.error('Calendar sync error:', error);
+    return null;
+  }
+}
+
+// Google Calendar endpoints
+app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
+  try {
+    const { jobId, customerName, serviceName, scheduledDate, scheduledTime, duration, address } = req.body;
+    
+    if (!jobId || !customerName || !serviceName || !scheduledDate || !scheduledTime) {
+      return res.status(400).json({ error: 'Missing required job details' });
+    }
+
+    // Get job and customer data
+    const { data: job } = await supabase
+      .from('jobs')
+      .select('*, customers(*)')
+      .eq('id', jobId)
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const result = await syncJobToCalendar(jobId, req.user.userId, job, job.customers);
+
+    if (!result) {
+      return res.status(400).json({ error: 'Google Calendar not connected. Please connect your Google account.' });
+    }
 
     res.json({ 
       success: true, 
       message: 'Job synced to Google Calendar',
-      eventId: response.data.id,
-      eventLink: response.data.htmlLink
+      eventId: result.eventId,
+      eventLink: result.eventLink
     });
 
   } catch (error) {
     console.error('Calendar sync error:', error);
     res.status(500).json({ error: 'Failed to sync to Google Calendar' });
+  }
+});
+
+// Get calendar sync settings
+app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
+  try {
+    const { data: userData, error } = await supabase
+      .from('users')
+      .select('google_calendar_enabled, google_calendar_id, google_access_token')
+      .eq('id', req.user.userId)
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch calendar settings' });
+    }
+
+    res.json({
+      enabled: userData?.google_calendar_enabled || false,
+      calendarId: userData?.google_calendar_id || 'primary',
+      connected: !!userData?.google_access_token
+    });
+  } catch (error) {
+    console.error('Get calendar settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch calendar settings' });
+  }
+});
+
+// Update calendar sync settings
+app.put('/api/calendar/settings', authenticateToken, async (req, res) => {
+  try {
+    const { enabled, calendarId } = req.body;
+
+    const updateData = {};
+    if (enabled !== undefined) {
+      updateData.google_calendar_enabled = enabled;
+    }
+    if (calendarId !== undefined) {
+      updateData.google_calendar_id = calendarId;
+    }
+
+    const { error } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.user.userId);
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to update calendar settings' });
+    }
+
+    res.json({ success: true, message: 'Calendar settings updated' });
+  } catch (error) {
+    console.error('Update calendar settings error:', error);
+    res.status(500).json({ error: 'Failed to update calendar settings' });
   }
 });
 
