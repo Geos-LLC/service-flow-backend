@@ -1579,15 +1579,57 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
     const { sub: googleId, email } = payload;
     
     // Get the current user
+    console.log('🔗 Fetching user from database, userId:', req.user.userId);
     const { data: userData, error: userError } = await supabase
       .from('users')
       .select('id, email, google_id, google_access_token')
       .eq('id', req.user.userId)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single() to avoid error if no rows
     
-    if (userError || !userData) {
-      return res.status(404).json({ error: 'User not found' });
+    if (userError) {
+      console.error('🔗 Supabase error fetching user:', {
+        code: userError.code,
+        message: userError.message,
+        details: userError.details,
+        hint: userError.hint,
+        userId: req.user.userId
+      });
+      return res.status(500).json({ 
+        error: 'Database error while fetching user',
+        details: userError.message 
+      });
     }
+    
+    if (!userData) {
+      console.error('🔗 User not found in database, userId:', req.user.userId);
+      // Try to get user by email as fallback
+      const { data: userByEmail } = await supabase
+        .from('users')
+        .select('id, email')
+        .eq('email', req.user.email)
+        .maybeSingle();
+      
+      if (userByEmail) {
+        console.log('🔗 User found by email, but ID mismatch:', {
+          jwtUserId: req.user.userId,
+          dbUserId: userByEmail.id,
+          email: userByEmail.email
+        });
+      }
+      
+      return res.status(404).json({ 
+        error: 'User not found',
+        userId: req.user.userId,
+        email: req.user.email
+      });
+    }
+    
+    console.log('🔗 User found successfully:', { 
+      id: userData.id, 
+      email: userData.email,
+      hasGoogleId: !!userData.google_id,
+      hasAccessToken: !!userData.google_access_token
+    });
     
     // Prepare update data
     const updateData = {
