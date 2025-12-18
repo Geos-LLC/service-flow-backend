@@ -1554,6 +1554,84 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
+// Connect Google account to existing user (for calendar sync, etc.)
+app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
+  try {
+    console.log('🔗 Connecting Google account for user:', req.user.userId);
+    
+    const { idToken, accessToken, refreshToken } = req.body;
+    
+    if (!idToken) {
+      return res.status(400).json({ error: 'Google ID token is required' });
+    }
+    
+    if (!GOOGLE_CLIENT_ID) {
+      return res.status(500).json({ error: 'Google OAuth not configured' });
+    }
+    
+    // Verify the Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: idToken,
+      audience: GOOGLE_CLIENT_ID
+    });
+    
+    const payload = ticket.getPayload();
+    const { sub: googleId, email } = payload;
+    
+    // Get the current user
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('id, email, google_id, google_access_token')
+      .eq('id', req.user.userId)
+      .single();
+    
+    if (userError || !userData) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Prepare update data
+    const updateData = {
+      google_id: googleId
+    };
+    
+    // Store access and refresh tokens if provided
+    if (accessToken) {
+      updateData.google_access_token = accessToken;
+    }
+    if (refreshToken) {
+      updateData.google_refresh_token = refreshToken;
+    }
+    
+    // Update user with Google connection
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.user.userId)
+      .select('id, email, google_id')
+      .single();
+    
+    if (updateError) {
+      console.error('Error connecting Google account:', updateError);
+      return res.status(500).json({ error: 'Failed to connect Google account' });
+    }
+    
+    console.log('✅ Google account connected successfully for user:', req.user.userId);
+    
+    res.json({
+      success: true,
+      message: 'Google account connected successfully',
+      connected: true
+    });
+    
+  } catch (error) {
+    console.error('❌ Connect Google account error:', error);
+    res.status(500).json({
+      error: 'Failed to connect Google account',
+      details: error.message
+    });
+  }
+});
+
 // Verify token endpoint
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   try {
