@@ -23951,8 +23951,23 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       .eq('id', userId)
       .single();
 
-    if (userError || !userData?.google_access_token || !userData?.google_calendar_enabled) {
-      return null; // Calendar not connected or disabled
+    if (userError) {
+      // If columns don't exist, return null (calendar sync not available)
+      if (userError.code === '42703' || userError.message?.includes('does not exist')) {
+        return null;
+      }
+      console.error('Error fetching user calendar settings:', userError);
+      return null;
+    }
+
+    if (!userData?.google_access_token) {
+      return null; // Google account not connected
+    }
+
+    // Check if calendar sync is enabled (default to true if column doesn't exist)
+    const calendarEnabled = userData?.google_calendar_enabled !== false; // Default to true if null/undefined
+    if (!calendarEnabled) {
+      return null; // Calendar sync disabled
     }
 
     // Create OAuth2 client
@@ -24105,6 +24120,7 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
 // Get calendar sync settings
 app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
   try {
+    // Try to get all fields, but handle case where columns might not exist yet
     const { data: userData, error } = await supabase
       .from('users')
       .select('google_calendar_enabled, google_calendar_id, google_access_token')
@@ -24112,6 +24128,16 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       .single();
 
     if (error) {
+      // If column doesn't exist, return defaults
+      if (error.code === '42703' || error.message?.includes('does not exist')) {
+        console.log('Calendar settings columns not found, returning defaults');
+        return res.json({
+          enabled: false,
+          calendarId: 'primary',
+          connected: false
+        });
+      }
+      console.error('Error fetching calendar settings:', error);
       return res.status(500).json({ error: 'Failed to fetch calendar settings' });
     }
 
@@ -24122,7 +24148,12 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Get calendar settings error:', error);
-    res.status(500).json({ error: 'Failed to fetch calendar settings' });
+    // Return defaults on any error
+    res.json({
+      enabled: false,
+      calendarId: 'primary',
+      connected: false
+    });
   }
 });
 
@@ -24145,6 +24176,15 @@ app.put('/api/calendar/settings', authenticateToken, async (req, res) => {
       .eq('id', req.user.userId);
 
     if (error) {
+      // If column doesn't exist, inform user to run migration
+      if (error.code === '42703' || error.message?.includes('does not exist')) {
+        console.error('Calendar settings columns not found. Please run migration:', error);
+        return res.status(400).json({ 
+          error: 'Calendar settings columns not found. Please run the database migration first.',
+          migrationRequired: true
+        });
+      }
+      console.error('Error updating calendar settings:', error);
       return res.status(500).json({ error: 'Failed to update calendar settings' });
     }
 
