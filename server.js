@@ -24122,7 +24122,7 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
   try {
     console.log('📅 Fetching calendar settings for user:', req.user.userId);
     
-    // Try to get all fields, but handle case where columns might not exist yet
+    // Try to get all fields
     const { data: userData, error } = await supabase
       .from('users')
       .select('google_calendar_enabled, google_calendar_id, google_access_token')
@@ -24137,14 +24137,10 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
         hint: error.hint
       });
       
-      // Check for column not found errors (PostgreSQL error code 42703)
-      const isColumnError = error.code === '42703' || 
-                           error.message?.toLowerCase().includes('does not exist') ||
-                           error.message?.toLowerCase().includes('column') ||
-                           error.details?.toLowerCase().includes('column');
-      
-      if (isColumnError) {
-        console.log('📅 Calendar settings columns not found, returning defaults');
+      // Only check for specific PostgreSQL column not found error (code 42703)
+      // This is the ONLY error that means columns don't exist
+      if (error.code === '42703') {
+        console.log('📅 Column not found error (42703) - migration required');
         return res.json({
           enabled: false,
           calendarId: 'primary',
@@ -24153,10 +24149,16 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
         });
       }
       
+      // For any other error, return the actual error (don't assume migration needed)
       console.error('📅 Unexpected error fetching calendar settings:', error);
-      return res.status(500).json({ error: 'Failed to fetch calendar settings: ' + error.message });
+      return res.status(500).json({ 
+        error: 'Failed to fetch calendar settings: ' + error.message,
+        code: error.code,
+        details: error.details
+      });
     }
 
+    // Success - columns exist and query worked
     console.log('📅 Calendar settings fetched successfully:', {
       enabled: userData?.google_calendar_enabled,
       calendarId: userData?.google_calendar_id,
@@ -24171,12 +24173,9 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('📅 Get calendar settings exception:', error);
-    // Return defaults on any error, but don't assume migration is required
-    res.json({
-      enabled: false,
-      calendarId: 'primary',
-      connected: false,
-      migrationRequired: false // Don't show migration error for unexpected exceptions
+    // Don't assume migration is required for exceptions
+    res.status(500).json({ 
+      error: 'Failed to fetch calendar settings: ' + error.message 
     });
   }
 });
@@ -24212,20 +24211,19 @@ app.put('/api/calendar/settings', authenticateToken, async (req, res) => {
         hint: error.hint
       });
       
-      // Check if it's a column not found error
-      const isColumnError = error.code === '42703' || 
-                           error.message?.toLowerCase().includes('does not exist') ||
-                           error.message?.toLowerCase().includes('column') ||
-                           error.details?.toLowerCase().includes('column');
-      
-      if (isColumnError) {
+      // Only check for specific PostgreSQL column not found error (code 42703)
+      if (error.code === '42703') {
         return res.status(400).json({ 
           error: 'Database migration required. Please run the migration SQL file (google-calendar-sync-migration.sql) to enable calendar sync settings.',
           migrationRequired: true
         });
       }
       
-      return res.status(500).json({ error: 'Failed to update calendar settings: ' + error.message });
+      return res.status(500).json({ 
+        error: 'Failed to update calendar settings: ' + error.message,
+        code: error.code,
+        details: error.details
+      });
     }
 
     console.log('✅ Calendar settings updated successfully:', updatedData);
