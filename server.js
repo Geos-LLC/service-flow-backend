@@ -24351,33 +24351,57 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       });
     }
 
-    // Success - calendar sync columns exist. Now check for Google OAuth token separately
+    // Success - calendar sync columns exist. Now check for Google connection
+    // Check for google_id first (this indicates connection), then check for tokens
+    let isConnected = false;
     let hasGoogleToken = false;
+    
     try {
-      const { data: tokenData, error: tokenError } = await supabase
+      // First check for google_id (indicates account is connected)
+      const { data: googleData, error: googleError } = await supabase
         .from('users')
-        .select('google_access_token')
+        .select('google_id, google_access_token, google_refresh_token')
         .eq('id', req.user.userId)
-        .single();
+        .maybeSingle();
       
-      if (!tokenError && tokenData?.google_access_token) {
-        hasGoogleToken = true;
+      if (!googleError && googleData) {
+        // If google_id exists, account is connected
+        if (googleData.google_id) {
+          isConnected = true;
+        }
+        // Check if we also have access token
+        if (googleData.google_access_token) {
+          hasGoogleToken = true;
+        }
       }
     } catch (tokenErr) {
-      // google_access_token column doesn't exist - that's okay, just means Google OAuth isn't set up
-      console.log('📅 google_access_token column not found (OAuth not configured)');
+      // If columns don't exist, try checking just google_id
+      try {
+        const { data: googleIdData, error: googleIdError } = await supabase
+          .from('users')
+          .select('google_id')
+          .eq('id', req.user.userId)
+          .maybeSingle();
+        
+        if (!googleIdError && googleIdData?.google_id) {
+          isConnected = true;
+        }
+      } catch (err) {
+        console.log('📅 Error checking google_id:', err.message);
+      }
     }
 
     console.log('📅 Calendar settings fetched successfully:', {
       enabled: userData?.google_calendar_enabled,
       calendarId: userData?.google_calendar_id,
+      isConnected: isConnected,
       hasToken: hasGoogleToken
     });
 
     res.json({
       enabled: userData?.google_calendar_enabled !== undefined ? userData.google_calendar_enabled : false,
       calendarId: userData?.google_calendar_id || 'primary',
-      connected: hasGoogleToken,
+      connected: isConnected, // Use google_id check instead of just token
       migrationRequired: false
     });
   } catch (error) {
