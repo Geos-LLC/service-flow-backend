@@ -1580,11 +1580,44 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
     
     // Get the current user
     console.log('🔗 Fetching user from database, userId:', req.user.userId);
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('id, email, google_id, google_access_token')
-      .eq('id', req.user.userId)
-      .maybeSingle(); // Use maybeSingle() instead of single() to avoid error if no rows
+    
+    // First, try to get user with all columns (including optional Google columns)
+    let userData, userError;
+    
+    try {
+      const result = await supabase
+        .from('users')
+        .select('id, email, google_id, google_access_token, google_refresh_token')
+        .eq('id', req.user.userId)
+        .maybeSingle();
+      
+      userData = result.data;
+      userError = result.error;
+    } catch (err) {
+      // If columns don't exist, try without them
+      console.log('🔗 Columns may not exist, trying without Google token columns');
+      const result = await supabase
+        .from('users')
+        .select('id, email, google_id')
+        .eq('id', req.user.userId)
+        .maybeSingle();
+      
+      userData = result.data;
+      userError = result.error;
+    }
+    
+    // If error is about missing columns, try again without them
+    if (userError && (userError.code === '42703' || userError.message?.includes('does not exist'))) {
+      console.log('🔗 Google token columns not found, fetching without them');
+      const result = await supabase
+        .from('users')
+        .select('id, email, google_id')
+        .eq('id', req.user.userId)
+        .maybeSingle();
+      
+      userData = result.data;
+      userError = result.error;
+    }
     
     if (userError) {
       console.error('🔗 Supabase error fetching user:', {
@@ -1636,7 +1669,8 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
       google_id: googleId
     };
     
-    // Store access and refresh tokens if provided
+    // Store access and refresh tokens if provided and columns exist
+    // Check if columns exist by trying to update them
     if (accessToken) {
       updateData.google_access_token = accessToken;
     }
@@ -1645,6 +1679,12 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
     }
     
     // Update user with Google connection
+    console.log('🔗 Updating user with Google connection data:', { 
+      hasGoogleId: !!updateData.google_id,
+      hasAccessToken: !!updateData.google_access_token,
+      hasRefreshToken: !!updateData.google_refresh_token
+    });
+    
     const { data: updatedUser, error: updateError } = await supabase
       .from('users')
       .update(updateData)
@@ -1653,8 +1693,43 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
       .single();
     
     if (updateError) {
-      console.error('Error connecting Google account:', updateError);
-      return res.status(500).json({ error: 'Failed to connect Google account' });
+      console.error('🔗 Error updating user with Google connection:', {
+        code: updateError.code,
+        message: updateError.message,
+        details: updateError.details
+      });
+      
+      // If error is about missing columns, try updating without token columns
+      if (updateError.code === '42703' || updateError.message?.includes('does not exist')) {
+        console.log('🔗 Token columns don\'t exist, updating only google_id');
+        const { data: retryUser, error: retryError } = await supabase
+          .from('users')
+          .update({ google_id: googleId })
+          .eq('id', req.user.userId)
+          .select('id, email, google_id')
+          .single();
+        
+        if (retryError) {
+          console.error('🔗 Error updating google_id:', retryError);
+          return res.status(500).json({ 
+            error: 'Failed to connect Google account',
+            details: retryError.message 
+          });
+        }
+        
+        console.log('✅ Google account connected (google_id only, token columns missing)');
+        return res.json({
+          success: true,
+          message: 'Google account connected successfully (Note: Token storage columns not available. Please run database migration for full functionality.)',
+          connected: true,
+          warning: 'Token storage not available - migration may be needed'
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to connect Google account',
+        details: updateError.message 
+      });
     }
     
     console.log('✅ Google account connected successfully for user:', req.user.userId);
@@ -1669,7 +1744,7 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
     console.error('❌ Connect Google account error:', error);
     res.status(500).json({
       error: 'Failed to connect Google account',
-      details: error.message
+      details: error.message 
     });
   }
 });
@@ -3933,15 +4008,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to create job', details: insertError.message });
       }
       
-      // Verify customer exists and get customer data
+            // Verify customer exists and get customer data
       let customerData = null;
-      if (result.customer_id) {
+            if (result.customer_id) {
         const { data: customer, error: customerError } = await supabase
-          .from('customers')
-          .select('id, first_name, last_name, email, phone')
-          .eq('id', result.customer_id)
-          .single();
-        
+                .from('customers')
+                .select('id, first_name, last_name, email, phone')
+                .eq('id', result.customer_id)
+                .single();
+              
         if (!customerError) {
           customerData = customer;
         }
@@ -3954,8 +4029,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         } catch (calendarError) {
           console.error('⚠️ Calendar sync failed (non-blocking):', calendarError);
           // Don't fail job creation if calendar sync fails
-        }
-      }
+               }
+            }
       
       // Send automatic confirmation if customer has email
       if (result.customer_id) {
@@ -24124,7 +24199,7 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
 
     const startDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
     const endDateTime = new Date(startDateTime.getTime() + duration * 60000);
-
+    
     const event = {
       summary: `${serviceName} - ${customerName}`,
       description: `Job ID: ${jobId}\nCustomer: ${customerName}\nService: ${serviceName}\nAddress: ${address || 'Not specified'}\nStatus: ${jobData.status || 'pending'}`,
@@ -24162,10 +24237,10 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       } catch (updateError) {
         // If update fails (event deleted), create new one
         if (updateError.code === 404) {
-          const response = await calendar.events.insert({
+    const response = await calendar.events.insert({
             calendarId: calendarId,
-            resource: event,
-          });
+      resource: event,
+    });
           eventId = response.data.id;
           eventLink = response.data.htmlLink;
           console.log('📅 Calendar event created (previous deleted):', eventId);
