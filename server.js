@@ -24122,10 +24122,10 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
   try {
     console.log('📅 Fetching calendar settings for user:', req.user.userId);
     
-    // Try to get all fields
+    // First, try to get just the calendar sync columns (from our migration)
     const { data: userData, error } = await supabase
       .from('users')
-      .select('google_calendar_enabled, google_calendar_id, google_access_token')
+      .select('google_calendar_enabled, google_calendar_id')
       .eq('id', req.user.userId)
       .single();
 
@@ -24138,7 +24138,6 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       });
       
       // Only check for specific PostgreSQL column not found error (code 42703)
-      // This is the ONLY error that means columns don't exist
       if (error.code === '42703') {
         console.log('📅 Column not found error (42703) - migration required');
         return res.json({
@@ -24149,7 +24148,6 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
         });
       }
       
-      // For any other error, return the actual error (don't assume migration needed)
       console.error('📅 Unexpected error fetching calendar settings:', error);
       return res.status(500).json({ 
         error: 'Failed to fetch calendar settings: ' + error.message,
@@ -24158,22 +24156,37 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       });
     }
 
-    // Success - columns exist and query worked
+    // Success - calendar sync columns exist. Now check for Google OAuth token separately
+    let hasGoogleToken = false;
+    try {
+      const { data: tokenData, error: tokenError } = await supabase
+        .from('users')
+        .select('google_access_token')
+        .eq('id', req.user.userId)
+        .single();
+      
+      if (!tokenError && tokenData?.google_access_token) {
+        hasGoogleToken = true;
+      }
+    } catch (tokenErr) {
+      // google_access_token column doesn't exist - that's okay, just means Google OAuth isn't set up
+      console.log('📅 google_access_token column not found (OAuth not configured)');
+    }
+
     console.log('📅 Calendar settings fetched successfully:', {
       enabled: userData?.google_calendar_enabled,
       calendarId: userData?.google_calendar_id,
-      hasToken: !!userData?.google_access_token
+      hasToken: hasGoogleToken
     });
 
     res.json({
       enabled: userData?.google_calendar_enabled !== undefined ? userData.google_calendar_enabled : false,
       calendarId: userData?.google_calendar_id || 'primary',
-      connected: !!userData?.google_access_token,
+      connected: hasGoogleToken,
       migrationRequired: false
     });
   } catch (error) {
     console.error('📅 Get calendar settings exception:', error);
-    // Don't assume migration is required for exceptions
     res.status(500).json({ 
       error: 'Failed to fetch calendar settings: ' + error.message 
     });
