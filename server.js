@@ -24160,7 +24160,7 @@ app.post('/api/sms/payment-reminder', authenticateToken, async (req, res) => {
 });
 
 // Helper function to sync job to Google Calendar
-async function syncJobToCalendar(jobId, userId, jobData, customerData) {
+async function syncJobToCalendar(jobId, userId, jobData, customerData, req = null) {
   try {
     // Check if user has Google Calendar enabled
     const { data: userData, error: userError } = await supabase
@@ -24181,6 +24181,12 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
     // Check if Google account is connected (has google_id)
     const hasGoogleId = userData?.google_id;
     if (!userData?.google_access_token) {
+      console.log('⚠️ Google access token missing:', {
+        userId,
+        hasGoogleId,
+        hasAccessToken: !!userData?.google_access_token,
+        hasRefreshToken: !!userData?.google_refresh_token
+      });
       if (hasGoogleId) {
         // Account is connected but missing access token - need to reconnect with OAuth scopes
         console.log('⚠️ Google account connected but missing access token. User needs to reconnect with OAuth scopes.');
@@ -24188,6 +24194,13 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       }
       return null; // Google account not connected
     }
+    
+    console.log('✅ Google Calendar sync check passed:', {
+      userId,
+      hasAccessToken: !!userData.google_access_token,
+      hasRefreshToken: !!userData.google_refresh_token,
+      calendarEnabled: userData.google_calendar_enabled
+    });
 
     // Check if calendar sync is enabled (default to true if column doesn't exist)
     const calendarEnabled = userData?.google_calendar_enabled !== false; // Default to true if null/undefined
@@ -24207,6 +24220,22 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       refresh_token: userData.google_refresh_token
     });
 
+    // Try to refresh token if needed
+    try {
+      const tokenInfo = await oauth2Client.getAccessToken();
+      if (tokenInfo.token && tokenInfo.token !== userData.google_access_token) {
+        // Token was refreshed, update in database
+        console.log('🔄 Google access token refreshed, updating database');
+        await supabase
+          .from('users')
+          .update({ google_access_token: tokenInfo.token })
+          .eq('id', userId);
+      }
+    } catch (refreshError) {
+      console.error('⚠️ Error refreshing token (may still work):', refreshError.message);
+      // Continue anyway - the token might still be valid
+    }
+
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     const calendarId = userData.google_calendar_id || 'primary';
 
@@ -24222,12 +24251,67 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       : jobData.customer_name || 'Unknown Customer';
     
     const serviceName = jobData.service_name || 'Service';
-    const scheduledDate = jobData.scheduled_date || jobData.scheduledDate;
-    const scheduledTime = jobData.scheduled_time || jobData.scheduledTime || '09:00:00';
+    
+    // Get date and time - handle both database format and frontend format
+    // Frontend sends: scheduledDate (date only) and scheduledTime (time only)
+    // Database has: scheduled_date (date + time together)
+    let scheduledDate = jobData.scheduled_date || jobData.scheduledDate;
+    let scheduledTime = jobData.scheduled_time || jobData.scheduledTime;
+    
+    // If we have scheduledDate from request body (frontend), use it
+    if (req && req.body && req.body.scheduledDate) {
+      scheduledDate = req.body.scheduledDate;
+    }
+    if (req && req.body && req.body.scheduledTime) {
+      scheduledTime = req.body.scheduledTime;
+    }
+    
     const duration = jobData.duration || jobData.estimated_duration || 60;
     const address = jobData.service_address_street || jobData.address || '';
 
-    const startDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
+    // Parse date and time more robustly
+    let startDateTime;
+    try {
+      // Handle different date formats
+      let dateStr = scheduledDate;
+      let timeStr = scheduledTime || '09:00';
+      
+      // If scheduledDate already contains time (space or T separator)
+      if (dateStr && (dateStr.includes(' ') || dateStr.includes('T'))) {
+        const parts = dateStr.split(/[\sT]/);
+        dateStr = parts[0];
+        if (parts[1]) {
+          timeStr = parts[1].substring(0, 5); // Get HH:MM
+        }
+      }
+      
+      // Ensure time format is HH:MM (remove seconds if present)
+      if (timeStr && timeStr.length > 5) {
+        timeStr = timeStr.substring(0, 5);
+      }
+      
+      // If time is still empty, use default
+      if (!timeStr || timeStr.length < 4) {
+        timeStr = '09:00';
+      }
+      
+      // Create date string in ISO format
+      const dateTimeString = `${dateStr}T${timeStr}:00`;
+      console.log('📅 Parsing date/time:', { scheduledDate, scheduledTime, dateStr, timeStr, dateTimeString });
+      startDateTime = new Date(dateTimeString);
+      
+      // Validate date
+      if (isNaN(startDateTime.getTime())) {
+        console.error('❌ Invalid date:', { scheduledDate, scheduledTime, dateTimeString, dateStr, timeStr });
+        throw new Error(`Invalid date/time: ${scheduledDate} ${scheduledTime}`);
+      }
+      
+      console.log('✅ Parsed date successfully:', startDateTime.toISOString());
+    } catch (error) {
+      console.error('❌ Error parsing date:', error);
+      throw new Error(`Failed to parse job date/time: ${error.message}`);
+    }
+    
     const endDateTime = new Date(startDateTime.getTime() + duration * 60000);
     
     const event = {
@@ -24297,7 +24381,18 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
 
     return { eventId, eventLink };
   } catch (error) {
-    console.error('Calendar sync error:', error);
+    console.error('❌ Calendar sync error:', {
+      message: error.message,
+      stack: error.stack,
+      jobId,
+      userId
+    });
+    
+    // If it's a date parsing error, we want to surface it
+    if (error.message && (error.message.includes('Invalid date') || error.message.includes('Failed to parse'))) {
+      throw error; // Re-throw so the endpoint can return a proper error
+    }
+    
     return null;
   }
 }
@@ -24323,15 +24418,31 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    const result = await syncJobToCalendar(jobId, req.user.userId, job, job.customers);
+    console.log('📅 Attempting to sync job to calendar:', {
+      jobId,
+      userId: req.user.userId,
+      hasJob: !!job,
+      hasCustomer: !!job?.customers,
+      scheduledDate: job?.scheduled_date
+    });
+
+    const result = await syncJobToCalendar(jobId, req.user.userId, job, job.customers, req);
 
     if (!result) {
+      console.log('❌ Calendar sync returned null, checking user connection status...');
       // Check if user has google_id but missing access token
       const { data: userCheck } = await supabase
         .from('users')
-        .select('google_id, google_access_token')
+        .select('google_id, google_access_token, google_refresh_token, google_calendar_enabled')
         .eq('id', req.user.userId)
         .maybeSingle();
+      
+      console.log('📅 User connection check:', {
+        hasGoogleId: !!userCheck?.google_id,
+        hasAccessToken: !!userCheck?.google_access_token,
+        hasRefreshToken: !!userCheck?.google_refresh_token,
+        calendarEnabled: userCheck?.google_calendar_enabled
+      });
       
       if (userCheck?.google_id && !userCheck?.google_access_token) {
         return res.status(400).json({ 
@@ -24350,8 +24461,20 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Calendar sync error:', error);
-    res.status(500).json({ error: 'Failed to sync to Google Calendar' });
+    console.error('❌ Calendar sync endpoint error:', {
+      message: error.message,
+      stack: error.stack,
+      jobId: req.body?.jobId
+    });
+    
+    // If it's a date parsing error, return a specific error
+    if (error.message && (error.message.includes('Invalid date') || error.message.includes('Failed to parse'))) {
+      return res.status(400).json({ 
+        error: `Invalid job date/time: ${error.message}. Please ensure the job has a valid scheduled date and time.` 
+      });
+    }
+    
+    res.status(500).json({ error: 'Failed to sync to Google Calendar: ' + error.message });
   }
 });
 
