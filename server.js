@@ -1559,24 +1559,47 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
   try {
     console.log('🔗 Connecting Google account for user:', req.user.userId);
     
-    const { idToken, accessToken, refreshToken } = req.body;
+    const { idToken, accessToken, refreshToken, email, googleId } = req.body;
     
-    if (!idToken) {
-      return res.status(400).json({ error: 'Google ID token is required' });
+    let verifiedGoogleId, verifiedEmail;
+    
+    // If we have an access token, use it to get user info (OAuth2 flow)
+    if (accessToken) {
+      try {
+        console.log('🔗 Using OAuth2 access token to get user info');
+        const userInfoResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`
+          }
+        });
+        verifiedGoogleId = userInfoResponse.data.id || googleId;
+        verifiedEmail = userInfoResponse.data.email || email;
+        console.log('🔗 User info from OAuth2:', { googleId: verifiedGoogleId, email: verifiedEmail });
+      } catch (error) {
+        console.error('Error getting user info from access token:', error);
+        return res.status(400).json({ error: 'Invalid access token' });
+      }
+    } else if (idToken) {
+      // Fallback to ID token verification (One Tap flow)
+      if (!GOOGLE_CLIENT_ID) {
+        return res.status(500).json({ error: 'Google OAuth not configured' });
+      }
+      
+      const ticket = await googleClient.verifyIdToken({
+        idToken: idToken,
+        audience: GOOGLE_CLIENT_ID
+      });
+      
+      const payload = ticket.getPayload();
+      verifiedGoogleId = payload.sub;
+      verifiedEmail = payload.email;
+    } else {
+      return res.status(400).json({ error: 'Google ID token or access token is required' });
     }
     
     if (!GOOGLE_CLIENT_ID) {
       return res.status(500).json({ error: 'Google OAuth not configured' });
     }
-    
-    // Verify the Google ID token
-    const ticket = await googleClient.verifyIdToken({
-      idToken: idToken,
-      audience: GOOGLE_CLIENT_ID
-    });
-    
-    const payload = ticket.getPayload();
-    const { sub: googleId, email } = payload;
     
     // Get the current user
     console.log('🔗 Fetching user from database, userId:', req.user.userId);
@@ -1666,7 +1689,7 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
     
     // Prepare update data
     const updateData = {
-      google_id: googleId
+      google_id: verifiedGoogleId
     };
     
     // Store access and refresh tokens if provided and columns exist
@@ -24155,7 +24178,14 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData) {
       return null;
     }
 
+    // Check if Google account is connected (has google_id)
+    const hasGoogleId = userData?.google_id;
     if (!userData?.google_access_token) {
+      if (hasGoogleId) {
+        // Account is connected but missing access token - need to reconnect with OAuth scopes
+        console.log('⚠️ Google account connected but missing access token. User needs to reconnect with OAuth scopes.');
+        return null; // Will show error message
+      }
       return null; // Google account not connected
     }
 
@@ -24296,7 +24326,20 @@ app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
     const result = await syncJobToCalendar(jobId, req.user.userId, job, job.customers);
 
     if (!result) {
-      return res.status(400).json({ error: 'Google Calendar not connected. Please connect your Google account.' });
+      // Check if user has google_id but missing access token
+      const { data: userCheck } = await supabase
+        .from('users')
+        .select('google_id, google_access_token')
+        .eq('id', req.user.userId)
+        .maybeSingle();
+      
+      if (userCheck?.google_id && !userCheck?.google_access_token) {
+        return res.status(400).json({ 
+          error: 'Google account is connected but access token is missing. Please reconnect your Google account in Settings → Calendar Syncing to grant calendar permissions.' 
+        });
+      }
+      
+      return res.status(400).json({ error: 'Google Calendar not connected. Please connect your Google account in Settings → Calendar Syncing.' });
     }
 
     res.json({ 
