@@ -24220,20 +24220,41 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
       refresh_token: userData.google_refresh_token
     });
 
-    // Try to refresh token if needed
-    try {
-      const tokenInfo = await oauth2Client.getAccessToken();
-      if (tokenInfo.token && tokenInfo.token !== userData.google_access_token) {
-        // Token was refreshed, update in database
-        console.log('🔄 Google access token refreshed, updating database');
-        await supabase
+    // Set up automatic token refresh callback
+    oauth2Client.on('tokens', (tokens) => {
+      if (tokens.refresh_token) {
+        console.log('🔄 Refresh token updated');
+        supabase
           .from('users')
-          .update({ google_access_token: tokenInfo.token })
-          .eq('id', userId);
+          .update({ google_refresh_token: tokens.refresh_token })
+          .eq('id', userId)
+          .then(() => console.log('✅ Refresh token saved to database'));
       }
-    } catch (refreshError) {
-      console.error('⚠️ Error refreshing token (may still work):', refreshError.message);
-      // Continue anyway - the token might still be valid
+      if (tokens.access_token) {
+        console.log('🔄 Access token refreshed');
+        supabase
+          .from('users')
+          .update({ google_access_token: tokens.access_token })
+          .eq('id', userId)
+          .then(() => console.log('✅ Access token saved to database'));
+      }
+    });
+
+    // Verify token is valid and refresh if needed
+    try {
+      console.log('🔍 Verifying Google access token...');
+      const tokenInfo = await oauth2Client.getAccessToken();
+      if (!tokenInfo.token) {
+        console.error('❌ Failed to get valid access token');
+        return null;
+      }
+      console.log('✅ Access token verified, token length:', tokenInfo.token.length);
+    } catch (tokenError) {
+      console.error('❌ Token verification failed:', {
+        message: tokenError.message,
+        code: tokenError.code
+      });
+      return null;
     }
 
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
@@ -24337,41 +24358,81 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
     let eventId;
     let eventLink;
 
-    if (existingJob?.google_calendar_event_id) {
-      // Update existing event
+    // Helper function to sync event with retry logic
+    const syncEvent = async (retryCount = 0) => {
+      const maxRetries = 2;
+      
       try {
-        const response = await calendar.events.update({
-          calendarId: calendarId,
-          eventId: existingJob.google_calendar_event_id,
-          resource: event,
-        });
-        eventId = response.data.id;
-        eventLink = response.data.htmlLink;
-        console.log('📅 Calendar event updated:', eventId);
-      } catch (updateError) {
-        // If update fails (event deleted), create new one
-        if (updateError.code === 404) {
-    const response = await calendar.events.insert({
+        if (existingJob?.google_calendar_event_id) {
+          // Update existing event
+          console.log('📅 Updating existing calendar event:', existingJob.google_calendar_event_id);
+          const response = await calendar.events.update({
             calendarId: calendarId,
-      resource: event,
-    });
-          eventId = response.data.id;
-          eventLink = response.data.htmlLink;
-          console.log('📅 Calendar event created (previous deleted):', eventId);
+            eventId: existingJob.google_calendar_event_id,
+            resource: event,
+          });
+          return {
+            eventId: response.data.id,
+            eventLink: response.data.htmlLink
+          };
         } else {
-          throw updateError;
+          // Create new event
+          console.log('📅 Creating new calendar event');
+          const response = await calendar.events.insert({
+            calendarId: calendarId,
+            resource: event,
+          });
+          return {
+            eventId: response.data.id,
+            eventLink: response.data.htmlLink
+          };
         }
+      } catch (error) {
+        console.error(`❌ Calendar API error (attempt ${retryCount + 1}):`, {
+          code: error.code,
+          message: error.message,
+          status: error.response?.status
+        });
+        
+        // Retry on network errors
+        if (retryCount < maxRetries && (
+          error.message?.includes('Premature close') ||
+          error.message?.includes('ECONNRESET') ||
+          error.message?.includes('timeout') ||
+          error.message?.includes('ETIMEDOUT')
+        )) {
+          const delay = 1000 * (retryCount + 1); // 1s, 2s
+          console.log(`🔄 Retrying calendar sync in ${delay}ms (attempt ${retryCount + 2}/${maxRetries + 1})...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return syncEvent(retryCount + 1);
+        }
+        
+        // If update failed with 404, try creating new event
+        if (existingJob?.google_calendar_event_id && (error.code === 404 || error.response?.status === 404)) {
+          console.log('📅 Event not found (404), creating new event instead');
+          try {
+            const response = await calendar.events.insert({
+              calendarId: calendarId,
+              resource: event,
+            });
+            return {
+              eventId: response.data.id,
+              eventLink: response.data.htmlLink
+            };
+          } catch (insertError) {
+            console.error('❌ Error creating new event after 404:', insertError.message);
+            throw insertError;
+          }
+        }
+        
+        throw error;
       }
-    } else {
-      // Create new event
-      const response = await calendar.events.insert({
-        calendarId: calendarId,
-        resource: event,
-      });
-      eventId = response.data.id;
-      eventLink = response.data.htmlLink;
-      console.log('📅 Calendar event created:', eventId);
-    }
+    };
+    
+    const result = await syncEvent();
+    eventId = result.eventId;
+    eventLink = result.eventLink;
+    console.log('✅ Calendar event synced successfully:', eventId);
 
     // Update job with calendar event ID
     await supabase
