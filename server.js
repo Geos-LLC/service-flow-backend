@@ -24378,10 +24378,10 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
         } else {
           // Create new event
           console.log('📅 Creating new calendar event');
-          const response = await calendar.events.insert({
+    const response = await calendar.events.insert({
             calendarId: calendarId,
-            resource: event,
-          });
+      resource: event,
+    });
           return {
             eventId: response.data.id,
             eventLink: response.data.htmlLink
@@ -24393,6 +24393,59 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
           message: error.message,
           status: error.response?.status
         });
+        
+        // Handle 401 (unauthorized) - token is invalid or expired
+        if (error.response?.status === 401 || error.code === 401) {
+          console.error('❌ Invalid or expired access token (401)');
+          // Try to refresh token if we have refresh token
+          if (userData.google_refresh_token) {
+            try {
+              console.log('🔄 Attempting to refresh access token...');
+              oauth2Client.setCredentials({
+                refresh_token: userData.google_refresh_token
+              });
+              const newToken = await oauth2Client.getAccessToken();
+              if (newToken.token) {
+                console.log('✅ Token refreshed, updating database');
+                await supabase
+                  .from('users')
+                  .update({ google_access_token: newToken.token })
+                  .eq('id', userId);
+                // Retry with new token
+                oauth2Client.setCredentials({
+                  access_token: newToken.token,
+                  refresh_token: userData.google_refresh_token
+                });
+                const retryCalendar = google.calendar({ version: 'v3', auth: oauth2Client });
+                if (existingJob?.google_calendar_event_id) {
+                  const response = await retryCalendar.events.update({
+                    calendarId: calendarId,
+                    eventId: existingJob.google_calendar_event_id,
+                    resource: event,
+                  });
+                  return {
+                    eventId: response.data.id,
+                    eventLink: response.data.htmlLink
+                  };
+                } else {
+                  const response = await retryCalendar.events.insert({
+                    calendarId: calendarId,
+                    resource: event,
+                  });
+                  return {
+                    eventId: response.data.id,
+                    eventLink: response.data.htmlLink
+                  };
+                }
+              }
+            } catch (refreshError) {
+              console.error('❌ Failed to refresh token:', refreshError.message);
+              throw new Error('Access token expired and refresh failed. Please reconnect your Google account.');
+            }
+          } else {
+            throw new Error('Access token is invalid and no refresh token available. Please reconnect your Google account in Settings → Calendar Syncing.');
+          }
+        }
         
         // Retry on network errors
         if (retryCount < maxRetries && (
