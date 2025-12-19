@@ -1465,11 +1465,17 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     // Exchange authorization code for tokens
     const { tokens } = await oauth2Client.getToken(code);
-    console.log('🔗 Tokens received:', {
+    console.log('🔗 Tokens received from Google:', {
       hasAccessToken: !!tokens.access_token,
       hasRefreshToken: !!tokens.refresh_token,
-      expiresIn: tokens.expiry_date
+      expiresIn: tokens.expiry_date,
+      scope: tokens.scope
     });
+
+    if (!tokens.refresh_token) {
+      console.warn('⚠️ No refresh token received from Google. This may happen if the user has already granted consent.');
+      console.warn('⚠️ We will still save the access token, but token refresh will not be possible.');
+    }
 
     // Get user info
     oauth2Client.setCredentials(tokens);
@@ -1479,17 +1485,16 @@ app.get('/api/auth/google/callback', async (req, res) => {
       }
     });
     const userInfo = userInfoResponse.data;
+    console.log('🔗 User info retrieved:', { email: userInfo.email, id: userInfo.id });
 
-    // Get user ID from state or from JWT if available
+    // Get user ID from state
     let userId = state;
-    if (req.user?.userId) {
-      userId = req.user.userId;
-    }
-
     if (!userId || userId === 'unknown') {
-      // Redirect to frontend with error
+      console.error('❌ No user ID in state parameter');
       return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=user_not_authenticated`);
     }
+
+    console.log('🔗 Updating user with Google connection, userId:', userId);
 
     // Update user with Google connection and tokens
     const { data: userData, error: userError } = await supabase
@@ -1508,8 +1513,15 @@ app.get('/api/auth/google/callback', async (req, res) => {
       google_access_token: tokens.access_token
     };
 
+    // Only update refresh token if we received one
+    // If user already has a refresh token and Google didn't provide a new one, keep the existing one
     if (tokens.refresh_token) {
       updateData.google_refresh_token = tokens.refresh_token;
+      console.log('✅ Refresh token will be saved');
+    } else if (userData.google_refresh_token) {
+      console.log('⚠️ No new refresh token, keeping existing one');
+    } else {
+      console.warn('⚠️ No refresh token available - user will need to reconnect when access token expires');
     }
 
     const { error: updateError } = await supabase
@@ -1522,10 +1534,14 @@ app.get('/api/auth/google/callback', async (req, res) => {
       return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=update_failed`);
     }
 
-    console.log('✅ Google account connected successfully with refresh token');
+    console.log('✅ Google account connected successfully', {
+      hasAccessToken: !!updateData.google_access_token,
+      hasRefreshToken: !!updateData.google_refresh_token
+    });
     
     // Redirect to frontend with success
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?success=connected`);
+    const successParam = tokens.refresh_token ? 'connected' : 'connected_no_refresh';
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?success=${successParam}`);
   } catch (error) {
     console.error('❌ Error in Google OAuth callback:', error);
     res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=callback_failed`);
