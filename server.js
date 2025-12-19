@@ -61,7 +61,12 @@ const getTodayString = () => {
 // Google OAuth Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/api/auth/google/callback';
+// Google OAuth redirect URI - use environment variable or construct from request
+// Default to production URL if not set
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 
+  (process.env.NODE_ENV === 'production' 
+    ? 'https://service-flow-backend-production-4568.up.railway.app/api/auth/google/callback'
+    : 'http://localhost:3001/api/auth/google/callback');
 
 // Google Calendar and Sheets Configuration
 const GOOGLE_CALENDAR_SCOPES = [
@@ -1426,7 +1431,14 @@ app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: 'User not authenticated. Please log in and try again.' });
     }
 
-    const redirectUri = GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
+    // Construct redirect URI - prefer environment variable, but use request host if localhost
+    let redirectUri = GOOGLE_REDIRECT_URI;
+    if (!redirectUri || redirectUri.includes('localhost')) {
+      // Use the request's protocol and host to construct the correct production URL
+      const protocol = req.protocol || 'https';
+      const host = req.get('host') || 'service-flow-backend-production-4568.up.railway.app';
+      redirectUri = `${protocol}://${host}/api/auth/google/callback`;
+    }
     console.log('🔗 Using redirect URI:', redirectUri);
 
     const oauth2Client = new OAuth2Client(
@@ -1477,10 +1489,19 @@ app.get('/api/auth/google/callback', async (req, res) => {
       return res.status(500).json({ error: 'Google OAuth not configured' });
     }
 
+    // Construct redirect URI - prefer environment variable, but use request host if localhost
+    let redirectUri = GOOGLE_REDIRECT_URI;
+    if (!redirectUri || redirectUri.includes('localhost')) {
+      // Use the request's protocol and host to construct the correct production URL
+      const protocol = req.protocol || 'https';
+      const host = req.get('host') || 'service-flow-backend-production-4568.up.railway.app';
+      redirectUri = `${protocol}://${host}/api/auth/google/callback`;
+    }
+
     const oauth2Client = new OAuth2Client(
       GOOGLE_CLIENT_ID,
       GOOGLE_CLIENT_SECRET,
-      GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`
+      redirectUri
     );
 
     // Exchange authorization code for tokens
