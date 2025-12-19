@@ -1405,6 +1405,133 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
   }
 });
 
+// Google OAuth Authorization Code Flow (for getting refresh tokens)
+app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
+  try {
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Google OAuth not configured' });
+    }
+
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+
+    const oauth2Client = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`
+    );
+
+    // Generate authorization URL with offline access to get refresh token
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline', // This is crucial for getting refresh tokens
+      scope: [
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/calendar.events',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile'
+      ],
+      prompt: 'consent', // Force consent screen to ensure refresh token
+      state: userId.toString() // Pass user ID in state for callback
+    });
+
+    console.log('🔗 Generated Google OAuth authorization URL for user:', userId);
+    res.json({ authUrl });
+  } catch (error) {
+    console.error('❌ Error generating Google OAuth URL:', error);
+    res.status(500).json({ error: 'Failed to generate authorization URL' });
+  }
+});
+
+// Google OAuth Callback (handles authorization code and exchanges for tokens)
+app.get('/api/auth/google/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code is required' });
+    }
+
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Google OAuth not configured' });
+    }
+
+    const oauth2Client = new OAuth2Client(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`
+    );
+
+    // Exchange authorization code for tokens
+    const { tokens } = await oauth2Client.getToken(code);
+    console.log('🔗 Tokens received:', {
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expiresIn: tokens.expiry_date
+    });
+
+    // Get user info
+    oauth2Client.setCredentials(tokens);
+    const userInfoResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: {
+        'Authorization': `Bearer ${tokens.access_token}`
+      }
+    });
+    const userInfo = userInfoResponse.data;
+
+    // Get user ID from state or from JWT if available
+    let userId = state;
+    if (req.user?.userId) {
+      userId = req.user.userId;
+    }
+
+    if (!userId || userId === 'unknown') {
+      // Redirect to frontend with error
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=user_not_authenticated`);
+    }
+
+    // Update user with Google connection and tokens
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('id, email, google_id, google_access_token, google_refresh_token')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (userError || !userData) {
+      console.error('❌ User not found:', userError);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=user_not_found`);
+    }
+
+    const updateData = {
+      google_id: userInfo.id,
+      google_access_token: tokens.access_token
+    };
+
+    if (tokens.refresh_token) {
+      updateData.google_refresh_token = tokens.refresh_token;
+    }
+
+    const { error: updateError } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('❌ Error updating user:', updateError);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=update_failed`);
+    }
+
+    console.log('✅ Google account connected successfully with refresh token');
+    
+    // Redirect to frontend with success
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?success=connected`);
+  } catch (error) {
+    console.error('❌ Error in Google OAuth callback:', error);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=callback_failed`);
+  }
+});
+
 // Google OAuth endpoints
 app.post('/api/auth/google', async (req, res) => {
   try {
