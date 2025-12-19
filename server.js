@@ -24445,6 +24445,7 @@ app.get('/api/calendar/settings', authenticateToken, async (req, res) => {
       enabled: userData?.google_calendar_enabled !== undefined ? userData.google_calendar_enabled : false,
       calendarId: userData?.google_calendar_id || 'primary',
       connected: isConnected, // Use google_id check instead of just token
+      hasAccessToken: hasGoogleToken, // Indicates if access token exists for calendar sync
       migrationRequired: false
     });
   } catch (error) {
