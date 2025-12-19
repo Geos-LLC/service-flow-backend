@@ -1505,13 +1505,45 @@ app.get('/api/auth/google/callback', async (req, res) => {
     );
 
     // Exchange authorization code for tokens
-    const { tokens } = await oauth2Client.getToken(code);
-    console.log('🔗 Tokens received from Google:', {
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token,
-      expiresIn: tokens.expiry_date,
-      scope: tokens.scope
-    });
+    let tokens;
+    try {
+      console.log('🔗 Exchanging authorization code for tokens...', {
+        hasCode: !!code,
+        codeLength: code?.length,
+        clientIdPrefix: GOOGLE_CLIENT_ID?.substring(0, 20) + '...',
+        hasClientSecret: !!GOOGLE_CLIENT_SECRET,
+        redirectUri: redirectUri
+      });
+      
+      const tokenResponse = await oauth2Client.getToken(code);
+      tokens = tokenResponse.tokens;
+      
+      console.log('✅ Tokens received from Google:', {
+        hasAccessToken: !!tokens.access_token,
+        hasRefreshToken: !!tokens.refresh_token,
+        expiresIn: tokens.expiry_date,
+        scope: tokens.scope
+      });
+    } catch (tokenError) {
+      console.error('❌ Error exchanging authorization code for tokens:', {
+        message: tokenError.message,
+        code: tokenError.code,
+        status: tokenError.response?.status,
+        error: tokenError.response?.data?.error,
+        errorDescription: tokenError.response?.data?.error_description,
+        clientIdPrefix: GOOGLE_CLIENT_ID?.substring(0, 20) + '...',
+        redirectUri: redirectUri
+      });
+      
+      // Provide helpful error message based on the error type
+      if (tokenError.response?.data?.error === 'invalid_client') {
+        console.error('❌ Invalid client credentials - check GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET');
+        return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=invalid_client_credentials`);
+      }
+      
+      // Re-throw other errors
+      throw tokenError;
+    }
 
     if (!tokens.refresh_token) {
       console.warn('⚠️ No refresh token received from Google. This may happen if the user has already granted consent.');
