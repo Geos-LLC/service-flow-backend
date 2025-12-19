@@ -1408,19 +1408,31 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 // Google OAuth Authorization Code Flow (for getting refresh tokens)
 app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
   try {
+    console.log('🔗 Google OAuth authorization request received:', {
+      userId: req.user?.userId,
+      hasGoogleClientId: !!GOOGLE_CLIENT_ID,
+      hasGoogleClientSecret: !!GOOGLE_CLIENT_SECRET,
+      redirectUri: GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`
+    });
+
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-      return res.status(500).json({ error: 'Google OAuth not configured' });
+      console.error('❌ Google OAuth not configured - missing credentials');
+      return res.status(500).json({ error: 'Google OAuth not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables.' });
     }
 
     const userId = req.user?.userId;
     if (!userId) {
-      return res.status(401).json({ error: 'User not authenticated' });
+      console.error('❌ User not authenticated - no userId in request');
+      return res.status(401).json({ error: 'User not authenticated. Please log in and try again.' });
     }
+
+    const redirectUri = GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
+    console.log('🔗 Using redirect URI:', redirectUri);
 
     const oauth2Client = new OAuth2Client(
       GOOGLE_CLIENT_ID,
       GOOGLE_CLIENT_SECRET,
-      GOOGLE_REDIRECT_URI || `${req.protocol}://${req.get('host')}/api/auth/google/callback`
+      redirectUri
     );
 
     // Generate authorization URL with offline access to get refresh token
@@ -1436,11 +1448,19 @@ app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
       state: userId.toString() // Pass user ID in state for callback
     });
 
-    console.log('🔗 Generated Google OAuth authorization URL for user:', userId);
+    console.log('✅ Generated Google OAuth authorization URL for user:', userId);
+    console.log('🔗 Authorization URL length:', authUrl.length);
     res.json({ authUrl });
   } catch (error) {
-    console.error('❌ Error generating Google OAuth URL:', error);
-    res.status(500).json({ error: 'Failed to generate authorization URL' });
+    console.error('❌ Error generating Google OAuth URL:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name
+    });
+    res.status(500).json({ 
+      error: 'Failed to generate authorization URL',
+      details: error.message 
+    });
   }
 });
 
