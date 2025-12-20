@@ -24532,16 +24532,31 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
         timeStr = '09:00';
       }
       
-      // Create date string in ISO format
-      const dateTimeString = `${dateStr}T${timeStr}:00`;
-      console.log('📅 Parsing date/time:', { scheduledDate, scheduledTime, dateStr, timeStr, dateTimeString });
-      startDateTime = new Date(dateTimeString);
+      // Parse date and time components
+      const [year, month, day] = dateStr.split('-').map(Number);
+      const [hours, minutes] = timeStr.split(':').map(Number);
+      
+      // Create date object in local timezone (not UTC)
+      // This ensures the time is preserved exactly as specified
+      startDateTime = new Date(year, month - 1, day, hours || 0, minutes || 0, 0, 0);
       
       // Validate date
       if (isNaN(startDateTime.getTime())) {
-        console.error('❌ Invalid date:', { scheduledDate, scheduledTime, dateTimeString, dateStr, timeStr });
+        console.error('❌ Invalid date:', { scheduledDate, scheduledTime, dateStr, timeStr, year, month, day, hours, minutes });
         throw new Error(`Invalid date/time: ${scheduledDate} ${scheduledTime}`);
       }
+      
+      console.log('📅 Parsing date/time:', { 
+        scheduledDate, 
+        scheduledTime, 
+        dateStr, 
+        timeStr, 
+        parsed: {
+          year, month, day, hours, minutes,
+          localTime: startDateTime.toLocaleString(),
+          isoString: startDateTime.toISOString()
+        }
+      });
       
       console.log('✅ Parsed date successfully:', startDateTime.toISOString());
     } catch (error) {
@@ -24551,16 +24566,40 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
     
     const endDateTime = new Date(startDateTime.getTime() + duration * 60000);
     
+    // Get the timezone - use server's timezone or default to America/New_York
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York';
+    
+    // Format dateTime in ISO 8601 format with timezone offset
+    // Google Calendar API expects dateTime to be in the specified timeZone
+    // We need to format it correctly to preserve the local time
+    const formatDateTimeForCalendar = (date) => {
+      // Get timezone offset in minutes
+      const offset = date.getTimezoneOffset();
+      const offsetHours = Math.floor(Math.abs(offset) / 60);
+      const offsetMinutes = Math.abs(offset) % 60;
+      const offsetSign = offset <= 0 ? '+' : '-';
+      
+      // Format: YYYY-MM-DDTHH:mm:ss+HH:mm
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      const seconds = String(date.getSeconds()).padStart(2, '0');
+      
+      return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${offsetSign}${String(offsetHours).padStart(2, '0')}:${String(offsetMinutes).padStart(2, '0')}`;
+    };
+    
     const event = {
       summary: `${serviceName} - ${customerName}`,
       description: `Job ID: ${jobId}\nCustomer: ${customerName}\nService: ${serviceName}\nAddress: ${address || 'Not specified'}\nStatus: ${jobData.status || 'pending'}`,
       start: {
-        dateTime: startDateTime.toISOString(),
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
+        dateTime: formatDateTimeForCalendar(startDateTime),
+        timeZone: timeZone,
       },
       end: {
-        dateTime: endDateTime.toISOString(),
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
+        dateTime: formatDateTimeForCalendar(endDateTime),
+        timeZone: timeZone,
       },
       reminders: {
         useDefault: false,
