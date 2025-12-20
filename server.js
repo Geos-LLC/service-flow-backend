@@ -25187,6 +25187,34 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
   }
 });
 
+// Disconnect Google account
+app.put('/api/user/google-disconnect', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Clear Google tokens from database
+    const { error } = await supabase
+      .from('users')
+      .update({
+        google_access_token: null,
+        google_refresh_token: null,
+        google_id: null,
+        google_calendar_enabled: false
+      })
+      .eq('id', userId);
+    
+    if (error) {
+      console.error('Error disconnecting Google:', error);
+      return res.status(500).json({ error: 'Failed to disconnect Google account' });
+    }
+    
+    res.json({ success: true, message: 'Google account disconnected successfully' });
+  } catch (error) {
+    console.error('Disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Google account' });
+  }
+});
+
 // Export jobs to Google Sheets
 app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
   try {
