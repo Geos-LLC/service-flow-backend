@@ -24476,10 +24476,10 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     const calendarId = userData.google_calendar_id || 'primary';
 
-    // Get existing calendar event ID if job was previously synced
+    // Get existing calendar event ID and link if job was previously synced
     const { data: existingJob } = await supabase
       .from('jobs')
-      .select('google_calendar_event_id')
+      .select('google_calendar_event_id, google_calendar_event_link')
       .eq('id', jobId)
       .single();
 
@@ -24703,10 +24703,13 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
     eventLink = result.eventLink;
     console.log('✅ Calendar event synced successfully:', eventId);
 
-    // Update job with calendar event ID
+    // Update job with calendar event ID and link
     await supabase
       .from('jobs')
-      .update({ google_calendar_event_id: eventId })
+      .update({ 
+        google_calendar_event_id: eventId,
+        google_calendar_event_link: eventLink // Store the htmlLink from API
+      })
       .eq('id', jobId);
 
     return { eventId, eventLink };
