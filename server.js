@@ -7141,6 +7141,29 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete all customers endpoint (for testing purposes) - MUST be before /:id route
+app.delete('/api/customers/all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Soft delete all customers for this user by setting status to 'archived'
+    const { error: updateError } = await supabase
+      .from('customers')
+      .update({ status: 'archived' })
+      .eq('user_id', userId);
+    
+    if (updateError) {
+      console.error('Error deleting all customers:', updateError);
+      return res.status(500).json({ error: 'Failed to delete all customers' });
+    }
+    
+    res.json({ message: 'All customers deleted successfully' });
+  } catch (error) {
+    console.error('Delete all customers error:', error);
+    res.status(500).json({ error: 'Failed to delete all customers' });
+  }
+});
+
 app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -7201,29 +7224,6 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Delete customer error:', error);
     res.status(500).json({ error: 'Failed to delete customer' });
-  }
-});
-
-// Delete all customers endpoint (for testing purposes)
-app.delete('/api/customers/all', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    
-    // Soft delete all customers for this user by setting status to 'archived'
-    const { error: updateError } = await supabase
-      .from('customers')
-      .update({ status: 'archived' })
-      .eq('user_id', userId);
-    
-    if (updateError) {
-      console.error('Error deleting all customers:', updateError);
-      return res.status(500).json({ error: 'Failed to delete all customers' });
-    }
-    
-    res.json({ message: 'All customers deleted successfully' });
-  } catch (error) {
-    console.error('Delete all customers error:', error);
-    res.status(500).json({ error: 'Failed to delete all customers' });
   }
 });
 
@@ -25360,65 +25360,6 @@ console.log('🔧 Setting up Google Import endpoints...');
 setupGoogleImportEndpoints(app, authenticateToken, supabase, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
 console.log('✅ Google Import endpoints setup complete');
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-// Start server
-app.listen(PORT, async () => {
-  console.log(`Serviceflow API server running on port ${PORT}`);
-  console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
-  console.log('🔍 Branding endpoints registered: /api/user/branding (GET, PUT)');
-  console.log('🔍 Test endpoint available: /api/test-branding');
-  
-  // Initialize database schema
-  try {
-    await initializeDatabase();
-  } catch (error) {
-    console.error('❌ Database initialization failed:', error);
-    console.log('⚠️ Server will continue without database initialization');
-  }
-});
-
-// Fix database schema endpoint (Supabase handles schema automatically)
-app.post('/api/fix-schema', async (req, res) => {
-  try {
-    console.log('🔧 Checking Supabase schema...');
-    
-    // Test connection to verify schema is working
-    const { data: jobsTest, error: jobsError } = await supabase
-      .from('jobs')
-      .select('id')
-      .limit(1);
-    
-    const { data: servicesTest, error: servicesError } = await supabase
-      .from('services')
-      .select('id')
-      .limit(1);
-    
-    if (jobsError || servicesError) {
-      console.error('❌ Schema check error:', { jobsError, servicesError });
-      return res.status(500).json({ 
-        error: 'Schema check failed', 
-        details: { jobsError, servicesError } 
-      });
-    }
-    
-    console.log('✅ Supabase schema is working correctly');
-    
-    res.json({
-      success: true,
-      message: 'Supabase schema is working correctly',
-      note: 'Supabase handles schema management automatically'
-    });
-  } catch (error) {
-    console.error('❌ Schema check error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-
-
 // Property Data API endpoint (using ATTOM Data API)
 app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   try {
@@ -25543,6 +25484,63 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
     console.error('❌ Property API error:', error);
     // Return null instead of error to allow UI to handle gracefully
     res.json(null);
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+// Start server
+app.listen(PORT, async () => {
+  console.log(`Serviceflow API server running on port ${PORT}`);
+  console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
+  console.log('🔍 Branding endpoints registered: /api/user/branding (GET, PUT)');
+  console.log('🔍 Test endpoint available: /api/test-branding');
+  
+  // Initialize database schema
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    console.log('⚠️ Server will continue without database initialization');
+  }
+});
+
+// Fix database schema endpoint (Supabase handles schema automatically)
+app.post('/api/fix-schema', async (req, res) => {
+  try {
+    console.log('🔧 Checking Supabase schema...');
+    
+    // Test connection to verify schema is working
+    const { data: jobsTest, error: jobsError } = await supabase
+      .from('jobs')
+      .select('id')
+      .limit(1);
+    
+    const { data: servicesTest, error: servicesError } = await supabase
+      .from('services')
+      .select('id')
+      .limit(1);
+    
+    if (jobsError || servicesError) {
+      console.error('❌ Schema check error:', { jobsError, servicesError });
+      return res.status(500).json({ 
+        error: 'Schema check failed', 
+        details: { jobsError, servicesError } 
+      });
+    }
+    
+    console.log('✅ Supabase schema is working correctly');
+    
+    res.json({
+      success: true,
+      message: 'Supabase schema is working correctly',
+      note: 'Supabase handles schema management automatically'
+    });
+  } catch (error) {
+    console.error('❌ Schema check error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
