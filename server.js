@@ -25396,6 +25396,54 @@ app.post('/api/fix-schema', async (req, res) => {
 
 
 
+// Zillow Property API endpoint
+app.post('/api/zillow/property', authenticateToken, async (req, res) => {
+  try {
+    const { address, street, city, state, zipCode } = req.body;
+    
+    if (!address && !street) {
+      return res.status(400).json({ error: 'Address is required' });
+    }
+    
+    // Note: Zillow API requires authentication and has specific terms of service
+    // For now, we'll use a mock response or integrate with Zillow API if credentials are available
+    // You'll need to set ZILLOW_API_KEY in your environment variables
+    
+    const zillowApiKey = process.env.ZILLOW_API_KEY;
+    
+    if (!zillowApiKey) {
+      // Return mock data for development/testing
+      console.log('⚠️ ZILLOW_API_KEY not set, returning mock data');
+      return res.json({
+        zpid: 'mock-zpid-12345',
+        address: address || `${street}, ${city}, ${state} ${zipCode}`,
+        price: '350000',
+        bedrooms: 3,
+        bathrooms: 2.5,
+        squareFeet: '2500',
+        yearBuilt: '2010',
+        propertyType: 'Single Family',
+        lotSize: '0.25 acres',
+        image: null
+      });
+    }
+    
+    // TODO: Implement actual Zillow API integration
+    // Zillow API documentation: https://www.zillow.com/howto/api/GetSearchResults.htm
+    // You'll need to use their GetSearchResults or GetUpdatedPropertyDetails API
+    
+    // For now, return a placeholder response
+    res.json({
+      message: 'Zillow API integration pending',
+      address: address || `${street}, ${city}, ${state} ${zipCode}`
+    });
+    
+  } catch (error) {
+    console.error('Zillow API error:', error);
+    res.status(500).json({ error: 'Failed to fetch Zillow property data' });
+  }
+});
+
 // Google Geocoding API proxy endpoint for address validation fallback
 
 
