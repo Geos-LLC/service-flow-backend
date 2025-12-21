@@ -5938,9 +5938,12 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
       .select('*', { count: 'exact' })
       .eq('user_id', userId);
     
-    // Add status filter
+    // Add status filter - by default, exclude archived customers unless explicitly requested
     if (status && status !== 'all') {
       query = query.eq('status', status);
+    } else {
+      // Exclude archived customers by default (show only active/null status)
+      query = query.or('status.is.null,status.neq.archived');
     }
     
     // Add search filter
@@ -7146,18 +7149,85 @@ app.delete('/api/customers/all', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     
-    // Soft delete all customers for this user by setting status to 'archived'
-    const { error: updateError } = await supabase
+    // Hard delete all customers for this user (for testing/import purposes)
+    // First, we need to delete associated records if they exist
+    // Get all customer IDs for this user
+    const { data: customers, error: fetchError } = await supabase
       .from('customers')
-      .update({ status: 'archived' })
+      .select('id')
       .eq('user_id', userId);
     
-    if (updateError) {
-      console.error('Error deleting all customers:', updateError);
-      return res.status(500).json({ error: 'Failed to delete all customers' });
+    if (fetchError) {
+      console.error('Error fetching customers for deletion:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch customers for deletion' });
     }
     
-    res.json({ message: 'All customers deleted successfully' });
+    if (!customers || customers.length === 0) {
+      return res.json({ message: 'No customers to delete' });
+    }
+    
+    const customerIds = customers.map(c => c.id);
+    
+    // Delete associated records first (if any exist, this will handle foreign key constraints)
+    // Note: This might fail if there are jobs/estimates, but for testing we'll try to proceed
+    
+    // Hard delete all customers
+    const { error: deleteError } = await supabase
+      .from('customers')
+      .delete()
+      .eq('user_id', userId);
+    
+    if (deleteError) {
+      console.error('Error deleting all customers:', deleteError);
+      
+      // Check if it's a foreign key constraint error
+      if (deleteError.code === '23503' || deleteError.message?.includes('foreign key') || deleteError.message?.includes('violates foreign key')) {
+        // For testing purposes, try to delete jobs and estimates first, then retry
+        console.log('⚠️ Foreign key constraint detected, attempting to delete associated records...');
+        
+        // Try to delete associated jobs (cascade delete if possible, otherwise just mark)
+        await supabase
+          .from('jobs')
+          .delete()
+          .in('customer_id', customerIds);
+        
+        // Try to delete associated estimates
+        await supabase
+          .from('estimates')
+          .delete()
+          .in('customer_id', customerIds);
+        
+        // Retry customer deletion
+        const { error: retryError } = await supabase
+          .from('customers')
+          .delete()
+          .eq('user_id', userId);
+        
+        if (retryError) {
+          return res.status(500).json({ 
+            error: 'Failed to delete customers. Some customers may have associated records that could not be removed.',
+            details: retryError.message 
+          });
+        }
+        
+        console.log(`✅ Deleted ${customerIds.length} customers and associated records for user ${userId}`);
+        return res.json({ 
+          message: `All ${customerIds.length} customers and associated records deleted successfully`,
+          deleted: customerIds.length
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to delete all customers',
+        details: deleteError.message 
+      });
+    }
+    
+    console.log(`✅ Deleted ${customerIds.length} customers for user ${userId}`);
+    res.json({ 
+      message: `All ${customerIds.length} customers deleted successfully`,
+      deleted: customerIds.length
+    });
   } catch (error) {
     console.error('Delete all customers error:', error);
     res.status(500).json({ error: 'Failed to delete all customers' });
