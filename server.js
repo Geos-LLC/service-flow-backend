@@ -7204,6 +7204,29 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete all customers endpoint (for testing purposes)
+app.delete('/api/customers/all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Soft delete all customers for this user by setting status to 'archived'
+    const { error: updateError } = await supabase
+      .from('customers')
+      .update({ status: 'archived' })
+      .eq('user_id', userId);
+    
+    if (updateError) {
+      console.error('Error deleting all customers:', updateError);
+      return res.status(500).json({ error: 'Failed to delete all customers' });
+    }
+    
+    res.json({ message: 'All customers deleted successfully' });
+  } catch (error) {
+    console.error('Delete all customers error:', error);
+    res.status(500).json({ error: 'Failed to delete all customers' });
+  }
+});
+
 
 // Jobs import endpoint
 app.post('/api/jobs/import', authenticateToken, async (req, res) => {
