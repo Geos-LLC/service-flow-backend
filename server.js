@@ -25419,7 +25419,7 @@ app.post('/api/fix-schema', async (req, res) => {
 
 
 
-// Zillow Property API endpoint
+// Property Data API endpoint (using ATTOM Data API)
 app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   try {
     const { address, street, city, state, zipCode } = req.body;
@@ -25428,42 +25428,121 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Address is required' });
     }
     
-    // Note: Zillow API requires authentication and has specific terms of service
-    // For now, we'll use a mock response or integrate with Zillow API if credentials are available
-    // You'll need to set ZILLOW_API_KEY in your environment variables
+    const attomApiKey = process.env.ATTOM_API_KEY;
+    const attomBaseUrl = process.env.ATTOM_API_BASE_URL || 'https://api.gateway.attomdata.com';
     
-    const zillowApiKey = process.env.ZILLOW_API_KEY;
-    
-    if (!zillowApiKey) {
-      // Return mock data for development/testing
-      console.log('⚠️ ZILLOW_API_KEY not set, returning mock data');
-      return res.json({
-        zpid: 'mock-zpid-12345',
-        address: address || `${street}, ${city}, ${state} ${zipCode}`,
-        price: '350000',
-        bedrooms: 3,
-        bathrooms: 2.5,
-        squareFeet: '2500',
-        yearBuilt: '2010',
-        propertyType: 'Single Family',
-        lotSize: '0.25 acres',
-        image: null
-      });
+    if (!attomApiKey) {
+      console.log('⚠️ ATTOM_API_KEY not set, returning null to indicate no property found');
+      return res.json(null); // Return null to indicate no property data available
     }
     
-    // TODO: Implement actual Zillow API integration
-    // Zillow API documentation: https://www.zillow.com/howto/api/GetSearchResults.htm
-    // You'll need to use their GetSearchResults or GetUpdatedPropertyDetails API
+    // Parse address components
+    let address1 = street || '';
+    let address2 = '';
+    let parsedCity = city || '';
+    let parsedState = state || '';
+    let parsedZip = zipCode || '';
     
-    // For now, return a placeholder response
-    res.json({
-      message: 'Zillow API integration pending',
-      address: address || `${street}, ${city}, ${state} ${zipCode}`
-    });
+    // If we have a full address string, try to parse it
+    if (address && !street) {
+      const addressParts = address.split(',').map(part => part.trim());
+      if (addressParts.length >= 3) {
+        address1 = addressParts[0];
+        parsedCity = parsedCity || addressParts[1];
+        const stateZip = addressParts[2].split(' ');
+        parsedState = parsedState || stateZip[0];
+        parsedZip = parsedZip || (stateZip[1] || '');
+      } else if (addressParts.length === 2) {
+        address1 = addressParts[0];
+        parsedCity = parsedCity || addressParts[1];
+      } else {
+        address1 = address;
+      }
+    }
+    
+    // Validate required fields
+    if (!address1 || !parsedCity || !parsedState || !parsedZip) {
+      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState, zip: parsedZip });
+      return res.json(null);
+    }
+    
+    try {
+      // Call ATTOM Data API - Property Detail endpoint
+      // Documentation: https://api.developer.attomdata.com/docs
+      const attomResponse = await axios.get(`${attomBaseUrl}/propertyapi/v1.0.0/property/detail`, {
+        headers: {
+          'apikey': attomApiKey,
+          'Accept': 'application/json'
+        },
+        params: {
+          address1: address1,
+          address2: address2 || undefined,
+          city: parsedCity,
+          state: parsedState,
+          zip: parsedZip
+        },
+        timeout: 10000 // 10 second timeout
+      });
+      
+      console.log('✅ ATTOM API response received');
+      
+      // Check if we have valid property data
+      if (attomResponse.data && attomResponse.data.property && attomResponse.data.property.length > 0) {
+        const property = attomResponse.data.property[0];
+        const identifier = property.identifier || {};
+        const building = property.building || {};
+        const lot = property.lot || {};
+        const assessment = property.assessment || {};
+        const addressData = property.address || {};
+        
+        // Map ATTOM data to our expected format
+        const formattedData = {
+          zpid: identifier.attomId || identifier.obPropId || identifier.fipsCode || null,
+          address: addressData.oneLine || address || `${address1}, ${parsedCity}, ${parsedState} ${parsedZip}`,
+          price: assessment.assessed?.assdTotalValue || assessment.market?.mktTtlValue || assessment.sale?.amount?.saleAmt || null,
+          bedrooms: building.rooms?.bedsTotal || building.rooms?.beds || null,
+          bathrooms: building.rooms?.bathstotal || building.rooms?.baths || null,
+          squareFeet: building.size?.livingsize || building.size?.grossSize || null,
+          yearBuilt: building.construction?.yearBuilt || null,
+          propertyType: building.summary?.propclass || building.summary?.propSubType || null,
+          lotSize: lot.size?.lotSize1 || lot.size?.lotSize2 || null,
+          image: property.image || null,
+          // Additional useful fields
+          assessedValue: assessment.assessed?.assdTotalValue || null,
+          marketValue: assessment.market?.mktTtlValue || null,
+          lastSalePrice: assessment.sale?.amount?.saleAmt || null,
+          lastSaleDate: assessment.sale?.saleDate || null,
+          lotSizeAcres: lot.size?.lotSizeAcres || null,
+          stories: building.summary?.stories || null,
+          units: building.summary?.units || null
+        };
+        
+        console.log('✅ Property data formatted successfully');
+        return res.json(formattedData);
+      } else {
+        console.log('⚠️ No property found in ATTOM API response');
+        return res.json(null);
+      }
+      
+    } catch (apiError) {
+      console.error('❌ ATTOM API error:', apiError.response?.status, apiError.response?.statusText);
+      console.error('Response data:', apiError.response?.data);
+      
+      // If API returns 404 or no results, return null instead of error
+      if (apiError.response?.status === 404 || apiError.response?.status === 400) {
+        console.log('⚠️ Property not found (404/400) - returning null');
+        return res.json(null);
+      }
+      
+      // For other errors, still return null to avoid breaking the UI
+      console.error('⚠️ ATTOM API request failed, returning null');
+      return res.json(null);
+    }
     
   } catch (error) {
-    console.error('Zillow API error:', error);
-    res.status(500).json({ error: 'Failed to fetch Zillow property data' });
+    console.error('❌ Property API error:', error);
+    // Return null instead of error to allow UI to handle gracefully
+    res.json(null);
   }
 });
 
