@@ -8999,7 +8999,9 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         phone,
         email_notifications,
         sms_notifications,
-        profile_picture
+        profile_picture,
+        google_access_token,
+        google_id
       `)
       .eq('id', userId)
       .maybeSingle(); // fetch a single row instead of array
@@ -9040,7 +9042,9 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
       emailNotifications: !!user.email_notifications,
       smsNotifications: !!user.sms_notifications,
         profilePicture: user.profile_picture,
-        role: userRole
+        role: userRole,
+        google_access_token: user.google_access_token || null,
+        google_id: user.google_id || null
       };
     } else {
       // Not found in users table, check team_members table
