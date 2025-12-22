@@ -25228,13 +25228,29 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
-    const spreadsheet = await sheets.spreadsheets.create({
-      resource: {
-        properties: {
-          title: `Serviceflow Customers - ${new Date().toLocaleDateString()}`
+    let spreadsheet;
+    try {
+      spreadsheet = await sheets.spreadsheets.create({
+        resource: {
+          properties: {
+            title: `Serviceflow Customers - ${new Date().toLocaleDateString()}`
+          }
         }
+      });
+    } catch (sheetsError) {
+      // Check if error is due to insufficient scopes
+      if (sheetsError.code === 403 && 
+          (sheetsError.message?.includes('insufficient authentication scopes') || 
+           sheetsError.message?.includes('PERMISSION_DENIED'))) {
+        console.error('❌ Insufficient Google Sheets scopes. User needs to reconnect with proper scopes.');
+        return res.status(403).json({ 
+          error: 'insufficient_scopes',
+          message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+          requiresReconnect: true
+        });
       }
-    });
+      throw sheetsError; // Re-throw if it's a different error
+    }
 
     const spreadsheetId = spreadsheet.data.spreadsheetId;
 
@@ -25386,13 +25402,29 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
     // Create new spreadsheet
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
-    const spreadsheet = await sheets.spreadsheets.create({
-      resource: {
-        properties: {
-          title: `Serviceflow Jobs - ${new Date().toLocaleDateString()}`
+    let spreadsheet;
+    try {
+      spreadsheet = await sheets.spreadsheets.create({
+        resource: {
+          properties: {
+            title: `Serviceflow Jobs - ${new Date().toLocaleDateString()}`
+          }
         }
+      });
+    } catch (sheetsError) {
+      // Check if error is due to insufficient scopes
+      if (sheetsError.code === 403 && 
+          (sheetsError.message?.includes('insufficient authentication scopes') || 
+           sheetsError.message?.includes('PERMISSION_DENIED'))) {
+        console.error('❌ Insufficient Google Sheets scopes. User needs to reconnect with proper scopes.');
+        return res.status(403).json({ 
+          error: 'insufficient_scopes',
+          message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+          requiresReconnect: true
+        });
       }
-    });
+      throw sheetsError; // Re-throw if it's a different error
+    }
 
     const spreadsheetId = spreadsheet.data.spreadsheetId;
 
