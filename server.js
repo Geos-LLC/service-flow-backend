@@ -25256,17 +25256,25 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
 
     // Prepare data for export
     const headers = ['Name', 'Email', 'Phone', 'Address', 'City', 'State', 'Zip Code', 'Created Date', 'Last Contact'];
-    const values = customers.map(customer => [
-      customer.name || '',
-      customer.email || '',
-      customer.phone || '',
-      customer.address || '',
-      customer.city || '',
-      customer.state || '',
-      customer.zip_code || '',
-      new Date(customer.created_at).toLocaleDateString(),
-      customer.last_contact ? new Date(customer.last_contact).toLocaleDateString() : ''
-    ]);
+    const values = customers.map(customer => {
+      // Combine first_name and last_name into full name
+      const fullName = [customer.first_name, customer.last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim() || '';
+      
+      return [
+        fullName,
+        customer.email || '',
+        customer.phone || '',
+        customer.address || '',
+        customer.city || '',
+        customer.state || '',
+        customer.zip_code || '',
+        customer.created_at ? new Date(customer.created_at).toLocaleDateString() : '',
+        customer.last_contact ? new Date(customer.last_contact).toLocaleDateString() : ''
+      ];
+    });
 
     // Add data to spreadsheet
     await sheets.spreadsheets.values.update({
@@ -25369,7 +25377,7 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
       .from('jobs')
       .select(`
         *,
-        customers(name, email, phone),
+        customers(first_name, last_name, email, phone),
         services(name, price)
       `)
       .eq('user_id', userId)
@@ -25430,17 +25438,27 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
 
     // Prepare data for export
     const headers = ['Job ID', 'Customer', 'Service', 'Date', 'Time', 'Status', 'Total Amount', 'Address', 'Notes'];
-    const values = jobs.map(job => [
-      job.id,
-      job.customers?.name || '',
-      job.services?.name || '',
-      new Date(job.scheduled_date).toLocaleDateString(),
-      job.scheduled_time || '',
-      job.status || '',
-      `$${job.total || 0}`,
-      job.address || '',
-      job.notes || ''
-    ]);
+    const values = jobs.map(job => {
+      // Combine first_name and last_name into full name
+      const customerName = job.customers 
+        ? [job.customers.first_name, job.customers.last_name]
+            .filter(Boolean)
+            .join(' ')
+            .trim() || ''
+        : '';
+      
+      return [
+        job.id,
+        customerName,
+        job.services?.name || '',
+        job.scheduled_date ? new Date(job.scheduled_date).toLocaleDateString() : '',
+        job.scheduled_time || '',
+        job.status || '',
+        `$${job.total || 0}`,
+        job.address || '',
+        job.notes || ''
+      ];
+    });
 
     // Add data to spreadsheet
     await sheets.spreadsheets.values.update({
