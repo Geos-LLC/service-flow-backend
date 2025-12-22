@@ -13492,6 +13492,28 @@ app.post('/api/team-members', async (req, res) => {
     const colors = ['#2563EB', '#DC2626', '#059669', '#D97706', '#7C3AED', '#DB2777', '#6B7280'];
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
     
+    // Set default availability if none provided
+    let defaultAvailability = availability;
+    if (!defaultAvailability || (typeof defaultAvailability === 'object' && Object.keys(defaultAvailability).length === 0)) {
+      defaultAvailability = {
+        workingHours: {
+          monday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          tuesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          wednesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          thursday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          friday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          saturday: { available: false, hours: "" },
+          sunday: { available: false, hours: "" }
+        },
+        customAvailability: []
+      };
+    }
+    
+    // Ensure availability is stored as JSON string
+    const availabilityString = typeof defaultAvailability === 'string' 
+      ? defaultAvailability 
+      : JSON.stringify(defaultAvailability);
+    
     const { data: newTeamMember, error: createError } = await supabase
       .from('team_members')
       .insert({
@@ -13505,7 +13527,7 @@ app.post('/api/team-members', async (req, res) => {
         role: role || null,
         skills,
         hourly_rate: hourlyRate || null,
-        availability,
+        availability: availabilityString,
         location: location || null,
         city: city || null,
         state: state || null,
@@ -15286,10 +15308,39 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/team-members/:id/availability', async (req, res) => {
+app.put('/api/team-members/:id/availability', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { availability } = req.body;
+    const userId = req.user.userId;
+    const userRole = req.user.role;
+    const teamMemberId = req.user.teamMemberId;
+    
+    // Check if team member exists
+    const { data: teamMember, error: memberError } = await supabase
+      .from('team_members')
+      .select('id, user_id')
+      .eq('id', id)
+      .maybeSingle();
+    
+    if (memberError || !teamMember) {
+      return res.status(404).json({ error: 'Team member not found' });
+    }
+    
+    // Permission check: 
+    // - Account owners can edit any team member's availability
+    // - Team members can only edit their own availability
+    const isAccountOwner = !userRole || userRole === 'owner' || userRole === 'account owner' || userRole === 'admin';
+    const isEditingSelf = teamMemberId && parseInt(teamMemberId) === parseInt(id);
+    
+    if (!isAccountOwner && !isEditingSelf) {
+      return res.status(403).json({ error: 'You do not have permission to edit this team member\'s availability' });
+    }
+    
+    // Validate availability format
+    if (!availability || (typeof availability === 'object' && Object.keys(availability).length === 0)) {
+      return res.status(400).json({ error: 'Availability data is required' });
+    }
     
     // Update team member availability in Supabase
     const availabilityJson = typeof availability === 'string' ? availability : JSON.stringify(availability);
@@ -15847,6 +15898,28 @@ app.post('/api/team-members/register', async (req, res) => {
     const colors = ['#2563EB', '#DC2626', '#059669', '#D97706', '#7C3AED', '#DB2777', '#6B7280'];
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
     
+    // Set default availability if none provided
+    let defaultAvailability = availability;
+    if (!defaultAvailability || (typeof defaultAvailability === 'object' && Object.keys(defaultAvailability).length === 0)) {
+      defaultAvailability = {
+        workingHours: {
+          monday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          tuesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          wednesday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          thursday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          friday: { available: true, hours: "9:00 AM - 5:00 PM" },
+          saturday: { available: false, hours: "" },
+          sunday: { available: false, hours: "" }
+        },
+        customAvailability: []
+      };
+    }
+    
+    // Ensure availability is stored as JSON string
+    const availabilityString = typeof defaultAvailability === 'string' 
+      ? defaultAvailability 
+      : JSON.stringify(defaultAvailability);
+    
     const { data: teamMember, error: insertError } = await supabase
       .from('team_members')
       .insert({
@@ -15862,7 +15935,7 @@ app.post('/api/team-members/register', async (req, res) => {
         role: role || 'worker',
         hourly_rate: hourlyRate ? parseFloat(hourlyRate) : null,
         territories: territories || [],
-        availability: availability || {},
+        availability: availabilityString,
         permissions: permissions || {},
         ...(await checkColorColumn() ? { color: randomColor } : {}),
         invitation_token: invitationToken,
