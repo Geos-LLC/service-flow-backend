@@ -50,6 +50,18 @@ app.get('/api/google/sheets/list', authenticateToken, async (req, res) => {
         pageSize: 50
       });
     } catch (driveError) {
+      // Check if Google Drive API is not enabled
+      if (driveError.code === 403 && 
+          driveError.message?.includes('Google Drive API has not been used') || 
+          driveError.message?.includes('it is disabled')) {
+        console.error('❌ Google Drive API is not enabled in the Google Cloud project.');
+        return res.status(403).json({ 
+          error: 'drive_api_not_enabled',
+          message: 'Google Drive API is not enabled in your Google Cloud project. Please enable it in the Google Cloud Console: https://console.developers.google.com/apis/api/drive.googleapis.com/overview',
+          requiresAdminAction: true,
+          helpUrl: 'https://console.developers.google.com/apis/api/drive.googleapis.com/overview'
+        });
+      }
       // Check if error is due to insufficient scopes
       if (driveError.code === 403 && 
           (driveError.message?.includes('insufficient authentication scopes') || 
