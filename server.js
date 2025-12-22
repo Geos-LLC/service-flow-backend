@@ -1448,16 +1448,23 @@ app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
     );
 
     // Generate authorization URL with offline access to get refresh token
+    // Include both Calendar and Sheets scopes
+    const allScopes = [
+      ...GOOGLE_CALENDAR_SCOPES,
+      ...GOOGLE_SHEETS_SCOPES,
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+    
+    // Include redirect path in state for callback (default to google-sheets for Sheets integration)
+    const redirectPath = 'google-sheets';
+    const stateValue = `${userId.toString()}:${redirectPath}`;
+    
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: 'offline', // This is crucial for getting refresh tokens
-      scope: [
-        'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/calendar.events',
-        'https://www.googleapis.com/auth/userinfo.email',
-        'https://www.googleapis.com/auth/userinfo.profile'
-      ],
+      scope: allScopes,
       prompt: 'consent', // Force consent screen to ensure refresh token
-      state: userId.toString() // Pass user ID in state for callback
+      state: stateValue // Pass user ID and redirect path in state for callback
     });
 
     console.log('✅ Generated Google OAuth authorization URL for user:', userId);
@@ -1560,11 +1567,20 @@ app.get('/api/auth/google/callback', async (req, res) => {
     const userInfo = userInfoResponse.data;
     console.log('🔗 User info retrieved:', { email: userInfo.email, id: userInfo.id });
 
-    // Get user ID from state
+    // Get user ID and redirect path from state
+    // State format: "userId" or "userId:redirectPath"
     let userId = state;
+    let redirectPath = 'google-sheets'; // Default to google-sheets for Sheets integration
+    
+    if (state && state.includes(':')) {
+      const parts = state.split(':');
+      userId = parts[0];
+      redirectPath = parts[1] || 'google-sheets';
+    }
+    
     if (!userId || userId === 'unknown') {
       console.error('❌ No user ID in state parameter');
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=user_not_authenticated`);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?error=user_not_authenticated`);
     }
 
     console.log('🔗 Updating user with Google connection, userId:', userId);
@@ -1578,7 +1594,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     if (userError || !userData) {
       console.error('❌ User not found:', userError);
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=user_not_found`);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?error=user_not_found`);
     }
 
     const updateData = {
@@ -1604,7 +1620,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     if (updateError) {
       console.error('❌ Error updating user:', updateError);
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=update_failed`);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?error=update_failed`);
     }
 
     console.log('✅ Google account connected successfully', {
@@ -1614,10 +1630,10 @@ app.get('/api/auth/google/callback', async (req, res) => {
     
     // Redirect to frontend with success
     const successParam = tokens.refresh_token ? 'connected' : 'connected_no_refresh';
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?success=${successParam}`);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?success=${successParam}`);
   } catch (error) {
     console.error('❌ Error in Google OAuth callback:', error);
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/calendar-syncing?error=callback_failed`);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?error=callback_failed`);
   }
 });
 
