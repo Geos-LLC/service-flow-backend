@@ -41,12 +41,28 @@ app.get('/api/google/sheets/list', authenticateToken, async (req, res) => {
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // List spreadsheets
-    const response = await drive.files.list({
-      q: "mimeType='application/vnd.google-apps.spreadsheet'",
-      fields: 'files(id, name, modifiedTime, webViewLink)',
-      orderBy: 'modifiedTime desc',
-      pageSize: 50
-    });
+    let response;
+    try {
+      response = await drive.files.list({
+        q: "mimeType='application/vnd.google-apps.spreadsheet'",
+        fields: 'files(id, name, modifiedTime, webViewLink)',
+        orderBy: 'modifiedTime desc',
+        pageSize: 50
+      });
+    } catch (driveError) {
+      // Check if error is due to insufficient scopes
+      if (driveError.code === 403 && 
+          (driveError.message?.includes('insufficient authentication scopes') || 
+           driveError.message?.includes('PERMISSION_DENIED'))) {
+        console.error('❌ Insufficient Google Drive scopes. User needs to reconnect with proper scopes.');
+        return res.status(403).json({ 
+          error: 'insufficient_scopes',
+          message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+          requiresReconnect: true
+        });
+      }
+      throw driveError; // Re-throw if it's a different error
+    }
 
     const spreadsheets = response.data.files.map(file => ({
       id: file.id,
@@ -62,6 +78,16 @@ app.get('/api/google/sheets/list', authenticateToken, async (req, res) => {
 
   } catch (error) {
     console.error('Error listing Google Sheets:', error);
+    // Check if it's a scope error that wasn't caught above
+    if (error.code === 403 && 
+        (error.message?.includes('insufficient authentication scopes') || 
+         error.message?.includes('PERMISSION_DENIED'))) {
+      return res.status(403).json({ 
+        error: 'insufficient_scopes',
+        message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+        requiresReconnect: true
+      });
+    }
     res.status(500).json({ error: 'Failed to list Google Sheets' });
   }
 });
@@ -98,10 +124,26 @@ app.get('/api/google/sheets/:spreadsheetId/data', authenticateToken, async (req,
 
     // Get spreadsheet data
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: spreadsheetId,
-      range: range
-    });
+    let response;
+    try {
+      response = await sheets.spreadsheets.values.get({
+        spreadsheetId: spreadsheetId,
+        range: range
+      });
+    } catch (sheetsError) {
+      // Check if error is due to insufficient scopes
+      if (sheetsError.code === 403 && 
+          (sheetsError.message?.includes('insufficient authentication scopes') || 
+           sheetsError.message?.includes('PERMISSION_DENIED'))) {
+        console.error('❌ Insufficient Google Sheets scopes. User needs to reconnect with proper scopes.');
+        return res.status(403).json({ 
+          error: 'insufficient_scopes',
+          message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+          requiresReconnect: true
+        });
+      }
+      throw sheetsError; // Re-throw if it's a different error
+    }
 
     const values = response.data.values || [];
     
@@ -183,10 +225,26 @@ app.post('/api/google/sheets/import', authenticateToken, async (req, res) => {
 
     // Get all spreadsheet data
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: spreadsheetId,
-      range: 'A1:Z1000'
-    });
+    let response;
+    try {
+      response = await sheets.spreadsheets.values.get({
+        spreadsheetId: spreadsheetId,
+        range: 'A1:Z1000'
+      });
+    } catch (sheetsError) {
+      // Check if error is due to insufficient scopes
+      if (sheetsError.code === 403 && 
+          (sheetsError.message?.includes('insufficient authentication scopes') || 
+           sheetsError.message?.includes('PERMISSION_DENIED'))) {
+        console.error('❌ Insufficient Google Sheets scopes. User needs to reconnect with proper scopes.');
+        return res.status(403).json({ 
+          error: 'insufficient_scopes',
+          message: 'Your Google account connection does not have the required permissions for Google Sheets. Please disconnect and reconnect your Google account to grant the necessary permissions.',
+          requiresReconnect: true
+        });
+      }
+      throw sheetsError; // Re-throw if it's a different error
+    }
 
     const values = response.data.values || [];
     if (values.length < 2) {
@@ -338,10 +396,20 @@ app.post('/api/google/sheets/import', authenticateToken, async (req, res) => {
         }
       }
 
+      // Add "imported" tag to the job
+      const jobWithTag = {
+        ...job,
+        tags: job.tags 
+          ? (Array.isArray(job.tags) 
+              ? [...job.tags, 'imported'] 
+              : `${job.tags},imported`)
+          : 'imported'
+      };
+
       // Insert job
       const { error } = await supabase
         .from('jobs')
-        .insert(job);
+        .insert(jobWithTag);
 
       if (error) {
         errors.push({
