@@ -25755,38 +25755,68 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       console.log('✅ RentCast API response received, status:', rentcastResponse.status);
       console.log('📋 RentCast response data:', JSON.stringify(rentcastResponse.data, null, 2));
       
-      // RentCast /v1/properties endpoint returns an array of properties
-      // We'll take the first one if available
+      // RentCast /v1/properties endpoint returns an array of properties with basic info
+      // We need to get the property ID and then fetch full details
       let property = null;
       if (Array.isArray(rentcastResponse.data) && rentcastResponse.data.length > 0) {
         property = rentcastResponse.data[0];
       } else if (rentcastResponse.data && typeof rentcastResponse.data === 'object') {
-        // Sometimes it might return a single object
         property = rentcastResponse.data;
       }
       
       // Check if we have valid property data
-      if (property) {
+      if (property && property.id) {
+        // Make a second API call to get full property details using the property ID
+        // Documentation: https://developers.rentcast.io/reference/property-records
+        try {
+          console.log('📤 Fetching full property details for ID:', property.id);
+          const propertyDetailsResponse = await axios.get(`${rentcastBaseUrl}/v1/property/${property.id}`, {
+            headers: {
+              'X-Api-Key': rentcastApiKey,
+              'Accept': 'application/json'
+            },
+            timeout: 10000,
+            validateStatus: function (status) {
+              return status < 500;
+            }
+          });
+          
+          if (propertyDetailsResponse.status === 200 && propertyDetailsResponse.data) {
+            // Use the full property details
+            property = propertyDetailsResponse.data;
+            console.log('✅ Full property details received');
+          } else {
+            console.log('⚠️ Full property details not available, using basic property info');
+          }
+        } catch (detailError) {
+          console.log('⚠️ Could not fetch full property details, using basic info:', detailError.response?.status);
+          // Continue with basic property info
+        }
+        
         // Map RentCast data to our expected format
+        // RentCast field names based on their API documentation
         const formattedData = {
           zpid: property.id || property.propertyId || null,
-          address: property.formattedAddress || property.address || `${address1}, ${parsedCity}, ${parsedState} ${parsedZip ? parsedZip : ''}`.trim(),
+          address: property.formattedAddress || property.address || 
+                   (property.addressLine1 ? `${property.addressLine1}, ${property.city || ''}, ${property.state || ''} ${property.zipCode || ''}`.trim() : null) ||
+                   `${address1}, ${parsedCity}, ${parsedState} ${parsedZip ? parsedZip : ''}`.trim(),
           price: property.price || property.estimatedValue || property.rentEstimate || property.value || null,
-          bedrooms: property.bedrooms || property.bedroomsTotal || null,
-          bathrooms: property.bathrooms || property.bathroomsTotal || null,
-          squareFeet: property.squareFootage || property.livingArea || property.totalArea || null,
-          yearBuilt: property.yearBuilt || null,
-          propertyType: property.propertyType || property.type || property.propertySubType || null,
-          lotSize: property.lotSize || null,
+          bedrooms: property.bedrooms || property.bedroomsTotal || property.bedroomCount || null,
+          bathrooms: property.bathrooms || property.bathroomsTotal || property.bathroomCount || null,
+          squareFeet: property.squareFootage || property.livingArea || property.totalArea || property.squareFeet || null,
+          yearBuilt: property.yearBuilt || property.yearBuiltValue || null,
+          propertyType: property.propertyType || property.type || property.propertySubType || property.propertyTypeName || null,
+          lotSize: property.lotSize || property.lotSizeSquareFeet || null,
           image: (property.photos && property.photos.length > 0) ? property.photos[0] : 
-                 (property.images && property.images.length > 0) ? property.images[0] : null,
+                 (property.images && property.images.length > 0) ? property.images[0] :
+                 (property.photo && property.photo.length > 0) ? property.photo[0] : null,
           // Additional useful fields
-          assessedValue: property.assessedValue || null,
-          marketValue: property.estimatedValue || property.value || null,
-          lastSalePrice: property.lastSalePrice || property.lastSaleAmount || null,
-          lastSaleDate: property.lastSaleDate || null,
+          assessedValue: property.assessedValue || property.taxAssessedValue || null,
+          marketValue: property.estimatedValue || property.value || property.marketValue || null,
+          lastSalePrice: property.lastSalePrice || property.lastSaleAmount || property.salePrice || null,
+          lastSaleDate: property.lastSaleDate || property.saleDate || null,
           lotSizeAcres: property.lotSizeAcres || null,
-          stories: property.stories || property.storyCount || null,
+          stories: property.stories || property.storyCount || property.story || null,
           units: property.units || property.unitCount || null
         };
         
