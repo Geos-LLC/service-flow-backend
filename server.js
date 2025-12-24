@@ -25755,8 +25755,8 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       console.log('✅ RentCast API response received, status:', rentcastResponse.status);
       console.log('📋 RentCast response data:', JSON.stringify(rentcastResponse.data, null, 2));
       
-      // RentCast /v1/properties endpoint returns an array of properties with basic info
-      // We need to get the property ID and then fetch full details
+      // RentCast /v1/properties endpoint returns an array of properties
+      // The response may contain basic info or full details depending on the endpoint
       let property = null;
       if (Array.isArray(rentcastResponse.data) && rentcastResponse.data.length > 0) {
         property = rentcastResponse.data[0];
@@ -25766,61 +25766,86 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       
       // Check if we have valid property data
       if (property && property.id) {
-        // Make a second API call to get full property details using the property ID
+        // Try to get full property details using the property ID
+        // RentCast has a "Property Record by Id" endpoint: GET /v1/property/{id}
         // Documentation: https://developers.rentcast.io/reference/property-records
         try {
           console.log('📤 Fetching full property details for ID:', property.id);
-          const propertyDetailsResponse = await axios.get(`${rentcastBaseUrl}/v1/property/${property.id}`, {
+          
+          // URL encode the property ID since it contains special characters like commas
+          const encodedId = encodeURIComponent(property.id);
+          
+          // Try the property record by ID endpoint
+          const propertyDetailsResponse = await axios.get(`${rentcastBaseUrl}/v1/property/${encodedId}`, {
             headers: {
               'X-Api-Key': rentcastApiKey,
               'Accept': 'application/json'
             },
             timeout: 10000,
             validateStatus: function (status) {
+              // Accept all status codes < 500 to handle 404, 400, etc. gracefully
               return status < 500;
             }
           });
           
+          console.log('📋 Property details response status:', propertyDetailsResponse.status);
+          console.log('📋 Property details response data:', JSON.stringify(propertyDetailsResponse.data, null, 2));
+          
           if (propertyDetailsResponse.status === 200 && propertyDetailsResponse.data) {
-            // Use the full property details
-            property = propertyDetailsResponse.data;
-            console.log('✅ Full property details received');
+            // Merge the full property details with the basic info
+            property = { ...property, ...propertyDetailsResponse.data };
+            console.log('✅ Full property details received and merged');
+          } else if (propertyDetailsResponse.status === 404) {
+            console.log('⚠️ Property details endpoint returned 404 - property may not have detailed data');
+            console.log('📋 Using basic property info from search results');
           } else {
-            console.log('⚠️ Full property details not available, using basic property info');
+            console.log('⚠️ Full property details not available, status:', propertyDetailsResponse.status);
+            console.log('📋 Response data:', propertyDetailsResponse.data);
+            // Continue with basic property info
           }
         } catch (detailError) {
-          console.log('⚠️ Could not fetch full property details, using basic info:', detailError.response?.status);
-          // Continue with basic property info
+          // If the endpoint doesn't exist or fails, continue with basic info
+          console.log('⚠️ Could not fetch full property details');
+          if (detailError.response) {
+            console.log('❌ Error status:', detailError.response.status);
+            console.log('❌ Error data:', detailError.response.data);
+          } else {
+            console.log('❌ Error message:', detailError.message);
+          }
+          // Continue with basic property info - this is OK, not all properties have full details
         }
         
         // Map RentCast data to our expected format
         // RentCast field names based on their API documentation
+        // Note: Some properties may only have basic address info, not full details
         const formattedData = {
           zpid: property.id || property.propertyId || null,
           address: property.formattedAddress || property.address || 
                    (property.addressLine1 ? `${property.addressLine1}, ${property.city || ''}, ${property.state || ''} ${property.zipCode || ''}`.trim() : null) ||
                    `${address1}, ${parsedCity}, ${parsedState} ${parsedZip ? parsedZip : ''}`.trim(),
           price: property.price || property.estimatedValue || property.rentEstimate || property.value || null,
-          bedrooms: property.bedrooms || property.bedroomsTotal || property.bedroomCount || null,
-          bathrooms: property.bathrooms || property.bathroomsTotal || property.bathroomCount || null,
-          squareFeet: property.squareFootage || property.livingArea || property.totalArea || property.squareFeet || null,
-          yearBuilt: property.yearBuilt || property.yearBuiltValue || null,
-          propertyType: property.propertyType || property.type || property.propertySubType || property.propertyTypeName || null,
-          lotSize: property.lotSize || property.lotSizeSquareFeet || null,
-          image: (property.photos && property.photos.length > 0) ? property.photos[0] : 
-                 (property.images && property.images.length > 0) ? property.images[0] :
-                 (property.photo && property.photo.length > 0) ? property.photo[0] : null,
+          bedrooms: property.bedrooms || property.bedroomsTotal || property.bedroomCount || property.bedroomsCount || null,
+          bathrooms: property.bathrooms || property.bathroomsTotal || property.bathroomCount || property.bathroomsCount || null,
+          squareFeet: property.squareFootage || property.livingArea || property.totalArea || property.squareFeet || property.area || null,
+          yearBuilt: property.yearBuilt || property.yearBuiltValue || property.yearBuiltYear || null,
+          propertyType: property.propertyType || property.type || property.propertySubType || property.propertyTypeName || property.propertyTypeLabel || null,
+          lotSize: property.lotSize || property.lotSizeSquareFeet || property.lotSquareFeet || null,
+          image: (property.photos && Array.isArray(property.photos) && property.photos.length > 0) ? property.photos[0] : 
+                 (property.images && Array.isArray(property.images) && property.images.length > 0) ? property.images[0] :
+                 (property.photo && Array.isArray(property.photo) && property.photo.length > 0) ? property.photo[0] :
+                 property.photo || property.image || null,
           // Additional useful fields
-          assessedValue: property.assessedValue || property.taxAssessedValue || null,
-          marketValue: property.estimatedValue || property.value || property.marketValue || null,
-          lastSalePrice: property.lastSalePrice || property.lastSaleAmount || property.salePrice || null,
-          lastSaleDate: property.lastSaleDate || property.saleDate || null,
-          lotSizeAcres: property.lotSizeAcres || null,
-          stories: property.stories || property.storyCount || property.story || null,
-          units: property.units || property.unitCount || null
+          assessedValue: property.assessedValue || property.taxAssessedValue || property.assessedValueAmount || null,
+          marketValue: property.estimatedValue || property.value || property.marketValue || property.avmValue || null,
+          lastSalePrice: property.lastSalePrice || property.lastSaleAmount || property.salePrice || property.lastSalePriceAmount || null,
+          lastSaleDate: property.lastSaleDate || property.saleDate || property.lastSaleDateValue || null,
+          lotSizeAcres: property.lotSizeAcres || property.lotAcres || null,
+          stories: property.stories || property.storyCount || property.story || property.storiesCount || null,
+          units: property.units || property.unitCount || property.unitsCount || null
         };
         
         console.log('✅ Property data formatted successfully');
+        console.log('📋 Formatted data being sent to frontend:', JSON.stringify(formattedData, null, 2));
         return res.json(formattedData);
       } else {
         console.log('⚠️ No property found in RentCast API response');
