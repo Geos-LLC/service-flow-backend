@@ -1452,8 +1452,8 @@ app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
     const allScopes = [
       ...GOOGLE_CALENDAR_SCOPES,
       ...GOOGLE_SHEETS_SCOPES,
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile'
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile'
     ];
     
     // Include redirect path in state for callback (default to google-sheets for Sheets integration)
@@ -25343,12 +25343,12 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
     let spreadsheet;
     try {
       spreadsheet = await sheets.spreadsheets.create({
-        resource: {
-          properties: {
-            title: `Serviceflow Customers - ${new Date().toLocaleDateString()}`
-          }
+      resource: {
+        properties: {
+          title: `Serviceflow Customers - ${new Date().toLocaleDateString()}`
         }
-      });
+      }
+    });
     } catch (sheetsError) {
       // Check if error is due to insufficient scopes
       if (sheetsError.code === 403 && 
@@ -25377,14 +25377,14 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
       
       return [
         fullName,
-        customer.email || '',
-        customer.phone || '',
-        customer.address || '',
-        customer.city || '',
-        customer.state || '',
-        customer.zip_code || '',
+      customer.email || '',
+      customer.phone || '',
+      customer.address || '',
+      customer.city || '',
+      customer.state || '',
+      customer.zip_code || '',
         customer.created_at ? new Date(customer.created_at).toLocaleDateString() : '',
-        customer.last_contact ? new Date(customer.last_contact).toLocaleDateString() : ''
+      customer.last_contact ? new Date(customer.last_contact).toLocaleDateString() : ''
       ];
     });
 
@@ -25525,12 +25525,12 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
     let spreadsheet;
     try {
       spreadsheet = await sheets.spreadsheets.create({
-        resource: {
-          properties: {
-            title: `Serviceflow Jobs - ${new Date().toLocaleDateString()}`
-          }
+      resource: {
+        properties: {
+          title: `Serviceflow Jobs - ${new Date().toLocaleDateString()}`
         }
-      });
+      }
+    });
     } catch (sheetsError) {
       // Check if error is due to insufficient scopes
       if (sheetsError.code === 403 && 
@@ -25560,15 +25560,15 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
         : '';
       
       return [
-        job.id,
+      job.id,
         customerName,
-        job.services?.name || '',
+      job.services?.name || '',
         job.scheduled_date ? new Date(job.scheduled_date).toLocaleDateString() : '',
-        job.scheduled_time || '',
-        job.status || '',
-        `$${job.total || 0}`,
-        job.address || '',
-        job.notes || ''
+      job.scheduled_time || '',
+      job.status || '',
+      `$${job.total || 0}`,
+      job.address || '',
+      job.notes || ''
       ];
     });
 
@@ -25612,7 +25612,7 @@ console.log('🔧 Setting up Google Import endpoints...');
 setupGoogleImportEndpoints(app, authenticateToken, supabase, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
 console.log('✅ Google Import endpoints setup complete');
 
-// Property Data API endpoint (using ATTOM Data API)
+// Property Data API endpoint (using RentCast API)
 app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   try {
     const { address, street, city, state, zipCode } = req.body;
@@ -25621,17 +25621,16 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Address is required' });
     }
     
-    const attomApiKey = process.env.ATTOM_API_KEY;
-    const attomBaseUrl = process.env.ATTOM_API_BASE_URL || 'https://api.gateway.attomdata.com';
+    const rentcastApiKey = process.env.RENTCAST_API_KEY;
+    const rentcastBaseUrl = process.env.RENTCAST_API_BASE_URL || 'https://api.rentcast.io';
     
-    if (!attomApiKey) {
-      console.log('⚠️ ATTOM_API_KEY not set, returning null to indicate no property found');
+    if (!rentcastApiKey) {
+      console.log('⚠️ RENTCAST_API_KEY not set, returning null to indicate no property found');
       return res.json(null); // Return null to indicate no property data available
     }
     
     // Parse address components
     let address1 = street || '';
-    let address2 = '';
     let parsedCity = city || '';
     let parsedState = state || '';
     let parsedZip = zipCode || '';
@@ -25653,82 +25652,76 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       }
     }
     
-    // Validate required fields
-    if (!address1 || !parsedCity || !parsedState || !parsedZip) {
-      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState, zip: parsedZip });
+    // Validate required fields - RentCast typically needs address, city, state
+    if (!address1 || !parsedCity || !parsedState) {
+      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState });
       return res.json(null);
     }
     
     try {
-      // Call ATTOM Data API - Property Detail endpoint
-      // Documentation: https://api.developer.attomdata.com/docs
-      const attomResponse = await axios.get(`${attomBaseUrl}/propertyapi/v1.0.0/property/detail`, {
+      // Call RentCast API - Property Details endpoint
+      // Documentation: https://developers.rentcast.io/reference/introduction
+      const rentcastResponse = await axios.get(`${rentcastBaseUrl}/v1/property/details`, {
         headers: {
-          'apikey': attomApiKey,
+          'X-Api-Key': rentcastApiKey,
           'Accept': 'application/json'
         },
         params: {
-          address1: address1,
-          address2: address2 || undefined,
+          address: address1,
           city: parsedCity,
           state: parsedState,
-          zip: parsedZip
+          zipCode: parsedZip || undefined
         },
         timeout: 10000 // 10 second timeout
       });
       
-      console.log('✅ ATTOM API response received');
+      console.log('✅ RentCast API response received');
       
       // Check if we have valid property data
-      if (attomResponse.data && attomResponse.data.property && attomResponse.data.property.length > 0) {
-        const property = attomResponse.data.property[0];
-        const identifier = property.identifier || {};
-        const building = property.building || {};
-        const lot = property.lot || {};
-        const assessment = property.assessment || {};
-        const addressData = property.address || {};
+      if (rentcastResponse.data) {
+        const property = rentcastResponse.data;
         
-        // Map ATTOM data to our expected format
+        // Map RentCast data to our expected format
         const formattedData = {
-          zpid: identifier.attomId || identifier.obPropId || identifier.fipsCode || null,
-          address: addressData.oneLine || address || `${address1}, ${parsedCity}, ${parsedState} ${parsedZip}`,
-          price: assessment.assessed?.assdTotalValue || assessment.market?.mktTtlValue || assessment.sale?.amount?.saleAmt || null,
-          bedrooms: building.rooms?.bedsTotal || building.rooms?.beds || null,
-          bathrooms: building.rooms?.bathstotal || building.rooms?.baths || null,
-          squareFeet: building.size?.livingsize || building.size?.grossSize || null,
-          yearBuilt: building.construction?.yearBuilt || null,
-          propertyType: building.summary?.propclass || building.summary?.propSubType || null,
-          lotSize: lot.size?.lotSize1 || lot.size?.lotSize2 || null,
-          image: property.image || null,
+          zpid: property.id || property.propertyId || null,
+          address: property.formattedAddress || property.address || `${address1}, ${parsedCity}, ${parsedState} ${parsedZip ? parsedZip : ''}`.trim(),
+          price: property.price || property.estimatedValue || property.rentEstimate || null,
+          bedrooms: property.bedrooms || null,
+          bathrooms: property.bathrooms || null,
+          squareFeet: property.squareFootage || property.livingArea || null,
+          yearBuilt: property.yearBuilt || null,
+          propertyType: property.propertyType || property.type || null,
+          lotSize: property.lotSize || null,
+          image: property.photos && property.photos.length > 0 ? property.photos[0] : null,
           // Additional useful fields
-          assessedValue: assessment.assessed?.assdTotalValue || null,
-          marketValue: assessment.market?.mktTtlValue || null,
-          lastSalePrice: assessment.sale?.amount?.saleAmt || null,
-          lastSaleDate: assessment.sale?.saleDate || null,
-          lotSizeAcres: lot.size?.lotSizeAcres || null,
-          stories: building.summary?.stories || null,
-          units: building.summary?.units || null
+          assessedValue: property.assessedValue || null,
+          marketValue: property.estimatedValue || null,
+          lastSalePrice: property.lastSalePrice || null,
+          lastSaleDate: property.lastSaleDate || null,
+          lotSizeAcres: property.lotSizeAcres || null,
+          stories: property.stories || null,
+          units: property.units || null
         };
         
         console.log('✅ Property data formatted successfully');
         return res.json(formattedData);
       } else {
-        console.log('⚠️ No property found in ATTOM API response');
+        console.log('⚠️ No property found in RentCast API response');
         return res.json(null);
       }
       
     } catch (apiError) {
-      console.error('❌ ATTOM API error:', apiError.response?.status, apiError.response?.statusText);
+      console.error('❌ RentCast API error:', apiError.response?.status, apiError.response?.statusText);
       console.error('Response data:', apiError.response?.data);
       
       // If API returns 404 or no results, return null instead of error
-      if (apiError.response?.status === 404 || apiError.response?.status === 400) {
-        console.log('⚠️ Property not found (404/400) - returning null');
+      if (apiError.response?.status === 404 || apiError.response?.status === 400 || apiError.response?.status === 422) {
+        console.log('⚠️ Property not found (404/400/422) - returning null');
         return res.json(null);
       }
       
       // For other errors, still return null to avoid breaking the UI
-      console.error('⚠️ ATTOM API request failed, returning null');
+      console.error('⚠️ RentCast API request failed, returning null');
       return res.json(null);
     }
     
