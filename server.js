@@ -25629,39 +25629,66 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       return res.json(null); // Return null to indicate no property data available
     }
     
-    // Parse address components
-    let address1 = street || '';
+    // Parse address components - ALWAYS prioritize explicit city, state, zipCode from request body
+    let address1 = '';
     let parsedCity = city || '';
     let parsedState = state || '';
     let parsedZip = zipCode || '';
     
-    // If street contains full address, parse it
-    if (street && street.includes(',')) {
-      const streetParts = street.split(',').map(part => part.trim());
-      if (streetParts.length >= 3) {
+    // Extract street address from street or address field
+    // But NEVER overwrite explicit city, state, zipCode values
+    if (street) {
+      if (street.includes(',')) {
+        // Street contains full address, extract just the street part
+        const streetParts = street.split(',').map(part => part.trim());
         address1 = streetParts[0];
-        parsedCity = parsedCity || streetParts[1];
-        const stateZip = streetParts[2].split(' ').filter(p => p);
-        parsedState = parsedState || stateZip[0];
-        parsedZip = parsedZip || (stateZip[1] || '');
-      } else if (streetParts.length === 2) {
-        address1 = streetParts[0];
-        parsedCity = parsedCity || streetParts[1];
+        // Only use parsed values if explicit values weren't provided
+        if (!parsedCity && streetParts.length > 1) {
+          parsedCity = streetParts[1];
+        }
+        if (!parsedState && streetParts.length > 2) {
+          const stateZipPart = streetParts[2].replace(/USA/gi, '').trim();
+          const stateZip = stateZipPart.split(/\s+/).filter(p => p && p.length > 0);
+          if (stateZip.length >= 2) {
+            parsedState = stateZip[0];
+            if (!parsedZip) parsedZip = stateZip[1];
+          } else if (stateZip.length === 1) {
+            if (stateZip[0].length === 2 && !parsedState) {
+              parsedState = stateZip[0];
+            } else if (!parsedZip) {
+              parsedZip = stateZip[0];
+            }
+          }
+        }
+      } else {
+        // Street is just the street address
+        address1 = street;
       }
     }
     
-    // If we have a full address string, try to parse it
+    // If we have a full address string and no street address yet, try to parse it
     if (address && !address1) {
       const addressParts = address.split(',').map(part => part.trim());
       if (addressParts.length >= 3) {
         address1 = addressParts[0];
-        parsedCity = parsedCity || addressParts[1];
-        const stateZip = addressParts[2].split(' ').filter(p => p);
-        parsedState = parsedState || stateZip[0];
-        parsedZip = parsedZip || (stateZip[1] || '');
+        if (!parsedCity) parsedCity = addressParts[1];
+        if (!parsedState && addressParts.length > 2) {
+          const stateZipPart = addressParts[2].replace(/USA/gi, '').trim();
+          const stateZip = stateZipPart.split(/\s+/).filter(p => p && p.length > 0);
+          if (stateZip.length >= 2) {
+            parsedState = stateZip[0];
+            if (!parsedZip) parsedZip = stateZip[1];
+          } else if (stateZip.length === 1) {
+            if (stateZip[0].length === 2 && !parsedState) {
+              parsedState = stateZip[0];
+            } else if (!parsedZip) {
+              parsedZip = stateZip[0];
+            }
+          }
+        }
       } else if (addressParts.length === 2) {
         address1 = addressParts[0];
-        parsedCity = parsedCity || addressParts[1];
+        if (!parsedCity) parsedCity = addressParts[1];
       } else {
         address1 = address;
       }
@@ -25672,31 +25699,60 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       address1 = address1.replace(/\s*,\s*USA$/, '').replace(/\s*USA$/, '').trim();
     }
     
+    // Log what we're sending to help debug
+    console.log('📤 RentCast API request params:', {
+      address: address1,
+      city: parsedCity,
+      state: parsedState,
+      zip: parsedZip,
+      originalRequest: { address, street, city, state, zipCode }
+    });
+    
     // Validate required fields - RentCast needs address, city, state
     if (!address1 || !parsedCity || !parsedState) {
-      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState, zip: parsedZip });
+      console.log('⚠️ Missing required address components:', { 
+        originalRequest: { address, street, city, state, zipCode },
+        parsed: { address1, city: parsedCity, state: parsedState, zip: parsedZip }
+      });
       return res.json(null);
     }
+    
+    // Ensure we're sending all required parameters to RentCast
+    const rentcastParams = {
+      address: address1,
+      city: parsedCity,
+      state: parsedState
+    };
+    
+    // Add zip if available (optional but helpful)
+    if (parsedZip) {
+      rentcastParams.zip = parsedZip;
+    }
+    
+    console.log('📤 Final RentCast params:', rentcastParams);
     
     try {
       // Call RentCast API - Properties endpoint (plural)
       // Documentation: https://developers.rentcast.io/reference/introduction
       // Endpoint: GET /v1/properties?address=...&city=...&state=...&zip=...
+      // Log the full request URL for debugging
+      const requestUrl = `${rentcastBaseUrl}/v1/properties?${new URLSearchParams(rentcastParams).toString()}`;
+      console.log('📤 RentCast request URL:', requestUrl);
+      
       const rentcastResponse = await axios.get(`${rentcastBaseUrl}/v1/properties`, {
         headers: {
           'X-Api-Key': rentcastApiKey,
           'Accept': 'application/json'
         },
-        params: {
-          address: address1,
-          city: parsedCity,
-          state: parsedState,
-          zip: parsedZip || undefined
-        },
-        timeout: 10000 // 10 second timeout
+        params: rentcastParams,
+        timeout: 10000, // 10 second timeout
+        validateStatus: function (status) {
+          // Don't throw error for 404, we'll handle it
+          return status < 500;
+        }
       });
       
-      console.log('✅ RentCast API response received');
+      console.log('✅ RentCast API response received, status:', rentcastResponse.status);
       console.log('📋 RentCast response data:', JSON.stringify(rentcastResponse.data, null, 2));
       
       // RentCast /v1/properties endpoint returns an array of properties
