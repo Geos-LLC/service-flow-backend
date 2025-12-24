@@ -25635,13 +25635,28 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
     let parsedState = state || '';
     let parsedZip = zipCode || '';
     
+    // If street contains full address, parse it
+    if (street && street.includes(',')) {
+      const streetParts = street.split(',').map(part => part.trim());
+      if (streetParts.length >= 3) {
+        address1 = streetParts[0];
+        parsedCity = parsedCity || streetParts[1];
+        const stateZip = streetParts[2].split(' ').filter(p => p);
+        parsedState = parsedState || stateZip[0];
+        parsedZip = parsedZip || (stateZip[1] || '');
+      } else if (streetParts.length === 2) {
+        address1 = streetParts[0];
+        parsedCity = parsedCity || streetParts[1];
+      }
+    }
+    
     // If we have a full address string, try to parse it
-    if (address && !street) {
+    if (address && !address1) {
       const addressParts = address.split(',').map(part => part.trim());
       if (addressParts.length >= 3) {
         address1 = addressParts[0];
         parsedCity = parsedCity || addressParts[1];
-        const stateZip = addressParts[2].split(' ');
+        const stateZip = addressParts[2].split(' ').filter(p => p);
         parsedState = parsedState || stateZip[0];
         parsedZip = parsedZip || (stateZip[1] || '');
       } else if (addressParts.length === 2) {
@@ -25652,16 +25667,22 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       }
     }
     
-    // Validate required fields - RentCast typically needs address, city, state
+    // Clean up address - remove "USA" or country names
+    if (address1) {
+      address1 = address1.replace(/\s*,\s*USA$/, '').replace(/\s*USA$/, '').trim();
+    }
+    
+    // Validate required fields - RentCast needs address, city, state
     if (!address1 || !parsedCity || !parsedState) {
-      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState });
+      console.log('⚠️ Missing required address components:', { address1, city: parsedCity, state: parsedState, zip: parsedZip });
       return res.json(null);
     }
     
     try {
-      // Call RentCast API - Property Details endpoint
+      // Call RentCast API - Properties endpoint (plural)
       // Documentation: https://developers.rentcast.io/reference/introduction
-      const rentcastResponse = await axios.get(`${rentcastBaseUrl}/v1/property/details`, {
+      // Endpoint: GET /v1/properties?address=...&city=...&state=...&zip=...
+      const rentcastResponse = await axios.get(`${rentcastBaseUrl}/v1/properties`, {
         headers: {
           'X-Api-Key': rentcastApiKey,
           'Accept': 'application/json'
@@ -25670,37 +25691,47 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
           address: address1,
           city: parsedCity,
           state: parsedState,
-          zipCode: parsedZip || undefined
+          zip: parsedZip || undefined
         },
         timeout: 10000 // 10 second timeout
       });
       
       console.log('✅ RentCast API response received');
+      console.log('📋 RentCast response data:', JSON.stringify(rentcastResponse.data, null, 2));
+      
+      // RentCast /v1/properties endpoint returns an array of properties
+      // We'll take the first one if available
+      let property = null;
+      if (Array.isArray(rentcastResponse.data) && rentcastResponse.data.length > 0) {
+        property = rentcastResponse.data[0];
+      } else if (rentcastResponse.data && typeof rentcastResponse.data === 'object') {
+        // Sometimes it might return a single object
+        property = rentcastResponse.data;
+      }
       
       // Check if we have valid property data
-      if (rentcastResponse.data) {
-        const property = rentcastResponse.data;
-        
+      if (property) {
         // Map RentCast data to our expected format
         const formattedData = {
           zpid: property.id || property.propertyId || null,
           address: property.formattedAddress || property.address || `${address1}, ${parsedCity}, ${parsedState} ${parsedZip ? parsedZip : ''}`.trim(),
-          price: property.price || property.estimatedValue || property.rentEstimate || null,
-          bedrooms: property.bedrooms || null,
-          bathrooms: property.bathrooms || null,
-          squareFeet: property.squareFootage || property.livingArea || null,
+          price: property.price || property.estimatedValue || property.rentEstimate || property.value || null,
+          bedrooms: property.bedrooms || property.bedroomsTotal || null,
+          bathrooms: property.bathrooms || property.bathroomsTotal || null,
+          squareFeet: property.squareFootage || property.livingArea || property.totalArea || null,
           yearBuilt: property.yearBuilt || null,
-          propertyType: property.propertyType || property.type || null,
+          propertyType: property.propertyType || property.type || property.propertySubType || null,
           lotSize: property.lotSize || null,
-          image: property.photos && property.photos.length > 0 ? property.photos[0] : null,
+          image: (property.photos && property.photos.length > 0) ? property.photos[0] : 
+                 (property.images && property.images.length > 0) ? property.images[0] : null,
           // Additional useful fields
           assessedValue: property.assessedValue || null,
-          marketValue: property.estimatedValue || null,
-          lastSalePrice: property.lastSalePrice || null,
+          marketValue: property.estimatedValue || property.value || null,
+          lastSalePrice: property.lastSalePrice || property.lastSaleAmount || null,
           lastSaleDate: property.lastSaleDate || null,
           lotSizeAcres: property.lotSizeAcres || null,
-          stories: property.stories || null,
-          units: property.units || null
+          stories: property.stories || property.storyCount || null,
+          units: property.units || property.unitCount || null
         };
         
         console.log('✅ Property data formatted successfully');
