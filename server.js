@@ -2396,6 +2396,45 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete all services endpoint - must come before /api/services/:id
+app.delete('/api/services/all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Hard delete all services for this user (for testing/import purposes)
+    // Get all service IDs for this user
+    const { data: services, error: fetchError } = await supabase
+      .from('services')
+      .select('id')
+      .eq('user_id', userId);
+    
+    if (fetchError) {
+      console.error('Error fetching services for deletion:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch services for deletion' });
+    }
+    
+    if (!services || services.length === 0) {
+      return res.json({ message: 'No services to delete' });
+    }
+    
+    // Hard delete all services
+    const { error: deleteError } = await supabase
+      .from('services')
+      .delete()
+      .eq('user_id', userId);
+    
+    if (deleteError) {
+      console.error('Error deleting services:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete services' });
+    }
+    
+    res.json({ message: `Successfully deleted ${services.length} service(s)` });
+  } catch (error) {
+    console.error('Delete all services error:', error);
+    res.status(500).json({ error: 'Failed to delete services' });
+  }
+});
+
 app.delete('/api/services/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
