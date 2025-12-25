@@ -7527,12 +7527,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         if (!serviceId && job.serviceName) {
           // Normalize service name for comparison
           // This function handles:
+          // - HTML entity decoding (e.g., &#x2F; -> /)
           // - Case insensitivity (lowercase)
           // - Whitespace normalization (trim, collapse multiple spaces)
           // - Special character spacing (normalize spaces around /, -, etc.)
+          const decodeHtmlEntities = (str) => {
+            if (!str || typeof str !== 'string') return str;
+            return str
+              .replace(/&#x([0-9a-fA-F]+);/g, (match, hex) => {
+                return String.fromCharCode(parseInt(hex, 16));
+              })
+              .replace(/&#(\d+);/g, (match, dec) => {
+                return String.fromCharCode(parseInt(dec, 10));
+              })
+              .replace(/&amp;/g, '&')
+              .replace(/&lt;/g, '<')
+              .replace(/&gt;/g, '>')
+              .replace(/&quot;/g, '"')
+              .replace(/&#39;/g, "'")
+              .replace(/&apos;/g, "'");
+          };
+          
           const normalizeServiceName = (name) => {
             if (!name || typeof name !== 'string') return '';
-            return name
+            // First decode HTML entities (e.g., "Move in&#x2F;out" -> "Move in/out")
+            let normalized = decodeHtmlEntities(name);
+            return normalized
               .trim()                                    // Remove leading/trailing spaces
               .toLowerCase()                             // Case insensitive
               .replace(/\s+/g, ' ')                      // Collapse multiple spaces to single space
