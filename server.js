@@ -7376,6 +7376,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     // Track jobs being imported in this batch to detect duplicates within the CSV
     const batchJobKeys = new Set(); // Format: "userId_customerId_serviceId_date" or "userId_customerId_serviceName_date"
     
+    // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
+    // Format: { externalId: internalId }
+    const crewIdMapping = {}; // Maps external crew IDs to team member IDs
+    const territoryIdMapping = {}; // Maps external region IDs to territory IDs
+    
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       
@@ -7564,24 +7569,73 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         }
 
-        // Find team member by name if provided
-        let teamMemberId = job.teamMemberId;
+        // Handle team member assignment from external crew ID
+        let teamMemberId = null;
         
-        // Validate teamMemberId - must be a valid integer (not a Hostinger ID string)
-        // Hostinger IDs look like "1741901522231x193961618392743940" and contain 'x'
-        if (teamMemberId) {
-          // Check if it's a valid integer
-          const parsedId = parseInt(teamMemberId);
-          if (isNaN(parsedId) || teamMemberId.toString().includes('x') || teamMemberId.toString().includes('X')) {
-            // Invalid ID - looks like a Hostinger crew ID, not a ZenBooker team member ID
-            console.log(`Row ${i + 1}: Invalid team member ID format "${teamMemberId}", setting to null`);
-            teamMemberId = null;
+        // First, check if we have an external crew ID (from CSV assigned_crew field)
+        if (job.assignedCrewExternalId) {
+          const externalCrewId = job.assignedCrewExternalId.trim();
+          
+          // Check if we've already created a team member for this external ID
+          if (crewIdMapping[externalCrewId]) {
+            teamMemberId = crewIdMapping[externalCrewId];
+            console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId}`);
           } else {
+            // Check if a team member with this external ID already exists in database
+            // We'll store the external ID in a metadata field or check by a custom identifier
+            // For now, create a new team member with a placeholder name
+            const newTeamMember = {
+              user_id: userId,
+              first_name: `Crew ${externalCrewId.substring(0, 8)}`, // Use first 8 chars of ID as identifier
+              last_name: '',
+              email: null,
+              phone: null,
+              role: 'worker',
+              is_service_provider: true,
+              status: 'active',
+              // Store external ID in notes or a metadata field for reference
+              notes: `Imported from external crew ID: ${externalCrewId}`,
+              availability: JSON.stringify({
+                workingHours: {
+                  monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                  tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                  wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                  thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                  friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                  saturday: { enabled: false },
+                  sunday: { enabled: false }
+                },
+                customAvailability: []
+              })
+            };
+            
+            const { data: createdTeamMember, error: createTeamError } = await supabase
+              .from('team_members')
+              .insert(newTeamMember)
+              .select('id')
+              .single();
+            
+            if (createTeamError) {
+              console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
+              results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
+            } else {
+              teamMemberId = createdTeamMember.id;
+              crewIdMapping[externalCrewId] = teamMemberId; // Store mapping to prevent duplicates
+              console.log(`Row ${i + 1}: Created new team member ${teamMemberId} for external crew ID ${externalCrewId}`);
+            }
+          }
+        }
+        
+        // Fallback: Try to find team member by internal ID (if provided as integer)
+        if (!teamMemberId && job.teamMemberId) {
+          const parsedId = parseInt(job.teamMemberId);
+          if (!isNaN(parsedId) && !job.teamMemberId.toString().includes('x') && !job.teamMemberId.toString().includes('X')) {
+            // Valid integer ID
             teamMemberId = parsedId;
           }
         }
         
-        // Try to find by name if provided and we don't have a valid ID
+        // Fallback: Try to find by name if provided
         if (!teamMemberId && job.teamMemberName) {
           const nameParts = job.teamMemberName.split(' ');
           const firstName = nameParts[0];
@@ -7600,6 +7654,58 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           } else if (teamMember) {
             teamMemberId = teamMember.id;
             console.log(`Row ${i + 1}: Found team member by name:`, teamMemberId);
+          }
+        }
+        
+        // Handle territory assignment from external region ID
+        let territoryId = null;
+        
+        if (job.serviceRegionExternalId) {
+          const externalRegionId = job.serviceRegionExternalId.trim();
+          
+          // Check if we've already created a territory for this external ID
+          if (territoryIdMapping[externalRegionId]) {
+            territoryId = territoryIdMapping[externalRegionId];
+            console.log(`Row ${i + 1}: Reusing existing territory ${territoryId} for external region ID ${externalRegionId}`);
+          } else {
+            // Check if territory with this external ID already exists
+            // For now, create a new territory with a placeholder name
+            const newTerritory = {
+              user_id: userId,
+              name: `Region ${externalRegionId.substring(0, 8)}`, // Use first 8 chars of ID as identifier
+              description: `Imported from external region ID: ${externalRegionId}`,
+              location: job.serviceAddress || 'Unknown',
+              zip_codes: job.serviceAddressZip ? [job.serviceAddressZip] : [],
+              radius_miles: 25.00,
+              timezone: 'America/New_York',
+              business_hours: {},
+              team_members: [],
+              services: [],
+              pricing_multiplier: 1.00
+            };
+            
+            const { data: createdTerritory, error: createTerritoryError } = await supabase
+              .from('territories')
+              .insert(newTerritory)
+              .select('id')
+              .single();
+            
+            if (createTerritoryError) {
+              console.error(`Row ${i + 1}: Failed to create territory for region ID ${externalRegionId}:`, createTerritoryError);
+              results.warnings.push(`Row ${i + 1}: Could not create territory for region ID ${externalRegionId} - ${createTerritoryError.message}`);
+            } else {
+              territoryId = createdTerritory.id;
+              territoryIdMapping[externalRegionId] = territoryId; // Store mapping to prevent duplicates
+              console.log(`Row ${i + 1}: Created new territory ${territoryId} for external region ID ${externalRegionId}`);
+            }
+          }
+        }
+        
+        // Fallback: Use territoryId if provided directly
+        if (!territoryId && job.territoryId) {
+          const parsedTerritoryId = parseInt(job.territoryId);
+          if (!isNaN(parsedTerritoryId)) {
+            territoryId = parsedTerritoryId;
           }
         }
 
@@ -7717,8 +7823,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           user_id: userId,
           customer_id: customerId,
           service_id: serviceId,
-          team_member_id: teamMemberId && !isNaN(parseInt(teamMemberId)) ? parseInt(teamMemberId) : null,
-          territory_id: job.territoryId || null,
+          team_member_id: teamMemberId || null,
+          territory_id: territoryId || null,
           notes: sanitizedNotes,
           status: job.status && job.status.trim() ? job.status.trim() : 'pending',
           invoice_status: job.invoiceStatus || 'draft',
