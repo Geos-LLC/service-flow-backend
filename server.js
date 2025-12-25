@@ -7693,16 +7693,29 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           const externalCrewId = job.assignedCrewExternalId.trim();
           console.log(`Row ${i + 1}: Processing external crew ID: ${externalCrewId}`);
           
-          // Check if we've already created a team member for this external ID
+          // Check if we've already created a team member for this external ID in this batch
           if (crewIdMapping[externalCrewId]) {
             teamMemberId = crewIdMapping[externalCrewId];
-            console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId}`);
+            console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId} (from batch mapping)`);
           } else {
-            console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
-            // Check if a team member with this external ID already exists in database
-            // We'll store the external ID in a metadata field or check by a custom identifier
-            // For now, create a new team member with a placeholder name
-            // Set default availability
+            // Check if a team member with this external ID already exists in the DATABASE
+            // We store external ID in first_name as "Crew {externalCrewId}" - search for exact match
+            const crewSearchPattern = `Crew ${externalCrewId}`;
+            const { data: existingCrews, error: crewSearchError } = await supabase
+              .from('team_members')
+              .select('id, first_name')
+              .eq('user_id', userId)
+              .eq('first_name', crewSearchPattern)
+              .limit(1);
+            
+            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+              // Found existing team member with this external ID
+              teamMemberId = existingCrews[0].id;
+              crewIdMapping[externalCrewId] = teamMemberId; // Store in mapping for this batch
+              console.log(`Row ${i + 1}: ✅ Found existing team member ${teamMemberId} in database for external crew ID ${externalCrewId}`);
+            } else {
+              console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
+              // Set default availability
             const defaultAvailability = {
               workingHours: {
                 monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
@@ -7748,6 +7761,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               crewIdMapping[externalCrewId] = teamMemberId; // Store mapping to prevent duplicates
               console.log(`Row ${i + 1}: Created new team member ${teamMemberId} for external crew ID ${externalCrewId}`);
             }
+            }
           }
         }
         
@@ -7790,14 +7804,28 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           const externalRegionId = job.serviceRegionExternalId.trim();
           console.log(`Row ${i + 1}: Processing external region ID: ${externalRegionId}`);
           
-          // Check if we've already created a territory for this external ID
+          // Check if we've already created a territory for this external ID in this batch
           if (territoryIdMapping[externalRegionId]) {
             territoryId = territoryIdMapping[externalRegionId];
-            console.log(`Row ${i + 1}: Reusing existing territory ${territoryId} for external region ID ${externalRegionId}`);
+            console.log(`Row ${i + 1}: Reusing existing territory ${territoryId} for external region ID ${externalRegionId} (from batch mapping)`);
           } else {
-            console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
-            // Check if territory with this external ID already exists
-            // For now, create a new territory with a placeholder name
+            // Check if territory with this external ID already exists in the DATABASE
+            // We store external ID in description as "Imported from external region ID: {externalRegionId}" - search for it
+            const regionSearchPattern = `Imported from external region ID: ${externalRegionId}`;
+            const { data: existingTerritories, error: territorySearchError } = await supabase
+              .from('territories')
+              .select('id, description')
+              .eq('user_id', userId)
+              .eq('description', regionSearchPattern)
+              .limit(1);
+            
+            if (!territorySearchError && existingTerritories && existingTerritories.length > 0) {
+              // Found existing territory with this external ID
+              territoryId = existingTerritories[0].id;
+              territoryIdMapping[externalRegionId] = territoryId; // Store in mapping for this batch
+              console.log(`Row ${i + 1}: ✅ Found existing territory ${territoryId} in database for external region ID ${externalRegionId}`);
+            } else {
+              console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
             const newTerritory = {
               user_id: userId,
               name: `Region ${externalRegionId}`, // Use full external ID
@@ -7825,6 +7853,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               territoryId = createdTerritory.id;
               territoryIdMapping[externalRegionId] = territoryId; // Store mapping to prevent duplicates
               console.log(`Row ${i + 1}: Created new territory ${territoryId} for external region ID ${externalRegionId}`);
+            }
             }
           }
         }
