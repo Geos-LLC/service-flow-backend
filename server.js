@@ -7380,6 +7380,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     // Format: { externalId: internalId }
     const crewIdMapping = {}; // Maps external crew IDs to team member IDs
     const territoryIdMapping = {}; // Maps external region IDs to territory IDs
+    const serviceNameMapping = {}; // Maps normalized service names to service IDs to prevent duplicates
     
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
@@ -7524,47 +7525,60 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // Find or create service by name if provided
         let serviceId = job.serviceId;
         if (!serviceId && job.serviceName) {
-          const { data: service, error: serviceError } = await supabase
-            .from('services')
-            .select('id')
-            .eq('user_id', userId)
-            .eq('name', job.serviceName)
-            .maybeSingle();
+          // Normalize service name for comparison (trim, lowercase)
+          const normalizedServiceName = job.serviceName.trim().toLowerCase();
           
-          if (serviceError) {
-            console.error(`Row ${i + 1}: Error searching service:`, serviceError);
-          } else if (service) {
-            serviceId = service.id;
-            console.log(`Row ${i + 1}: Found service:`, serviceId, job.serviceName);
+          // First check our mapping to see if we've already created/found this service in this import batch
+          if (serviceNameMapping[normalizedServiceName]) {
+            serviceId = serviceNameMapping[normalizedServiceName];
+            console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for name "${job.serviceName}" (from mapping)`);
           } else {
-            // Service not found - create it
-            const newService = {
-              user_id: userId,
-              name: sanitizeInput(job.serviceName),
-              description: null,
-              price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
-              duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
-              category: null,
-              modifiers: null,
-              intake_questions: null,
-              is_active: true
-            };
-            
-            console.log(`Row ${i + 1}: Creating new service:`, job.serviceName);
-            
-            const { data: createdService, error: createServiceError } = await supabase
+            // Search database for existing service (case-insensitive search)
+            const { data: services, error: serviceError } = await supabase
               .from('services')
-              .insert(newService)
-              .select('id')
-              .single();
+              .select('id, name')
+              .eq('user_id', userId)
+              .ilike('name', job.serviceName.trim()); // Case-insensitive search
             
-            if (createServiceError) {
-              console.error(`Row ${i + 1}: Failed to create service ${job.serviceName}:`, createServiceError);
-              results.errors.push(`Row ${i + 1}: Failed to create service "${job.serviceName}" - ${createServiceError.message}`);
-              // Continue without service ID - job can still be created
+            if (serviceError) {
+              console.error(`Row ${i + 1}: Error searching service:`, serviceError);
+            } else if (services && services.length > 0) {
+              // Found existing service(s) - use the first one
+              serviceId = services[0].id;
+              serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping
+              console.log(`Row ${i + 1}: Found existing service:`, serviceId, job.serviceName);
             } else {
-              serviceId = createdService.id;
-              console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
+              // Service not found - create it
+              const sanitizedName = sanitizeInput(job.serviceName.trim());
+              const newService = {
+                user_id: userId,
+                name: sanitizedName,
+                description: null,
+                price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+                duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
+                category: null,
+                modifiers: null,
+                intake_questions: null,
+                is_active: true
+              };
+              
+              console.log(`Row ${i + 1}: Creating new service:`, sanitizedName);
+              
+              const { data: createdService, error: createServiceError } = await supabase
+                .from('services')
+                .insert(newService)
+                .select('id')
+                .single();
+              
+              if (createServiceError) {
+                console.error(`Row ${i + 1}: Failed to create service ${sanitizedName}:`, createServiceError);
+                results.errors.push(`Row ${i + 1}: Failed to create service "${sanitizedName}" - ${createServiceError.message}`);
+                // Continue without service ID - job can still be created
+              } else {
+                serviceId = createdService.id;
+                serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping to prevent duplicates
+                console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
+              }
             }
           }
         }
