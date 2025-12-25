@@ -7535,29 +7535,41 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             serviceId = serviceNameMapping[normalizedServiceName];
             console.log(`Row ${i + 1}: ✅ Reusing existing service ${serviceId} for name "${job.serviceName}" (from mapping)`);
           } else {
-            // Search database for existing service (case-insensitive search with trimmed comparison)
-            // Use a pattern that matches the trimmed name (handles trailing/leading spaces in DB)
-            const trimmedSearchName = job.serviceName.trim();
-            const { data: services, error: serviceError } = await supabase
+            // Search database for existing service (case-insensitive exact match)
+            // Fetch all services for this user and filter manually to catch all variations
+            // This is more reliable than .ilike() which might not work as expected
+            const { data: allServices, error: serviceError } = await supabase
               .from('services')
-              .select('id, name')
-              .eq('user_id', userId)
-              .ilike('name', trimmedSearchName); // Case-insensitive search
+              .select('id, name, price')
+              .eq('user_id', userId);
+            
+            let services = null;
+            if (!serviceError && allServices) {
+              // Filter services that match when normalized (case-insensitive, trimmed)
+              // This catches all variations: "Move in/out", "Move In/Out", "move in/out", etc.
+              services = allServices.filter(service => {
+                const serviceNormalized = service.name.trim().toLowerCase();
+                return serviceNormalized === normalizedServiceName;
+              });
+            }
             
             if (serviceError) {
               console.error(`Row ${i + 1}: Error searching service:`, serviceError);
             } else if (services && services.length > 0) {
               // Found existing service(s) - use the first one
+              // Note: If multiple services with same normalized name exist, we use the first one
+              // This prevents duplicates within this import batch
               // Also normalize all found services and add them to mapping to prevent future duplicates
               services.forEach(service => {
                 const foundNormalized = service.name.trim().toLowerCase();
                 if (!serviceNameMapping[foundNormalized]) {
                   serviceNameMapping[foundNormalized] = service.id;
+                  console.log(`Row ${i + 1}: 📋 Adding service "${service.name}" (normalized: "${foundNormalized}", price: ${service.price}) to mapping with ID ${service.id}`);
                 }
               });
               serviceId = services[0].id;
               serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping
-              console.log(`Row ${i + 1}: Found existing service:`, serviceId, job.serviceName, `(DB had: "${services[0].name}")`);
+              console.log(`Row ${i + 1}: ✅ Found existing service ID ${serviceId} for "${job.serviceName}" (DB had: "${services[0].name}", price: ${services[0].price})`);
             } else {
             // Service not found - create it
               const sanitizedName = sanitizeInput(job.serviceName.trim());
