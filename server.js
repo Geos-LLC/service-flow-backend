@@ -7427,9 +7427,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       const job = jobs[i];
       
       try {
-        // Log every 10th job for debugging
+        // Log every 10th job for debugging, and always log date for troubleshooting
         if (i === 0 || (i + 1) % 10 === 0) {
-          console.log(`📥 Processing job ${i + 1}/${jobs.length}:`, job.customerName, job.serviceName);
+          console.log(`📥 Processing job ${i + 1}/${jobs.length}:`, job.customerName, job.serviceName, `Date: ${job.scheduledDate || 'N/A'}`);
         }
         
         // Validate required fields - need customer ID, email, or name
@@ -7885,7 +7885,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             const dateMatch = normalizedDate.match(/^(\d{4}-\d{2}-\d{2})/);
             if (dateMatch) {
               normalizedDate = dateMatch[1];
+            } else {
+              // Log warning if date format is unexpected
+              console.warn(`Row ${i + 1}: Date format may be unexpected: "${normalizedDate}" (expected YYYY-MM-DD format)`);
             }
+          } else if (!normalizedDate) {
+            console.warn(`Row ${i + 1}: Missing scheduledDate, skipping duplicate check`);
           }
           
           // Create a unique key for this job to check for duplicates within the same import batch
@@ -8012,19 +8017,39 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Combine scheduled date and time into scheduled_date field
           // Format: "YYYY-MM-DD HH:MM:SS"
           scheduled_date: (() => {
-            if (job.scheduledDate && job.scheduledTime) {
-              // Combine date and time
-              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
-              const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
-              return `${datePart} ${timePart}`;
-            } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
-              // Already combined format
-              return job.scheduledDate;
-            } else if (job.scheduledDate) {
-              // Only date provided, use default time
-              return `${job.scheduledDate} 09:00:00`;
-            } else {
-              return job.scheduled_date || null;
+            try {
+              if (job.scheduledDate && job.scheduledTime) {
+                // Combine date and time
+                const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
+                const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
+                const combinedDate = `${datePart} ${timePart}`;
+                // Validate the date format
+                if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(combinedDate)) {
+                  console.warn(`Row ${i + 1}: Invalid date format: ${combinedDate} (original: ${job.scheduledDate}, time: ${job.scheduledTime})`);
+                }
+                return combinedDate;
+              } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
+                // Already combined format
+                const dateStr = job.scheduledDate.trim();
+                // Validate the date format
+                if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(dateStr)) {
+                  console.warn(`Row ${i + 1}: Invalid combined date format: ${dateStr}`);
+                }
+                return dateStr;
+              } else if (job.scheduledDate) {
+                // Only date provided, use default time
+                const dateStr = job.scheduledDate.trim();
+                // Validate the date format (YYYY-MM-DD)
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+                  console.warn(`Row ${i + 1}: Invalid date format (expected YYYY-MM-DD): ${dateStr}`);
+                }
+                return `${dateStr} 09:00:00`;
+              } else {
+                return job.scheduled_date || null;
+              }
+            } catch (dateError) {
+              console.error(`Row ${i + 1}: Error parsing scheduled date:`, dateError, `Original value:`, job.scheduledDate);
+              return null;
             }
           })(),
           scheduled_time: job.scheduledTime || '09:00:00',
