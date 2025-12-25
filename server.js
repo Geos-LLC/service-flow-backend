@@ -7587,20 +7587,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         let teamMemberId = null;
         
         // First, check if we have an external crew ID (from CSV assigned_crew field)
-        if (job.assignedCrewExternalId) {
+        console.log(`Row ${i + 1}: Checking for assignedCrewExternalId:`, job.assignedCrewExternalId);
+        if (job.assignedCrewExternalId && job.assignedCrewExternalId.trim()) {
           const externalCrewId = job.assignedCrewExternalId.trim();
+          console.log(`Row ${i + 1}: Processing external crew ID: ${externalCrewId}`);
           
           // Check if we've already created a team member for this external ID
           if (crewIdMapping[externalCrewId]) {
             teamMemberId = crewIdMapping[externalCrewId];
             console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId}`);
           } else {
+            console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
             // Check if a team member with this external ID already exists in database
             // We'll store the external ID in a metadata field or check by a custom identifier
             // For now, create a new team member with a placeholder name
             const newTeamMember = {
               user_id: userId,
-              first_name: `Crew ${externalCrewId.substring(0, 8)}`, // Use first 8 chars of ID as identifier
+              first_name: `Crew ${externalCrewId}`, // Use full external ID
               last_name: '',
               email: null,
               phone: null,
@@ -7674,19 +7677,22 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // Handle territory assignment from external region ID
         let territoryId = null;
         
-        if (job.serviceRegionExternalId) {
+        console.log(`Row ${i + 1}: Checking for serviceRegionExternalId:`, job.serviceRegionExternalId);
+        if (job.serviceRegionExternalId && job.serviceRegionExternalId.trim()) {
           const externalRegionId = job.serviceRegionExternalId.trim();
+          console.log(`Row ${i + 1}: Processing external region ID: ${externalRegionId}`);
           
           // Check if we've already created a territory for this external ID
           if (territoryIdMapping[externalRegionId]) {
             territoryId = territoryIdMapping[externalRegionId];
             console.log(`Row ${i + 1}: Reusing existing territory ${territoryId} for external region ID ${externalRegionId}`);
           } else {
+            console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
             // Check if territory with this external ID already exists
             // For now, create a new territory with a placeholder name
             const newTerritory = {
               user_id: userId,
-              name: `Region ${externalRegionId.substring(0, 8)}`, // Use first 8 chars of ID as identifier
+              name: `Region ${externalRegionId}`, // Use full external ID
               description: `Imported from external region ID: ${externalRegionId}`,
               location: job.serviceAddress || 'Unknown',
               zip_codes: job.serviceAddressZip ? [job.serviceAddressZip] : [],
