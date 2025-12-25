@@ -7525,8 +7525,25 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // Find or create service by name if provided
         let serviceId = job.serviceId;
         if (!serviceId && job.serviceName) {
-          // Normalize service name for comparison (trim, lowercase)
-          const normalizedServiceName = job.serviceName.trim().toLowerCase();
+          // Normalize service name for comparison
+          // This function handles:
+          // - Case insensitivity (lowercase)
+          // - Whitespace normalization (trim, collapse multiple spaces)
+          // - Special character spacing (normalize spaces around /, -, etc.)
+          const normalizeServiceName = (name) => {
+            if (!name || typeof name !== 'string') return '';
+            return name
+              .trim()                                    // Remove leading/trailing spaces
+              .toLowerCase()                             // Case insensitive
+              .replace(/\s+/g, ' ')                      // Collapse multiple spaces to single space
+              .replace(/\s*\/\s*/g, '/')                  // Normalize spaces around "/" (e.g., "in / out" -> "in/out")
+              .replace(/\s*-\s*/g, '-')                  // Normalize spaces around "-" (e.g., "move - in" -> "move-in")
+              .replace(/\s*\+\s*/g, '+')                 // Normalize spaces around "+" (e.g., "A + B" -> "A+B")
+              .replace(/\s*&\s*/g, '&')                  // Normalize spaces around "&" (e.g., "A & B" -> "A&B")
+              .trim();                                   // Final trim
+          };
+          
+          const normalizedServiceName = normalizeServiceName(job.serviceName);
           
           console.log(`Row ${i + 1}: Looking for service "${job.serviceName}" (normalized: "${normalizedServiceName}")`);
           
@@ -7545,10 +7562,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             let services = null;
             if (!serviceError && allServices) {
-              // Filter services that match when normalized (case-insensitive, trimmed)
-              // This catches all variations: "Move in/out", "Move In/Out", "move in/out", etc.
+              // Filter services that match when normalized
+              // This catches all variations: "Move in/out", "Move In / Out", "move in / out", etc.
               services = allServices.filter(service => {
-                const serviceNormalized = service.name.trim().toLowerCase();
+                const serviceNormalized = normalizeServiceName(service.name);
                 return serviceNormalized === normalizedServiceName;
               });
             }
@@ -7561,7 +7578,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // This prevents duplicates within this import batch
               // Also normalize all found services and add them to mapping to prevent future duplicates
               services.forEach(service => {
-                const foundNormalized = service.name.trim().toLowerCase();
+                const foundNormalized = normalizeServiceName(service.name);
                 if (!serviceNameMapping[foundNormalized]) {
                   serviceNameMapping[foundNormalized] = service.id;
                   console.log(`Row ${i + 1}: 📋 Adding service "${service.name}" (normalized: "${foundNormalized}", price: ${service.price}) to mapping with ID ${service.id}`);
