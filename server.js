@@ -2735,8 +2735,10 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       // Fetch status history for all jobs
       const jobIds = (jobs || []).map(job => job.id);
       let allStatusHistory = {};
+      let allTeamAssignments = {};
       
       if (jobIds.length > 0) {
+        // Fetch status history
         const { data: historyData, error: historyError } = await supabase
           .from('job_status_history')
           .select('*')
@@ -2752,6 +2754,35 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
             allStatusHistory[entry.job_id].push(entry);
           });
         }
+        
+        // Fetch team assignments from job_team_assignments table
+        const { data: assignmentsData, error: assignmentsError } = await supabase
+          .from('job_team_assignments')
+          .select(`
+            job_id,
+            team_member_id,
+            is_primary,
+            team_members!left(first_name, last_name, email)
+          `)
+          .in('job_id', jobIds)
+          .order('is_primary', { ascending: false })
+          .order('assigned_at', { ascending: true });
+        
+        if (!assignmentsError && assignmentsData) {
+          // Group by job_id
+          assignmentsData.forEach(assignment => {
+            if (!allTeamAssignments[assignment.job_id]) {
+              allTeamAssignments[assignment.job_id] = [];
+            }
+            allTeamAssignments[assignment.job_id].push({
+              team_member_id: assignment.team_member_id,
+              is_primary: assignment.is_primary,
+              first_name: assignment.team_members?.first_name,
+              last_name: assignment.team_members?.last_name,
+              email: assignment.team_members?.email
+            });
+          });
+        }
       }
       
       // Process jobs to add team assignments and format data
@@ -2761,14 +2792,24 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         const service = job.services || {};
         const teamMember = job.team_members || {};
         
-        // Create team assignments array for backward compatibility
-        const teamAssignments = teamMember.id ? [{
-          team_member_id: teamMember.id,
-          is_primary: true,
-          first_name: teamMember.first_name,
-          last_name: teamMember.last_name,
-          email: teamMember.email
-        }] : [];
+        // Get team assignments from job_team_assignments table first
+        let teamAssignments = allTeamAssignments[job.id] || [];
+        
+        // Fallback: If no assignments found in job_team_assignments, use team_member_id from jobs table (backward compatibility)
+        if (teamAssignments.length === 0 && (teamMember.id || job.team_member_id)) {
+          const memberId = teamMember.id || job.team_member_id;
+          const memberFirstName = teamMember.first_name || '';
+          const memberLastName = teamMember.last_name || '';
+          const memberEmail = teamMember.email || '';
+          
+          teamAssignments = [{
+            team_member_id: memberId,
+            is_primary: true,
+            first_name: memberFirstName,
+            last_name: memberLastName,
+            email: memberEmail
+          }];
+        }
         
         return {
           ...job,
