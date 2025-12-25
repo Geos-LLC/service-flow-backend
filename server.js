@@ -7528,57 +7528,68 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Normalize service name for comparison (trim, lowercase)
           const normalizedServiceName = job.serviceName.trim().toLowerCase();
           
+          console.log(`Row ${i + 1}: Looking for service "${job.serviceName}" (normalized: "${normalizedServiceName}")`);
+          
           // First check our mapping to see if we've already created/found this service in this import batch
           if (serviceNameMapping[normalizedServiceName]) {
             serviceId = serviceNameMapping[normalizedServiceName];
-            console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for name "${job.serviceName}" (from mapping)`);
+            console.log(`Row ${i + 1}: ✅ Reusing existing service ${serviceId} for name "${job.serviceName}" (from mapping)`);
           } else {
-            // Search database for existing service (case-insensitive search)
+            // Search database for existing service (case-insensitive search with trimmed comparison)
+            // Use a pattern that matches the trimmed name (handles trailing/leading spaces in DB)
+            const trimmedSearchName = job.serviceName.trim();
             const { data: services, error: serviceError } = await supabase
               .from('services')
               .select('id, name')
               .eq('user_id', userId)
-              .ilike('name', job.serviceName.trim()); // Case-insensitive search
+              .ilike('name', trimmedSearchName); // Case-insensitive search
             
             if (serviceError) {
               console.error(`Row ${i + 1}: Error searching service:`, serviceError);
             } else if (services && services.length > 0) {
               // Found existing service(s) - use the first one
+              // Also normalize all found services and add them to mapping to prevent future duplicates
+              services.forEach(service => {
+                const foundNormalized = service.name.trim().toLowerCase();
+                if (!serviceNameMapping[foundNormalized]) {
+                  serviceNameMapping[foundNormalized] = service.id;
+                }
+              });
               serviceId = services[0].id;
               serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping
-              console.log(`Row ${i + 1}: Found existing service:`, serviceId, job.serviceName);
+              console.log(`Row ${i + 1}: Found existing service:`, serviceId, job.serviceName, `(DB had: "${services[0].name}")`);
             } else {
-              // Service not found - create it
+            // Service not found - create it
               const sanitizedName = sanitizeInput(job.serviceName.trim());
-              const newService = {
-                user_id: userId,
+            const newService = {
+              user_id: userId,
                 name: sanitizedName,
-                description: null,
-                price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
-                duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
-                category: null,
-                modifiers: null,
-                intake_questions: null,
-                is_active: true
-              };
-              
+              description: null,
+              price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+              duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
+              category: null,
+              modifiers: null,
+              intake_questions: null,
+              is_active: true
+            };
+            
               console.log(`Row ${i + 1}: Creating new service:`, sanitizedName);
-              
-              const { data: createdService, error: createServiceError } = await supabase
-                .from('services')
-                .insert(newService)
-                .select('id')
-                .single();
-              
-              if (createServiceError) {
+            
+            const { data: createdService, error: createServiceError } = await supabase
+              .from('services')
+              .insert(newService)
+              .select('id')
+              .single();
+            
+            if (createServiceError) {
                 console.error(`Row ${i + 1}: Failed to create service ${sanitizedName}:`, createServiceError);
                 results.errors.push(`Row ${i + 1}: Failed to create service "${sanitizedName}" - ${createServiceError.message}`);
-                // Continue without service ID - job can still be created
-              } else {
-                serviceId = createdService.id;
+              // Continue without service ID - job can still be created
+            } else {
+              serviceId = createdService.id;
                 serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping to prevent duplicates
-                console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
-              }
+              console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
+            }
             }
           }
         }
@@ -7601,29 +7612,36 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // Check if a team member with this external ID already exists in database
             // We'll store the external ID in a metadata field or check by a custom identifier
             // For now, create a new team member with a placeholder name
+            // Set default availability
+            const defaultAvailability = {
+              workingHours: {
+                monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                saturday: { enabled: false },
+                sunday: { enabled: false }
+              },
+              customAvailability: []
+            };
+            
+            // Generate a placeholder email since email is required (NOT NULL in schema)
+            // Use external ID to create a unique email that won't conflict
+            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+            
             const newTeamMember = {
               user_id: userId,
               first_name: `Crew ${externalCrewId}`, // Use full external ID
               last_name: '',
-              email: null,
+              email: placeholderEmail, // Required field - use placeholder email
               phone: null,
               role: 'worker',
               is_service_provider: true,
               status: 'active',
-              // Store external ID in notes or a metadata field for reference
-              notes: `Imported from external crew ID: ${externalCrewId}`,
-              availability: JSON.stringify({
-                workingHours: {
-                  monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                  tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                  wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                  thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                  friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                  saturday: { enabled: false },
-                  sunday: { enabled: false }
-                },
-                customAvailability: []
-              })
+              availability: JSON.stringify(defaultAvailability),
+              territories: [],
+              permissions: {}
             };
             
             const { data: createdTeamMember, error: createTeamError } = await supabase
