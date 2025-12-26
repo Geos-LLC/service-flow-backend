@@ -8241,19 +8241,21 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
         const customer = customers[i];
         
         try {
-          // Map Booking Koala fields to ZenBooker fields
+          // Map Booking Koala fields to ZenBooker fields (handle both mapped and original field names)
           const mappedCustomer = {
             user_id: userId,
-            first_name: customer.firstName || customer['First Name'] || customer.first_name || '',
-            last_name: customer.lastName || customer['Last Name'] || customer.last_name || '',
-            email: customer.email || customer.Email || customer.email_address || null,
-            phone: customer.phone || customer.Phone || customer.phone_number || customer.mobile || null,
+            first_name: customer.firstName || customer['First Name'] || customer['First name'] || customer.first_name || '',
+            last_name: customer.lastName || customer['Last Name'] || customer['Last name'] || customer.last_name || '',
+            email: customer.email || customer['Email Address'] || customer.Email || customer.email_address || null,
+            phone: customer.phone || customer['Phone Number'] || customer.Phone || customer.phone_number || customer.mobile || null,
             address: customer.address || customer.Address || customer.street_address || null,
+            apt: customer.apt || customer['Apt. No.'] || customer['Apt'] || customer.apartment || null,
             city: customer.city || customer.City || null,
             state: customer.state || customer.State || customer.state_province || null,
-            zip_code: customer.zipCode || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
-            notes: customer.notes || customer.Notes || customer.comments || null,
-            status: 'active'
+            zip_code: customer.zipCode || customer['Zip/Postal Code'] || customer['Zip/Postal code'] || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
+            company_name: customer.companyName || customer['Company Name'] || customer.company_name || null,
+            notes: customer.notes || customer.Note || customer['Note'] || customer.Notes || customer.comments || null,
+            status: customer.status || customer.Status || 'active'
           };
 
           // Validate required fields
@@ -8324,62 +8326,298 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
         customerMap[nameKey] = c.id;
       });
 
+      // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
+      const crewIdMapping = {}; // Maps external crew/provider IDs to team member IDs
+      const territoryIdMapping = {}; // Maps external location IDs to territory IDs
+
       for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
         
         try {
           // Map Booking Koala fields to ZenBooker fields
-          // Find customer by email or name
+          // Find customer by email or name (handle both mapped and original field names)
           let customerId = null;
-          if (job.customerEmail || job['Customer Email'] || job.customer_email) {
-            const email = (job.customerEmail || job['Customer Email'] || job.customer_email).toLowerCase();
+          const customerEmail = job.customerEmail || job.email || job.Email || job['Email'] || job.customer_email;
+          const customerFirstName = job.customerFirstName || job['First name'] || job['First Name'] || job.firstName;
+          const customerLastName = job.customerLastName || job['Last name'] || job['Last Name'] || job.lastName;
+          
+          if (customerEmail) {
+            const email = customerEmail.toLowerCase().trim();
             customerId = customerMap[email];
           }
           
-          if (!customerId && (job.customerName || job['Customer Name'] || job.customer_name)) {
-            const name = (job.customerName || job['Customer Name'] || job.customer_name).toLowerCase();
+          if (!customerId && customerFirstName && customerLastName) {
+            const name = `${customerFirstName} ${customerLastName}`.toLowerCase().trim();
             customerId = customerMap[name];
           }
 
           if (!customerId) {
-            results.jobs.errors.push(`Row ${i + 1}: Customer not found`);
+            results.jobs.errors.push(`Row ${i + 1}: Customer not found. Please ensure customers are imported first or the email/name matches.`);
             continue;
           }
 
-          // Parse date/time
+          // Parse date/time from Booking Koala format
           let scheduledDate = null;
           let scheduledTime = '09:00:00';
           
-          if (job.scheduledDate || job['Scheduled Date'] || job.scheduled_date) {
-            const dateStr = job.scheduledDate || job['Scheduled Date'] || job.scheduled_date;
-            const dateObj = new Date(dateStr);
-            if (!isNaN(dateObj.getTime())) {
-              scheduledDate = dateObj.toISOString();
-              // Extract time if available
-              if (job.scheduledTime || job['Scheduled Time'] || job.scheduled_time) {
-                const timeStr = job.scheduledTime || job['Scheduled Time'] || job.scheduled_time;
-                scheduledTime = parseTime(timeStr);
+          // Try Booking start date time first (ISO format like "2025-10-02T09:00:00-07:00")
+          const bookingStartDateTime = job.bookingStartDateTime || job['Booking start date time'];
+          if (bookingStartDateTime) {
+            try {
+              const dt = new Date(bookingStartDateTime);
+              if (!isNaN(dt.getTime())) {
+                scheduledDate = dt.toISOString().split('T')[0];
+                const timePart = dt.toTimeString().split(' ')[0].substring(0, 5);
+                scheduledTime = parseTime(timePart);
+              }
+            } catch (e) {
+              // Fall through to other methods
+            }
+          }
+          
+          // Fallback to Date and Time fields
+          if (!scheduledDate) {
+            const dateStr = job.scheduledDate || job['Date'] || job.date;
+            const timeStr = job.scheduledTime || job['Time'] || job.time;
+            
+            if (dateStr) {
+              try {
+                // Handle formats like "10/02/2025"
+                if (dateStr.includes('/')) {
+                  const dateParts = dateStr.split('/');
+                  if (dateParts.length === 3) {
+                    const month = dateParts[0].padStart(2, '0');
+                    const day = dateParts[1].padStart(2, '0');
+                    const year = dateParts[2];
+                    scheduledDate = `${year}-${month}-${day}`;
+                  }
+                } else {
+                  const dateObj = new Date(dateStr);
+                  if (!isNaN(dateObj.getTime())) {
+                    scheduledDate = dateObj.toISOString().split('T')[0];
+                  }
+                }
+                
+                if (timeStr) {
+                  scheduledTime = parseTime(timeStr);
+                }
+              } catch (e) {
+                // Use current date as fallback
+                scheduledDate = new Date().toISOString().split('T')[0];
               }
             }
           }
 
+          // Parse status from Booking status
+          let jobStatus = 'pending';
+          const bookingStatus = job.status || job['Booking status'] || job['Status'];
+          if (bookingStatus) {
+            const statusMap = {
+              'Completed': 'completed',
+              'Upcoming': 'pending',
+              'Unassigned': 'pending',
+              'Cancelled': 'cancelled',
+              'completed': 'completed',
+              'pending': 'pending',
+              'cancelled': 'cancelled'
+            };
+            jobStatus = statusMap[bookingStatus] || bookingStatus.toLowerCase() || 'pending';
+          }
+
+          // Parse price from Final amount or Service total
+          const finalAmount = job.finalAmount || job['Final amount (USD)'] || job['Final amount'] || job.price || job.Price;
+          const serviceTotal = job.serviceTotal || job['Service total (USD)'] || job['Service total'];
+          const priceValue = parseFloat(finalAmount || serviceTotal || job.total || job.Total || job.amount || job.Amount || 0);
+
+          // Parse duration from Estimated job length (HH:MM)
+          let duration = 60; // default 1 hour
+          const durationStr = job.duration || job['Estimated job length (HH:MM)'] || job['Estimated job length'];
+          if (durationStr && durationStr.includes(':')) {
+            const [hours, minutes] = durationStr.split(':');
+            duration = (parseInt(hours) || 0) * 60 + (parseInt(minutes) || 0);
+          } else if (durationStr) {
+            duration = parseInt(durationStr) || 60;
+          }
+
+          // Parse recurring from Frequency
+          let isRecurring = false;
+          let recurringFrequency = null;
+          const frequency = job.recurringFrequency || job.frequency || job['Frequency'] || job.isRecurring;
+          if (frequency) {
+            const freqStr = frequency.toString().toLowerCase();
+            if (freqStr !== 'one-time' && freqStr !== 'onetime') {
+              isRecurring = true;
+              // Map Booking Koala frequencies
+              if (freqStr.includes('weekly')) {
+                recurringFrequency = 'weekly';
+              } else if (freqStr.includes('every other week') || freqStr.includes('every 2 weeks')) {
+                recurringFrequency = 'bi-weekly';
+              } else if (freqStr.includes('every 4 weeks')) {
+                recurringFrequency = 'monthly';
+              } else {
+                recurringFrequency = 'custom';
+              }
+            }
+          }
+
+          // Handle team member assignment from Provider details (create on the fly like normal import)
+          let teamMemberId = null;
+          const assignedCrewExternalId = job.assignedCrewExternalId || job['assignedCrewExternalId'];
+          if (assignedCrewExternalId && assignedCrewExternalId.toString().trim()) {
+            const externalCrewId = assignedCrewExternalId.toString().trim();
+            
+            // Check if we've already created a team member for this external ID in this batch
+            if (crewIdMapping[externalCrewId]) {
+              teamMemberId = crewIdMapping[externalCrewId];
+              console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external provider ID ${externalCrewId} (from batch mapping)`);
+            } else {
+              // Check if a team member with this external ID already exists in the DATABASE
+              const crewSearchPattern = `Crew ${externalCrewId}`;
+              const { data: existingCrews, error: crewSearchError } = await supabase
+                .from('team_members')
+                .select('id, first_name')
+                .eq('user_id', userId)
+                .eq('first_name', crewSearchPattern)
+                .limit(1);
+              
+              if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+                teamMemberId = existingCrews[0].id;
+                crewIdMapping[externalCrewId] = teamMemberId;
+                console.log(`Row ${i + 1}: Found existing team member ${teamMemberId} for external provider ID ${externalCrewId}`);
+              } else {
+                // Create new team member
+                const defaultAvailability = {
+                  workingHours: {
+                    monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                    tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                    wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                    thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                    friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                    saturday: { enabled: false },
+                    sunday: { enabled: false }
+                  },
+                  customAvailability: []
+                };
+                
+                const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+                
+                const newTeamMember = {
+                  user_id: userId,
+                  first_name: `Crew ${externalCrewId}`,
+                  last_name: '',
+                  email: placeholderEmail,
+                  phone: null,
+                  role: 'worker',
+                  is_service_provider: true,
+                  status: 'active',
+                  availability: JSON.stringify(defaultAvailability),
+                  territories: [],
+                  permissions: {}
+                };
+                
+                const { data: createdTeamMember, error: createTeamError } = await supabase
+                  .from('team_members')
+                  .insert(newTeamMember)
+                  .select('id')
+                  .single();
+                
+                if (createTeamError) {
+                  console.error(`Row ${i + 1}: Failed to create team member for provider ID ${externalCrewId}:`, createTeamError);
+                  results.jobs.errors.push(`Row ${i + 1}: Could not create team member for provider ID ${externalCrewId}`);
+                } else {
+                  teamMemberId = createdTeamMember.id;
+                  crewIdMapping[externalCrewId] = teamMemberId;
+                  console.log(`Row ${i + 1}: Created new team member ${teamMemberId} for external provider ID ${externalCrewId}`);
+                }
+              }
+            }
+          }
+
+          // Handle territory assignment from Location (create on the fly like normal import)
+          let territoryId = null;
+          const serviceRegionExternalId = job.serviceRegionExternalId || job['serviceRegionExternalId'];
+          if (serviceRegionExternalId && serviceRegionExternalId.toString().trim()) {
+            const externalRegionId = serviceRegionExternalId.toString().trim();
+            
+            // Check if we've already created a territory for this external ID in this batch
+            if (territoryIdMapping[externalRegionId]) {
+              territoryId = territoryIdMapping[externalRegionId];
+              console.log(`Row ${i + 1}: Reusing existing territory ${territoryId} for external location ID ${externalRegionId} (from batch mapping)`);
+            } else {
+              // Check if territory with this external ID already exists in the DATABASE
+              const regionSearchPattern = `Imported from external region ID: ${externalRegionId}`;
+              const { data: existingTerritories, error: territorySearchError } = await supabase
+                .from('territories')
+                .select('id, description')
+                .eq('user_id', userId)
+                .eq('description', regionSearchPattern)
+                .limit(1);
+              
+              if (!territorySearchError && existingTerritories && existingTerritories.length > 0) {
+                territoryId = existingTerritories[0].id;
+                territoryIdMapping[externalRegionId] = territoryId;
+                console.log(`Row ${i + 1}: Found existing territory ${territoryId} for external location ID ${externalRegionId}`);
+              } else {
+                // Create new territory
+                const newTerritory = {
+                  user_id: userId,
+                  name: `Region ${externalRegionId}`,
+                  description: `Imported from external region ID: ${externalRegionId}`,
+                  location: job.address || job.serviceAddress || 'Unknown',
+                  zip_codes: job.zipCode || job.serviceAddressZip ? [job.zipCode || job.serviceAddressZip] : [],
+                  radius_miles: 25.00,
+                  timezone: 'America/New_York',
+                  business_hours: {},
+                  team_members: [],
+                  services: [],
+                  pricing_multiplier: 1.00
+                };
+                
+                const { data: createdTerritory, error: createTerritoryError } = await supabase
+                  .from('territories')
+                  .insert(newTerritory)
+                  .select('id')
+                  .single();
+                
+                if (createTerritoryError) {
+                  console.error(`Row ${i + 1}: Failed to create territory for location ID ${externalRegionId}:`, createTerritoryError);
+                  results.jobs.errors.push(`Row ${i + 1}: Could not create territory for location ID ${externalRegionId}`);
+                } else {
+                  territoryId = createdTerritory.id;
+                  territoryIdMapping[externalRegionId] = territoryId;
+                  console.log(`Row ${i + 1}: Created new territory ${territoryId} for external location ID ${externalRegionId}`);
+                }
+              }
+            }
+          }
+
+          // Combine notes from multiple fields
+          const notes = [
+            job.notes,
+            job.bookingNote || job['Booking note'],
+            job.providerNote || job['Provider note'],
+            job.specialNotes || job['Special notes']
+          ].filter(n => n && n.trim()).join('\n\n') || null;
+
           const mappedJob = {
             user_id: userId,
             customer_id: customerId,
-            service_name: job.serviceName || job['Service Name'] || job.service_name || job.service || 'Imported Service',
-            scheduled_date: scheduledDate || new Date().toISOString(),
+            team_member_id: teamMemberId || null,
+            territory_id: territoryId || null,
+            service_name: job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service',
+            scheduled_date: scheduledDate || new Date().toISOString().split('T')[0],
             scheduled_time: scheduledTime,
-            status: job.status || job.Status || 'pending',
-            notes: job.notes || job.Notes || job.description || job.Description || null,
-            price: parseFloat(job.price || job.Price || job.total || job.Total || job.amount || job.Amount || 0),
-            total: parseFloat(job.total || job.Total || job.price || job.Price || job.amount || job.Amount || 0),
+            status: jobStatus,
+            notes: notes,
+            price: priceValue,
+            total: priceValue,
             service_address_street: job.address || job.Address || job.street_address || null,
             service_address_city: job.city || job.City || null,
             service_address_state: job.state || job.State || null,
-            service_address_zip: job.zipCode || job['Zip Code'] || job.zip_code || job.postal_code || null,
-            estimated_duration: parseInt(job.duration || job.Duration || job.estimated_duration || 60),
-            is_recurring: job.isRecurring || job['Is Recurring'] || job.is_recurring || false,
-            recurring_frequency: job.recurringFrequency || job['Recurring Frequency'] || job.recurring_frequency || null
+            service_address_zip: job.zipCode || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code || null,
+            estimated_duration: duration,
+            is_recurring: isRecurring,
+            recurring_frequency: recurringFrequency
           };
 
           // Check for duplicates if skipDuplicates is enabled
