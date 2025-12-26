@@ -8425,7 +8425,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 email: customerEmail ? customerEmail.trim() : null,
                 phone: customerPhone ? customerPhone.trim() : null,
                 address: customerAddress ? customerAddress.trim() : null,
-                apt: customerApt ? customerApt.trim() : null,
+                suite: customerApt ? customerApt.trim() : null, // Database column is 'suite', not 'apt'
                 city: customerCity ? customerCity.trim() : null,
                 state: customerState ? customerState.trim() : null,
                 zip_code: customerZip ? customerZip.trim() : null,
