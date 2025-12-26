@@ -2628,8 +2628,18 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       console.log(`📅 Backend: Received dateRange: "${dateRange}" -> Decoded: "${decodedDateRange}" -> Split: [${startDate}, ${endDate}]`);
       
       if (startDate && endDate) {
-        console.log(`📅 Backend: Filtering jobs by date range: ${startDate} to ${endDate}`);
-        query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
+        // For date range queries, scheduled_date might be stored as "YYYY-MM-DD HH:MM:SS" format
+        // We need to compare the date part, so we use >= startDate and < next day
+        // Or use string comparison if it's TEXT field
+        const nextDay = new Date(endDate);
+        nextDay.setDate(nextDay.getDate() + 1);
+        const nextDayString = `${nextDay.getFullYear()}-${String(nextDay.getMonth() + 1).padStart(2, '0')}-${String(nextDay.getDate()).padStart(2, '0')}`;
+        
+        console.log(`📅 Backend: Filtering jobs by date range: ${startDate} to ${endDate} (using < ${nextDayString})`);
+        
+        // Use gte for start date and lt for next day to catch all times on the end date
+        // This handles both TEXT format ("2025-12-27 09:00:00") and DATE format
+        query = query.gte('scheduled_date', startDate).lt('scheduled_date', nextDayString);
       } else if (startDate) {
         // If only start date provided, use it as minimum
         console.log(`📅 Backend: Filtering jobs from date: ${startDate}`);
@@ -2660,6 +2670,20 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       jobs = result.data;
       error = result.error;
       count = result.count;
+      
+      // Log results for date range queries
+      if (dateRange) {
+        console.log(`📅 Backend: Query returned ${jobs?.length || 0} jobs for date range ${dateRange}`);
+        if (jobs && jobs.length > 0) {
+          console.log(`📅 Backend: Sample job dates:`, jobs.slice(0, 3).map(j => ({
+            id: j.id,
+            scheduled_date: j.scheduled_date,
+            service_name: j.service_name
+          })));
+        } else {
+          console.log(`⚠️ Backend: No jobs found for date range ${dateRange}. Total count: ${count || 0}`);
+        }
+      }
     } catch (queryError) {
       console.error('🔄 Backend: Query execution error:', queryError);
       console.error('🔄 Backend: Query error details:', {
@@ -2689,7 +2713,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         sortOrder,
         page,
         limit,
-        dateFilter
+        dateFilter,
+        dateRange
       });
       
       // If it's a search-related error, try without search
