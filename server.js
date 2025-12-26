@@ -2605,13 +2605,21 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       // Compare as date string to handle datetime fields correctly
       query = query.lt('scheduled_date', todayString);
     } else if (dateRange) {
+      // Decode URL-encoded date range (spaces become + in URLs)
+      let decodedDateRange = decodeURIComponent(dateRange);
+      // Also handle + as space (URL encoding)
+      decodedDateRange = decodedDateRange.replace(/\+/g, ' ');
+      
       // Support both ":" and " to " separators for date range
-      const dateSeparator = dateRange.includes(' to ') ? ' to ' : ':';
-      const [startDate, endDate] = dateRange.split(dateSeparator).map(d => d.trim());
+      const dateSeparator = decodedDateRange.includes(' to ') ? ' to ' : ':';
+      const [startDate, endDate] = decodedDateRange.split(dateSeparator).map(d => d.trim());
+      
       if (startDate && endDate) {
-         query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
+        console.log(`📅 Backend: Filtering jobs by date range: ${startDate} to ${endDate}`);
+        query = query.gte('scheduled_date', startDate).lte('scheduled_date', endDate);
       } else if (startDate) {
         // If only start date provided, use it as minimum
+        console.log(`📅 Backend: Filtering jobs from date: ${startDate}`);
         query = query.gte('scheduled_date', startDate);
       }
     }
