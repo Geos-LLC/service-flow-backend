@@ -2605,14 +2605,27 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       // Compare as date string to handle datetime fields correctly
       query = query.lt('scheduled_date', todayString);
     } else if (dateRange) {
-      // Decode URL-encoded date range (spaces become + in URLs)
-      let decodedDateRange = decodeURIComponent(dateRange);
-      // Also handle + as space (URL encoding)
-      decodedDateRange = decodedDateRange.replace(/\+/g, ' ');
+      // Express automatically decodes URL parameters, but + signs remain as literal +
+      // Handle both encoded (+) and decoded (spaces) formats
+      let decodedDateRange = dateRange;
+      
+      // If it contains + signs (URL-encoded spaces), replace them with spaces
+      if (decodedDateRange.includes('+')) {
+        decodedDateRange = decodedDateRange.replace(/\+/g, ' ');
+      }
+      
+      // Also try decodeURIComponent in case of other encoding
+      try {
+        decodedDateRange = decodeURIComponent(decodedDateRange);
+      } catch (e) {
+        // If decode fails, use the original
+      }
       
       // Support both ":" and " to " separators for date range
       const dateSeparator = decodedDateRange.includes(' to ') ? ' to ' : ':';
       const [startDate, endDate] = decodedDateRange.split(dateSeparator).map(d => d.trim());
+      
+      console.log(`📅 Backend: Received dateRange: "${dateRange}" -> Decoded: "${decodedDateRange}" -> Split: [${startDate}, ${endDate}]`);
       
       if (startDate && endDate) {
         console.log(`📅 Backend: Filtering jobs by date range: ${startDate} to ${endDate}`);
@@ -2621,6 +2634,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         // If only start date provided, use it as minimum
         console.log(`📅 Backend: Filtering jobs from date: ${startDate}`);
         query = query.gte('scheduled_date', startDate);
+      } else {
+        console.log(`⚠️ Backend: Could not parse dateRange: "${dateRange}"`);
       }
     }
     
