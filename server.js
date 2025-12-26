@@ -8377,31 +8377,130 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
       // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
       const crewIdMapping = {}; // Maps external crew/provider IDs to team member IDs
       const territoryIdMapping = {}; // Maps external location IDs to territory IDs
+      const customerIdMapping = {}; // Track customers created in this batch to avoid duplicates
 
       for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
         
         try {
           // Map Booking Koala fields to ZenBooker fields
-          // Find customer by email or name (handle both mapped and original field names)
+          // Find or create customer by email or name (handle both mapped and original field names)
+          // Support both mapped field names (customerEmail) and raw CSV column names (Email, First name, etc.)
           let customerId = null;
-          const customerEmail = job.customerEmail || job.email || job.Email || job['Email'] || job.customer_email;
-          const customerFirstName = job.customerFirstName || job['First name'] || job['First Name'] || job.firstName;
-          const customerLastName = job.customerLastName || job['Last name'] || job['Last Name'] || job.lastName;
+          const customerEmail = job.customerEmail || job.email || job.Email || job['Email'] || job['Email Address'] || job.customer_email;
+          const customerFirstName = job.customerFirstName || job['First name'] || job['First Name'] || job['First name'] || job.firstName || job.first_name;
+          const customerLastName = job.customerLastName || job['Last name'] || job['Last Name'] || job['Last name'] || job.lastName || job.last_name;
+          const customerPhone = job.phone || job.Phone || job['Phone'] || job['Phone Number'] || job.phone_number;
+          const customerAddress = job.address || job.Address || job['Address'] || job.serviceAddress;
+          const customerApt = job.apt || job.Apt || job['Apt'] || job['Apt. No.'] || job['Apt. No'] || job.apartment;
+          const customerCity = job.city || job.City || job['City'];
+          const customerState = job.state || job.State || job['State'];
+          const customerZip = job.zipCode || job['Zip/Postal Code'] || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code;
+          const customerCompany = job.companyName || job['Company name'] || job['Company Name'] || job.company_name;
           
+          // Check if customer exists in database or was created in this batch
           if (customerEmail) {
             const email = customerEmail.toLowerCase().trim();
-            customerId = customerMap[email];
+            customerId = customerMap[email] || customerIdMapping[email];
           }
           
           if (!customerId && customerFirstName && customerLastName) {
             const name = `${customerFirstName} ${customerLastName}`.toLowerCase().trim();
-            customerId = customerMap[name];
+            customerId = customerMap[name] || customerIdMapping[name];
           }
 
+          // Create customer on-the-fly if not found (like team members and territories)
           if (!customerId) {
-            results.jobs.errors.push(`Row ${i + 1}: Customer not found. Please ensure customers are imported first or the email/name matches.`);
-            continue;
+            // Validate required fields
+            if (!customerFirstName || !customerLastName) {
+              results.jobs.errors.push(`Row ${i + 1}: Cannot create customer - missing first name or last name.`);
+              continue;
+            }
+
+            try {
+              const newCustomer = {
+                user_id: userId,
+                first_name: customerFirstName.trim(),
+                last_name: customerLastName.trim(),
+                email: customerEmail ? customerEmail.trim() : null,
+                phone: customerPhone ? customerPhone.trim() : null,
+                address: customerAddress ? customerAddress.trim() : null,
+                apt: customerApt ? customerApt.trim() : null,
+                city: customerCity ? customerCity.trim() : null,
+                state: customerState ? customerState.trim() : null,
+                zip_code: customerZip ? customerZip.trim() : null,
+                company_name: customerCompany || null,
+                notes: job.notes || job.Note || job['Note'] || null
+              };
+
+              const { data: createdCustomer, error: createCustomerError } = await supabase
+                .from('customers')
+                .insert(newCustomer)
+                .select('id, email, first_name, last_name')
+                .single();
+
+              if (createCustomerError) {
+                // Check if it's a duplicate (unique constraint violation)
+                if (createCustomerError.code === '23505' || createCustomerError.message.includes('duplicate')) {
+                  // Customer already exists, try to find it
+                  let existingCustomer = null;
+                  if (customerEmail) {
+                    const { data: foundByEmail } = await supabase
+                      .from('customers')
+                      .select('id, email, first_name, last_name')
+                      .eq('user_id', userId)
+                      .eq('email', customerEmail.toLowerCase().trim())
+                      .limit(1)
+                      .maybeSingle();
+                    existingCustomer = foundByEmail;
+                  }
+                  
+                  if (!existingCustomer && customerFirstName && customerLastName) {
+                    const { data: foundByName } = await supabase
+                      .from('customers')
+                      .select('id, email, first_name, last_name')
+                      .eq('user_id', userId)
+                      .eq('first_name', customerFirstName.trim())
+                      .eq('last_name', customerLastName.trim())
+                      .limit(1)
+                      .maybeSingle();
+                    existingCustomer = foundByName;
+                  }
+                  
+                  if (existingCustomer) {
+                    customerId = existingCustomer.id;
+                    // Update maps
+                    if (existingCustomer.email) customerMap[existingCustomer.email.toLowerCase()] = customerId;
+                    const nameKey = `${existingCustomer.first_name} ${existingCustomer.last_name}`.toLowerCase();
+                    customerMap[nameKey] = customerId;
+                    customerIdMapping[nameKey] = customerId;
+                    if (existingCustomer.email) customerIdMapping[existingCustomer.email.toLowerCase()] = customerId;
+                    console.log(`Row ${i + 1}: Found existing customer ${customerId} after duplicate error`);
+                  } else {
+                    results.jobs.errors.push(`Row ${i + 1}: Could not create customer - duplicate detected but not found: ${createCustomerError.message}`);
+                    continue;
+                  }
+                } else {
+                  results.jobs.errors.push(`Row ${i + 1}: Could not create customer - ${createCustomerError.message}`);
+                  continue;
+                }
+              } else {
+                customerId = createdCustomer.id;
+                // Update maps
+                if (createdCustomer.email) {
+                  customerMap[createdCustomer.email.toLowerCase()] = customerId;
+                  customerIdMapping[createdCustomer.email.toLowerCase()] = customerId;
+                }
+                const nameKey = `${createdCustomer.first_name} ${createdCustomer.last_name}`.toLowerCase();
+                customerMap[nameKey] = customerId;
+                customerIdMapping[nameKey] = customerId;
+                console.log(`Row ${i + 1}: Created new customer ${customerId} (${createdCustomer.first_name} ${createdCustomer.last_name})`);
+              }
+            } catch (createError) {
+              console.error(`Row ${i + 1}: Error creating customer:`, createError);
+              results.jobs.errors.push(`Row ${i + 1}: Could not create customer - ${createError.message}`);
+              continue;
+            }
           }
 
           // Parse date/time from Booking Koala format
