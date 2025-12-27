@@ -8387,9 +8387,46 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // Find or create customer by email or name (handle both mapped and original field names)
           // Support both mapped field names (customerEmail) and raw CSV column names (Email, First name, etc.)
           let customerId = null;
-          const customerEmail = job.customerEmail || job.email || job.Email || job['Email'] || job['Email Address'] || job.customer_email;
-          const customerFirstName = job.customerFirstName || job['First name'] || job['First Name'] || job['First name'] || job.firstName || job.first_name;
-          const customerLastName = job.customerLastName || job['Last name'] || job['Last Name'] || job['Last name'] || job.lastName || job.last_name;
+          
+          // Extract customer fields - try mapped names first, then raw CSV column names
+          // Booking Koala CSV has: "First name", "Last name", "Email", "Phone", "Address", "Apt", "City", "State", "Zip/Postal code"
+          // IMPORTANT: Always check raw CSV column names as fallback since frontend mapping might miss some
+          let customerEmail = job.customerEmail || job.email || job.Email || job['Email'] || job['Email Address'] || job.customer_email || '';
+          let customerFirstName = job.customerFirstName || job['First name'] || job['First Name'] || job.firstName || job.first_name || '';
+          let customerLastName = job.customerLastName || job['Last name'] || job['Last Name'] || job.lastName || job.last_name || '';
+          
+          // If still empty, try ALL possible key variations (CSV parsing might create different key formats)
+          if (!customerFirstName || !customerLastName) {
+            // Try every possible key in the job object
+            const jobKeys = Object.keys(job);
+            for (const key of jobKeys) {
+              const keyLower = key.toLowerCase().trim();
+              if (!customerFirstName && (keyLower === 'first name' || keyLower === 'firstname' || keyLower === 'first_name')) {
+                customerFirstName = job[key] || '';
+              }
+              if (!customerLastName && (keyLower === 'last name' || keyLower === 'lastname' || keyLower === 'last_name')) {
+                customerLastName = job[key] || '';
+              }
+              if (!customerEmail && (keyLower === 'email' || keyLower === 'email address')) {
+                customerEmail = job[key] || '';
+              }
+            }
+          }
+          
+          // Trim whitespace and clean up values
+          customerFirstName = (customerFirstName || '').toString().trim();
+          customerLastName = (customerLastName || '').toString().trim();
+          customerEmail = (customerEmail || '').toString().trim();
+          
+          // Remove invalid values like "--" or "-" that might be used as placeholders
+          if (customerFirstName === '--' || customerFirstName === '-' || customerFirstName === '') customerFirstName = '';
+          if (customerLastName === '--' || customerLastName === '-' || customerLastName === '') customerLastName = '';
+          
+          // Debug logging for missing names (only log first few to avoid spam)
+          if ((!customerFirstName || !customerLastName) && i < 5) {
+            console.log(`Row ${i + 1}: Missing name fields - First: "${customerFirstName}", Last: "${customerLastName}"`);
+            console.log(`Row ${i + 1}: Available job keys:`, Object.keys(job).slice(0, 30));
+          }
           const customerPhone = job.phone || job.Phone || job['Phone'] || job['Phone Number'] || job.phone_number;
           const customerAddress = job.address || job.Address || job['Address'] || job.serviceAddress;
           const customerApt = job.apt || job.Apt || job['Apt'] || job['Apt. No.'] || job['Apt. No'] || job.apartment;
