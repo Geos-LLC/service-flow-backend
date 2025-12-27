@@ -7732,121 +7732,181 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         }
 
-        // Handle team member assignment from external crew ID
-        let teamMemberId = null;
+        // Handle team member assignment - support multiple team members
+        let teamMemberIds = []; // Array to store all team member IDs
+        let primaryTeamMemberId = null; // Primary team member ID
         
-        // First, check if we have an external crew ID (from CSV assigned_crew field)
-        console.log(`Row ${i + 1}: Checking for assignedCrewExternalId:`, job.assignedCrewExternalId);
-        if (job.assignedCrewExternalId && job.assignedCrewExternalId.trim()) {
-          const externalCrewId = job.assignedCrewExternalId.trim();
-          console.log(`Row ${i + 1}: Processing external crew ID: ${externalCrewId}`);
-          
+        // Helper function to find or create team member from external ID
+        const findOrCreateTeamMember = async (externalCrewId) => {
           // Check if we've already created a team member for this external ID in this batch
           if (crewIdMapping[externalCrewId]) {
-            teamMemberId = crewIdMapping[externalCrewId];
-            console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId} (from batch mapping)`);
+            return crewIdMapping[externalCrewId];
+          }
+          
+          // Check if a team member with this external ID already exists in the DATABASE
+          // We store external ID in first_name as "Crew {last6digits}" - use last 6 digits for display
+          const displayCrewId = externalCrewId.toString().slice(-6);
+          const crewSearchPattern = `Crew ${displayCrewId}`;
+          const { data: existingCrews, error: crewSearchError } = await supabase
+            .from('team_members')
+            .select('id, first_name')
+            .eq('user_id', userId)
+            .eq('first_name', crewSearchPattern)
+            .limit(1);
+          
+          if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+            // Found existing team member with this external ID
+            const foundId = existingCrews[0].id;
+            crewIdMapping[externalCrewId] = foundId; // Store in mapping for this batch
+            console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} in database for external crew ID ${externalCrewId}`);
+            return foundId;
+          }
+          
+          // Create new team member
+          console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
+          const defaultAvailability = {
+            workingHours: {
+              monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              saturday: { enabled: false },
+              sunday: { enabled: false }
+            },
+            customAvailability: []
+          };
+          
+          const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+          const displayCrewIdForNew = externalCrewId.toString().slice(-6);
+          
+          const newTeamMember = {
+            user_id: userId,
+            first_name: `Crew ${displayCrewIdForNew}`, // Use last 6 digits of external ID
+            last_name: '',
+            email: placeholderEmail,
+            phone: null,
+            role: 'worker',
+            is_service_provider: true,
+            status: 'active',
+            availability: JSON.stringify(defaultAvailability),
+            territories: [],
+            permissions: {}
+          };
+          
+          const { data: createdTeamMember, error: createTeamError } = await supabase
+            .from('team_members')
+            .insert(newTeamMember)
+            .select('id')
+            .single();
+          
+          if (createTeamError) {
+            console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
+            results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
+            return null;
           } else {
-            // Check if a team member with this external ID already exists in the DATABASE
-            // We store external ID in first_name as "Crew {last6digits}" - use last 6 digits for display
-            const displayCrewId = externalCrewId.toString().slice(-6);
-            const crewSearchPattern = `Crew ${displayCrewId}`;
-            const { data: existingCrews, error: crewSearchError } = await supabase
-              .from('team_members')
-              .select('id, first_name')
-              .eq('user_id', userId)
-              .eq('first_name', crewSearchPattern)
-              .limit(1);
-            
-            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
-              // Found existing team member with this external ID
-              teamMemberId = existingCrews[0].id;
-              crewIdMapping[externalCrewId] = teamMemberId; // Store in mapping for this batch
-              console.log(`Row ${i + 1}: ✅ Found existing team member ${teamMemberId} in database for external crew ID ${externalCrewId}`);
-            } else {
-              console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
-              // Set default availability
-            const defaultAvailability = {
-              workingHours: {
-                monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                saturday: { enabled: false },
-                sunday: { enabled: false }
-              },
-              customAvailability: []
-            };
-            
-            // Generate a placeholder email since email is required (NOT NULL in schema)
-            // Use external ID to create a unique email that won't conflict
-            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
-            
-            // Use last 6 digits of external ID for display
-            const displayCrewId = externalCrewId.toString().slice(-6);
-            
-            const newTeamMember = {
-              user_id: userId,
-              first_name: `Crew ${displayCrewId}`, // Use last 6 digits of external ID
-              last_name: '',
-              email: placeholderEmail, // Required field - use placeholder email
-              phone: null,
-              role: 'worker',
-              is_service_provider: true,
-              status: 'active',
-              availability: JSON.stringify(defaultAvailability),
-              territories: [],
-              permissions: {}
-            };
-            
-            const { data: createdTeamMember, error: createTeamError } = await supabase
-              .from('team_members')
-              .insert(newTeamMember)
-              .select('id')
-              .single();
-            
-            if (createTeamError) {
-              console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
-              results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
-            } else {
-              teamMemberId = createdTeamMember.id;
-              crewIdMapping[externalCrewId] = teamMemberId; // Store mapping to prevent duplicates
-              console.log(`Row ${i + 1}: Created new team member ${teamMemberId} for external crew ID ${externalCrewId}`);
+            const newId = createdTeamMember.id;
+            crewIdMapping[externalCrewId] = newId; // Store mapping to prevent duplicates
+            console.log(`Row ${i + 1}: Created new team member ${newId} for external crew ID ${externalCrewId}`);
+            return newId;
+          }
+        };
+        
+        // First, check if we have multiple team member IDs (from assignedCrewIds array)
+        if (job.assignedCrewIds && Array.isArray(job.assignedCrewIds) && job.assignedCrewIds.length > 0) {
+          console.log(`Row ${i + 1}: Processing multiple team members:`, job.assignedCrewIds);
+          for (const externalCrewId of job.assignedCrewIds) {
+            if (externalCrewId && externalCrewId.toString().trim()) {
+              const memberId = await findOrCreateTeamMember(externalCrewId.toString().trim());
+              if (memberId) {
+                teamMemberIds.push(memberId);
+                if (!primaryTeamMemberId) {
+                  primaryTeamMemberId = memberId; // First one is primary
+                }
+              }
             }
+          }
+        }
+        
+        // Also check for single external crew ID (for backward compatibility)
+        if (job.assignedCrewExternalId && job.assignedCrewExternalId.trim()) {
+          const externalCrewId = job.assignedCrewExternalId.trim();
+          console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewId}`);
+          
+          const memberId = await findOrCreateTeamMember(externalCrewId);
+          if (memberId && !teamMemberIds.includes(memberId)) {
+            teamMemberIds.push(memberId);
+            if (!primaryTeamMemberId) {
+              primaryTeamMemberId = memberId;
             }
           }
         }
         
         // Fallback: Try to find team member by internal ID (if provided as integer)
-        if (!teamMemberId && job.teamMemberId) {
-          const parsedId = parseInt(job.teamMemberId);
-          if (!isNaN(parsedId) && !job.teamMemberId.toString().includes('x') && !job.teamMemberId.toString().includes('X')) {
-            // Valid integer ID
-            teamMemberId = parsedId;
+        if (teamMemberIds.length === 0 && job.teamMemberId) {
+          // Check if it's a comma-separated list or array
+          let memberIds = [];
+          if (Array.isArray(job.teamMemberId)) {
+            memberIds = job.teamMemberId;
+          } else if (typeof job.teamMemberId === 'string' && job.teamMemberId.includes(',')) {
+            memberIds = job.teamMemberId.split(',').map(id => id.trim());
+          } else {
+            memberIds = [job.teamMemberId];
+          }
+          
+          for (const memberIdStr of memberIds) {
+            const parsedId = parseInt(memberIdStr);
+            if (!isNaN(parsedId) && !memberIdStr.toString().includes('x') && !memberIdStr.toString().includes('X')) {
+              // Valid integer ID
+              if (!teamMemberIds.includes(parsedId)) {
+                teamMemberIds.push(parsedId);
+                if (!primaryTeamMemberId) {
+                  primaryTeamMemberId = parsedId;
+                }
+              }
+            }
           }
         }
         
         // Fallback: Try to find by name if provided
-        if (!teamMemberId && job.teamMemberName) {
-          const nameParts = job.teamMemberName.split(' ');
-          const firstName = nameParts[0];
-          const lastName = nameParts.slice(1).join(' ');
+        if (teamMemberIds.length === 0 && job.teamMemberName) {
+          // Check if it's a comma-separated list
+          let names = [];
+          if (typeof job.teamMemberName === 'string' && job.teamMemberName.includes(',')) {
+            names = job.teamMemberName.split(',').map(n => n.trim());
+          } else {
+            names = [job.teamMemberName];
+          }
           
-          const { data: teamMember, error: teamError } = await supabase
-            .from('team_members')
-            .select('id')
-            .eq('user_id', userId)
-            .eq('first_name', firstName)
-            .eq('last_name', lastName)
-            .maybeSingle();
-          
-          if (teamError) {
-            console.error(`Row ${i + 1}: Error searching team member:`, teamError);
-          } else if (teamMember) {
-            teamMemberId = teamMember.id;
-            console.log(`Row ${i + 1}: Found team member by name:`, teamMemberId);
+          for (const name of names) {
+            const nameParts = name.split(' ');
+            const firstName = nameParts[0];
+            const lastName = nameParts.slice(1).join(' ');
+            
+            const { data: teamMember, error: teamError } = await supabase
+              .from('team_members')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('first_name', firstName)
+              .eq('last_name', lastName)
+              .maybeSingle();
+            
+            if (teamError) {
+              console.error(`Row ${i + 1}: Error searching team member:`, teamError);
+            } else if (teamMember && !teamMemberIds.includes(teamMember.id)) {
+              teamMemberIds.push(teamMember.id);
+              if (!primaryTeamMemberId) {
+                primaryTeamMemberId = teamMember.id;
+              }
+              console.log(`Row ${i + 1}: Found team member by name:`, teamMember.id);
+            }
           }
         }
+        
+        // Set primary team member ID (first one in the array, or single ID)
+        const teamMemberId = primaryTeamMemberId || (teamMemberIds.length > 0 ? teamMemberIds[0] : null);
+        
+        console.log(`Row ${i + 1}: Team member assignment - Primary: ${teamMemberId}, All: [${teamMemberIds.join(', ')}]`);
         
         // Handle territory assignment from external region ID
         let territoryId = null;
@@ -8226,6 +8286,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         } else {
           console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
+          
+          // Create team member assignments in job_team_assignments table for multiple team members
+          if (teamMemberIds.length > 0) {
+            try {
+              const assignments = teamMemberIds.map((memberId, index) => ({
+                job_id: newJob.id,
+                team_member_id: memberId,
+                is_primary: index === 0 || memberId === primaryTeamMemberId, // First one or explicitly primary
+                assigned_by: userId
+              }));
+              
+              const { error: assignmentError } = await supabase
+                .from('job_team_assignments')
+                .insert(assignments);
+              
+              if (assignmentError) {
+                console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentError);
+                results.warnings.push(`Row ${i + 1}: Could not assign all team members - ${assignmentError.message}`);
+              } else {
+                console.log(`Row ${i + 1}: ✅ Created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+              }
+            } catch (assignmentError) {
+              console.error(`Row ${i + 1}: Error creating team assignments:`, assignmentError);
+              // Don't fail the import if team assignment fails
+            }
+          }
           
           // Add to batch tracking set to prevent duplicates within the same import
           if (job.scheduledDate && customerId) {
@@ -8887,80 +8973,118 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             }
           }
 
-          // Handle team member assignment from Provider details (create on the fly like normal import)
-          let teamMemberId = null;
-          const assignedCrewExternalId = job.assignedCrewExternalId || job['assignedCrewExternalId'];
-          if (assignedCrewExternalId && assignedCrewExternalId.toString().trim()) {
-            const externalCrewId = assignedCrewExternalId.toString().trim();
-            
+          // Handle team member assignment - support multiple team members (from Provider details)
+          let teamMemberIds = []; // Array to store all team member IDs
+          let primaryTeamMemberId = null; // Primary team member ID
+          
+          // Helper function to find or create team member from external ID
+          const findOrCreateTeamMember = async (externalCrewId) => {
             // Check if we've already created a team member for this external ID in this batch
             if (crewIdMapping[externalCrewId]) {
-              teamMemberId = crewIdMapping[externalCrewId];
-              console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external provider ID ${externalCrewId} (from batch mapping)`);
+              return crewIdMapping[externalCrewId];
+            }
+            
+            // Check if a team member with this external ID already exists in the DATABASE
+            // Use last 6 digits for display
+            const displayCrewId = externalCrewId.toString().slice(-6);
+            const crewSearchPattern = `Crew ${displayCrewId}`;
+            const { data: existingCrews, error: crewSearchError } = await supabase
+              .from('team_members')
+              .select('id, first_name')
+              .eq('user_id', userId)
+              .eq('first_name', crewSearchPattern)
+              .limit(1);
+            
+            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+              const foundId = existingCrews[0].id;
+              crewIdMapping[externalCrewId] = foundId;
+              console.log(`Row ${i + 1}: Found existing team member ${foundId} for external provider ID ${externalCrewId}`);
+              return foundId;
+            }
+            
+            // Create new team member
+            const defaultAvailability = {
+              workingHours: {
+                monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                saturday: { enabled: false },
+                sunday: { enabled: false }
+              },
+              customAvailability: []
+            };
+            
+            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+            
+            const newTeamMember = {
+              user_id: userId,
+              first_name: `Crew ${displayCrewId}`, // Use last 6 digits for display
+              last_name: '',
+              email: placeholderEmail,
+              phone: null,
+              role: 'worker',
+              is_service_provider: true,
+              status: 'active',
+              availability: JSON.stringify(defaultAvailability),
+              territories: [],
+              permissions: {}
+            };
+            
+            const { data: createdTeamMember, error: createTeamError } = await supabase
+              .from('team_members')
+              .insert(newTeamMember)
+              .select('id')
+              .single();
+            
+            if (createTeamError) {
+              console.error(`Row ${i + 1}: Failed to create team member for provider ID ${externalCrewId}:`, createTeamError);
+              results.jobs.errors.push(`Row ${i + 1}: Could not create team member for provider ID ${externalCrewId}`);
+              return null;
             } else {
-              // Check if a team member with this external ID already exists in the DATABASE
-              // Use last 6 digits for display
-              const displayCrewId = externalCrewId.toString().slice(-6);
-              const crewSearchPattern = `Crew ${displayCrewId}`;
-              const { data: existingCrews, error: crewSearchError } = await supabase
-                .from('team_members')
-                .select('id, first_name')
-                .eq('user_id', userId)
-                .eq('first_name', crewSearchPattern)
-                .limit(1);
-              
-              if (!crewSearchError && existingCrews && existingCrews.length > 0) {
-                teamMemberId = existingCrews[0].id;
-                crewIdMapping[externalCrewId] = teamMemberId;
-                console.log(`Row ${i + 1}: Found existing team member ${teamMemberId} for external provider ID ${externalCrewId}`);
-              } else {
-                // Create new team member
-                const defaultAvailability = {
-                  workingHours: {
-                    monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                    tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                    wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                    thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                    friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                    saturday: { enabled: false },
-                    sunday: { enabled: false }
-                  },
-                  customAvailability: []
-                };
-                
-                const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
-                
-                const newTeamMember = {
-                  user_id: userId,
-                  first_name: `Crew ${displayCrewId}`, // Use last 6 digits for display
-                  last_name: '',
-                  email: placeholderEmail,
-                  phone: null,
-                  role: 'worker',
-                  is_service_provider: true,
-                  status: 'active',
-                  availability: JSON.stringify(defaultAvailability),
-                  territories: [],
-                  permissions: {}
-                };
-                
-                const { data: createdTeamMember, error: createTeamError } = await supabase
-                  .from('team_members')
-                  .insert(newTeamMember)
-                  .select('id')
-                  .single();
-                
-                if (createTeamError) {
-                  console.error(`Row ${i + 1}: Failed to create team member for provider ID ${externalCrewId}:`, createTeamError);
-                  results.jobs.errors.push(`Row ${i + 1}: Could not create team member for provider ID ${externalCrewId}`);
-                } else {
-                  teamMemberId = createdTeamMember.id;
-                  crewIdMapping[externalCrewId] = teamMemberId;
-                  console.log(`Row ${i + 1}: Created new team member ${teamMemberId} for external provider ID ${externalCrewId}`);
+              const newId = createdTeamMember.id;
+              crewIdMapping[externalCrewId] = newId;
+              console.log(`Row ${i + 1}: Created new team member ${newId} for external provider ID ${externalCrewId}`);
+              return newId;
+            }
+          };
+          
+          // First, check if we have multiple team member IDs (from assignedCrewIds array)
+          const assignedCrewIds = job.assignedCrewIds || job['assignedCrewIds'];
+          if (assignedCrewIds && Array.isArray(assignedCrewIds) && assignedCrewIds.length > 0) {
+            console.log(`Row ${i + 1}: Processing multiple team members:`, assignedCrewIds);
+            for (const externalCrewId of assignedCrewIds) {
+              if (externalCrewId && externalCrewId.toString().trim()) {
+                const memberId = await findOrCreateTeamMember(externalCrewId.toString().trim());
+                if (memberId) {
+                  teamMemberIds.push(memberId);
+                  if (!primaryTeamMemberId) {
+                    primaryTeamMemberId = memberId; // First one is primary
+                  }
                 }
               }
             }
           }
+          
+          // Also check for single external crew ID (for backward compatibility)
+          const assignedCrewExternalId = job.assignedCrewExternalId || job['assignedCrewExternalId'];
+          if (assignedCrewExternalId && assignedCrewExternalId.toString().trim()) {
+            const externalCrewId = assignedCrewExternalId.toString().trim();
+            console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewId}`);
+            
+            const memberId = await findOrCreateTeamMember(externalCrewId);
+            if (memberId && !teamMemberIds.includes(memberId)) {
+              teamMemberIds.push(memberId);
+              if (!primaryTeamMemberId) {
+                primaryTeamMemberId = memberId;
+              }
+            }
+          }
+          
+          // Set primary team member ID (first one in the array, or single ID)
+          const teamMemberId = primaryTeamMemberId || (teamMemberIds.length > 0 ? teamMemberIds[0] : null);
+          console.log(`Row ${i + 1}: Team member assignment - Primary: ${teamMemberId}, All: [${teamMemberIds.join(', ')}]`);
 
           // Handle territory assignment from Location (create on the fly like normal import)
           let territoryId = null;
@@ -9032,15 +9156,15 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // Determine payment status from Booking Koala data
           // Check for payment-related fields: "Amount paid by customer (USD)", "Payment method", "Amount owed by customer (USD)"
           const amountPaid = parseFloat(job['Amount paid by customer (USD)'] || job.amountPaidByCustomer || job.amountPaid || 0);
-          const finalAmount = parseFloat(job['Final amount (USD)'] || job.finalAmount || job.total || priceValue || 0);
-          const amountOwed = parseFloat(job['Amount owed by customer (USD)'] || job.amountOwed || (finalAmount - amountPaid));
+          const finalAmountValue = parseFloat(job['Final amount (USD)'] || job.finalAmount || job.total || priceValue || 0);
+          const amountOwed = parseFloat(job['Amount owed by customer (USD)'] || job.amountOwed || (finalAmountValue - amountPaid));
           const paymentMethod = job['Payment method'] || job.paymentMethod || job.payment_method || null;
           
           // Determine if job is paid based on amounts
           let paymentStatus = 'pending';
           let invoiceStatus = 'not_invoiced';
           
-          if (amountOwed <= 0 && amountPaid > 0 && finalAmount > 0) {
+          if (amountOwed <= 0 && amountPaid > 0 && finalAmountValue > 0) {
             // Fully paid
             paymentStatus = 'paid';
             invoiceStatus = 'paid';
@@ -9048,7 +9172,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             // Partially paid
             paymentStatus = 'partial';
             invoiceStatus = 'unpaid';
-          } else if (finalAmount > 0) {
+          } else if (finalAmountValue > 0) {
             // Has amount but not paid
             paymentStatus = 'pending';
             invoiceStatus = 'unpaid';
@@ -9157,6 +9281,32 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             results.jobs.errors.push(`Row ${i + 1}: ${insertError.message}`);
           } else {
             results.jobs.imported++;
+            
+            // Create team member assignments in job_team_assignments table for multiple team members
+            if (teamMemberIds.length > 0) {
+              try {
+                const assignments = teamMemberIds.map((memberId, index) => ({
+                  job_id: newJob.id,
+                  team_member_id: memberId,
+                  is_primary: index === 0 || memberId === primaryTeamMemberId, // First one or explicitly primary
+                  assigned_by: userId
+                }));
+                
+                const { error: assignmentError } = await supabase
+                  .from('job_team_assignments')
+                  .insert(assignments);
+                
+                if (assignmentError) {
+                  console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentError);
+                  results.jobs.errors.push(`Row ${i + 1}: Could not assign all team members - ${assignmentError.message}`);
+                } else {
+                  console.log(`Row ${i + 1}: ✅ Created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+                }
+              } catch (assignmentError) {
+                console.error(`Row ${i + 1}: Error creating team assignments:`, assignmentError);
+                // Don't fail the import if team assignment fails
+              }
+            }
           }
         } catch (error) {
           results.jobs.errors.push(`Row ${i + 1}: ${error.message}`);
