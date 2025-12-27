@@ -26919,9 +26919,54 @@ console.log('✅ Google Import endpoints setup complete');
 // Correct implementation following RentCast API documentation
 app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   try {
-    const { address, city, state, zipCode } = req.body;
+    let { address, city, state, zipCode, street } = req.body;
 
-    if (!address || !city || !state) {
+    // Auto-extract city from address if not provided (fallback for Zillow-style full addresses)
+    // Example: "445 Albee Square W, Brooklyn, NY 11201, USA" -> city = "Brooklyn"
+    let finalCity = city;
+    let finalAddress = address || street;
+    let finalState = state;
+    let finalZipCode = zipCode;
+    
+    // If city is missing, try to extract it from the full address string
+    if (!finalCity && finalAddress && finalAddress.includes(',')) {
+      const parts = finalAddress.split(',').map(p => p.trim());
+      if (parts.length >= 2) {
+        // Extract city from second part (e.g., "Brooklyn" from "445 Albee Square W, Brooklyn, NY 11201")
+        finalCity = parts[1];
+        // Extract just the street address (first part)
+        finalAddress = parts[0];
+        
+        // Also try to extract state and zip from the address string if not provided
+        if (parts.length >= 3) {
+          const stateZipPart = parts[2].replace(/USA/gi, '').trim();
+          const stateZip = stateZipPart.split(/\s+/).filter(p => p && p.length > 0);
+          if (stateZip.length >= 1) {
+            if (!finalState && stateZip[0].length === 2) {
+              finalState = stateZip[0];
+            }
+            if (!finalZipCode && stateZip.length >= 2) {
+              finalZipCode = stateZip[1];
+            } else if (!finalZipCode && stateZip.length === 1 && stateZip[0].length >= 5) {
+              finalZipCode = stateZip[0];
+            }
+          }
+        }
+      }
+    } else if (finalAddress && finalAddress.includes(',')) {
+      // If we have city but address is a full string, extract just the street part
+      const parts = finalAddress.split(',').map(p => p.trim());
+      if (parts.length >= 1) {
+        finalAddress = parts[0];
+      }
+    }
+
+    // Validate required fields - RentCast needs address, city, state
+    if (!finalAddress || !finalCity || !finalState) {
+      console.log('⚠️ Missing required address components:', { 
+        originalRequest: req.body,
+        parsed: { address: finalAddress, city: finalCity, state: finalState, zipCode: finalZipCode }
+      });
       return res.json(null);
     }
 
@@ -26934,14 +26979,16 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
     }
 
     const apiParams = {
-      address,
-      city,
-      state
+      address: finalAddress,
+      city: finalCity,
+      state: finalState
     };
 
-    if (zipCode) {
-      apiParams.zip = zipCode;
+    if (finalZipCode) {
+      apiParams.zip = finalZipCode;
     }
+
+    console.log('📤 RentCast API request params:', apiParams);
 
     try {
       // Step 1: Search for property
