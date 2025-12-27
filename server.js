@@ -8284,8 +8284,18 @@ app.post('/api/customers/import', authenticateToken, async (req, res) => {
   }
 });
 
+// Helper function to send progress update
+const sendProgress = (res, type, data) => {
+  res.write(JSON.stringify({ type, ...data }) + '\n');
+};
+
 // Booking Koala import endpoint
 app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
+  // Set headers for streaming response
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
   try {
     const userId = req.user.userId;
     const { customers, jobs, importSettings } = req.body;
@@ -8295,6 +8305,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
       customers: { imported: 0, skipped: 0, errors: [] },
       jobs: { imported: 0, skipped: 0, errors: [] }
     };
+
+    const totalCustomers = customers && Array.isArray(customers) ? customers.length : 0;
+    const totalJobs = jobs && Array.isArray(jobs) ? jobs.length : 0;
 
     // Import customers if provided
     if (customers && Array.isArray(customers) && customers.length > 0) {
@@ -8382,6 +8395,26 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           }
         } catch (error) {
           results.customers.errors.push(`Row ${i + 1}: ${error.message}`);
+        }
+
+        // Send progress update every 10 items or on last item
+        if ((i + 1) % 10 === 0 || i === customers.length - 1) {
+          sendProgress(res, 'progress', {
+            customers: {
+              current: i + 1,
+              total: totalCustomers,
+              imported: results.customers.imported,
+              skipped: results.customers.skipped,
+              errors: results.customers.errors.length
+            },
+            jobs: {
+              current: 0,
+              total: totalJobs,
+              imported: 0,
+              skipped: 0,
+              errors: 0
+            }
+          });
         }
       }
     }
@@ -9013,17 +9046,43 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
         } catch (error) {
           results.jobs.errors.push(`Row ${i + 1}: ${error.message}`);
         }
+
+        // Send progress update every 10 items or on last item
+        if ((i + 1) % 10 === 0 || i === jobs.length - 1) {
+          sendProgress(res, 'progress', {
+            customers: {
+              current: totalCustomers,
+              total: totalCustomers,
+              imported: results.customers.imported,
+              skipped: results.customers.skipped,
+              errors: results.customers.errors.length
+            },
+            jobs: {
+              current: i + 1,
+              total: totalJobs,
+              imported: results.jobs.imported,
+              skipped: results.jobs.skipped,
+              errors: results.jobs.errors.length
+            }
+          });
+        }
       }
     }
 
-    res.json({
+    // Send final result
+    sendProgress(res, 'complete', {
       success: true,
       message: 'Import completed',
       results
     });
+    res.end();
   } catch (error) {
     console.error('Booking Koala import error:', error);
-    res.status(500).json({ error: 'Failed to import Booking Koala data' });
+    sendProgress(res, 'error', {
+      error: 'Failed to import Booking Koala data',
+      message: error.message
+    });
+    res.end();
   }
 });
 
