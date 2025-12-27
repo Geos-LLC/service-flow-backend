@@ -8297,7 +8297,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             email: customer.email || customer['Email Address'] || customer.Email || customer.email_address || null,
             phone: customer.phone || customer['Phone Number'] || customer.Phone || customer.phone_number || customer.mobile || null,
             address: customer.address || customer.Address || customer.street_address || null,
-            apt: customer.apt || customer['Apt. No.'] || customer['Apt'] || customer.apartment || null,
+            suite: customer.apt || customer['Apt. No.'] || customer['Apt'] || customer.apartment || null, // Database column is 'suite', not 'apt'
             city: customer.city || customer.City || null,
             state: customer.state || customer.State || customer.state_province || null,
             zip_code: customer.zipCode || customer['Zip/Postal Code'] || customer['Zip/Postal code'] || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
