@@ -9188,8 +9188,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           }
           
           // Check Booking status - if "Completed" and has payment, likely paid
-          const bookingStatus = job['Booking status'] || job.bookingStatus || job.status || '';
-          if (bookingStatus && String(bookingStatus).toLowerCase() === 'completed' && amountPaid > 0) {
+          // Reuse bookingStatus from earlier declaration (line 8836) or get it again
+          const bookingStatusForPayment = job['Booking status'] || job.bookingStatus || job.status || '';
+          if (bookingStatusForPayment && String(bookingStatusForPayment).toLowerCase() === 'completed' && amountPaid > 0) {
             paymentStatus = 'paid';
             invoiceStatus = 'paid';
           }
