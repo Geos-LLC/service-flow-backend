@@ -8629,12 +8629,16 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
 
           // Parse duration from Estimated job length (HH:MM)
           let duration = 60; // default 1 hour
-          const durationStr = job.duration || job['Estimated job length (HH:MM)'] || job['Estimated job length'];
-          if (durationStr && durationStr.includes(':')) {
-            const [hours, minutes] = durationStr.split(':');
-            duration = (parseInt(hours) || 0) * 60 + (parseInt(minutes) || 0);
-          } else if (durationStr) {
-            duration = parseInt(durationStr) || 60;
+          const durationStr = job.duration || job['Estimated job length (HH:MM)'] || job['Estimated job length'] || null;
+          if (durationStr) {
+            // Convert to string to ensure we can call .includes() safely
+            const durationStrSafe = String(durationStr).trim();
+            if (durationStrSafe.includes(':')) {
+              const [hours, minutes] = durationStrSafe.split(':');
+              duration = (parseInt(hours) || 0) * 60 + (parseInt(minutes) || 0);
+            } else {
+              duration = parseInt(durationStrSafe) || 60;
+            }
           }
 
           // Parse recurring from Frequency
