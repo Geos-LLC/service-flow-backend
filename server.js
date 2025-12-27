@@ -8455,17 +8455,25 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             customerId = customerMap[email] || customerIdMapping[email];
           }
           
-          if (!customerId && customerFirstName && customerLastName) {
-            const name = `${customerFirstName} ${customerLastName}`.toLowerCase().trim();
+          // Use 'customer' as default last name for lookup if missing
+          const lookupLastName = customerLastName || 'customer';
+          if (!customerId && customerFirstName) {
+            const name = `${customerFirstName} ${lookupLastName}`.toLowerCase().trim();
             customerId = customerMap[name] || customerIdMapping[name];
           }
 
           // Create customer on-the-fly if not found (like team members and territories)
           if (!customerId) {
-            // Validate required fields
-            if (!customerFirstName || !customerLastName) {
-              results.jobs.errors.push(`Row ${i + 1}: Cannot create customer - missing first name or last name.`);
+            // Validate required fields - first name is required, but use 'customer' as default last name if missing
+            if (!customerFirstName) {
+              results.jobs.errors.push(`Row ${i + 1}: Cannot create customer - missing first name.`);
               continue;
+            }
+            
+            // Use 'customer' as default last name if missing (Booking Koala sometimes has customers without last names)
+            if (!customerLastName) {
+              customerLastName = 'customer';
+              console.log(`Row ${i + 1}: No last name provided, using 'customer' as default for ${customerFirstName}`);
             }
 
             try {
@@ -8506,13 +8514,15 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                     existingCustomer = foundByEmail;
                   }
                   
-                  if (!existingCustomer && customerFirstName && customerLastName) {
+                  if (!existingCustomer && customerFirstName) {
+                    // Use 'customer' as default last name if missing
+                    const searchLastName = customerLastName || 'customer';
                     const { data: foundByName } = await supabase
                       .from('customers')
                       .select('id, email, first_name, last_name')
                       .eq('user_id', userId)
                       .eq('first_name', customerFirstName.trim())
-                      .eq('last_name', customerLastName.trim())
+                      .eq('last_name', searchLastName.trim())
                       .limit(1)
                       .maybeSingle();
                     existingCustomer = foundByName;
@@ -8819,7 +8829,8 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             service_address_zip: job.zipCode || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code || null,
             estimated_duration: duration,
             is_recurring: isRecurring,
-            recurring_frequency: recurringFrequency
+            recurring_frequency: recurringFrequency,
+            tags: job.tags ? (Array.isArray(job.tags) ? [...job.tags, 'imported', 'booking-koala'] : `${job.tags},imported,booking-koala`) : 'imported,booking-koala'
           };
 
           // Check for duplicates if skipDuplicates is enabled
