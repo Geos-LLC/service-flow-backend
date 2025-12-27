@@ -8387,10 +8387,11 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
         customerMap[nameKey] = c.id;
       });
 
-      // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
+      // Track external IDs to internal IDs mapping to prevent duplicate team members, territories, and services
       const crewIdMapping = {}; // Maps external crew/provider IDs to team member IDs
       const territoryIdMapping = {}; // Maps external location IDs to territory IDs
       const customerIdMapping = {}; // Track customers created in this batch to avoid duplicates
+      const serviceNameMapping = {}; // Maps normalized service names to service IDs to prevent duplicates
 
       for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
@@ -8685,6 +8686,92 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             }
           }
 
+          // Handle service creation (create on the fly like normal import, prevent duplicates)
+          let serviceId = null;
+          const serviceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
+          if (serviceName && serviceName.trim() !== 'Imported Service') {
+            // Normalize service name for comparison (same logic as regular import)
+            const normalizeServiceName = (name) => {
+              if (!name || typeof name !== 'string') return '';
+              return name
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, ' ')
+                .replace(/\s*\/\s*/g, '/')
+                .replace(/\s*-\s*/g, '-')
+                .replace(/\s*\+\s*/g, '+')
+                .replace(/\s*&\s*/g, '&')
+                .trim();
+            };
+            
+            const normalizedServiceName = normalizeServiceName(serviceName);
+            
+            // First check our mapping to see if we've already created/found this service in this import batch
+            if (serviceNameMapping[normalizedServiceName]) {
+              serviceId = serviceNameMapping[normalizedServiceName];
+              console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for "${serviceName}" (from batch mapping)`);
+            } else {
+              // Search database for existing service (case-insensitive)
+              const { data: allServices, error: serviceError } = await supabase
+                .from('services')
+                .select('id, name, price')
+                .eq('user_id', userId);
+              
+              let services = [];
+              if (!serviceError && allServices) {
+                services = allServices.filter(service => {
+                  const serviceNormalized = normalizeServiceName(service.name);
+                  return serviceNormalized === normalizedServiceName;
+                });
+              }
+              
+              if (serviceError) {
+                console.error(`Row ${i + 1}: Error searching service:`, serviceError);
+              } else if (services && services.length > 0) {
+                // Found existing service - use it
+                serviceId = services[0].id;
+                serviceNameMapping[normalizedServiceName] = serviceId;
+                // Also add all found services to mapping to prevent future duplicates
+                services.forEach(service => {
+                  const foundNormalized = normalizeServiceName(service.name);
+                  if (!serviceNameMapping[foundNormalized]) {
+                    serviceNameMapping[foundNormalized] = service.id;
+                  }
+                });
+                console.log(`Row ${i + 1}: Found existing service ${serviceId} for "${serviceName}"`);
+              } else {
+                // Service not found - create it
+                const sanitizedName = sanitizeInput(serviceName.trim());
+                const newService = {
+                  user_id: userId,
+                  name: sanitizedName,
+                  description: null,
+                  price: priceValue || 0,
+                  duration: duration || 60,
+                  category: null,
+                  modifiers: null,
+                  intake_questions: null,
+                  is_active: true
+                };
+                
+                const { data: createdService, error: createServiceError } = await supabase
+                  .from('services')
+                  .insert(newService)
+                  .select('id')
+                  .single();
+                
+                if (createServiceError) {
+                  console.error(`Row ${i + 1}: Failed to create service "${sanitizedName}":`, createServiceError);
+                  // Continue without service ID - job can still be created with service_name
+                } else {
+                  serviceId = createdService.id;
+                  serviceNameMapping[normalizedServiceName] = serviceId;
+                  console.log(`Row ${i + 1}: Created new service ${serviceId} for "${sanitizedName}"`);
+                }
+              }
+            }
+          }
+
           // Handle team member assignment from Provider details (create on the fly like normal import)
           let teamMemberId = null;
           const assignedCrewExternalId = job.assignedCrewExternalId || job['assignedCrewExternalId'];
@@ -8827,6 +8914,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           const mappedJob = {
             user_id: userId,
             customer_id: customerId,
+            service_id: serviceId || null, // Add service_id if service was created/found
             team_member_id: teamMemberId || null,
             territory_id: territoryId || null,
             service_name: job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service',
