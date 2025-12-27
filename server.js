@@ -7480,6 +7480,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           console.log(`📥 Processing job ${i + 1}/${jobs.length}:`, job.customerName, job.serviceName, `Date: ${job.scheduledDate || 'N/A'}`);
         }
         
+        // Debug: Log invoice_fully_paid_boolean field for first few jobs
+        if (i < 3) {
+          const invoicePaidField = job.invoice_fully_paid_boolean || job['invoice_fully_paid_boolean'] || job.invoiceFullyPaidBoolean;
+          console.log(`🔍 Row ${i + 1}: invoice_fully_paid_boolean field value:`, invoicePaidField, `(type: ${typeof invoicePaidField})`);
+          console.log(`🔍 Row ${i + 1}: Available job keys containing 'invoice' or 'paid':`, Object.keys(job).filter(k => k.toLowerCase().includes('invoice') || k.toLowerCase().includes('paid')));
+        }
+        
         // Validate required fields - need customer ID, email, or name
         if (!job.customerId && !job.customerEmail && !job.customerName) {
           results.errors.push(`Row ${i + 1}: Customer ID, email, or name is required`);
@@ -8202,14 +8209,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Determine payment status - check multiple possible field names and values
           payment_status: (() => {
             // First, check invoice_fully_paid_boolean field (highest priority)
-            const invoiceFullyPaid = job.invoice_fully_paid_boolean || job.invoiceFullyPaidBoolean || job['invoice_fully_paid_boolean'] || job['Invoice Fully Paid Boolean'];
-            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null) {
-              const isPaid = String(invoiceFullyPaid).toLowerCase() === 'true' || invoiceFullyPaid === true || invoiceFullyPaid === 1 || invoiceFullyPaid === '1';
+            // Try all possible field name variations (CSV column names can vary)
+            const invoiceFullyPaid = job.invoice_fully_paid_boolean || 
+                                     job.invoiceFullyPaidBoolean || 
+                                     job['invoice_fully_paid_boolean'] || 
+                                     job['Invoice Fully Paid Boolean'] ||
+                                     job['invoice_fully_paid_boolean_text'] ||
+                                     job.invoice_fully_paid_boolean_text;
+            
+            // Check if field exists and is not empty
+            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null && invoiceFullyPaid !== '') {
+              const invoiceFullyPaidStr = String(invoiceFullyPaid).trim().toLowerCase();
+              // Handle various boolean representations: TRUE, true, True, 1, '1', true boolean, etc.
+              const isPaid = invoiceFullyPaidStr === 'true' || 
+                            invoiceFullyPaidStr === '1' || 
+                            invoiceFullyPaid === true || 
+                            invoiceFullyPaid === 1 ||
+                            invoiceFullyPaidStr === 'yes' ||
+                            invoiceFullyPaidStr === 'y';
+              
               if (isPaid) {
+                console.log(`Row ${i + 1}: invoice_fully_paid_boolean = ${invoiceFullyPaid} -> payment_status = 'paid'`);
                 return 'paid';
               } else {
                 // If explicitly false, check if there's an amount to determine if it's pending or unpaid
                 const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+                console.log(`Row ${i + 1}: invoice_fully_paid_boolean = ${invoiceFullyPaid} (false) -> payment_status = 'pending'`);
                 return totalAmount > 0 ? 'pending' : 'pending';
               }
             }
@@ -8244,14 +8269,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Determine invoice status - check multiple possible field names
           invoice_status: (() => {
             // First, check invoice_fully_paid_boolean field (highest priority)
-            const invoiceFullyPaid = job.invoice_fully_paid_boolean || job.invoiceFullyPaidBoolean || job['invoice_fully_paid_boolean'] || job['Invoice Fully Paid Boolean'];
-            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null) {
-              const isPaid = String(invoiceFullyPaid).toLowerCase() === 'true' || invoiceFullyPaid === true || invoiceFullyPaid === 1 || invoiceFullyPaid === '1';
+            // Try all possible field name variations (CSV column names can vary)
+            const invoiceFullyPaid = job.invoice_fully_paid_boolean || 
+                                     job.invoiceFullyPaidBoolean || 
+                                     job['invoice_fully_paid_boolean'] || 
+                                     job['Invoice Fully Paid Boolean'] ||
+                                     job['invoice_fully_paid_boolean_text'] ||
+                                     job.invoice_fully_paid_boolean_text;
+            
+            // Check if field exists and is not empty
+            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null && invoiceFullyPaid !== '') {
+              const invoiceFullyPaidStr = String(invoiceFullyPaid).trim().toLowerCase();
+              // Handle various boolean representations: TRUE, true, True, 1, '1', true boolean, etc.
+              const isPaid = invoiceFullyPaidStr === 'true' || 
+                            invoiceFullyPaidStr === '1' || 
+                            invoiceFullyPaid === true || 
+                            invoiceFullyPaid === 1 ||
+                            invoiceFullyPaidStr === 'yes' ||
+                            invoiceFullyPaidStr === 'y';
+              
               if (isPaid) {
+                console.log(`Row ${i + 1}: invoice_fully_paid_boolean = ${invoiceFullyPaid} -> invoice_status = 'paid'`);
                 return 'paid';
               } else {
                 // If explicitly false, check if there's an amount to determine if it's unpaid or draft
                 const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+                console.log(`Row ${i + 1}: invoice_fully_paid_boolean = ${invoiceFullyPaid} (false) -> invoice_status = '${totalAmount > 0 ? 'unpaid' : 'draft'}'`);
                 return totalAmount > 0 ? 'unpaid' : 'draft';
               }
             }
