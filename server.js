@@ -8201,6 +8201,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           special_instructions: job.specialInstructions || null,
           // Determine payment status - check multiple possible field names and values
           payment_status: (() => {
+            // First, check invoice_fully_paid_boolean field (highest priority)
+            const invoiceFullyPaid = job.invoice_fully_paid_boolean || job.invoiceFullyPaidBoolean || job['invoice_fully_paid_boolean'] || job['Invoice Fully Paid Boolean'];
+            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null) {
+              const isPaid = String(invoiceFullyPaid).toLowerCase() === 'true' || invoiceFullyPaid === true || invoiceFullyPaid === 1 || invoiceFullyPaid === '1';
+              if (isPaid) {
+                return 'paid';
+              } else {
+                // If explicitly false, check if there's an amount to determine if it's pending or unpaid
+                const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+                return totalAmount > 0 ? 'pending' : 'pending';
+              }
+            }
+            
             const paymentStatus = job.paymentStatus || job.paymentStatus || job['Payment Status'] || job['payment status'] || null;
             if (paymentStatus) {
               const statusLower = String(paymentStatus).toLowerCase().trim();
@@ -8230,6 +8243,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           })(),
           // Determine invoice status - check multiple possible field names
           invoice_status: (() => {
+            // First, check invoice_fully_paid_boolean field (highest priority)
+            const invoiceFullyPaid = job.invoice_fully_paid_boolean || job.invoiceFullyPaidBoolean || job['invoice_fully_paid_boolean'] || job['Invoice Fully Paid Boolean'];
+            if (invoiceFullyPaid !== undefined && invoiceFullyPaid !== null) {
+              const isPaid = String(invoiceFullyPaid).toLowerCase() === 'true' || invoiceFullyPaid === true || invoiceFullyPaid === 1 || invoiceFullyPaid === '1';
+              if (isPaid) {
+                return 'paid';
+              } else {
+                // If explicitly false, check if there's an amount to determine if it's unpaid or draft
+                const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+                return totalAmount > 0 ? 'unpaid' : 'draft';
+              }
+            }
+            
             const invoiceStatus = job.invoiceStatus || job.invoiceStatus || job['Invoice Status'] || job['invoice status'] || null;
             if (invoiceStatus) {
               const statusLower = String(invoiceStatus).toLowerCase().trim();
