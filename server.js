@@ -7747,8 +7747,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external crew ID ${externalCrewId} (from batch mapping)`);
           } else {
             // Check if a team member with this external ID already exists in the DATABASE
-            // We store external ID in first_name as "Crew {externalCrewId}" - search for exact match
-            const crewSearchPattern = `Crew ${externalCrewId}`;
+            // We store external ID in first_name as "Crew {last6digits}" - use last 6 digits for display
+            const displayCrewId = externalCrewId.toString().slice(-6);
+            const crewSearchPattern = `Crew ${displayCrewId}`;
             const { data: existingCrews, error: crewSearchError } = await supabase
               .from('team_members')
               .select('id, first_name')
@@ -7781,9 +7782,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // Use external ID to create a unique email that won't conflict
             const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
             
+            // Use last 6 digits of external ID for display
+            const displayCrewId = externalCrewId.toString().slice(-6);
+            
             const newTeamMember = {
               user_id: userId,
-              first_name: `Crew ${externalCrewId}`, // Use full external ID
+              first_name: `Crew ${displayCrewId}`, // Use last 6 digits of external ID
               last_name: '',
               email: placeholderEmail, // Required field - use placeholder email
               phone: null,
@@ -7874,9 +7878,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               console.log(`Row ${i + 1}: ✅ Found existing territory ${territoryId} in database for external region ID ${externalRegionId}`);
             } else {
               console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
+              // Use last 6 digits of external ID for display
+              const displayRegionId = externalRegionId.toString().slice(-6);
+              
             const newTerritory = {
               user_id: userId,
-              name: `Region ${externalRegionId}`, // Use full external ID
+              name: `Region ${displayRegionId}`, // Use last 6 digits of external ID
               description: `Imported from external region ID: ${externalRegionId}`,
               location: job.serviceAddress || 'Unknown',
               zip_codes: job.serviceAddressZip ? [job.serviceAddressZip] : [],
@@ -8116,7 +8123,68 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           total_amount: parseFloat(job.totalAmount) || parseFloat(job.total) || parseFloat(job.price) || 0,
           estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
           special_instructions: job.specialInstructions || null,
-          payment_status: job.paymentStatus || 'pending',
+          // Determine payment status - check multiple possible field names and values
+          payment_status: (() => {
+            const paymentStatus = job.paymentStatus || job.paymentStatus || job['Payment Status'] || job['payment status'] || null;
+            if (paymentStatus) {
+              const statusLower = String(paymentStatus).toLowerCase().trim();
+              // Map common payment status values
+              if (statusLower === 'paid' || statusLower === 'complete' || statusLower === 'completed') {
+                return 'paid';
+              } else if (statusLower === 'pending' || statusLower === 'unpaid' || statusLower === 'due') {
+                return 'pending';
+              } else if (statusLower === 'partial' || statusLower === 'partially paid') {
+                return 'partial';
+              }
+              return statusLower; // Use as-is if it's a valid value
+            }
+            // Check if amount paid indicates payment status
+            const amountPaid = parseFloat(job.amountPaid || job.amountPaidByCustomer || job['Amount paid by customer'] || 0);
+            const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+            const amountOwed = parseFloat(job.amountOwed || job['Amount owed by customer'] || totalAmount - amountPaid);
+            
+            if (amountOwed <= 0 && amountPaid > 0) {
+              return 'paid';
+            } else if (amountPaid > 0 && amountOwed > 0) {
+              return 'partial';
+            } else if (totalAmount > 0) {
+              return 'pending';
+            }
+            return 'pending'; // Default
+          })(),
+          // Determine invoice status - check multiple possible field names
+          invoice_status: (() => {
+            const invoiceStatus = job.invoiceStatus || job.invoiceStatus || job['Invoice Status'] || job['invoice status'] || null;
+            if (invoiceStatus) {
+              const statusLower = String(invoiceStatus).toLowerCase().trim();
+              // Map common invoice status values
+              if (statusLower === 'paid' || statusLower === 'invoiced' || statusLower === 'sent') {
+                return statusLower === 'paid' ? 'paid' : 'invoiced';
+              } else if (statusLower === 'unpaid' || statusLower === 'due') {
+                return 'unpaid';
+              } else if (statusLower === 'draft' || statusLower === 'not_invoiced') {
+                return 'not_invoiced';
+              }
+              return statusLower; // Use as-is
+            }
+            // Infer from payment status
+            const paymentStatus = job.paymentStatus || job.paymentStatus || job['Payment Status'] || null;
+            if (paymentStatus) {
+              const statusLower = String(paymentStatus).toLowerCase().trim();
+              if (statusLower === 'paid' || statusLower === 'complete') {
+                return 'paid';
+              }
+            }
+            // Check if amount paid indicates invoice status
+            const amountPaid = parseFloat(job.amountPaid || job.amountPaidByCustomer || job['Amount paid by customer'] || 0);
+            const totalAmount = parseFloat(job.total || job.totalAmount || job.finalAmount || job.price || 0);
+            if (amountPaid >= totalAmount && totalAmount > 0) {
+              return 'paid';
+            } else if (totalAmount > 0) {
+              return 'unpaid';
+            }
+            return 'not_invoiced'; // Default
+          })(),
           priority: job.priority || 'normal',
           quality_check: job.qualityCheck !== false,
           photos_required: job.photosRequired || false,
@@ -8479,7 +8547,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               // Try to match email
               if (!customerEmail && (keyLower === 'email' || keyLower === 'email address' || keyLower === 'customeremail')) {
                 customerEmail = value.toString().trim();
-              }
+          }
             }
           }
           
@@ -8528,9 +8596,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             // Validate required fields - first name is required, but use 'customer' as default last name if missing
             if (!customerFirstName) {
               results.jobs.errors.push(`Row ${i + 1}: Cannot create customer - missing first name.`);
-              continue;
-            }
-            
+            continue;
+          }
+
             // Use 'customer' as default last name if missing (Booking Koala sometimes has customers without last names)
             if (!customerLastName) {
               customerLastName = 'customer';
@@ -8661,15 +8729,15 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                     scheduledDate = `${year}-${month}-${day}`;
                   }
                 } else {
-                  const dateObj = new Date(dateStr);
-                  if (!isNaN(dateObj.getTime())) {
+            const dateObj = new Date(dateStr);
+            if (!isNaN(dateObj.getTime())) {
                     scheduledDate = dateObj.toISOString().split('T')[0];
                   }
                 }
                 
                 if (timeStr) {
-                  scheduledTime = parseTime(timeStr);
-                }
+                scheduledTime = parseTime(timeStr);
+              }
               } catch (e) {
                 // Use current date as fallback
                 scheduledDate = new Date().toISOString().split('T')[0];
@@ -8831,7 +8899,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               console.log(`Row ${i + 1}: Reusing existing team member ${teamMemberId} for external provider ID ${externalCrewId} (from batch mapping)`);
             } else {
               // Check if a team member with this external ID already exists in the DATABASE
-              const crewSearchPattern = `Crew ${externalCrewId}`;
+              // Use last 6 digits for display
+              const displayCrewId = externalCrewId.toString().slice(-6);
+              const crewSearchPattern = `Crew ${displayCrewId}`;
               const { data: existingCrews, error: crewSearchError } = await supabase
                 .from('team_members')
                 .select('id, first_name')
@@ -8862,7 +8932,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 
                 const newTeamMember = {
                   user_id: userId,
-                  first_name: `Crew ${externalCrewId}`,
+                  first_name: `Crew ${displayCrewId}`, // Use last 6 digits for display
                   last_name: '',
                   email: placeholderEmail,
                   phone: null,
@@ -8917,10 +8987,11 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 territoryIdMapping[externalRegionId] = territoryId;
                 console.log(`Row ${i + 1}: Found existing territory ${territoryId} for external location ID ${externalRegionId}`);
               } else {
-                // Create new territory
+                // Create new territory - use last 6 digits for display
+                const displayRegionId = externalRegionId.toString().slice(-6);
                 const newTerritory = {
                   user_id: userId,
-                  name: `Region ${externalRegionId}`,
+                  name: `Region ${displayRegionId}`, // Use last 6 digits for display
                   description: `Imported from external region ID: ${externalRegionId}`,
                   location: job.address || job.serviceAddress || 'Unknown',
                   zip_codes: job.zipCode || job.serviceAddressZip ? [job.zipCode || job.serviceAddressZip] : [],
@@ -8958,6 +9029,47 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             job.specialNotes || job['Special notes']
           ].filter(n => n && n.trim()).join('\n\n') || null;
 
+          // Determine payment status from Booking Koala data
+          // Check for payment-related fields: "Amount paid by customer (USD)", "Payment method", "Amount owed by customer (USD)"
+          const amountPaid = parseFloat(job['Amount paid by customer (USD)'] || job.amountPaidByCustomer || job.amountPaid || 0);
+          const finalAmount = parseFloat(job['Final amount (USD)'] || job.finalAmount || job.total || priceValue || 0);
+          const amountOwed = parseFloat(job['Amount owed by customer (USD)'] || job.amountOwed || (finalAmount - amountPaid));
+          const paymentMethod = job['Payment method'] || job.paymentMethod || job.payment_method || null;
+          
+          // Determine if job is paid based on amounts
+          let paymentStatus = 'pending';
+          let invoiceStatus = 'not_invoiced';
+          
+          if (amountOwed <= 0 && amountPaid > 0 && finalAmount > 0) {
+            // Fully paid
+            paymentStatus = 'paid';
+            invoiceStatus = 'paid';
+          } else if (amountPaid > 0 && amountOwed > 0) {
+            // Partially paid
+            paymentStatus = 'partial';
+            invoiceStatus = 'unpaid';
+          } else if (finalAmount > 0) {
+            // Has amount but not paid
+            paymentStatus = 'pending';
+            invoiceStatus = 'unpaid';
+          }
+          
+          // Override with explicit payment method if present (Cash/Check might indicate paid)
+          if (paymentMethod) {
+            const methodLower = String(paymentMethod).toLowerCase();
+            if ((methodLower.includes('cash') || methodLower.includes('check')) && amountPaid > 0) {
+              paymentStatus = 'paid';
+              invoiceStatus = 'paid';
+            }
+          }
+          
+          // Check Booking status - if "Completed" and has payment, likely paid
+          const bookingStatus = job['Booking status'] || job.bookingStatus || job.status || '';
+          if (bookingStatus && String(bookingStatus).toLowerCase() === 'completed' && amountPaid > 0) {
+            paymentStatus = 'paid';
+            invoiceStatus = 'paid';
+          }
+
           const mappedJob = {
             user_id: userId,
             customer_id: customerId,
@@ -8978,6 +9090,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             estimated_duration: duration,
             is_recurring: isRecurring,
             recurring_frequency: recurringFrequency,
+            payment_status: paymentStatus,
+            invoice_status: invoiceStatus,
+            payment_method: paymentMethod,
             tags: (() => {
               // Tags column is JSONB, so store as array
               if (job.tags) {
@@ -26764,7 +26879,7 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
             }
             
             if (!propertyDetails) {
-              console.log('📋 Using basic property info from search results');
+            console.log('📋 Using basic property info from search results');
             }
           } else {
             console.log('⚠️ Full property details not available, status:', propertyDetailsResponse.status);
