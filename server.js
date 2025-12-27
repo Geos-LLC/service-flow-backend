@@ -8316,7 +8316,21 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             zip_code: customer.zipCode || customer['Zip/Postal Code'] || customer['Zip/Postal code'] || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
             // Note: company_name column doesn't exist in customers table, so we skip it
             notes: customer.notes || customer.Note || customer['Note'] || customer.Notes || customer.comments || null,
-            status: customer.status || customer.Status || 'active'
+            // Normalize status to lowercase enum values: 'active', 'inactive', 'archived'
+            status: (() => {
+              const statusValue = customer.status || customer.Status || 'active';
+              const statusLower = String(statusValue).toLowerCase().trim();
+              // Map common variations to valid enum values
+              if (statusLower === 'active' || statusLower === 'enabled' || statusLower === '') {
+                return 'active';
+              } else if (statusLower === 'inactive' || statusLower === 'disabled') {
+                return 'inactive';
+              } else if (statusLower === 'archived') {
+                return 'archived';
+              }
+              // Default to 'active' if unknown value
+              return 'active';
+            })()
           };
 
           // Validate required fields
