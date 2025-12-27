@@ -7828,16 +7828,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         }
         
-        // Also check for single external crew ID (for backward compatibility)
-        if (job.assignedCrewExternalId && job.assignedCrewExternalId.trim()) {
-          const externalCrewId = job.assignedCrewExternalId.trim();
-          console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewId}`);
+        // Also check for external crew ID (could be single or comma-separated)
+        if (job.assignedCrewExternalId && job.assignedCrewExternalId.toString().trim()) {
+          const externalCrewIdStr = job.assignedCrewExternalId.toString().trim();
           
-          const memberId = await findOrCreateTeamMember(externalCrewId);
-          if (memberId && !teamMemberIds.includes(memberId)) {
-            teamMemberIds.push(memberId);
-            if (!primaryTeamMemberId) {
-              primaryTeamMemberId = memberId;
+          // Check if it's comma-separated (e.g., "16, 22" or "16,22")
+          if (externalCrewIdStr.includes(',')) {
+            console.log(`Row ${i + 1}: Processing comma-separated external crew IDs: ${externalCrewIdStr}`);
+            const externalIds = externalCrewIdStr.split(',').map(id => id.trim()).filter(id => id);
+            for (const externalCrewId of externalIds) {
+              const memberId = await findOrCreateTeamMember(externalCrewId);
+              if (memberId && !teamMemberIds.includes(memberId)) {
+                teamMemberIds.push(memberId);
+                if (!primaryTeamMemberId) {
+                  primaryTeamMemberId = memberId;
+                }
+              }
+            }
+          } else {
+            // Single external crew ID
+            console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewIdStr}`);
+            const memberId = await findOrCreateTeamMember(externalCrewIdStr);
+            if (memberId && !teamMemberIds.includes(memberId)) {
+              teamMemberIds.push(memberId);
+              if (!primaryTeamMemberId) {
+                primaryTeamMemberId = memberId;
+              }
             }
           }
         }
@@ -9067,17 +9083,33 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             }
           }
           
-          // Also check for single external crew ID (for backward compatibility)
+          // Also check for external crew ID (could be single or comma-separated)
           const assignedCrewExternalId = job.assignedCrewExternalId || job['assignedCrewExternalId'];
           if (assignedCrewExternalId && assignedCrewExternalId.toString().trim()) {
-            const externalCrewId = assignedCrewExternalId.toString().trim();
-            console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewId}`);
+            const externalCrewIdStr = assignedCrewExternalId.toString().trim();
             
-            const memberId = await findOrCreateTeamMember(externalCrewId);
-            if (memberId && !teamMemberIds.includes(memberId)) {
-              teamMemberIds.push(memberId);
-              if (!primaryTeamMemberId) {
-                primaryTeamMemberId = memberId;
+            // Check if it's comma-separated (e.g., "16, 22" or "16,22")
+            if (externalCrewIdStr.includes(',')) {
+              console.log(`Row ${i + 1}: Processing comma-separated external crew IDs: ${externalCrewIdStr}`);
+              const externalIds = externalCrewIdStr.split(',').map(id => id.trim()).filter(id => id);
+              for (const externalCrewId of externalIds) {
+                const memberId = await findOrCreateTeamMember(externalCrewId);
+                if (memberId && !teamMemberIds.includes(memberId)) {
+                  teamMemberIds.push(memberId);
+                  if (!primaryTeamMemberId) {
+                    primaryTeamMemberId = memberId;
+                  }
+                }
+              }
+            } else {
+              // Single external crew ID
+              console.log(`Row ${i + 1}: Processing single external crew ID: ${externalCrewIdStr}`);
+              const memberId = await findOrCreateTeamMember(externalCrewIdStr);
+              if (memberId && !teamMemberIds.includes(memberId)) {
+                teamMemberIds.push(memberId);
+                if (!primaryTeamMemberId) {
+                  primaryTeamMemberId = memberId;
+                }
               }
             }
           }
