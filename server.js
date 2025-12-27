@@ -8124,7 +8124,20 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           auto_invoice: job.autoInvoice !== false,
           auto_reminders: job.autoReminders !== false,
           recurring_end_date: job.recurringEndDate || null,
-          tags: job.tags ? (Array.isArray(job.tags) ? [...job.tags, 'imported'] : `${job.tags},imported`) : 'imported',
+          tags: (() => {
+            // Tags column is JSONB, so store as array
+            if (job.tags) {
+              if (Array.isArray(job.tags)) {
+                return job.tags.includes('imported') ? job.tags : [...job.tags, 'imported'];
+              } else {
+                // If it's a string, convert to array
+                const tagsStr = String(job.tags);
+                const tagsArray = tagsStr.split(',').map(t => t.trim()).filter(t => t);
+                return tagsArray.includes('imported') ? tagsArray : [...tagsArray, 'imported'];
+              }
+            }
+            return ['imported'];
+          })(),
           intake_question_answers: job.intakeQuestionAnswers || null,
           service_modifiers: job.serviceModifiers || null,
           service_intake_questions: job.serviceIntakeQuestions || null
@@ -8830,7 +8843,27 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             estimated_duration: duration,
             is_recurring: isRecurring,
             recurring_frequency: recurringFrequency,
-            tags: job.tags ? (Array.isArray(job.tags) ? [...job.tags, 'imported', 'booking-koala'] : `${job.tags},imported,booking-koala`) : 'imported,booking-koala'
+            tags: (() => {
+              // Tags column is JSONB, so store as array
+              if (job.tags) {
+                if (Array.isArray(job.tags)) {
+                  // If already an array, add our tags if not present
+                  const tagsArray = [...job.tags];
+                  if (!tagsArray.includes('imported')) tagsArray.push('imported');
+                  if (!tagsArray.includes('booking-koala')) tagsArray.push('booking-koala');
+                  return tagsArray;
+                } else {
+                  // If it's a string, convert to array
+                  const tagsStr = String(job.tags);
+                  const tagsArray = tagsStr.split(',').map(t => t.trim()).filter(t => t);
+                  if (!tagsArray.includes('imported')) tagsArray.push('imported');
+                  if (!tagsArray.includes('booking-koala')) tagsArray.push('booking-koala');
+                  return tagsArray;
+                }
+              }
+              // Default: return array with imported tags
+              return ['imported', 'booking-koala'];
+            })()
           };
 
           // Check for duplicates if skipDuplicates is enabled
