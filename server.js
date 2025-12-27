@@ -7481,10 +7481,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
         
         // Debug: Log invoice_fully_paid_boolean field for first few jobs
-        if (i < 3) {
+        if (i < 5) {
           const invoicePaidField = job.invoice_fully_paid_boolean || job['invoice_fully_paid_boolean'] || job.invoiceFullyPaidBoolean;
-          console.log(`🔍 Row ${i + 1}: invoice_fully_paid_boolean field value:`, invoicePaidField, `(type: ${typeof invoicePaidField})`);
-          console.log(`🔍 Row ${i + 1}: Available job keys containing 'invoice' or 'paid':`, Object.keys(job).filter(k => k.toLowerCase().includes('invoice') || k.toLowerCase().includes('paid')));
+          console.log(`🔍 Row ${i + 1}: Backend received invoice_fully_paid_boolean =`, invoicePaidField, `(type: ${typeof invoicePaidField})`);
+          if (!invoicePaidField) {
+            console.log(`⚠️ Row ${i + 1}: invoice_fully_paid_boolean is MISSING! Available job keys:`, Object.keys(job).slice(0, 20));
+            console.log(`⚠️ Row ${i + 1}: All keys containing 'invoice' or 'paid':`, Object.keys(job).filter(k => k.toLowerCase().includes('invoice') || k.toLowerCase().includes('paid')));
+          }
         }
         
         // Validate required fields - need customer ID, email, or name
