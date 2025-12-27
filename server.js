@@ -8301,7 +8301,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             city: customer.city || customer.City || null,
             state: customer.state || customer.State || customer.state_province || null,
             zip_code: customer.zipCode || customer['Zip/Postal Code'] || customer['Zip/Postal code'] || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
-            company_name: customer.companyName || customer['Company Name'] || customer.company_name || null,
+            // Note: company_name column doesn't exist in customers table, so we skip it
             notes: customer.notes || customer.Note || customer['Note'] || customer.Notes || customer.comments || null,
             status: customer.status || customer.Status || 'active'
           };
@@ -8429,7 +8429,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 city: customerCity ? customerCity.trim() : null,
                 state: customerState ? customerState.trim() : null,
                 zip_code: customerZip ? customerZip.trim() : null,
-                company_name: customerCompany || null,
+                // Note: company_name column doesn't exist in customers table, so we skip it
                 notes: job.notes || job.Note || job['Note'] || null
               };
 
