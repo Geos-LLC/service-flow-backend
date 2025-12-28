@@ -2552,12 +2552,44 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     // If recurring is not provided or is 'all', show all jobs
     
     // Add team member filter
+    // IMPORTANT: We need to check BOTH direct assignment AND job_team_assignments
+    // Since Supabase doesn't support complex subqueries in filters, we'll:
+    // 1. First get job IDs from job_team_assignments for this team member
+    // 2. Then query jobs with those IDs OR team_member_id filter
+    let teamMemberFilterId = null;
+    let jobIdsFromAssignments = [];
+    
     if (teamMember) {
       // Check if teamMember is a numeric ID (not a special string)
       const teamMemberIdNum = parseInt(teamMember);
       if (!isNaN(teamMemberIdNum) && teamMemberIdNum > 0) {
-        // Filter by specific team member ID
-        query = query.eq('team_member_id', teamMemberIdNum);
+        teamMemberFilterId = teamMemberIdNum;
+        
+        // First, get all job IDs from job_team_assignments where this team member is assigned
+        const { data: assignmentJobs, error: assignmentJobsError } = await supabase
+          .from('job_team_assignments')
+          .select('job_id')
+          .eq('team_member_id', teamMemberIdNum);
+        
+        if (!assignmentJobsError && assignmentJobs) {
+          jobIdsFromAssignments = assignmentJobs.map(a => a.job_id);
+        }
+        
+        // Filter by direct assignment OR by job IDs from assignments
+        if (jobIdsFromAssignments.length > 0) {
+          // Combine direct assignment and assignments from job_team_assignments
+          // Use OR to include jobs with direct assignment OR jobs from assignments table
+          // Supabase OR syntax requires proper formatting
+          const orConditions = [`team_member_id.eq.${teamMemberIdNum}`];
+          // Add IN condition for job IDs from assignments
+          if (jobIdsFromAssignments.length > 0) {
+            orConditions.push(`id.in.(${jobIdsFromAssignments.join(',')})`);
+          }
+          query = query.or(orConditions.join(','));
+        } else {
+          // Only direct assignment
+          query = query.eq('team_member_id', teamMemberIdNum);
+        }
       } else {
         // Handle special string values
         switch (teamMember) {
@@ -2801,6 +2833,54 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
             }
             allStatusHistory[entry.job_id].push(entry);
           });
+        }
+        
+        // If filtering by team member, also fetch jobs from job_team_assignments
+        let additionalJobIds = [];
+        if (teamMemberFilterId) {
+          const { data: assignmentJobs, error: assignmentJobsError } = await supabase
+            .from('job_team_assignments')
+            .select('job_id')
+            .eq('team_member_id', teamMemberFilterId)
+            .eq('user_id', userId); // Ensure we only get jobs for this user
+          
+          if (!assignmentJobsError && assignmentJobs) {
+            additionalJobIds = assignmentJobs.map(a => a.job_id).filter(id => !jobIds.includes(id));
+            // If we found additional jobs, fetch them too
+            if (additionalJobIds.length > 0) {
+              const additionalJobsQuery = supabase
+                .from('jobs')
+                .select(`
+                  *,
+                  customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+                  services!left(name, price, duration),
+                  team_members!left(first_name, last_name, email)
+                `)
+                .eq('user_id', userId)
+                .in('id', additionalJobIds);
+              
+              // Reapply all other filters to additional jobs
+              if (status) {
+                const statusArray = status.split(',');
+                const mappedStatusArray = statusArray.map(s => {
+                  switch (s) {
+                    case 'in_progress':
+                      return 'in-progress';
+                    default:
+                      return s;
+                  }
+                });
+                additionalJobsQuery.in('status', mappedStatusArray);
+              }
+              // Add other filters as needed...
+              
+              const { data: additionalJobs, error: additionalError } = await additionalJobsQuery;
+              if (!additionalError && additionalJobs) {
+                jobs = [...(jobs || []), ...additionalJobs];
+                jobIds = [...jobIds, ...additionalJobIds];
+              }
+            }
+          }
         }
         
         // Fetch team assignments from job_team_assignments table
