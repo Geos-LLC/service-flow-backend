@@ -7701,8 +7701,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           continue;
         }
 
-        // Find or create service by name if provided
+        // Find service by name if provided (DO NOT create if not found - just attach by name)
         let serviceId = job.serviceId;
+        let serviceBasePrice = null; // Store service's base price from database
+        
         if (!serviceId && job.serviceName) {
           // Normalize service name for comparison
           // This function handles:
@@ -7746,10 +7748,22 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           console.log(`Row ${i + 1}: Looking for service "${job.serviceName}" (normalized: "${normalizedServiceName}")`);
           
-          // First check our mapping to see if we've already created/found this service in this import batch
+          // First check our mapping to see if we've already found this service in this import batch
           if (serviceNameMapping[normalizedServiceName]) {
             serviceId = serviceNameMapping[normalizedServiceName];
             console.log(`Row ${i + 1}: ✅ Reusing existing service ${serviceId} for name "${job.serviceName}" (from mapping)`);
+            
+            // Fetch the service's price from database
+            const { data: mappedService, error: mappedServiceError } = await supabase
+              .from('services')
+              .select('price')
+              .eq('id', serviceId)
+              .single();
+            
+            if (!mappedServiceError && mappedService) {
+              serviceBasePrice = parseFloat(mappedService.price) || 0;
+              console.log(`Row ${i + 1}: Found service base price: ${serviceBasePrice}`);
+            }
           } else {
             // Search database for existing service (case-insensitive exact match)
             // Fetch all services for this user and filter manually to catch all variations
@@ -7784,40 +7798,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 }
               });
               serviceId = services[0].id;
+              serviceBasePrice = parseFloat(services[0].price) || 0; // Store the service's base price
               serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping
-              console.log(`Row ${i + 1}: ✅ Found existing service ID ${serviceId} for "${job.serviceName}" (DB had: "${services[0].name}", price: ${services[0].price})`);
+              console.log(`Row ${i + 1}: ✅ Found existing service ID ${serviceId} for "${job.serviceName}" (DB had: "${services[0].name}", base price: ${serviceBasePrice})`);
             } else {
-            // Service not found - create it
-              const sanitizedName = sanitizeInput(job.serviceName.trim());
-            const newService = {
-              user_id: userId,
-                name: sanitizedName,
-              description: null,
-              price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
-              duration: parseInt(job.duration) || parseInt(job.estimatedDuration) || 60,
-              category: null,
-              modifiers: null,
-              intake_questions: null,
-              is_active: true
-            };
-            
-              console.log(`Row ${i + 1}: Creating new service:`, sanitizedName);
-            
-            const { data: createdService, error: createServiceError } = await supabase
-              .from('services')
-              .insert(newService)
-              .select('id')
-              .single();
-            
-            if (createServiceError) {
-                console.error(`Row ${i + 1}: Failed to create service ${sanitizedName}:`, createServiceError);
-                results.errors.push(`Row ${i + 1}: Failed to create service "${sanitizedName}" - ${createServiceError.message}`);
-              // Continue without service ID - job can still be created
-            } else {
-              serviceId = createdService.id;
-                serviceNameMapping[normalizedServiceName] = serviceId; // Store in mapping to prevent duplicates
-              console.log(`Row ${i + 1}: Created new service with ID:`, serviceId);
-            }
+              // Service not found - DO NOT CREATE IT
+              // Just attach by name (service_name field) without service_id
+              console.log(`Row ${i + 1}: ⚠️ Service "${job.serviceName}" not found in database - will attach by name only (no service_id)`);
+              serviceId = null; // Explicitly set to null
+              // serviceBasePrice remains null - will use job.servicePrice or job.price as fallback
             }
           }
         }
@@ -8285,7 +8274,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           bathroom_count: job.bathroomCount || null,
           workers_needed: parseInt(job.workersNeeded) || 1,
           skills: job.skills || null,
-          service_price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
+          // IMPORTANT: Use service's base price from database if service exists, otherwise use job's price
+          // This ensures service_price reflects the actual service base price when the service exists
+          service_price: serviceBasePrice !== null ? serviceBasePrice : (parseFloat(job.servicePrice) || parseFloat(job.price) || 0),
           total_amount: parseFloat(job.totalAmount) || parseFloat(job.total) || parseFloat(job.price) || 0,
           estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
           special_instructions: job.specialInstructions || null,
@@ -9055,8 +9046,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             }
           }
 
-          // Handle service creation (create on the fly like normal import, prevent duplicates)
+          // Handle service lookup (DO NOT create if not found - just attach by name)
           let serviceId = null;
+          let serviceBasePrice = null; // Store service's base price from database
           const serviceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
           if (serviceName && serviceName.trim() !== 'Imported Service') {
             // Normalize service name for comparison (same logic as regular import)
@@ -9075,10 +9067,22 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             
             const normalizedServiceName = normalizeServiceName(serviceName);
             
-            // First check our mapping to see if we've already created/found this service in this import batch
+            // First check our mapping to see if we've already found this service in this import batch
             if (serviceNameMapping[normalizedServiceName]) {
               serviceId = serviceNameMapping[normalizedServiceName];
               console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for "${serviceName}" (from batch mapping)`);
+              
+              // Fetch the service's price from database
+              const { data: mappedService, error: mappedServiceError } = await supabase
+                .from('services')
+                .select('price')
+                .eq('id', serviceId)
+                .single();
+              
+              if (!mappedServiceError && mappedService) {
+                serviceBasePrice = parseFloat(mappedService.price) || 0;
+                console.log(`Row ${i + 1}: Found service base price: ${serviceBasePrice}`);
+              }
             } else {
               // Search database for existing service (case-insensitive)
               const { data: allServices, error: serviceError } = await supabase
@@ -9097,8 +9101,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               if (serviceError) {
                 console.error(`Row ${i + 1}: Error searching service:`, serviceError);
               } else if (services && services.length > 0) {
-                // Found existing service - use it
+                // Found existing service - use it and store its base price
                 serviceId = services[0].id;
+                serviceBasePrice = parseFloat(services[0].price) || 0; // Store the service's base price
                 serviceNameMapping[normalizedServiceName] = serviceId;
                 // Also add all found services to mapping to prevent future duplicates
                 services.forEach(service => {
@@ -9107,36 +9112,13 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                     serviceNameMapping[foundNormalized] = service.id;
                   }
                 });
-                console.log(`Row ${i + 1}: Found existing service ${serviceId} for "${serviceName}"`);
+                console.log(`Row ${i + 1}: Found existing service ${serviceId} for "${serviceName}" (base price: ${serviceBasePrice})`);
               } else {
-                // Service not found - create it
-                const sanitizedName = sanitizeInput(serviceName.trim());
-                const newService = {
-                  user_id: userId,
-                  name: sanitizedName,
-                  description: null,
-                  price: priceValue || 0,
-                  duration: duration || 60,
-                  category: null,
-                  modifiers: null,
-                  intake_questions: null,
-                  is_active: true
-                };
-                
-                const { data: createdService, error: createServiceError } = await supabase
-                  .from('services')
-                  .insert(newService)
-                  .select('id')
-                  .single();
-                
-                if (createServiceError) {
-                  console.error(`Row ${i + 1}: Failed to create service "${sanitizedName}":`, createServiceError);
-                  // Continue without service ID - job can still be created with service_name
-                } else {
-                  serviceId = createdService.id;
-                  serviceNameMapping[normalizedServiceName] = serviceId;
-                  console.log(`Row ${i + 1}: Created new service ${serviceId} for "${sanitizedName}"`);
-                }
+                // Service not found - DO NOT CREATE IT
+                // Just attach by name (service_name field) without service_id
+                console.log(`Row ${i + 1}: ⚠️ Service "${serviceName}" not found in database - will attach by name only (no service_id)`);
+                serviceId = null; // Explicitly set to null
+                // serviceBasePrice remains null - will use priceValue as fallback
               }
             }
           }
@@ -9382,7 +9364,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           const mappedJob = {
             user_id: userId,
             customer_id: customerId,
-            service_id: serviceId || null, // Add service_id if service was created/found
+            service_id: serviceId || null, // Add service_id if service was found (not created)
             team_member_id: teamMemberId || null,
             territory_id: territoryId || null,
             service_name: job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service',
@@ -9391,6 +9373,8 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             status: jobStatus,
             notes: notes,
             price: priceValue,
+            // IMPORTANT: Use service's base price from database if service exists, otherwise use priceValue
+            service_price: serviceBasePrice !== null ? serviceBasePrice : (priceValue || 0),
             total: priceValue,
             service_address_street: job.address || job.Address || job.street_address || null,
             service_address_city: job.city || job.City || null,
