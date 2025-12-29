@@ -7630,30 +7630,44 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // If not found by email or phone, try to find by name
           if (!customerFound && job.customerName) {
             // Parse customer name into first and last name
-            const nameParts = job.customerName.trim().split(/\s+/);
+            // Normalize whitespace: trim and collapse multiple spaces
+            const normalizedCustomerName = job.customerName.trim().replace(/\s+/g, ' ');
+            const nameParts = normalizedCustomerName.split(/\s+/);
             const firstName = nameParts[0] || '';
             const lastName = nameParts.slice(1).join(' ') || '';
             
             if (firstName) {
-              // Try to find by first and last name
-              let query = supabase
+              // Fetch all customers and match by normalized names (handles whitespace differences)
+              // This is more reliable than exact database matches which fail on whitespace differences
+              const { data: allCustomers, error: nameError } = await supabase
                 .from('customers')
-                .select('id')
-                .eq('user_id', userId)
-                .eq('first_name', firstName);
+                .select('id, first_name, last_name')
+                .eq('user_id', userId);
               
-              if (lastName) {
-                query = query.eq('last_name', lastName);
-              }
-              
-              const { data: nameMatches, error: nameError } = await query;
-              
-              if (nameError) {
+              if (!nameError && allCustomers && allCustomers.length > 0) {
+                // Find customer by comparing normalized names (trim and collapse whitespace)
+                const foundCustomer = allCustomers.find(c => {
+                  const dbFirstName = (c.first_name || '').trim().replace(/\s+/g, ' ');
+                  const dbLastName = (c.last_name || '').trim().replace(/\s+/g, ' ');
+                  
+                  // Match first name (case-insensitive)
+                  const firstNameMatch = dbFirstName.toLowerCase() === firstName.toLowerCase();
+                  
+                  // Match last name if provided (case-insensitive, or both empty)
+                  const lastNameMatch = !lastName || !dbLastName 
+                    ? (!lastName && !dbLastName) // Both empty
+                    : dbLastName.toLowerCase() === lastName.toLowerCase();
+                  
+                  return firstNameMatch && lastNameMatch;
+                });
+                
+                if (foundCustomer) {
+                  customer = { id: foundCustomer.id };
+                  customerFound = true;
+                  console.log(`Row ${i + 1}: Found customer by name (whitespace-normalized):`, customer.id);
+                }
+              } else if (nameError) {
                 console.error(`Row ${i + 1}: Error searching customer by name:`, nameError);
-              } else if (nameMatches && nameMatches.length > 0) {
-                customer = nameMatches[0]; // Take first match
-                customerFound = true;
-                console.log(`Row ${i + 1}: Found customer by name:`, customer.id);
               }
             }
           }
@@ -8102,7 +8116,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // CRITICAL: Must filter by user_id to ensure we only check duplicates within the same account
         
         // First, check if this job has an external ID (jobId from source system)
-        const externalJobId = job.jobId || job.id || job.externalId || job.external_id || null;
+        // IMPORTANT: service_order_custom_service_order is the primary identifier for duplicate detection
+        const externalJobId = job.jobId || job.service_order_custom_service_order || job.id || job.externalId || job.external_id || null;
         
         if (externalJobId) {
           // Check if we've already seen this external ID in the current import batch
@@ -8315,8 +8330,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           internal_notes: sanitizedInternalNotes,
           contact_info: (() => {
             // Store external job ID in contact_info for duplicate detection
+            // IMPORTANT: service_order_custom_service_order is the primary identifier
             const contactInfo = job.contactInfo || {};
-            const externalJobId = job.jobId || job.id || job.externalId || job.external_id || null;
+            const externalJobId = job.jobId || job.service_order_custom_service_order || job.id || job.externalId || job.external_id || null;
             
             // If contactInfo is a string, try to parse it as JSON
             let parsedContactInfo = {};
@@ -8843,6 +8859,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
     // Import jobs if provided
     if (jobs && Array.isArray(jobs) && jobs.length > 0) {
       // First, get all customers to map by email/name
+      // Normalize whitespace when building the map to handle whitespace differences
       const { data: allCustomers } = await supabase
         .from('customers')
         .select('id, email, first_name, last_name')
@@ -8850,9 +8867,16 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
 
       const customerMap = {};
       (allCustomers || []).forEach(c => {
-        if (c.email) customerMap[c.email.toLowerCase()] = c.id;
-        const nameKey = `${c.first_name} ${c.last_name}`.toLowerCase();
-        customerMap[nameKey] = c.id;
+        // Normalize email (trim and lowercase)
+        if (c.email) {
+          const normalizedEmail = (c.email || '').trim().toLowerCase();
+          customerMap[normalizedEmail] = c.id;
+        }
+        // Normalize name (trim, collapse whitespace, lowercase)
+        const normalizedFirstName = (c.first_name || '').trim().replace(/\s+/g, ' ');
+        const normalizedLastName = (c.last_name || '').trim().replace(/\s+/g, ' ');
+        const nameKey = `${normalizedFirstName} ${normalizedLastName}`.trim().toLowerCase();
+        if (nameKey) customerMap[nameKey] = c.id;
       });
 
       // Track external IDs to internal IDs mapping to prevent duplicate team members, territories, and services
@@ -8995,16 +9019,20 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           const customerCompany = job.companyName || job['Company name'] || job['Company Name'] || job.company_name;
           
           // Check if customer exists in database or was created in this batch
+          // Normalize whitespace for matching
           if (customerEmail) {
-            const email = customerEmail.toLowerCase().trim();
-            customerId = customerMap[email] || customerIdMapping[email];
+            const normalizedEmail = customerEmail.toLowerCase().trim();
+            customerId = customerMap[normalizedEmail] || customerIdMapping[normalizedEmail];
           }
           
           // Use 'customer' as default last name for lookup if missing
           const lookupLastName = customerLastName || 'customer';
           if (!customerId && customerFirstName) {
-            const name = `${customerFirstName} ${lookupLastName}`.toLowerCase().trim();
-            customerId = customerMap[name] || customerIdMapping[name];
+            // Normalize whitespace: trim and collapse multiple spaces
+            const normalizedFirstName = customerFirstName.trim().replace(/\s+/g, ' ');
+            const normalizedLastName = lookupLastName.trim().replace(/\s+/g, ' ');
+            const normalizedName = `${normalizedFirstName} ${normalizedLastName}`.trim().toLowerCase();
+            customerId = customerMap[normalizedName] || customerIdMapping[normalizedName];
           }
 
           // Create customer on-the-fly if not found (like team members and territories)
@@ -9061,16 +9089,29 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                   
                   if (!existingCustomer && customerFirstName) {
                     // Use 'customer' as default last name if missing
-                    const searchLastName = customerLastName || 'customer';
-                    const { data: foundByName } = await supabase
+                    // Use normalized name matching to handle whitespace differences
+                    // Fetch all customers and match by normalized names
+                    const { data: allCustomersForNameMatch } = await supabase
                       .from('customers')
                       .select('id, email, first_name, last_name')
-                      .eq('user_id', userId)
-                      .eq('first_name', customerFirstName.trim())
-                      .eq('last_name', searchLastName.trim())
-                      .limit(1)
-                      .maybeSingle();
-                    existingCustomer = foundByName;
+                      .eq('user_id', userId);
+                    
+                    if (allCustomersForNameMatch && allCustomersForNameMatch.length > 0) {
+                      const searchLastName = customerLastName || 'customer';
+                      const normalizedSearchFirstName = customerFirstName.trim().replace(/\s+/g, ' ');
+                      const normalizedSearchLastName = searchLastName.trim().replace(/\s+/g, ' ');
+                      
+                      const foundByName = allCustomersForNameMatch.find(c => {
+                        const dbFirstName = (c.first_name || '').trim().replace(/\s+/g, ' ');
+                        const dbLastName = (c.last_name || '').trim().replace(/\s+/g, ' ');
+                        return dbFirstName.toLowerCase() === normalizedSearchFirstName.toLowerCase() &&
+                               dbLastName.toLowerCase() === normalizedSearchLastName.toLowerCase();
+                      });
+                      
+                      if (foundByName) {
+                        existingCustomer = { id: foundByName.id, email: foundByName.email, first_name: foundByName.first_name, last_name: foundByName.last_name };
+                      }
+                    }
                   }
                   
                   if (existingCustomer) {
