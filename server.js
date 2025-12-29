@@ -8115,16 +8115,28 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
           
           // Create a unique key for this job to check for duplicates within the same import batch
-          const serviceIdentifier = serviceId ? `service_${serviceId}` : (job.serviceName ? `name_${job.serviceName}` : 'no_service');
+          // CRITICAL: Use serviceName (not serviceId) for batch key because:
+          // 1. serviceName is available from the CSV immediately
+          // 2. serviceId might not exist yet (service might be created on-the-fly)
+          // 3. This ensures consistent key generation before and after service creation
+          const serviceNameForKey = (job.serviceName || '').trim().toLowerCase();
+          const serviceIdentifier = serviceNameForKey ? `name_${serviceNameForKey}` : 'no_service';
           const batchKey = `${userId}_${customerId}_${serviceIdentifier}_${normalizedDate}`;
           
           // First check if this exact combination already exists in the current import batch
+          // This MUST happen before database check to prevent duplicates within the same CSV
           if (batchJobKeys.has(batchKey)) {
-            console.log(`Row ${i + 1}: DUPLICATE in CSV - Same job already being imported in this batch (user ${userId}, customer ${customerId}, ${serviceIdentifier}, date ${normalizedDate})`);
+            console.log(`Row ${i + 1}: DUPLICATE in CSV - Same job already being imported in this batch (user ${userId}, customer ${customerId}, service "${serviceNameForKey}", date ${normalizedDate})`);
             results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - same customer, service, and date already exists in this import`);
             results.skipped++;
             continue;
           }
+          
+          // Add to batch tracking IMMEDIATELY to prevent duplicates in the same CSV
+          // This must happen BEFORE database check and BEFORE insertion
+          // This ensures that if the same job appears twice in the CSV, the second one will be caught
+          batchJobKeys.add(batchKey);
+          console.log(`Row ${i + 1}: Added to batch tracking: ${batchKey}`);
           
           // CRITICAL: Always filter by user_id FIRST to ensure we only check within the same account
           // This prevents cross-account duplicate detection
@@ -8192,13 +8204,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             if (isDuplicate) {
               console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
               results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
-            results.skipped++;
-            continue;
-          }
+              results.skipped++;
+              // Keep the key in batchJobKeys to prevent re-checking if the same job appears again in the CSV
+              // This ensures consistent duplicate detection - the key stays in the set to mark it as "processed"
+              continue;
+            }
           }
           
-          // Add this job to the batch tracking set (only if we're going to create it)
-          // We'll add it after successful creation
+          // Note: batchJobKeys.add() was already called above to prevent CSV duplicates
+          // The key remains in the set even if database check passes, ensuring consistency
         }
 
         // Create job with all fields
@@ -8481,13 +8495,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
           }
           
-          // Add to batch tracking set to prevent duplicates within the same import
-          if (job.scheduledDate && customerId) {
-            const normalizedDate = job.scheduledDate.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || job.scheduledDate;
-            const serviceIdentifier = serviceId ? `service_${serviceId}` : (job.serviceName ? `name_${job.serviceName}` : 'no_service');
-            const batchKey = `${userId}_${customerId}_${serviceIdentifier}_${normalizedDate}`;
-            batchJobKeys.add(batchKey);
-          }
+          // Note: batchJobKeys.add() was already called earlier to prevent CSV duplicates
+          // No need to add again here - it's already tracked
         }
       } catch (error) {
         results.errors.push(`Row ${i + 1}: ${error.message}`);
