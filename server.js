@@ -8172,13 +8172,17 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Add to batch tracking immediately to prevent duplicates in the same CSV
           batchExternalJobIds.add(externalJobId);
           console.log(`Row ${i + 1}: Tracking external job ID: ${externalJobId}`);
-        }
-        
-        // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (fallback if no external ID)
-        // Only check for duplicates if we have all required fields
-        // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
-        // from being incorrectly flagged as duplicates
-        if (job.scheduledDate && customerId) {
+          
+          // CRITICAL: If we have an external ID, SKIP the fallback duplicate check (customer + service + date)
+          // The external ID is the definitive identifier - different external IDs = different jobs
+          // even if they have the same customer, service, and date
+          // This prevents legitimate jobs from being flagged as duplicates
+        } else {
+          // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no external ID)
+          // Only check for duplicates if we have all required fields
+          // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
+          // from being incorrectly flagged as duplicates
+          if (job.scheduledDate && customerId) {
           // Normalize the scheduled date to just the date part (YYYY-MM-DD) for comparison
           // This handles cases where dates might have time components
           let normalizedDate = job.scheduledDate;
@@ -8294,6 +8298,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           // Note: batchJobKeys.add() was already called above to prevent CSV duplicates
           // The key remains in the set even if database check passes, ensuring consistency
+          }
         }
 
         // Create job with all fields
