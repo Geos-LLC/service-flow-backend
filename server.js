@@ -7545,6 +7545,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     // Track jobs being imported in this batch to detect duplicates within the CSV
     const batchJobKeys = new Set(); // Format: "userId_customerId_serviceId_date" or "userId_customerId_serviceName_date"
     
+    // Track external job IDs to detect duplicates by external ID (highest priority)
+    // Format: { externalJobId: true } - tracks if we've seen this external ID in this batch
+    const batchExternalJobIds = new Set(); // Tracks external job IDs in current import batch
+    
     // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
     // Format: { externalId: internalId }
     const crewIdMapping = {}; // Maps external crew IDs to team member IDs
@@ -8092,8 +8096,70 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedServiceAddress = job.serviceAddress ? sanitizeInput(job.serviceAddress) : null;
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
-        // Check for duplicate jobs (same customer, service, and scheduled date)
+        // Check for duplicate jobs
+        // PRIORITY 1: Check by external job ID (if available) - this is the most reliable way
+        // PRIORITY 2: Check by customer, service, and scheduled date (fallback)
         // CRITICAL: Must filter by user_id to ensure we only check duplicates within the same account
+        
+        // First, check if this job has an external ID (jobId from source system)
+        const externalJobId = job.jobId || job.id || job.externalId || job.external_id || null;
+        
+        if (externalJobId) {
+          // Check if we've already seen this external ID in the current import batch
+          if (batchExternalJobIds.has(externalJobId)) {
+            console.log(`Row ${i + 1}: DUPLICATE in CSV by external ID - Job ID "${externalJobId}" already being imported in this batch`);
+            results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - job ID "${externalJobId}" already exists in this import`);
+            results.skipped++;
+            continue;
+          }
+          
+          // Check if this external ID already exists in the database
+          // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
+          // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
+          // We store external IDs in contact_info JSONB field as { external_id: "..." }
+          // Query all jobs with contact_info and check JSONB field for external_id match
+          const { data: jobsWithContactInfo, error: externalIdError } = await supabase
+            .from('jobs')
+            .select('id, user_id, contact_info')
+            .eq('user_id', userId)
+            .not('contact_info', 'is', null);
+          
+          if (!externalIdError && jobsWithContactInfo && jobsWithContactInfo.length > 0) {
+            // Check if any job has this external ID in contact_info
+            // Compare CSV external ID with stored external ID (NOT internal DB ID)
+            const foundByExternalId = jobsWithContactInfo.find(existingJob => {
+              if (existingJob.user_id !== userId) return false; // Safety check
+              try {
+                const contactInfo = existingJob.contact_info;
+                if (contactInfo && typeof contactInfo === 'object') {
+                  // Compare CSV external ID with stored external ID
+                  const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
+                  return storedExternalId === externalJobId; // String comparison
+                }
+                return false;
+              } catch (e) {
+                return false;
+              }
+            });
+            
+            if (foundByExternalId) {
+              // Found duplicate: CSV external ID matches stored external ID
+              // foundByExternalId.id is the internal DB ID (for logging only)
+              console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${foundByExternalId.id} (internal DB ID)`);
+              results.warnings.push(`Row ${i + 1}: Job with external ID "${externalJobId}" already exists in database (skipped)`);
+              results.skipped++;
+              // Add to batch tracking to prevent re-checking
+              batchExternalJobIds.add(externalJobId);
+              continue;
+            }
+          }
+          
+          // Add to batch tracking immediately to prevent duplicates in the same CSV
+          batchExternalJobIds.add(externalJobId);
+          console.log(`Row ${i + 1}: Tracking external job ID: ${externalJobId}`);
+        }
+        
+        // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (fallback if no external ID)
         // Only check for duplicates if we have all required fields
         // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
         // from being incorrectly flagged as duplicates
@@ -8247,7 +8313,31 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           let_customer_schedule: job.letCustomerSchedule || false,
           offer_to_providers: job.offerToProviders || false,
           internal_notes: sanitizedInternalNotes,
-          contact_info: job.contactInfo || null,
+          contact_info: (() => {
+            // Store external job ID in contact_info for duplicate detection
+            const contactInfo = job.contactInfo || {};
+            const externalJobId = job.jobId || job.id || job.externalId || job.external_id || null;
+            
+            // If contactInfo is a string, try to parse it as JSON
+            let parsedContactInfo = {};
+            if (typeof contactInfo === 'string') {
+              try {
+                parsedContactInfo = JSON.parse(contactInfo);
+              } catch (e) {
+                parsedContactInfo = {};
+              }
+            } else if (contactInfo && typeof contactInfo === 'object') {
+              parsedContactInfo = { ...contactInfo };
+            }
+            
+            // Add external_id to contact_info if we have one
+            if (externalJobId) {
+              parsedContactInfo.external_id = externalJobId;
+            }
+            
+            // Return null if empty, otherwise return the object
+            return Object.keys(parsedContactInfo).length > 0 ? parsedContactInfo : null;
+          })(),
           customer_notes: job.customerNotes || null,
           // Combine scheduled date and time into scheduled_date field
           // Format: "YYYY-MM-DD HH:MM:SS"
@@ -8770,11 +8860,74 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
       const territoryIdMapping = {}; // Maps external location IDs to territory IDs
       const customerIdMapping = {}; // Track customers created in this batch to avoid duplicates
       const serviceNameMapping = {}; // Maps normalized service names to service IDs to prevent duplicates
+      
+      // Track external job IDs to detect duplicates by external ID (highest priority)
+      const batchExternalJobIds = new Set(); // Tracks external job IDs in current import batch
 
       for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
         
         try {
+          // PRIORITY 1: Check for duplicate by external job ID (if available)
+          // Booking Koala jobs might have an ID field - check for it
+          const externalJobId = job.jobId || job.id || job.externalId || job.external_id || job['Booking ID'] || job['Booking id'] || job['booking_id'] || null;
+          
+          if (externalJobId) {
+            // Check if we've already seen this external ID in the current import batch
+            if (batchExternalJobIds.has(externalJobId)) {
+              console.log(`Row ${i + 1}: DUPLICATE in CSV by external ID - Booking ID "${externalJobId}" already being imported in this batch`);
+              results.jobs.errors.push(`Row ${i + 1}: Duplicate job in CSV - Booking ID "${externalJobId}" already exists in this import`);
+              results.jobs.skipped++;
+              continue;
+            }
+            
+            // Check if this external ID already exists in the database
+            // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
+            // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
+            // We store external IDs in contact_info JSONB field as { external_id: "..." }
+            // Query all jobs with contact_info and check JSONB field for external_id match
+            const { data: jobsWithContactInfo, error: externalIdError } = await supabase
+              .from('jobs')
+              .select('id, user_id, contact_info')
+              .eq('user_id', userId)
+              .not('contact_info', 'is', null);
+            
+            if (!externalIdError && jobsWithContactInfo && jobsWithContactInfo.length > 0) {
+              // Check if any job has this external ID in contact_info
+              // Compare CSV external ID with stored external ID (NOT internal DB ID)
+              const foundByExternalId = jobsWithContactInfo.find(existingJob => {
+                if (existingJob.user_id !== userId) return false; // Safety check
+                try {
+                  const contactInfo = existingJob.contact_info;
+                  if (contactInfo && typeof contactInfo === 'object') {
+                    // Compare CSV external ID with stored external ID
+                    const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
+                    return storedExternalId === externalJobId; // String comparison
+                  }
+                  return false;
+                } catch (e) {
+                  return false;
+                }
+              });
+              
+              if (foundByExternalId) {
+                // Found duplicate: CSV external ID matches stored external ID
+                // foundByExternalId.id is the internal DB ID (for logging only)
+                console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${foundByExternalId.id} (internal DB ID)`);
+                if (settings.updateExisting) {
+                  // Will update later in the code using foundByExternalId.id
+                } else {
+                  results.jobs.skipped++;
+                  batchExternalJobIds.add(externalJobId);
+                  continue;
+                }
+              }
+            }
+            
+            // Add to batch tracking immediately to prevent duplicates in the same CSV
+            batchExternalJobIds.add(externalJobId);
+            console.log(`Row ${i + 1}: Tracking external Booking ID: ${externalJobId}`);
+          }
           // Map Booking Koala fields to ZenBooker fields
           // Find or create customer by email or name (handle both mapped and original field names)
           // Support both mapped field names (customerEmail) and raw CSV column names (Email, First name, etc.)
@@ -9431,6 +9584,15 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               }
               // Default: return array with imported tags
               return ['imported', 'booking-koala'];
+            })(),
+            contact_info: (() => {
+              // Store external job ID in contact_info for duplicate detection
+              const externalJobId = job.jobId || job.id || job.externalId || job.external_id || job['Booking ID'] || job['Booking id'] || job['booking_id'] || null;
+              
+              if (externalJobId) {
+                return { external_id: externalJobId };
+              }
+              return null;
             })()
           };
 
