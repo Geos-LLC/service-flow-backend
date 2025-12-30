@@ -2487,13 +2487,15 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     const userRole = req.user.role; // Get user role from JWT token
   
     // Build Supabase query with joins
+    // IMPORTANT: Include job_team_assignments to support multiple team members per job
     let query = supabase
       .from('jobs')
       .select(`
         *,
         customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
         services!left(name, price, duration),
-        team_members!left(first_name, last_name, email)
+        team_members!left(first_name, last_name, email),
+        job_team_assignments!left(team_member_id, is_primary, assigned_by, team_members(id, first_name, last_name, email))
       `, { count: 'exact' })
       .eq('user_id', userId);
     
@@ -2703,6 +2705,45 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       error = result.error;
       count = result.count;
       
+      // Transform jobs to include team_assignments array for frontend compatibility
+      if (jobs && Array.isArray(jobs)) {
+        jobs = jobs.map(job => {
+          // Create team_assignments array from job_team_assignments relation
+          const teamAssignments = [];
+          
+          // If job_team_assignments exists and is an array, use it
+          if (job.job_team_assignments && Array.isArray(job.job_team_assignments)) {
+            teamAssignments.push(...job.job_team_assignments.map(ta => ({
+              team_member_id: ta.team_member_id,
+              is_primary: ta.is_primary,
+              assigned_by: ta.assigned_by,
+              team_members: ta.team_members || null
+            })));
+          }
+          
+          // Also include primary team member from team_member_id if not already in assignments
+          if (job.team_member_id) {
+            const alreadyInAssignments = teamAssignments.some(ta => 
+              Number(ta.team_member_id) === Number(job.team_member_id)
+            );
+            if (!alreadyInAssignments) {
+              teamAssignments.push({
+                team_member_id: job.team_member_id,
+                is_primary: true,
+                assigned_by: job.user_id,
+                team_members: job.team_members || null
+              });
+            }
+          }
+          
+          // Add team_assignments array to job object
+          return {
+            ...job,
+            team_assignments: teamAssignments
+          };
+        });
+      }
+      
       // Log results for date range queries
       if (dateRange) {
         console.log(`📅 Backend: Query returned ${jobs?.length || 0} jobs for date range ${dateRange}`);
@@ -2710,7 +2751,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           console.log(`📅 Backend: Sample job dates:`, jobs.slice(0, 3).map(j => ({
             id: j.id,
             scheduled_date: j.scheduled_date,
-            service_name: j.service_name
+            service_name: j.service_name,
+            team_assignments_count: j.team_assignments?.length || 0
           })));
         } else {
           console.log(`⚠️ Backend: No jobs found for date range ${dateRange}. Total count: ${count || 0}`);
@@ -8058,6 +8100,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const teamMemberId = primaryTeamMemberId || (teamMemberIds.length > 0 ? teamMemberIds[0] : null);
         
         console.log(`Row ${i + 1}: Team member assignment - Primary: ${teamMemberId}, All: [${teamMemberIds.join(', ')}]`);
+        console.log(`Row ${i + 1}: Team member IDs array length: ${teamMemberIds.length}, will create assignments: ${teamMemberIds.length > 0}`);
         
         // Handle territory assignment from external region ID
         let territoryId = null;
@@ -8665,7 +8708,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           results.imported++;
           
           // Create team member assignments in job_team_assignments table for multiple team members
+          // IMPORTANT: This must run for ALL team members, including existing ones
           if (teamMemberIds.length > 0) {
+            console.log(`Row ${i + 1}: Creating team assignments for ${teamMemberIds.length} team member(s): [${teamMemberIds.join(', ')}]`);
             try {
               const assignments = teamMemberIds.map((memberId, index) => ({
                 job_id: newJob.id,
@@ -8673,6 +8718,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 is_primary: index === 0 || memberId === primaryTeamMemberId, // First one or explicitly primary
                 assigned_by: userId
               }));
+              
+              console.log(`Row ${i + 1}: Assignment data:`, assignments.map(a => ({ job_id: a.job_id, team_member_id: a.team_member_id, is_primary: a.is_primary })));
               
               try {
                 const assignmentResult = await retrySupabaseOperation(async () => {
@@ -8684,17 +8731,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 if (assignmentResult.error) {
                   const errorMessage = assignmentResult.error.message || String(assignmentResult.error);
                   if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
-                    console.error(`Row ${i + 1}: Failed to create team assignments (Cloudflare timeout):`, assignmentResult.error);
+                    console.error(`Row ${i + 1}: ❌ Failed to create team assignments (Cloudflare timeout):`, assignmentResult.error);
                     results.warnings.push(`Row ${i + 1}: Could not assign all team members - database connection error`);
                   } else {
-                    console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentResult.error);
+                    console.error(`Row ${i + 1}: ❌ Failed to create team assignments:`, assignmentResult.error);
                     results.warnings.push(`Row ${i + 1}: Could not assign all team members - ${errorMessage}`);
                   }
                 } else {
-                  console.log(`Row ${i + 1}: ✅ Created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+                  console.log(`Row ${i + 1}: ✅ Successfully created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+                  console.log(`Row ${i + 1}: ✅ Assignments created for team members: [${teamMemberIds.join(', ')}]`);
                 }
               } catch (error) {
-                console.error(`Row ${i + 1}: Unexpected error creating team assignments:`, error);
+                console.error(`Row ${i + 1}: ❌ Unexpected error creating team assignments:`, error);
                 const errorMessage = error.message || String(error);
                 if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
                   results.warnings.push(`Row ${i + 1}: Could not assign all team members - database connection error`);
@@ -8703,9 +8751,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 }
               }
             } catch (assignmentError) {
-              console.error(`Row ${i + 1}: Error creating team assignments:`, assignmentError);
+              console.error(`Row ${i + 1}: ❌ Error creating team assignments:`, assignmentError);
               // Don't fail the import if team assignment fails
             }
+          } else {
+            console.log(`Row ${i + 1}: ⚠️ No team members to assign - teamMemberIds array is empty`);
           }
           
           // Note: batchJobKeys.add() was already called earlier to prevent CSV duplicates
