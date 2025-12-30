@@ -7930,9 +7930,52 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         };
         
+        // PRIORITY 1: Check for internal team member ID first (if team member already exists in database)
+        // This is the most reliable way since the team member already exists
+        if (job.teamMemberId) {
+          console.log(`Row ${i + 1}: Checking for internal team member ID(s):`, job.teamMemberId);
+          // Check if it's a comma-separated list or array
+          let memberIds = [];
+          if (Array.isArray(job.teamMemberId)) {
+            memberIds = job.teamMemberId;
+          } else if (typeof job.teamMemberId === 'string' && job.teamMemberId.includes(',')) {
+            memberIds = job.teamMemberId.split(',').map(id => id.trim());
+          } else {
+            memberIds = [job.teamMemberId];
+          }
+          
+          for (const memberIdStr of memberIds) {
+            const parsedId = parseInt(memberIdStr);
+            // Only use if it's a valid integer ID (not an external ID with 'x' in it)
+            if (!isNaN(parsedId) && !memberIdStr.toString().includes('x') && !memberIdStr.toString().includes('X')) {
+              // Verify the team member exists and belongs to this user
+              const { data: existingMember, error: memberCheckError } = await supabase
+                .from('team_members')
+                .select('id')
+                .eq('id', parsedId)
+                .eq('user_id', userId)
+                .maybeSingle();
+              
+              if (!memberCheckError && existingMember) {
+                // Team member exists and belongs to this user - use it directly
+                if (!teamMemberIds.includes(parsedId)) {
+                  teamMemberIds.push(parsedId);
+                  if (!primaryTeamMemberId) {
+                    primaryTeamMemberId = parsedId;
+                  }
+                  console.log(`Row ${i + 1}: ✅ Using existing team member ID ${parsedId} (already exists in database)`);
+                }
+              } else {
+                console.log(`Row ${i + 1}: ⚠️ Team member ID ${parsedId} not found or doesn't belong to user ${userId}, will try external ID lookup`);
+              }
+            }
+          }
+        }
+        
+        // PRIORITY 2: If no internal IDs found, check for external crew IDs (will create if needed)
         // First, check if we have multiple team member IDs (from assignedCrewIds array)
-        if (job.assignedCrewIds && Array.isArray(job.assignedCrewIds) && job.assignedCrewIds.length > 0) {
-          console.log(`Row ${i + 1}: Processing multiple team members:`, job.assignedCrewIds);
+        if (teamMemberIds.length === 0 && job.assignedCrewIds && Array.isArray(job.assignedCrewIds) && job.assignedCrewIds.length > 0) {
+          console.log(`Row ${i + 1}: Processing multiple team members from external IDs:`, job.assignedCrewIds);
           for (const externalCrewId of job.assignedCrewIds) {
             if (externalCrewId && externalCrewId.toString().trim()) {
               const memberId = await findOrCreateTeamMember(externalCrewId.toString().trim());
@@ -7947,7 +7990,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
         
         // Also check for external crew ID (could be single or comma-separated)
-        if (job.assignedCrewExternalId && job.assignedCrewExternalId.toString().trim()) {
+        if (teamMemberIds.length === 0 && job.assignedCrewExternalId && job.assignedCrewExternalId.toString().trim()) {
           const externalCrewIdStr = job.assignedCrewExternalId.toString().trim();
           
           // Check if it's comma-separated (e.g., "16, 22" or "16,22")
@@ -7971,32 +8014,6 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               teamMemberIds.push(memberId);
               if (!primaryTeamMemberId) {
                 primaryTeamMemberId = memberId;
-              }
-            }
-          }
-        }
-        
-        // Fallback: Try to find team member by internal ID (if provided as integer)
-        if (teamMemberIds.length === 0 && job.teamMemberId) {
-          // Check if it's a comma-separated list or array
-          let memberIds = [];
-          if (Array.isArray(job.teamMemberId)) {
-            memberIds = job.teamMemberId;
-          } else if (typeof job.teamMemberId === 'string' && job.teamMemberId.includes(',')) {
-            memberIds = job.teamMemberId.split(',').map(id => id.trim());
-          } else {
-            memberIds = [job.teamMemberId];
-          }
-          
-          for (const memberIdStr of memberIds) {
-            const parsedId = parseInt(memberIdStr);
-            if (!isNaN(parsedId) && !memberIdStr.toString().includes('x') && !memberIdStr.toString().includes('X')) {
-              // Valid integer ID
-              if (!teamMemberIds.includes(parsedId)) {
-                teamMemberIds.push(parsedId);
-                if (!primaryTeamMemberId) {
-                  primaryTeamMemberId = parsedId;
-                }
               }
             }
           }
