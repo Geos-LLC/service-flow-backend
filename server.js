@@ -8593,17 +8593,74 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
 
         console.log(`Row ${i + 1}: Creating job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
         
-        const { data: newJob, error: insertError } = await supabase
-          .from('jobs')
-          .insert(jobData)
-          .select()
-          .single();
+        // Helper function to retry Supabase operations with exponential backoff
+        const retrySupabaseOperation = async (operation, maxRetries = 3, delay = 1000) => {
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+              const result = await operation();
+              // Check if error response is HTML (Cloudflare error page)
+              if (result.error) {
+                const errorMessage = result.error.message || String(result.error);
+                if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
+                  console.warn(`Row ${i + 1}: Attempt ${attempt}/${maxRetries} - Received HTML error (likely Cloudflare timeout), retrying...`);
+                  if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, delay * attempt));
+                    continue;
+                  }
+                }
+              }
+              return result;
+            } catch (error) {
+              const errorMessage = error.message || String(error);
+              if ((errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare') || errorMessage.includes('timeout') || errorMessage.includes('ECONNRESET')) && attempt < maxRetries) {
+                console.warn(`Row ${i + 1}: Attempt ${attempt}/${maxRetries} - Database error (${errorMessage.substring(0, 100)}), retrying in ${delay * attempt}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay * attempt));
+                continue;
+              }
+              throw error;
+            }
+          }
+        };
+        
+        let newJob = null;
+        let insertError = null;
+        
+        try {
+          const insertResult = await retrySupabaseOperation(async () => {
+            return await supabase
+              .from('jobs')
+              .insert(jobData)
+              .select()
+              .single();
+          });
+          
+          newJob = insertResult.data;
+          insertError = insertResult.error;
+        } catch (error) {
+          // Catch any unexpected errors (network, timeout, etc.)
+          console.error(`Row ${i + 1}: Unexpected error during job creation:`, error);
+          const errorMessage = error.message || String(error);
+          // Check if it's an HTML error response
+          if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
+            results.errors.push(`Row ${i + 1}: Database connection error (Cloudflare timeout) - please try importing this job again`);
+          } else {
+            results.errors.push(`Row ${i + 1}: ${errorMessage.substring(0, 200)}`);
+          }
+          results.skipped++;
+          continue; // Skip to next job
+        }
 
         if (insertError) {
           console.error(`Row ${i + 1}: Failed to create job:`, insertError);
-          results.errors.push(`Row ${i + 1}: ${insertError.message}`);
+          const errorMessage = insertError.message || String(insertError);
+          // Check if error is HTML (Cloudflare error page)
+          if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
+            results.errors.push(`Row ${i + 1}: Database connection error (Cloudflare timeout) - please try importing this job again`);
+          } else {
+            results.errors.push(`Row ${i + 1}: ${errorMessage}`);
+          }
           results.skipped++;
-        } else {
+        } else if (newJob) {
           console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
           
@@ -8617,15 +8674,33 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 assigned_by: userId
               }));
               
-              const { error: assignmentError } = await supabase
-                .from('job_team_assignments')
-                .insert(assignments);
-              
-              if (assignmentError) {
-                console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentError);
-                results.warnings.push(`Row ${i + 1}: Could not assign all team members - ${assignmentError.message}`);
-              } else {
-                console.log(`Row ${i + 1}: ✅ Created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+              try {
+                const assignmentResult = await retrySupabaseOperation(async () => {
+                  return await supabase
+                    .from('job_team_assignments')
+                    .insert(assignments);
+                });
+                
+                if (assignmentResult.error) {
+                  const errorMessage = assignmentResult.error.message || String(assignmentResult.error);
+                  if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
+                    console.error(`Row ${i + 1}: Failed to create team assignments (Cloudflare timeout):`, assignmentResult.error);
+                    results.warnings.push(`Row ${i + 1}: Could not assign all team members - database connection error`);
+                  } else {
+                    console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentResult.error);
+                    results.warnings.push(`Row ${i + 1}: Could not assign all team members - ${errorMessage}`);
+                  }
+                } else {
+                  console.log(`Row ${i + 1}: ✅ Created ${assignments.length} team member assignment(s) for job ${newJob.id}`);
+                }
+              } catch (error) {
+                console.error(`Row ${i + 1}: Unexpected error creating team assignments:`, error);
+                const errorMessage = error.message || String(error);
+                if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
+                  results.warnings.push(`Row ${i + 1}: Could not assign all team members - database connection error`);
+                } else {
+                  results.warnings.push(`Row ${i + 1}: Could not assign all team members - ${errorMessage.substring(0, 200)}`);
+                }
               }
             } catch (assignmentError) {
               console.error(`Row ${i + 1}: Error creating team assignments:`, assignmentError);
