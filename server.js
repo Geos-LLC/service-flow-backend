@@ -9452,12 +9452,33 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // Extract first service name from patterns like "Service Name, + 1 more" or "Service Name, + 1 other"
           const extractFirstServiceName = (name) => {
             if (!name || typeof name !== 'string') return name;
+            
+            let cleaned = name.trim();
+            
             // Remove patterns like ", + 1 more", ", + 1 other", ", + -1 more", etc.
-            // Pattern: comma, optional space, plus sign, optional space, optional minus, number, space, "more" or "other"
-            let cleaned = name.replace(/,\s*\+\s*-?\d+\s*(more|other)/gi, '').trim();
-            // Also handle patterns like "* , + -1 more" - remove leading asterisk and comma
-            cleaned = cleaned.replace(/^\*\s*,\s*/, '').trim();
-            return cleaned || name; // Return original if cleaning results in empty string
+            // Handle various spacing: ", + 1 more", ",+1 more", ", +-1 more", ", + 1more"
+            // Pattern: comma, optional spaces, plus sign, optional spaces, optional minus, number, optional spaces, "more" or "other"
+            cleaned = cleaned.replace(/,\s*\+\s*-?\d+\s*(more|other)/gi, '').trim();
+            
+            // Handle patterns that start with comma and plus (like ", + -1 more" or ", + 1 more")
+            cleaned = cleaned.replace(/^,\s*\+\s*-?\d+\s*(more|other)/gi, '').trim();
+            
+            // Handle patterns like "* , + -1 more" - remove leading asterisk, comma, and plus
+            cleaned = cleaned.replace(/^\*\s*,\s*\+\s*-?\d+\s*(more|other)/gi, '').trim();
+            
+            // Remove trailing commas and plus signs
+            cleaned = cleaned.replace(/,\s*\+\s*$/gi, '').trim();
+            cleaned = cleaned.replace(/,\s*$/g, '').trim(); // Remove trailing comma
+            
+            // Remove leading commas
+            cleaned = cleaned.replace(/^,\s*/g, '').trim();
+            
+            // If result is empty or just special characters, return original
+            if (!cleaned || cleaned === ',' || cleaned === '+' || cleaned === ', +' || cleaned === '*') {
+              return name;
+            }
+            
+            return cleaned;
           };
           
           const rawServiceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
