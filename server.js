@@ -9450,10 +9450,18 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // Handle service creation (create on the fly like normal import, prevent duplicates)
           let serviceId = null;
           // Extract first service name from patterns like "Service Name, + 1 more" or "Service Name, + 1 other"
+          // Returns null if the service name is invalid (only contains the suffix pattern)
           const extractFirstServiceName = (name) => {
             if (!name || typeof name !== 'string') return name;
             
             let cleaned = name.trim();
+            
+            // Check if the entire string is just the pattern (like ", + -1 more" or "* , + -1 more")
+            // If so, this is an invalid service name and should be skipped
+            const isOnlyPattern = /^[\*\s]*,\s*\+\s*-?\d+\s*(more|other)\s*$/gi.test(cleaned);
+            if (isOnlyPattern) {
+              return null; // Return null to indicate invalid service name
+            }
             
             // Remove patterns like ", + 1 more", ", + 1 other", ", + -1 more", etc.
             // Handle various spacing: ", + 1 more", ",+1 more", ", +-1 more", ", + 1more"
@@ -9473,17 +9481,28 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             // Remove leading commas
             cleaned = cleaned.replace(/^,\s*/g, '').trim();
             
-            // If result is empty or just special characters, return original
-            if (!cleaned || cleaned === ',' || cleaned === '+' || cleaned === ', +' || cleaned === '*') {
-              return name;
+            // Remove leading asterisks
+            cleaned = cleaned.replace(/^\*\s*/g, '').trim();
+            
+            // If result is empty or just special characters, this is invalid
+            if (!cleaned || cleaned === ',' || cleaned === '+' || cleaned === ', +' || cleaned === '*' || cleaned === ', + -1' || cleaned === ', + 1') {
+              return null; // Return null to indicate invalid service name
             }
             
             return cleaned;
           };
           
           const rawServiceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
-          const serviceName = extractFirstServiceName(rawServiceName);
-          if (serviceName && serviceName.trim() !== 'Imported Service') {
+          const cleanedServiceName = extractFirstServiceName(rawServiceName);
+          // Skip service creation if service name is invalid (only contains pattern like ", + -1 more")
+          let finalServiceName = cleanedServiceName;
+          if (!cleanedServiceName || cleanedServiceName === null) {
+            console.log(`Row ${i + 1}: Invalid service name detected: "${rawServiceName}" - will use default "Imported Service"`);
+            finalServiceName = 'Imported Service'; // Use default for invalid names
+          }
+          
+          // Only create/find service if we have a valid service name (not the default)
+          if (finalServiceName && finalServiceName.trim() !== 'Imported Service') {
             // Normalize service name for comparison (same logic as regular import)
             const normalizeServiceName = (name) => {
               if (!name || typeof name !== 'string') return '';
@@ -9498,12 +9517,12 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 .trim();
             };
             
-            const normalizedServiceName = normalizeServiceName(serviceName);
+            const normalizedServiceName = normalizeServiceName(finalServiceName);
             
             // First check our mapping to see if we've already created/found this service in this import batch
             if (serviceNameMapping[normalizedServiceName]) {
               serviceId = serviceNameMapping[normalizedServiceName];
-              console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for "${serviceName}" (from batch mapping)`);
+              console.log(`Row ${i + 1}: Reusing existing service ${serviceId} for "${finalServiceName}" (from batch mapping)`);
             } else {
               // Search database for existing service (case-insensitive)
               const { data: allServices, error: serviceError } = await supabase
@@ -9532,10 +9551,10 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                     serviceNameMapping[foundNormalized] = service.id;
                   }
                 });
-                console.log(`Row ${i + 1}: Found existing service ${serviceId} for "${serviceName}"`);
+                console.log(`Row ${i + 1}: Found existing service ${serviceId} for "${finalServiceName}"`);
               } else {
                 // Service not found - create it
-                const sanitizedName = sanitizeInput(serviceName.trim());
+                const sanitizedName = sanitizeInput(finalServiceName.trim());
                 const newService = {
                   user_id: userId,
                   name: sanitizedName,
@@ -9565,6 +9584,9 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               }
             }
           }
+          
+          // Store the final service name for use in mappedJob
+          const serviceNameForJob = finalServiceName;
 
           // Handle team member assignment - support multiple team members (from Provider details)
           let teamMemberIds = []; // Array to store all team member IDs
@@ -9810,7 +9832,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             service_id: serviceId || null, // Add service_id if service was created/found
             team_member_id: teamMemberId || null,
             territory_id: territoryId || null,
-            service_name: job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service',
+            service_name: serviceNameForJob || 'Imported Service',
             scheduled_date: scheduledDate || new Date().toISOString().split('T')[0],
             scheduled_time: scheduledTime,
             status: jobStatus,
