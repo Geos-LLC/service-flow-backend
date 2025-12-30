@@ -5441,23 +5441,33 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
     const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
     
     // Update job to be recurring
+    // Note: Only update fields that exist in the database schema
+    const updateData = {
+      is_recurring: true,
+      recurring_frequency: frequency,
+      recurring_end_date: endDate || null,
+      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : null
+    };
+    
+    console.log(`🔄 Converting job ${id} to recurring with frequency: ${frequency}, endDate: ${endDate || 'none'}, nextBillingDate: ${updateData.next_billing_date}`);
+    
     const { data: updatedJob, error: updateError } = await supabase
       .from('jobs')
-      .update({
-        is_recurring: true,
-        recurring_job: true,
-        recurring_frequency: frequency,
-        recurring_end_date: endDate || null,
-        next_billing_date: nextBillingDate ? nextBillingDate.toISOString() : null
-      })
+      .update(updateData)
       .eq('id', id)
       .select()
       .single();
     
     if (updateError) {
-      console.error('Error converting job to recurring:', updateError);
-      return res.status(500).json({ error: 'Failed to convert job to recurring' });
+      console.error('❌ Error converting job to recurring:', updateError);
+      console.error('❌ Update data attempted:', updateData);
+      return res.status(500).json({ 
+        error: 'Failed to convert job to recurring',
+        details: updateError.message 
+      });
     }
+    
+    console.log(`✅ Successfully converted job ${id} to recurring`);
     
     res.json({
       message: 'Job converted to recurring successfully',
