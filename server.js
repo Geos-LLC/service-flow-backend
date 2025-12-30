@@ -2606,7 +2606,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         } else {
           // Only direct assignment (no assignments found in job_team_assignments)
           // But still check team_member_id
-          query = query.eq('team_member_id', teamMemberIdNum);
+        query = query.eq('team_member_id', teamMemberIdNum);
           console.log(`🔍 Applied direct filter: team_member_id=${teamMemberIdNum} (no assignments found in job_team_assignments table)`);
         }
       } else {
@@ -9449,7 +9449,19 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
 
           // Handle service creation (create on the fly like normal import, prevent duplicates)
           let serviceId = null;
-          const serviceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
+          // Extract first service name from patterns like "Service Name, + 1 more" or "Service Name, + 1 other"
+          const extractFirstServiceName = (name) => {
+            if (!name || typeof name !== 'string') return name;
+            // Remove patterns like ", + 1 more", ", + 1 other", ", + -1 more", etc.
+            // Pattern: comma, optional space, plus sign, optional space, optional minus, number, space, "more" or "other"
+            let cleaned = name.replace(/,\s*\+\s*-?\d+\s*(more|other)/gi, '').trim();
+            // Also handle patterns like "* , + -1 more" - remove leading asterisk and comma
+            cleaned = cleaned.replace(/^\*\s*,\s*/, '').trim();
+            return cleaned || name; // Return original if cleaning results in empty string
+          };
+          
+          const rawServiceName = job.serviceName || job['Service'] || job.service_name || job.service || 'Imported Service';
+          const serviceName = extractFirstServiceName(rawServiceName);
           if (serviceName && serviceName.trim() !== 'Imported Service') {
             // Normalize service name for comparison (same logic as regular import)
             const normalizeServiceName = (name) => {
