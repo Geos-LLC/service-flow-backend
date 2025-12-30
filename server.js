@@ -18464,39 +18464,72 @@ app.get('/api/team-analytics', async (req, res) => {
     
     try {
       // Get team performance summary
-      const [performanceSummary] = await connection.query(`
+      // Include jobs from both direct assignment (team_member_id) and job_team_assignments table
+      const performanceSummaryQuery = `
         SELECT 
           tm.id,
           tm.first_name,
           tm.last_name,
           tm.role,
-          COUNT(j.id) as total_jobs,
-          COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed_jobs,
-          COUNT(CASE WHEN j.status IN ('pending', 'confirmed', 'in-progress') THEN 1 END) as active_jobs,
-          AVG(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as avg_job_value,
-          SUM(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as total_revenue,
-          AVG(CASE WHEN j.status = 'completed' THEN TIMESTAMPDIFF(MINUTE, j.scheduled_date, j.updated_at) END) as avg_completion_time
+          COUNT(DISTINCT all_jobs.job_id) as total_jobs,
+          COUNT(DISTINCT CASE WHEN all_jobs.status = 'completed' THEN all_jobs.job_id END) as completed_jobs,
+          COUNT(DISTINCT CASE WHEN all_jobs.status IN ('pending', 'confirmed', 'in-progress') THEN all_jobs.job_id END) as active_jobs,
+          AVG(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as avg_job_value,
+          SUM(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as total_revenue,
+          AVG(CASE WHEN all_jobs.status = 'completed' THEN TIMESTAMPDIFF(MINUTE, all_jobs.scheduled_date, all_jobs.updated_at) END) as avg_completion_time
         FROM team_members tm
-        LEFT JOIN jobs j ON tm.id = j.team_member_id
+        LEFT JOIN (
+          SELECT j.id as job_id, j.team_member_id, j.status, j.invoice_amount, j.scheduled_date, j.updated_at
+          FROM jobs j
+          WHERE j.team_member_id IS NOT NULL
+          ${startDate && endDate ? 'AND DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
+          UNION
+          SELECT j.id as job_id, jta.team_member_id, j.status, j.invoice_amount, j.scheduled_date, j.updated_at
+          FROM jobs j
+          INNER JOIN job_team_assignments jta ON j.id = jta.job_id
+          ${startDate && endDate ? 'WHERE DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
+        ) all_jobs ON tm.id = all_jobs.team_member_id
         WHERE tm.user_id = ? AND tm.status = 'active'
-        ${startDate && endDate ? 'AND DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
-        GROUP BY tm.id
+        GROUP BY tm.id, tm.first_name, tm.last_name, tm.role
         ORDER BY total_revenue DESC
-      `, startDate && endDate ? [userId, startDate, endDate] : [userId]);
+      `;
+      const performanceSummaryParams = startDate && endDate 
+        ? [startDate, endDate, startDate, endDate, userId]
+        : [userId];
+      const [performanceSummary] = await connection.query(performanceSummaryQuery, performanceSummaryParams);
       
       // Get overall team stats
-      const [teamStats] = await connection.query(`
+      // Count all distinct jobs assigned to team members (either directly or through job_team_assignments)
+      // Get unique job IDs first, then join back to jobs table to get details and avoid double-counting
+      const teamStatsQuery = `
         SELECT 
-          COUNT(DISTINCT tm.id) as total_team_members,
+          (SELECT COUNT(DISTINCT id) FROM team_members WHERE user_id = ? AND status = 'active') as total_team_members,
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed_jobs,
-          SUM(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as total_revenue,
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
+          SUM(CASE WHEN j.status = 'completed' THEN j.invoice_amount ELSE 0 END) as total_revenue,
           AVG(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as avg_job_value
-        FROM team_members tm
-        LEFT JOIN jobs j ON tm.id = j.team_member_id
-        WHERE tm.user_id = ? AND tm.status = 'active'
-        ${startDate && endDate ? 'AND DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
-      `, startDate && endDate ? [userId, startDate, endDate] : [userId]);
+        FROM jobs j
+        WHERE j.id IN (
+          SELECT DISTINCT job_id FROM (
+            SELECT j.id as job_id
+            FROM jobs j
+            INNER JOIN team_members tm ON j.team_member_id = tm.id
+            WHERE tm.user_id = ? AND tm.status = 'active'
+            ${startDate && endDate ? 'AND DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
+            UNION
+            SELECT j.id as job_id
+            FROM jobs j
+            INNER JOIN job_team_assignments jta ON j.id = jta.job_id
+            INNER JOIN team_members tm ON jta.team_member_id = tm.id
+            WHERE tm.user_id = ? AND tm.status = 'active'
+            ${startDate && endDate ? 'AND DATE(j.scheduled_date) BETWEEN ? AND ?' : ''}
+          ) unique_job_ids
+        )
+      `;
+      const teamStatsParams = startDate && endDate 
+        ? [userId, userId, startDate, endDate, userId, startDate, endDate]
+        : [userId, userId, userId];
+      const [teamStats] = await connection.query(teamStatsQuery, teamStatsParams);
       
       res.json({
         performanceSummary,
