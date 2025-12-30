@@ -2483,6 +2483,11 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   
   try {
     const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring } = req.query;
+    
+    // Debug logging for team member filter
+    if (teamMember) {
+      console.log(`🔍 Backend: Received teamMember filter: ${teamMember} (type: ${typeof teamMember})`);
+    }
     const teamMemberId = req.user.teamMemberId; // Get team member ID from JWT token
     const userRole = req.user.role; // Get user role from JWT token
   
@@ -2584,19 +2589,25 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         
         // Filter by direct assignment OR by job IDs from assignments
         // Always check both - some jobs might only have team_member_id, others might only have assignments
+        // IMPORTANT: We need to check BOTH even if one is empty, because:
+        // - Jobs might have team_member_id but no assignments entry
+        // - Jobs might have assignments entry but no team_member_id
         if (jobIdsFromAssignments.length > 0) {
           // Combine direct assignment and assignments from job_team_assignments
-          // Use OR to include jobs with direct assignment OR jobs from assignments table
-          // Supabase OR syntax: "field1.eq.value1,field2.in.(val1,val2)"
+          // Supabase OR syntax: "field1.eq.value1,field2.in.(val1,val2,val3)"
+          // For IN clause, we need to format it correctly
           const orConditions = [`team_member_id.eq.${teamMemberIdNum}`];
-          // Add IN condition for job IDs from assignments
-          orConditions.push(`id.in.(${jobIdsFromAssignments.join(',')})`);
+          // Add IN condition for job IDs from assignments - format: id.in.(1,2,3)
+          if (jobIdsFromAssignments.length > 0) {
+            orConditions.push(`id.in.(${jobIdsFromAssignments.join(',')})`);
+          }
           query = query.or(orConditions.join(','));
-          console.log(`🔍 Applied OR filter: team_member_id=${teamMemberIdNum} OR id in [${jobIdsFromAssignments.length} jobs]`);
+          console.log(`🔍 Applied OR filter: team_member_id=${teamMemberIdNum} OR id in [${jobIdsFromAssignments.length} jobs: ${jobIdsFromAssignments.slice(0, 5).join(',')}${jobIdsFromAssignments.length > 5 ? '...' : ''}]`);
         } else {
           // Only direct assignment (no assignments found in job_team_assignments)
+          // But still check team_member_id
           query = query.eq('team_member_id', teamMemberIdNum);
-          console.log(`🔍 Applied direct filter: team_member_id=${teamMemberIdNum} (no assignments found)`);
+          console.log(`🔍 Applied direct filter: team_member_id=${teamMemberIdNum} (no assignments found in job_team_assignments table)`);
         }
       } else {
         // Handle special string values
@@ -2710,6 +2721,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       jobs = result.data;
       error = result.error;
       count = result.count;
+      
+      // Debug: Log how many jobs were returned when filtering by team member
+      if (teamMember) {
+        console.log(`🔍 Backend: Query returned ${jobs?.length || 0} jobs for team member ${teamMember} (total count: ${count || 0})`);
+        if (jobs && jobs.length > 0) {
+          console.log(`🔍 Backend: Sample job IDs returned:`, jobs.slice(0, 5).map(j => j.id));
+        }
+      }
       
       // Transform jobs to include team_assignments array for frontend compatibility
       if (jobs && Array.isArray(jobs)) {
