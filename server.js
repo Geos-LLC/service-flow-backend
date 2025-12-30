@@ -14720,13 +14720,10 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       .eq('id', userId)
       .maybeSingle();
     
-    // Build Supabase query with joins and aggregations for team members
+    // Build Supabase query for team members (without jobs initially)
     let query = supabase
       .from('team_members')
-      .select(`
-        *,
-        jobs!left(id, status, invoice_amount)
-      `, { count: 'exact' })
+      .select('*', { count: 'exact' })
       .eq('user_id', userId);
     
     // Add status filter (but don't filter out account owner if they don't have status)
@@ -14790,6 +14787,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     
     if (accountOwner && (!accountOwnerInTeam || !accountOwnerInFilteredResults)) {
       // Get jobs assigned to the account owner (using user_id)
+      // This is for the account owner who may not be in team_members table
       const { data: ownerJobs, error: jobsError } = await supabase
         .from('jobs')
         .select('id, status, invoice_amount')
@@ -14826,9 +14824,93 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       };
     }
     
+    // Fetch jobs for all team members from both sources
+    // First, get all team member IDs
+    const teamMemberIds = (teamMembers || []).map(m => m.id);
+    
+    // Fetch jobs directly assigned via team_member_id
+    const { data: directJobs, error: directJobsError } = teamMemberIds.length > 0
+      ? await supabase
+          .from('jobs')
+          .select('id, status, invoice_amount, team_member_id')
+          .in('team_member_id', teamMemberIds)
+      : { data: [], error: null };
+    
+    // Fetch job assignments from job_team_assignments table
+    const { data: assignments, error: assignmentError } = teamMemberIds.length > 0
+      ? await supabase
+          .from('job_team_assignments')
+          .select('job_id, team_member_id')
+          .in('team_member_id', teamMemberIds)
+      : { data: [], error: null };
+    
+    // Get unique job IDs from assignments
+    const assignmentJobIds = assignments && !assignmentError 
+      ? [...new Set(assignments.map(a => a.job_id))] 
+      : [];
+    
+    // Fetch job details for assignments
+    const { data: assignmentJobs, error: assignmentJobsError } = assignmentJobIds.length > 0
+      ? await supabase
+          .from('jobs')
+          .select('id, status, invoice_amount')
+          .in('id', assignmentJobIds)
+      : { data: [], error: null };
+    
+    // Create a map of job_id to job data for quick lookup
+    const assignmentJobsMap = {};
+    if (assignmentJobs && !assignmentJobsError) {
+      assignmentJobs.forEach(job => {
+        assignmentJobsMap[job.id] = job;
+      });
+    }
+    
+    // Combine jobs from both sources, grouped by team_member_id
+    const jobsByMember = {};
+    
+    // Add direct assignments
+    if (directJobs && !directJobsError) {
+      directJobs.forEach(job => {
+        if (job.team_member_id) {
+          if (!jobsByMember[job.team_member_id]) {
+            jobsByMember[job.team_member_id] = [];
+          }
+          // Avoid duplicates
+          if (!jobsByMember[job.team_member_id].find(j => j.id === job.id)) {
+            jobsByMember[job.team_member_id].push({
+              id: job.id,
+              status: job.status,
+              invoice_amount: job.invoice_amount
+            });
+          }
+        }
+      });
+    }
+    
+    // Add assignments from job_team_assignments
+    if (assignments && !assignmentError) {
+      assignments.forEach(assignment => {
+        const memberId = assignment.team_member_id;
+        const job = assignmentJobsMap[assignment.job_id];
+        if (memberId && job) {
+          if (!jobsByMember[memberId]) {
+            jobsByMember[memberId] = [];
+          }
+          // Avoid duplicates
+          if (!jobsByMember[memberId].find(j => j.id === job.id)) {
+            jobsByMember[memberId].push({
+              id: job.id,
+              status: job.status,
+              invoice_amount: job.invoice_amount
+            });
+          }
+        }
+      });
+    }
+    
     // Process team members to add job statistics
     let processedTeamMembers = (teamMembers || []).map(member => {
-      const jobs = member.jobs || [];
+      const jobs = jobsByMember[member.id] || [];
       const totalJobs = jobs.length;
       const completedJobs = jobs.filter(job => job.status === 'completed').length;
       const avgJobValue = completedJobs > 0 
@@ -14841,11 +14923,13 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
         profile_picture: member.profile_picture || null, // Ensure profile_picture is always included
         total_jobs: totalJobs,
         completed_jobs: completedJobs,
-        avg_job_value: avgJobValue
+        avg_job_value: avgJobValue,
+        jobs: jobs
       };
     });
     
     // If account owner exists in team_members, update their profile_picture from users table
+    // Also ensure their jobs include assignments from job_team_assignments
     if (accountOwnerInTeam && accountOwner) {
       // Find the account owner in the processed results
       const accountOwnerIndex = processedTeamMembers.findIndex(member => 
@@ -14858,6 +14942,17 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
         // Update profile_picture from users table if it exists
         if (accountOwner.profile_picture) {
           processedTeamMembers[accountOwnerIndex].profile_picture = accountOwner.profile_picture;
+        }
+        // Jobs should already be included from jobsByMember above, but ensure they're there
+        if (!processedTeamMembers[accountOwnerIndex].jobs || processedTeamMembers[accountOwnerIndex].jobs.length === 0) {
+          processedTeamMembers[accountOwnerIndex].jobs = jobsByMember[accountOwnerInTeam.id] || [];
+          processedTeamMembers[accountOwnerIndex].total_jobs = processedTeamMembers[accountOwnerIndex].jobs.length;
+          processedTeamMembers[accountOwnerIndex].completed_jobs = processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed').length;
+          const completedJobs = processedTeamMembers[accountOwnerIndex].completed_jobs;
+          processedTeamMembers[accountOwnerIndex].avg_job_value = completedJobs > 0 
+            ? Math.round((processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed')
+                .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
+            : 0;
         }
       }
     }
