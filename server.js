@@ -2567,30 +2567,36 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       if (!isNaN(teamMemberIdNum) && teamMemberIdNum > 0) {
         teamMemberFilterId = teamMemberIdNum;
         
+        console.log(`🔍 Filtering jobs by team member ID: ${teamMemberIdNum}`);
+        
         // First, get all job IDs from job_team_assignments where this team member is assigned
         const { data: assignmentJobs, error: assignmentJobsError } = await supabase
           .from('job_team_assignments')
           .select('job_id')
           .eq('team_member_id', teamMemberIdNum);
         
-        if (!assignmentJobsError && assignmentJobs) {
+        if (assignmentJobsError) {
+          console.error(`❌ Error fetching job_team_assignments for team member ${teamMemberIdNum}:`, assignmentJobsError);
+        } else if (assignmentJobs) {
           jobIdsFromAssignments = assignmentJobs.map(a => a.job_id);
+          console.log(`✅ Found ${jobIdsFromAssignments.length} jobs from job_team_assignments for team member ${teamMemberIdNum}`);
         }
         
         // Filter by direct assignment OR by job IDs from assignments
+        // Always check both - some jobs might only have team_member_id, others might only have assignments
         if (jobIdsFromAssignments.length > 0) {
           // Combine direct assignment and assignments from job_team_assignments
           // Use OR to include jobs with direct assignment OR jobs from assignments table
-          // Supabase OR syntax requires proper formatting
+          // Supabase OR syntax: "field1.eq.value1,field2.in.(val1,val2)"
           const orConditions = [`team_member_id.eq.${teamMemberIdNum}`];
           // Add IN condition for job IDs from assignments
-          if (jobIdsFromAssignments.length > 0) {
-            orConditions.push(`id.in.(${jobIdsFromAssignments.join(',')})`);
-          }
+          orConditions.push(`id.in.(${jobIdsFromAssignments.join(',')})`);
           query = query.or(orConditions.join(','));
+          console.log(`🔍 Applied OR filter: team_member_id=${teamMemberIdNum} OR id in [${jobIdsFromAssignments.length} jobs]`);
         } else {
-          // Only direct assignment
+          // Only direct assignment (no assignments found in job_team_assignments)
           query = query.eq('team_member_id', teamMemberIdNum);
+          console.log(`🔍 Applied direct filter: team_member_id=${teamMemberIdNum} (no assignments found)`);
         }
       } else {
         // Handle special string values
@@ -2737,10 +2743,17 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           }
           
           // Add team_assignments array to job object
-          return {
+          const transformedJob = {
             ...job,
             team_assignments: teamAssignments
           };
+          
+          // Debug logging for team assignments (only log first few jobs to avoid spam)
+          if (jobs.indexOf(job) < 3 && teamAssignments.length > 0) {
+            console.log(`🔍 Job ${job.id} team_assignments:`, teamAssignments.map(ta => ta.team_member_id));
+          }
+          
+          return transformedJob;
         });
       }
       
@@ -5485,9 +5498,9 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
     // Update job to be recurring
     // Note: Only update fields that exist in the database schema
     const updateData = {
-      is_recurring: true,
-      recurring_frequency: frequency,
-      recurring_end_date: endDate || null,
+        is_recurring: true,
+        recurring_frequency: frequency,
+        recurring_end_date: endDate || null,
       next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : null
     };
     
@@ -7715,7 +7728,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 
                 if (foundCustomer) {
                   customer = { id: foundCustomer.id };
-                  customerFound = true;
+                customerFound = true;
                   console.log(`Row ${i + 1}: Found customer by name (whitespace-normalized):`, customer.id);
                 }
               } else if (nameError) {
@@ -7903,19 +7916,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             return crewIdMapping[externalCrewId];
           }
           
-          // Check if a team member with this external ID already exists in the DATABASE
+            // Check if a team member with this external ID already exists in the DATABASE
           // We store external ID in first_name as "Crew {last6digits}" - use last 6 digits for display
           const displayCrewId = externalCrewId.toString().slice(-6);
           const crewSearchPattern = `Crew ${displayCrewId}`;
-          const { data: existingCrews, error: crewSearchError } = await supabase
-            .from('team_members')
-            .select('id, first_name')
-            .eq('user_id', userId)
-            .eq('first_name', crewSearchPattern)
-            .limit(1);
-          
-          if (!crewSearchError && existingCrews && existingCrews.length > 0) {
-            // Found existing team member with this external ID
+            const { data: existingCrews, error: crewSearchError } = await supabase
+              .from('team_members')
+              .select('id, first_name')
+              .eq('user_id', userId)
+              .eq('first_name', crewSearchPattern)
+              .limit(1);
+            
+            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+              // Found existing team member with this external ID
             const foundId = existingCrews[0].id;
             crewIdMapping[externalCrewId] = foundId; // Store in mapping for this batch
             console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} in database for external crew ID ${externalCrewId}`);
@@ -7923,48 +7936,48 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
           
           // Create new team member
-          console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
-          const defaultAvailability = {
-            workingHours: {
-              monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-              tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-              wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-              thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-              friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-              saturday: { enabled: false },
-              sunday: { enabled: false }
-            },
-            customAvailability: []
-          };
-          
-          const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+              console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
+            const defaultAvailability = {
+              workingHours: {
+                monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+                saturday: { enabled: false },
+                sunday: { enabled: false }
+              },
+              customAvailability: []
+            };
+            
+            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
           const displayCrewIdForNew = externalCrewId.toString().slice(-6);
-          
-          const newTeamMember = {
-            user_id: userId,
+            
+            const newTeamMember = {
+              user_id: userId,
             first_name: `Crew ${displayCrewIdForNew}`, // Use last 6 digits of external ID
-            last_name: '',
+              last_name: '',
             email: placeholderEmail,
-            phone: null,
-            role: 'worker',
-            is_service_provider: true,
-            status: 'active',
-            availability: JSON.stringify(defaultAvailability),
-            territories: [],
-            permissions: {}
-          };
-          
-          const { data: createdTeamMember, error: createTeamError } = await supabase
-            .from('team_members')
-            .insert(newTeamMember)
-            .select('id')
-            .single();
-          
-          if (createTeamError) {
-            console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
-            results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
+              phone: null,
+              role: 'worker',
+              is_service_provider: true,
+              status: 'active',
+              availability: JSON.stringify(defaultAvailability),
+              territories: [],
+              permissions: {}
+            };
+            
+            const { data: createdTeamMember, error: createTeamError } = await supabase
+              .from('team_members')
+              .insert(newTeamMember)
+              .select('id')
+              .single();
+            
+            if (createTeamError) {
+              console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
+              results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
             return null;
-          } else {
+            } else {
             const newId = createdTeamMember.id;
             crewIdMapping[externalCrewId] = newId; // Store mapping to prevent duplicates
             console.log(`Row ${i + 1}: Created new team member ${newId} for external crew ID ${externalCrewId}`);
@@ -8073,19 +8086,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           for (const name of names) {
             const nameParts = name.split(' ');
-            const firstName = nameParts[0];
-            const lastName = nameParts.slice(1).join(' ');
-            
-            const { data: teamMember, error: teamError } = await supabase
-              .from('team_members')
-              .select('id')
-              .eq('user_id', userId)
-              .eq('first_name', firstName)
-              .eq('last_name', lastName)
-              .maybeSingle();
-            
-            if (teamError) {
-              console.error(`Row ${i + 1}: Error searching team member:`, teamError);
+          const firstName = nameParts[0];
+          const lastName = nameParts.slice(1).join(' ');
+          
+          const { data: teamMember, error: teamError } = await supabase
+            .from('team_members')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('first_name', firstName)
+            .eq('last_name', lastName)
+            .maybeSingle();
+          
+          if (teamError) {
+            console.error(`Row ${i + 1}: Error searching team member:`, teamError);
             } else if (teamMember && !teamMemberIds.includes(teamMember.id)) {
               teamMemberIds.push(teamMember.id);
               if (!primaryTeamMemberId) {
@@ -8249,10 +8262,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // This prevents legitimate jobs from being flagged as duplicates
         } else {
           // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no external ID)
-          // Only check for duplicates if we have all required fields
-          // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
-          // from being incorrectly flagged as duplicates
-          if (job.scheduledDate && customerId) {
+        // Only check for duplicates if we have all required fields
+        // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
+        // from being incorrectly flagged as duplicates
+        if (job.scheduledDate && customerId) {
           // Normalize the scheduled date to just the date part (YYYY-MM-DD) for comparison
           // This handles cases where dates might have time components
           let normalizedDate = job.scheduledDate;
@@ -8359,11 +8372,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             if (isDuplicate) {
               console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
               results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
-              results.skipped++;
+            results.skipped++;
               // Keep the key in batchJobKeys to prevent re-checking if the same job appears again in the CSV
               // This ensures consistent duplicate detection - the key stays in the set to mark it as "processed"
-              continue;
-            }
+            continue;
+          }
           }
           
           // Note: batchJobKeys.add() was already called above to prevent CSV duplicates
@@ -8671,10 +8684,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         try {
           const insertResult = await retrySupabaseOperation(async () => {
             return await supabase
-              .from('jobs')
-              .insert(jobData)
-              .select()
-              .single();
+          .from('jobs')
+          .insert(jobData)
+          .select()
+          .single();
           });
           
           newJob = insertResult.data;
@@ -8699,7 +8712,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Check if error is HTML (Cloudflare error page)
           if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
             results.errors.push(`Row ${i + 1}: Database connection error (Cloudflare timeout) - please try importing this job again`);
-          } else {
+        } else {
             results.errors.push(`Row ${i + 1}: ${errorMessage}`);
           }
           results.skipped++;
@@ -27409,7 +27422,7 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
         finalAddress = parts[0];
       }
     }
-
+    
     // Validate required fields - RentCast needs address, city, state
     if (!finalAddress || !finalCity || !finalState) {
       console.log('⚠️ Missing required address components:', { 
@@ -27418,7 +27431,7 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       });
       return res.json(null);
     }
-
+    
     const rentcastApiKey = process.env.RENTCAST_API_KEY;
     const rentcastBaseUrl = process.env.RENTCAST_API_BASE_URL || 'https://api.rentcast.io';
 
@@ -27494,10 +27507,10 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
         }
       } catch (rentError) {
         console.log('⚠️ Could not fetch rent estimate:', rentError.message);
-      }
-
-      // Map RentCast data to our expected format
-      const formattedData = {
+        }
+        
+        // Map RentCast data to our expected format
+        const formattedData = {
         zpid: property.id || null,
         address: property.formattedAddress || property.address || `${address}, ${city}, ${state} ${zipCode || ''}`.trim(),
         bedrooms: property.bedrooms || null,
@@ -27518,11 +27531,11 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
         lotSizeAcres: property.lotSizeAcres || null,
         stories: property.stories || null,
         units: property.units || null
-      };
-
-      console.log('✅ Property data formatted successfully');
-      return res.json(formattedData);
-
+        };
+        
+        console.log('✅ Property data formatted successfully');
+        return res.json(formattedData);
+      
     } catch (apiError) {
       console.error('❌ RentCast API error:', apiError.response?.status, apiError.response?.statusText);
       
@@ -27534,7 +27547,7 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
       console.error('⚠️ RentCast API request failed, returning null');
       return res.json(null);
     }
-
+    
   } catch (error) {
     console.error('❌ Property API error:', error);
     return res.json(null);
