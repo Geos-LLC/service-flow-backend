@@ -6965,7 +6965,7 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
 app.post('/api/leads', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { firstName, lastName, email, phone, company, source, notes, value, stageId, pipelineId } = req.body;
+    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId, pipelineId } = req.body;
     
     // Get default pipeline if not provided
     let finalPipelineId = pipelineId;
@@ -7017,6 +7017,7 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
         email: email || null,
         phone: phone || null,
         company: company || null,
+        address: address || null,
         source: source || null,
         notes: notes || null,
         value: leadValue
@@ -7030,7 +7031,22 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
     
     if (error) {
       console.error('Error creating lead:', error);
-      return res.status(500).json({ error: 'Failed to create lead' });
+      console.error('Error details:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      
+      // If error is about missing column, provide helpful message
+      if (error.message?.includes('address') || error.message?.includes('column')) {
+        return res.status(500).json({ 
+          error: 'Database schema issue: address column may be missing. Please run the migration: add-leads-address-column.sql',
+          details: error.message
+        });
+      }
+      
+      return res.status(500).json({ error: 'Failed to create lead', details: error.message });
     }
     
     res.status(201).json(lead);
@@ -7045,7 +7061,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { firstName, lastName, email, phone, company, source, notes, value, stageId } = req.body;
+    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId } = req.body;
     
     // Verify ownership
     const { data: existingLead, error: checkError } = await supabase
@@ -7070,6 +7086,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     if (email !== undefined) updateData.email = email || null;
     if (phone !== undefined) updateData.phone = phone || null;
     if (company !== undefined) updateData.company = company || null;
+    if (address !== undefined) updateData.address = address || null;
     if (source !== undefined) updateData.source = source || null;
     if (notes !== undefined) updateData.notes = notes || null;
     if (value !== undefined) updateData.value = leadValue;
@@ -7088,7 +7105,22 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     
     if (error) {
       console.error('Error updating lead:', error);
-      return res.status(500).json({ error: 'Failed to update lead' });
+      console.error('Error details:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      
+      // If error is about missing column, provide helpful message
+      if (error.message?.includes('address') || error.message?.includes('column')) {
+        return res.status(500).json({ 
+          error: 'Database schema issue: address column may be missing. Please run the migration: add-leads-address-column.sql',
+          details: error.message
+        });
+      }
+      
+      return res.status(500).json({ error: 'Failed to update lead', details: error.message });
     }
     
     res.json(lead);
