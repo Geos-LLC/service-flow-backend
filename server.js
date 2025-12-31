@@ -2044,8 +2044,51 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
 // Services endpoints
 app.get('/api/services', async (req, res) => {
   try {
-    const { userId, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC', includeInactive } = req.query;
+    const { userId: queryUserId, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC', includeInactive } = req.query;
     
+    // Determine the actual userId to use
+    let userId = queryUserId;
+    
+    // If userId not provided in query, try to get it from token
+    if (!userId) {
+      const authHeader = req.headers['authorization'];
+      const token = authHeader && authHeader.split(' ')[1];
+      
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userId = decoded.userId || decoded.id;
+          console.log('🔧 Using userId from token:', userId);
+        } catch (tokenError) {
+          console.log('❌ Token verification failed, userId required');
+          return res.status(400).json({ error: 'userId is required' });
+        }
+      } else {
+        return res.status(400).json({ error: 'userId is required' });
+      }
+    }
+    
+    // If userId is provided in query, verify it matches the authenticated user (if token exists)
+    if (userId && queryUserId) {
+      const authHeader = req.headers['authorization'];
+      const token = authHeader && authHeader.split(' ')[1];
+      
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          const tokenUserId = decoded.userId || decoded.id;
+          
+          // Verify that the query userId matches the token userId
+          if (parseInt(queryUserId) !== parseInt(tokenUserId)) {
+            console.log('❌ userId mismatch:', { queryUserId, tokenUserId });
+            return res.status(403).json({ error: 'Access denied: userId mismatch' });
+          }
+        } catch (tokenError) {
+          // If token is invalid but userId was provided, still allow (for backward compatibility)
+          console.log('⚠️ Token verification failed, but userId provided:', queryUserId);
+        }
+      }
+    }
     
     // Build Supabase query
     let query = supabase
@@ -2482,7 +2525,24 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
   try {
-    const { userId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring } = req.query;
+    const { userId: queryUserId, status, search, page = 1, limit = 20, dateRange, dateFilter, sortBy = 'scheduled_date', sortOrder = 'ASC', teamMember, invoiceStatus, customerId, territoryId, recurring } = req.query;
+    
+    // Get userId from token (authenticated user)
+    const tokenUserId = req.user.userId || req.user.id;
+    
+    // Use userId from query if provided, otherwise use token userId
+    // But verify they match if both are provided
+    let userId = queryUserId || tokenUserId;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    
+    // Verify that query userId matches token userId (security check)
+    if (queryUserId && parseInt(queryUserId) !== parseInt(tokenUserId)) {
+      console.log('❌ Jobs API: userId mismatch:', { queryUserId, tokenUserId });
+      return res.status(403).json({ error: 'Access denied: userId mismatch' });
+    }
     
     // Debug logging for team member filter
     if (teamMember) {
@@ -12430,7 +12490,24 @@ app.get('/api/territories', authenticateToken, async (req, res) => {
 
   
   try {
-    const { userId, status, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
+    const { userId: queryUserId, status, search, page = 1, limit = 20, sortBy = 'name', sortOrder = 'ASC' } = req.query;
+    
+    // Get userId from token (authenticated user)
+    const tokenUserId = req.user.userId || req.user.id;
+    
+    // Use userId from query if provided, otherwise use token userId
+    // But verify they match if both are provided
+    let userId = queryUserId || tokenUserId;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    
+    // Verify that query userId matches token userId (security check)
+    if (queryUserId && parseInt(queryUserId) !== parseInt(tokenUserId)) {
+      console.log('❌ Territories API: userId mismatch:', { queryUserId, tokenUserId });
+      return res.status(403).json({ error: 'Access denied: userId mismatch' });
+    }
     
     // Build Supabase query
     let query = supabase
@@ -12830,14 +12907,55 @@ app.post('/api/territories/detect', async (req, res) => {
 // Invoices endpoints
 app.get('/api/invoices', async (req, res) => {
   try {
-    const { userId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId, job_id } = req.query;
+    const { userId: queryUserId, search = '', status = '', page = 1, limit = 10, sortBy = 'created_at', sortOrder = 'DESC', customerId, job_id } = req.query;
     
-    console.log('📋 Invoices API called with params:', { userId, job_id, customerId, status });
+    console.log('📋 Invoices API called with params:', { queryUserId, job_id, customerId, status });
+    
+    // Determine the actual userId to use
+    let userId = queryUserId;
     
     // If job_id is provided, we don't need userId (for public access)
     if (!userId && !job_id) {
-      console.log('❌ No userId or job_id provided');
-      return res.status(400).json({ error: 'userId or job_id is required' });
+      // Try to get userId from authenticated token if available
+      const authHeader = req.headers['authorization'];
+      const token = authHeader && authHeader.split(' ')[1];
+      
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userId = decoded.userId || decoded.id;
+          console.log('📋 Using userId from token:', userId);
+        } catch (tokenError) {
+          console.log('❌ Token verification failed, requiring userId or job_id');
+        }
+      }
+      
+      if (!userId && !job_id) {
+        console.log('❌ No userId or job_id provided');
+        return res.status(400).json({ error: 'userId or job_id is required' });
+      }
+    }
+    
+    // If userId is provided in query, verify it matches the authenticated user (if token exists)
+    if (userId && queryUserId) {
+      const authHeader = req.headers['authorization'];
+      const token = authHeader && authHeader.split(' ')[1];
+      
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          const tokenUserId = decoded.userId || decoded.id;
+          
+          // Verify that the query userId matches the token userId
+          if (parseInt(queryUserId) !== parseInt(tokenUserId)) {
+            console.log('❌ userId mismatch:', { queryUserId, tokenUserId });
+            return res.status(403).json({ error: 'Access denied: userId mismatch' });
+          }
+        } catch (tokenError) {
+          // If token is invalid but userId was provided, still allow (for backward compatibility)
+          console.log('⚠️ Token verification failed, but userId provided:', queryUserId);
+        }
+      }
     }
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -14711,7 +14829,24 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
   // CORS handled by middleware
 
   try {
-    const { userId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
+    const { userId: queryUserId, status, search, page = 1, limit = 20, sortBy = 'first_name', sortOrder = 'ASC' } = req.query;
+    
+    // Get userId from token (authenticated user)
+    const tokenUserId = req.user.userId || req.user.id;
+    
+    // Use userId from query if provided, otherwise use token userId
+    // But verify they match if both are provided
+    let userId = queryUserId || tokenUserId;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+    
+    // Verify that query userId matches token userId (security check)
+    if (queryUserId && parseInt(queryUserId) !== parseInt(tokenUserId)) {
+      console.log('❌ Team members API: userId mismatch:', { queryUserId, tokenUserId });
+      return res.status(403).json({ error: 'Access denied: userId mismatch' });
+    }
     
     // First, get the account owner from users table
     const { data: accountOwner, error: ownerError } = await supabase
