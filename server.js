@@ -7001,28 +7001,26 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       finalStageId = stages.id;
     }
     
-    // Prepare insert data - convert value to number or null
-    const insertData = {
-      user_id: userId,
-      pipeline_id: finalPipelineId,
-      stage_id: finalStageId,
-      first_name: firstName || null,
-      last_name: lastName || null,
-      email: email || null,
-      phone: phone || null,
-      company: company || null,
-      source: source || null,
-      notes: notes || null,
-      value: value !== undefined && value !== null && value !== '' 
-        ? (typeof value === 'string' ? parseFloat(value) || null : value)
-        : null
-    };
-    
-    console.log('📝 Creating lead with data:', insertData);
+    // Convert value to number or null (handle empty strings, undefined, etc.)
+    const leadValue = value !== undefined && value !== null && value !== '' 
+      ? (typeof value === 'number' ? value : parseFloat(value) || null)
+      : null;
     
     const { data: lead, error } = await supabase
       .from('leads')
-      .insert(insertData)
+      .insert({
+        user_id: userId,
+        pipeline_id: finalPipelineId,
+        stage_id: finalStageId,
+        first_name: firstName || null,
+        last_name: lastName || null,
+        email: email || null,
+        phone: phone || null,
+        company: company || null,
+        source: source || null,
+        notes: notes || null,
+        value: leadValue
+      })
       .select(`
         *,
         lead_stages (*),
@@ -7031,17 +7029,8 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       .single();
     
     if (error) {
-      console.error('❌ Error creating lead:', error);
-      console.error('❌ Error details:', {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code
-      });
-      return res.status(500).json({ 
-        error: 'Failed to create lead',
-        details: error.message || 'Database error'
-      });
+      console.error('Error creating lead:', error);
+      return res.status(500).json({ error: 'Failed to create lead' });
     }
     
     res.status(201).json(lead);
@@ -7070,6 +7059,11 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Lead not found' });
     }
     
+    // Convert value to number or null (handle empty strings, undefined, etc.)
+    const leadValue = value !== undefined && value !== null && value !== '' 
+      ? (typeof value === 'number' ? value : parseFloat(value) || null)
+      : (value === '' ? null : value); // If explicitly empty string, set to null
+    
     const updateData = {};
     if (firstName !== undefined) updateData.first_name = firstName || null;
     if (lastName !== undefined) updateData.last_name = lastName || null;
@@ -7078,12 +7072,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     if (company !== undefined) updateData.company = company || null;
     if (source !== undefined) updateData.source = source || null;
     if (notes !== undefined) updateData.notes = notes || null;
-    if (value !== undefined) {
-      // Convert value to number or null (never empty string)
-      updateData.value = value !== null && value !== '' 
-        ? (typeof value === 'string' ? parseFloat(value) || null : value)
-        : null;
-    }
+    if (value !== undefined) updateData.value = leadValue;
     if (stageId !== undefined) updateData.stage_id = stageId;
     
     const { data: lead, error } = await supabase
@@ -12957,9 +12946,9 @@ app.get('/api/invoices', async (req, res) => {
         }
       }
       
-      if (!userId && !job_id) {
-        console.log('❌ No userId or job_id provided');
-        return res.status(400).json({ error: 'userId or job_id is required' });
+    if (!userId && !job_id) {
+      console.log('❌ No userId or job_id provided');
+      return res.status(400).json({ error: 'userId or job_id is required' });
       }
     }
     
