@@ -2530,19 +2530,25 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     // Get userId from token (authenticated user)
     const tokenUserId = req.user.userId || req.user.id;
     
+    console.log('🔍 Jobs API: userId check', { queryUserId, tokenUserId, user: req.user });
+    
     // Use userId from query if provided, otherwise use token userId
     // But verify they match if both are provided
     let userId = queryUserId || tokenUserId;
     
     if (!userId) {
+      console.log('❌ Jobs API: No userId found in query or token');
       return res.status(400).json({ error: 'userId is required' });
     }
     
     // Verify that query userId matches token userId (security check)
-    if (queryUserId && parseInt(queryUserId) !== parseInt(tokenUserId)) {
+    // Only check if both are provided and both are valid
+    if (queryUserId && tokenUserId && parseInt(queryUserId) !== parseInt(tokenUserId)) {
       console.log('❌ Jobs API: userId mismatch:', { queryUserId, tokenUserId });
       return res.status(403).json({ error: 'Access denied: userId mismatch' });
     }
+    
+    console.log('✅ Jobs API: Using userId:', userId);
     
     // Debug logging for team member filter
     if (teamMember) {
