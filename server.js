@@ -7001,21 +7001,28 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       finalStageId = stages.id;
     }
     
+    // Prepare insert data - convert value to number or null
+    const insertData = {
+      user_id: userId,
+      pipeline_id: finalPipelineId,
+      stage_id: finalStageId,
+      first_name: firstName || null,
+      last_name: lastName || null,
+      email: email || null,
+      phone: phone || null,
+      company: company || null,
+      source: source || null,
+      notes: notes || null,
+      value: value !== undefined && value !== null && value !== '' 
+        ? (typeof value === 'string' ? parseFloat(value) || null : value)
+        : null
+    };
+    
+    console.log('📝 Creating lead with data:', insertData);
+    
     const { data: lead, error } = await supabase
       .from('leads')
-      .insert({
-        user_id: userId,
-        pipeline_id: finalPipelineId,
-        stage_id: finalStageId,
-        first_name: firstName,
-        last_name: lastName,
-        email: email,
-        phone: phone,
-        company: company,
-        source: source,
-        notes: notes,
-        value: value
-      })
+      .insert(insertData)
       .select(`
         *,
         lead_stages (*),
@@ -7024,8 +7031,17 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
       .single();
     
     if (error) {
-      console.error('Error creating lead:', error);
-      return res.status(500).json({ error: 'Failed to create lead' });
+      console.error('❌ Error creating lead:', error);
+      console.error('❌ Error details:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code
+      });
+      return res.status(500).json({ 
+        error: 'Failed to create lead',
+        details: error.message || 'Database error'
+      });
     }
     
     res.status(201).json(lead);
@@ -7055,14 +7071,19 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     }
     
     const updateData = {};
-    if (firstName !== undefined) updateData.first_name = firstName;
-    if (lastName !== undefined) updateData.last_name = lastName;
-    if (email !== undefined) updateData.email = email;
-    if (phone !== undefined) updateData.phone = phone;
-    if (company !== undefined) updateData.company = company;
-    if (source !== undefined) updateData.source = source;
-    if (notes !== undefined) updateData.notes = notes;
-    if (value !== undefined) updateData.value = value;
+    if (firstName !== undefined) updateData.first_name = firstName || null;
+    if (lastName !== undefined) updateData.last_name = lastName || null;
+    if (email !== undefined) updateData.email = email || null;
+    if (phone !== undefined) updateData.phone = phone || null;
+    if (company !== undefined) updateData.company = company || null;
+    if (source !== undefined) updateData.source = source || null;
+    if (notes !== undefined) updateData.notes = notes || null;
+    if (value !== undefined) {
+      // Convert value to number or null (never empty string)
+      updateData.value = value !== null && value !== '' 
+        ? (typeof value === 'string' ? parseFloat(value) || null : value)
+        : null;
+    }
     if (stageId !== undefined) updateData.stage_id = stageId;
     
     const { data: lead, error } = await supabase
