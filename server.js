@@ -18386,46 +18386,17 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       // Include jobs from both direct assignment (team_member_id) and job_team_assignments table
       let jobs = [];
       try {
-      // Build the date filter
-      const startDateFilter = startDate || '2024-01-01';
-      const endDateFilter = endDate || '2030-12-31';
+      // Build the date filter - handle date strings properly
+      const startDateFilter = startDate ? String(startDate).split('T')[0] : '2024-01-01';
+      const endDateFilter = endDate ? String(endDate).split('T')[0] : '2030-12-31';
+      
+      console.log(`📊 Dashboard: Fetching jobs for team member ${teamMemberId} from ${startDateFilter} to ${endDateFilter}`);
       
       // Fetch jobs directly assigned via team_member_id
-      const { data: directJobsData, error: directJobsError } = await supabase
-        .from('jobs')
-        .select(`
-          *,
-          customers:customer_id (
-            first_name,
-            last_name,
-            phone,
-            address
-          ),
-          services:service_id (
-            name,
-            duration
-          )
-        `)
-        .eq('team_member_id', teamMemberId)
-        .gte('scheduled_date', startDateFilter)
-        .lte('scheduled_date', endDateFilter)
-        .order('scheduled_date', { ascending: true });
-      
-      // Fetch job IDs from job_team_assignments
-      const { data: assignments, error: assignmentsError } = await supabase
-        .from('job_team_assignments')
-        .select('job_id')
-        .eq('team_member_id', teamMemberId);
-      
-      // Get unique job IDs from assignments
-      const assignmentJobIds = assignments && !assignmentsError 
-        ? [...new Set(assignments.map(a => a.job_id))] 
-        : [];
-      
-      // Fetch jobs from job_team_assignments
-      let assignmentJobsData = [];
-      if (assignmentJobIds.length > 0) {
-        const { data: assignedJobs, error: assignedJobsError } = await supabase
+      let directJobsData = [];
+      let directJobsError = null;
+      try {
+        const directQuery = supabase
           .from('jobs')
           .select(`
             *,
@@ -18440,45 +18411,109 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
               duration
             )
           `)
-          .in('id', assignmentJobIds)
+          .eq('team_member_id', teamMemberId)
           .gte('scheduled_date', startDateFilter)
           .lte('scheduled_date', endDateFilter)
           .order('scheduled_date', { ascending: true });
         
-        if (!assignedJobsError) {
-          assignmentJobsData = assignedJobs || [];
+        const directResult = await directQuery;
+        
+        directJobsData = directResult.data || [];
+        directJobsError = directResult.error;
+        
+        if (directJobsError) {
+          console.warn('⚠️ Warning fetching direct jobs:', directJobsError);
+        }
+      } catch (err) {
+        console.warn('⚠️ Exception fetching direct jobs:', err);
+        directJobsError = err;
+      }
+      
+      // Fetch job IDs from job_team_assignments
+      let assignments = [];
+      let assignmentsError = null;
+      try {
+        const assignmentsResult = await supabase
+          .from('job_team_assignments')
+          .select('job_id')
+          .eq('team_member_id', teamMemberId);
+        
+        assignments = assignmentsResult.data || [];
+        assignmentsError = assignmentsResult.error;
+        
+        if (assignmentsError) {
+          console.warn('⚠️ Warning fetching job assignments:', assignmentsError);
+        }
+      } catch (err) {
+        console.warn('⚠️ Exception fetching job assignments:', err);
+        assignmentsError = err;
+      }
+      
+      // Get unique job IDs from assignments
+      const assignmentJobIds = assignments && !assignmentsError 
+        ? [...new Set(assignments.map(a => a.job_id).filter(id => id != null))] 
+        : [];
+      
+      // Fetch jobs from job_team_assignments
+      let assignmentJobsData = [];
+      if (assignmentJobIds.length > 0) {
+        try {
+          const assignedQuery = supabase
+            .from('jobs')
+            .select(`
+              *,
+              customers:customer_id (
+                first_name,
+                last_name,
+                phone,
+                address
+              ),
+              services:service_id (
+                name,
+                duration
+              )
+            `)
+            .in('id', assignmentJobIds)
+            .gte('scheduled_date', startDateFilter)
+            .lte('scheduled_date', endDateFilter)
+            .order('scheduled_date', { ascending: true });
+          
+          const assignedResult = await assignedQuery;
+          
+          if (!assignedResult.error) {
+            assignmentJobsData = assignedResult.data || [];
+          } else {
+            console.warn('⚠️ Warning fetching assigned jobs:', assignedResult.error);
+          }
+        } catch (err) {
+          console.warn('⚠️ Exception fetching assigned jobs:', err);
         }
       }
       
       // Combine jobs from both sources and remove duplicates
-      const allJobsData = [...(directJobsData || []), ...assignmentJobsData];
+      const allJobsData = [...directJobsData, ...assignmentJobsData];
       const uniqueJobsMap = new Map();
       
       allJobsData.forEach(job => {
-        if (!uniqueJobsMap.has(job.id)) {
+        if (job && job.id && !uniqueJobsMap.has(job.id)) {
           uniqueJobsMap.set(job.id, job);
         }
       });
       
       const allJobs = Array.from(uniqueJobsMap.values());
       
-      if (directJobsError && assignmentsError) {
-        console.error('❌ Error fetching jobs for team member:', directJobsError, assignmentsError);
-        jobs = [];
-      } else {
-        // Transform the data to match frontend expectations
-        jobs = allJobs.map(job => ({
-          ...job,
-          // Flatten customer data
-          customer_first_name: job.customers?.first_name || '',
-          customer_last_name: job.customers?.last_name || '',
-          customer_phone: job.customers?.phone || '',
-          customer_address: job.customers?.address || '',
-          // Flatten service data
-          service_name: job.services?.name || '',
-          duration: job.services?.duration || 60
-        }));
-      }
+      // Transform the data to match frontend expectations
+      jobs = allJobs.map(job => ({
+        ...job,
+        // Flatten customer data
+        customer_first_name: job.customers?.first_name || '',
+        customer_last_name: job.customers?.last_name || '',
+        customer_phone: job.customers?.phone || '',
+        customer_address: job.customers?.address || '',
+        // Flatten service data
+        service_name: job.services?.name || '',
+        duration: job.services?.duration || 60
+      }));
       } catch (jobsError) {
         console.error('❌ Error fetching jobs for team member:', jobsError);
         jobs = [];
@@ -18547,14 +18582,20 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
           hourly_rate: teamMember.hourly_rate,
           availability: teamMember.availability
         },
-        jobs: jobs,
-        stats: stats,
-        notifications: notifications
+        jobs: jobs || [],
+        stats: stats || {
+          totalJobs: 0,
+          todayJobs: 0,
+          completedJobs: 0,
+          avgJobValue: 0
+        },
+        notifications: notifications || []
       };
       
       res.json(response);
   } catch (error) {
     console.error('❌ Team member dashboard error:', error);
+    console.error('❌ Error stack:', error.stack);
     console.error('❌ Error details:', {
       message: error.message,
       stack: error.stack,
