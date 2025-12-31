@@ -18383,13 +18383,15 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       const teamMember = teamMembers[0];
       
     // Get jobs assigned to this team member using Supabase
+      // Include jobs from both direct assignment (team_member_id) and job_team_assignments table
       let jobs = [];
       try {
       // Build the date filter
       const startDateFilter = startDate || '2024-01-01';
       const endDateFilter = endDate || '2030-12-31';
       
-      const { data: jobsData, error: jobsError } = await supabase
+      // Fetch jobs directly assigned via team_member_id
+      const { data: directJobsData, error: directJobsError } = await supabase
         .from('jobs')
         .select(`
           *,
@@ -18409,12 +18411,63 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         .lte('scheduled_date', endDateFilter)
         .order('scheduled_date', { ascending: true });
       
-      if (jobsError) {
-        console.error('❌ Error fetching jobs for team member:', jobsError);
+      // Fetch job IDs from job_team_assignments
+      const { data: assignments, error: assignmentsError } = await supabase
+        .from('job_team_assignments')
+        .select('job_id')
+        .eq('team_member_id', teamMemberId);
+      
+      // Get unique job IDs from assignments
+      const assignmentJobIds = assignments && !assignmentsError 
+        ? [...new Set(assignments.map(a => a.job_id))] 
+        : [];
+      
+      // Fetch jobs from job_team_assignments
+      let assignmentJobsData = [];
+      if (assignmentJobIds.length > 0) {
+        const { data: assignedJobs, error: assignedJobsError } = await supabase
+          .from('jobs')
+          .select(`
+            *,
+            customers:customer_id (
+              first_name,
+              last_name,
+              phone,
+              address
+            ),
+            services:service_id (
+              name,
+              duration
+            )
+          `)
+          .in('id', assignmentJobIds)
+          .gte('scheduled_date', startDateFilter)
+          .lte('scheduled_date', endDateFilter)
+          .order('scheduled_date', { ascending: true });
+        
+        if (!assignedJobsError) {
+          assignmentJobsData = assignedJobs || [];
+        }
+      }
+      
+      // Combine jobs from both sources and remove duplicates
+      const allJobsData = [...(directJobsData || []), ...assignmentJobsData];
+      const uniqueJobsMap = new Map();
+      
+      allJobsData.forEach(job => {
+        if (!uniqueJobsMap.has(job.id)) {
+          uniqueJobsMap.set(job.id, job);
+        }
+      });
+      
+      const allJobs = Array.from(uniqueJobsMap.values());
+      
+      if (directJobsError && assignmentsError) {
+        console.error('❌ Error fetching jobs for team member:', directJobsError, assignmentsError);
         jobs = [];
       } else {
         // Transform the data to match frontend expectations
-        jobs = (jobsData || []).map(job => ({
+        jobs = allJobs.map(job => ({
           ...job,
           // Flatten customer data
           customer_first_name: job.customers?.first_name || '',
@@ -18432,8 +18485,22 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       }
       
       // Calculate stats
-      const todayString = getTodayString();
-    const todayJobs = jobs.filter(job => job.scheduled_date?.split('T')[0] === todayString);
+      const today = new Date();
+      const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      
+      const todayJobs = jobs.filter(job => {
+        if (!job.scheduled_date) return false;
+        // Handle both ISO format (2025-08-20T09:00:00) and space format (2025-08-20 09:00:00)
+        let jobDateString = '';
+        if (job.scheduled_date.includes('T')) {
+          jobDateString = job.scheduled_date.split('T')[0];
+        } else if (job.scheduled_date.includes(' ')) {
+          jobDateString = job.scheduled_date.split(' ')[0];
+        } else {
+          jobDateString = job.scheduled_date;
+        }
+        return jobDateString === todayString;
+      });
       const completedJobs = jobs.filter(job => job.status === 'completed');
       
       const stats = {
