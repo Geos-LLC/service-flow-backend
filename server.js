@@ -21101,38 +21101,57 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
   try {
     const { jobId } = req.params;
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      // Check if job exists and belongs to user
-      const [jobCheck] = await connection.query('SELECT id, user_id FROM jobs WHERE id = ?', [jobId]);
-      if (jobCheck.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
-      }
-      
-      if (jobCheck[0].user_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-      
-      // Get team assignments for this job
-      const [assignments] = await connection.query(`
-        SELECT 
-          jta.*,
-          tm.first_name,
-          tm.last_name,
-          tm.email,
-          tm.phone,
-          tm.role
-        FROM job_team_assignments jta
-        LEFT JOIN team_members tm ON jta.team_member_id = tm.id
-        WHERE jta.job_id = ?
-        ORDER BY jta.is_primary DESC, jta.assigned_at ASC
-      `, [jobId]);
-      
-      res.json({ assignments });
-    } finally {
-      connection.release();
+    // Check if job exists and belongs to user
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+    
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
     }
+    
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Get team assignments for this job with team member details
+    const { data: assignments, error: assignmentsError } = await supabase
+      .from('job_team_assignments')
+      .select(`
+        *,
+        team_members(id, first_name, last_name, email, phone, role)
+      `)
+      .eq('job_id', jobId)
+      .order('is_primary', { ascending: false })
+      .order('assigned_at', { ascending: true });
+    
+    if (assignmentsError) {
+      console.error('Error fetching assignments:', assignmentsError);
+      return res.status(500).json({ error: 'Failed to get team assignments' });
+    }
+    
+    // Format the response to match the expected structure
+    const formattedAssignments = (assignments || []).map(assignment => {
+      const teamMember = assignment.team_members || (Array.isArray(assignment.team_members) ? assignment.team_members[0] : null);
+      return {
+        ...assignment,
+        first_name: teamMember?.first_name,
+        last_name: teamMember?.last_name,
+        email: teamMember?.email,
+        phone: teamMember?.phone,
+        role: teamMember?.role
+      };
+    });
+    
+    res.json({ assignments: formattedAssignments });
   } catch (error) {
     console.error('Get team assignments error:', error);
     res.status(500).json({ error: 'Failed to get team assignments' });
@@ -21147,56 +21166,92 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     const { jobId } = req.params;
     const { teamMemberIds, primaryMemberId } = req.body;
     const userId = req.user.userId;
-    const connection = await pool.getConnection();
     
-    try {
-      // Check if job exists and belongs to user
-      const [jobCheck] = await connection.query('SELECT id, user_id FROM jobs WHERE id = ?', [jobId]);
-      if (jobCheck.length === 0) {
-        return res.status(404).json({ error: 'Job not found' });
-      }
-      
-      if (jobCheck[0].user_id !== userId) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-      
-      // Validate team member IDs
-      if (!Array.isArray(teamMemberIds) || teamMemberIds.length === 0) {
-        return res.status(400).json({ error: 'Team member IDs array is required' });
-      }
-      
-      // Check if all team members exist and belong to user
-      for (const memberId of teamMemberIds) {
-        const [memberCheck] = await connection.query('SELECT id FROM team_members WHERE id = ? AND user_id = ?', [memberId, userId]);
-        if (memberCheck.length === 0) {
-          return res.status(404).json({ error: `Team member ${memberId} not found` });
-        }
-      }
-      
-      // Remove existing assignments for this job
-      await connection.query('DELETE FROM job_team_assignments WHERE job_id = ?', [jobId]);
-      
-      // Create new assignments
-      for (const memberId of teamMemberIds) {
-        const isPrimary = memberId === primaryMemberId || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
-        
-        await connection.query(`
-          INSERT INTO job_team_assignments (job_id, team_member_id, is_primary, assigned_by)
-          VALUES (?, ?, ?, ?)
-        `, [jobId, memberId, isPrimary ? 1 : 0, userId]);
-      }
-      
-      // Update the job with the primary team member (for backward compatibility)
-      const primaryId = primaryMemberId || teamMemberIds[0];
-      await connection.query(
-        'UPDATE jobs SET team_member_id = ? WHERE id = ?',
-        [primaryId, jobId]
-      );
-      
-     res.json({ message: 'Team members assigned successfully' });
-    } finally {
-      connection.release();
+    // Check if job exists and belongs to user
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+    
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
     }
+    
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Validate team member IDs
+    if (!Array.isArray(teamMemberIds) || teamMemberIds.length === 0) {
+      return res.status(400).json({ error: 'Team member IDs array is required' });
+    }
+    
+    // Check if all team members exist and belong to user
+    const { data: memberChecks, error: memberError } = await supabase
+      .from('team_members')
+      .select('id')
+      .in('id', teamMemberIds)
+      .eq('user_id', userId);
+    
+    if (memberError) {
+      console.error('Error checking team members:', memberError);
+      return res.status(500).json({ error: 'Failed to check team members' });
+    }
+    
+    if (!memberChecks || memberChecks.length !== teamMemberIds.length) {
+      return res.status(404).json({ error: 'One or more team members not found' });
+    }
+    
+    // Remove existing assignments for this job
+    const { error: deleteError } = await supabase
+      .from('job_team_assignments')
+      .delete()
+      .eq('job_id', jobId);
+    
+    if (deleteError) {
+      console.error('Error deleting existing assignments:', deleteError);
+      return res.status(500).json({ error: 'Failed to remove existing assignments' });
+    }
+    
+    // Create new assignments
+    const assignments = teamMemberIds.map(memberId => {
+      const isPrimary = memberId === primaryMemberId || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
+      return {
+        job_id: parseInt(jobId),
+        team_member_id: parseInt(memberId),
+        is_primary: isPrimary,
+        assigned_by: userId
+      };
+    });
+    
+    const { error: insertError } = await supabase
+      .from('job_team_assignments')
+      .insert(assignments);
+    
+    if (insertError) {
+      console.error('Error inserting assignments:', insertError);
+      return res.status(500).json({ error: 'Failed to create assignments' });
+    }
+    
+    // Update the job with the primary team member (for backward compatibility)
+    const primaryId = primaryMemberId || teamMemberIds[0];
+    const { error: updateError } = await supabase
+      .from('jobs')
+      .update({ team_member_id: parseInt(primaryId) })
+      .eq('id', jobId);
+    
+    if (updateError) {
+      console.error('Error updating job team_member_id:', updateError);
+      // Don't fail the request if this update fails, it's just for backward compatibility
+    }
+    
+    res.json({ message: 'Team members assigned successfully' });
   } catch (error) {
     console.error('Multiple team assignment error:', error);
     res.status(500).json({ error: 'Failed to assign team members' });
