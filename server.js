@@ -6965,7 +6965,7 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
 app.post('/api/leads', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId, pipelineId } = req.body;
+    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId, pipelineId, serviceId } = req.body;
     
     // Get default pipeline if not provided
     let finalPipelineId = pipelineId;
@@ -7020,7 +7020,8 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
         address: address || null,
         source: source || null,
         notes: notes || null,
-        value: leadValue
+        value: leadValue,
+        service_id: serviceId || null
       })
       .select(`
         *,
@@ -7061,7 +7062,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId } = req.body;
+    const { firstName, lastName, email, phone, company, address, source, notes, value, stageId, serviceId } = req.body;
     
     // Verify ownership
     const { data: existingLead, error: checkError } = await supabase
@@ -7091,6 +7092,7 @@ app.put('/api/leads/:id', authenticateToken, async (req, res) => {
     if (notes !== undefined) updateData.notes = notes || null;
     if (value !== undefined) updateData.value = leadValue;
     if (stageId !== undefined) updateData.stage_id = stageId;
+    if (serviceId !== undefined) updateData.service_id = serviceId || null;
     
     const { data: lead, error } = await supabase
       .from('leads')
