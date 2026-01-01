@@ -7523,6 +7523,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
         last_name: lead.last_name,
         email: lead.email,
         phone: lead.phone,
+        address: lead.address || null, // Include address from lead
         notes: lead.notes || `Converted from lead: ${lead.source || 'Unknown source'}`
       })
       .select()
@@ -21102,7 +21103,7 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
     const { jobId } = req.params;
     const userId = req.user.userId;
     
-    // Check if job exists and belongs to user
+      // Check if job exists and belongs to user
     const { data: jobCheck, error: jobError } = await supabase
       .from('jobs')
       .select('id, user_id')
@@ -21115,13 +21116,13 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
     }
     
     if (!jobCheck || jobCheck.length === 0) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    if (jobCheck[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      
+      if (jobCheck[0].user_id !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
     // Get team assignments for this job with team member details
     const { data: assignments, error: assignmentsError } = await supabase
       .from('job_team_assignments')
@@ -21150,7 +21151,7 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
         role: teamMember?.role
       };
     });
-    
+      
     res.json({ assignments: formattedAssignments });
   } catch (error) {
     console.error('Get team assignments error:', error);
@@ -21167,7 +21168,7 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     const { teamMemberIds, primaryMemberId } = req.body;
     const userId = req.user.userId;
     
-    // Check if job exists and belongs to user
+      // Check if job exists and belongs to user
     const { data: jobCheck, error: jobError } = await supabase
       .from('jobs')
       .select('id, user_id')
@@ -21180,19 +21181,19 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     }
     
     if (!jobCheck || jobCheck.length === 0) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    if (jobCheck[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    // Validate team member IDs
-    if (!Array.isArray(teamMemberIds) || teamMemberIds.length === 0) {
-      return res.status(400).json({ error: 'Team member IDs array is required' });
-    }
-    
-    // Check if all team members exist and belong to user
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      
+      if (jobCheck[0].user_id !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Validate team member IDs
+      if (!Array.isArray(teamMemberIds) || teamMemberIds.length === 0) {
+        return res.status(400).json({ error: 'Team member IDs array is required' });
+      }
+      
+      // Check if all team members exist and belong to user
     const { data: memberChecks, error: memberError } = await supabase
       .from('team_members')
       .select('id')
@@ -21206,9 +21207,9 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     
     if (!memberChecks || memberChecks.length !== teamMemberIds.length) {
       return res.status(404).json({ error: 'One or more team members not found' });
-    }
-    
-    // Remove existing assignments for this job
+      }
+      
+      // Remove existing assignments for this job
     const { error: deleteError } = await supabase
       .from('job_team_assignments')
       .delete()
@@ -21218,10 +21219,10 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
       console.error('Error deleting existing assignments:', deleteError);
       return res.status(500).json({ error: 'Failed to remove existing assignments' });
     }
-    
-    // Create new assignments
+      
+      // Create new assignments
     const assignments = teamMemberIds.map(memberId => {
-      const isPrimary = memberId === primaryMemberId || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
+        const isPrimary = memberId === primaryMemberId || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
       return {
         job_id: parseInt(jobId),
         team_member_id: parseInt(memberId),
@@ -21237,10 +21238,10 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     if (insertError) {
       console.error('Error inserting assignments:', insertError);
       return res.status(500).json({ error: 'Failed to create assignments' });
-    }
-    
-    // Update the job with the primary team member (for backward compatibility)
-    const primaryId = primaryMemberId || teamMemberIds[0];
+      }
+      
+      // Update the job with the primary team member (for backward compatibility)
+      const primaryId = primaryMemberId || teamMemberIds[0];
     const { error: updateError } = await supabase
       .from('jobs')
       .update({ team_member_id: parseInt(primaryId) })
@@ -21250,8 +21251,8 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
       console.error('Error updating job team_member_id:', updateError);
       // Don't fail the request if this update fails, it's just for backward compatibility
     }
-    
-    res.json({ message: 'Team members assigned successfully' });
+      
+     res.json({ message: 'Team members assigned successfully' });
   } catch (error) {
     console.error('Multiple team assignment error:', error);
     res.status(500).json({ error: 'Failed to assign team members' });
