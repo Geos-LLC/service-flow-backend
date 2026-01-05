@@ -2041,6 +2041,164 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete account endpoint
+app.delete('/api/auth/delete-account/:userId', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const authenticatedUserId = req.user.userId;
+
+    // Verify that the user is deleting their own account
+    if (userId !== authenticatedUserId) {
+      return res.status(403).json({ error: 'You can only delete your own account' });
+    }
+
+    console.log(`🗑️ Starting account deletion for user ${userId}`);
+
+    // Delete all user-related data in the correct order (to respect foreign key constraints)
+    
+    // 1. Delete jobs (and related data)
+    const { error: jobsError } = await supabase
+      .from('jobs')
+      .delete()
+      .eq('user_id', userId);
+    if (jobsError) {
+      console.error('Error deleting jobs:', jobsError);
+    } else {
+      console.log('✅ Jobs deleted');
+    }
+
+    // 2. Delete invoices
+    const { error: invoicesError } = await supabase
+      .from('invoices')
+      .delete()
+      .eq('user_id', userId);
+    if (invoicesError) {
+      console.error('Error deleting invoices:', invoicesError);
+    } else {
+      console.log('✅ Invoices deleted');
+    }
+
+    // 3. Delete customers
+    const { error: customersError } = await supabase
+      .from('customers')
+      .delete()
+      .eq('user_id', userId);
+    if (customersError) {
+      console.error('Error deleting customers:', customersError);
+    } else {
+      console.log('✅ Customers deleted');
+    }
+
+    // 4. Delete team members (workers)
+    const { error: teamMembersError } = await supabase
+      .from('team_members')
+      .delete()
+      .eq('user_id', userId);
+    if (teamMembersError) {
+      console.error('Error deleting team members:', teamMembersError);
+    } else {
+      console.log('✅ Team members deleted');
+    }
+
+    // 5. Delete services
+    const { error: servicesError } = await supabase
+      .from('services')
+      .delete()
+      .eq('user_id', userId);
+    if (servicesError) {
+      console.error('Error deleting services:', servicesError);
+    } else {
+      console.log('✅ Services deleted');
+    }
+
+    // 6. Delete territories
+    const { error: territoriesError } = await supabase
+      .from('territories')
+      .delete()
+      .eq('user_id', userId);
+    if (territoriesError) {
+      console.error('Error deleting territories:', territoriesError);
+    } else {
+      console.log('✅ Territories deleted');
+    }
+
+    // 7. Delete recurring bookings
+    const { error: recurringError } = await supabase
+      .from('recurring_bookings')
+      .delete()
+      .eq('user_id', userId);
+    if (recurringError) {
+      console.error('Error deleting recurring bookings:', recurringError);
+    } else {
+      console.log('✅ Recurring bookings deleted');
+    }
+
+    // 8. Delete estimates
+    const { error: estimatesError } = await supabase
+      .from('estimates')
+      .delete()
+      .eq('user_id', userId);
+    if (estimatesError) {
+      console.error('Error deleting estimates:', estimatesError);
+    } else {
+      console.log('✅ Estimates deleted');
+    }
+
+    // 9. Delete coupons
+    const { error: couponsError } = await supabase
+      .from('coupons')
+      .delete()
+      .eq('user_id', userId);
+    if (couponsError) {
+      console.error('Error deleting coupons:', couponsError);
+    } else {
+      console.log('✅ Coupons deleted');
+    }
+
+    // 10. Delete leads and related data
+    const { error: leadsError } = await supabase
+      .from('leads')
+      .delete()
+      .eq('user_id', userId);
+    if (leadsError) {
+      console.error('Error deleting leads:', leadsError);
+    } else {
+      console.log('✅ Leads deleted');
+    }
+
+    // 11. Delete requests
+    const { error: requestsError } = await supabase
+      .from('requests')
+      .delete()
+      .eq('user_id', userId);
+    if (requestsError) {
+      console.error('Error deleting requests:', requestsError);
+    } else {
+      console.log('✅ Requests deleted');
+    }
+
+    // 12. Finally, delete the user account
+    const { error: userError } = await supabase
+      .from('users')
+      .delete()
+      .eq('id', userId);
+    
+    if (userError) {
+      console.error('Error deleting user:', userError);
+      return res.status(500).json({ error: 'Failed to delete user account' });
+    }
+
+    console.log(`✅ Account deletion completed for user ${userId}`);
+    
+    res.json({ 
+      message: 'Account and all associated data deleted successfully' 
+    });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
 // Services endpoints
 app.get('/api/services', async (req, res) => {
   try {
