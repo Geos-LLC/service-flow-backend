@@ -7692,13 +7692,53 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to create customer' });
     }
     
-    // Update lead with converted customer ID
+    // Find the "Won" stage for this user's pipeline
+    let wonStageId = null;
+    try {
+      // Get user's pipeline
+      const { data: pipelines, error: pipelineError } = await supabase
+        .from('lead_pipelines')
+        .select('id')
+        .eq('user_id', userId)
+        .limit(1);
+      
+      if (!pipelineError && pipelines && pipelines.length > 0) {
+        const pipelineId = pipelines[0].id;
+        
+        // Find "Won" stage in this pipeline
+        const { data: wonStage, error: stageError } = await supabase
+          .from('lead_stages')
+          .select('id')
+          .eq('pipeline_id', pipelineId)
+          .ilike('name', 'Won')
+          .limit(1);
+        
+        if (!stageError && wonStage && wonStage.length > 0) {
+          wonStageId = wonStage[0].id;
+          console.log(`Found "Won" stage with ID: ${wonStageId} for pipeline ${pipelineId}`);
+        } else {
+          console.log('No "Won" stage found, lead will remain in current stage');
+        }
+      }
+    } catch (stageLookupError) {
+      console.error('Error looking up "Won" stage:', stageLookupError);
+      // Continue with conversion even if stage lookup fails
+    }
+    
+    // Update lead with converted customer ID and move to "Won" stage if found
+    const updateData = {
+      converted_customer_id: customer.id,
+      converted_at: new Date().toISOString()
+    };
+    
+    // Add stage_id if "Won" stage was found
+    if (wonStageId) {
+      updateData.stage_id = wonStageId;
+    }
+    
     const { error: updateError } = await supabase
       .from('leads')
-      .update({
-        converted_customer_id: customer.id,
-        converted_at: new Date().toISOString()
-      })
+      .update(updateData)
       .eq('id', id);
     
     if (updateError) {
@@ -7712,7 +7752,8 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       lead: {
         ...lead,
         converted_customer_id: customer.id,
-        converted_at: new Date().toISOString()
+        converted_at: new Date().toISOString(),
+        stage_id: wonStageId || lead.stage_id
       }
     });
   } catch (error) {
@@ -8530,13 +8571,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             if (foundByExternalId) {
               // Found duplicate: CSV external ID matches stored external ID
-              // foundByExternalId.id is the internal DB ID (for logging only)
-              console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${foundByExternalId.id} (internal DB ID)`);
-              results.warnings.push(`Row ${i + 1}: Job with external ID "${externalJobId}" already exists in database (skipped)`);
-              results.skipped++;
+              // UPDATE the existing job instead of skipping
+              const existingJobId = foundByExternalId.id;
+              console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${existingJobId} (internal DB ID) - UPDATING existing job`);
+              results.warnings.push(`Row ${i + 1}: Job with external ID "${externalJobId}" already exists - updating with new data`);
+              
+              // We'll update the job after building jobData below
+              // Store the existing job ID for update
+              job.existingJobId = existingJobId;
+              job.isUpdate = true;
+              
               // Add to batch tracking to prevent re-checking
               batchExternalJobIds.add(externalJobId);
-              continue;
+              // Continue to build jobData and then update instead of insert
             }
           }
           
@@ -8658,12 +8705,32 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             });
             
             if (isDuplicate) {
-              console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate}`);
-              results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
-            results.skipped++;
-              // Keep the key in batchJobKeys to prevent re-checking if the same job appears again in the CSV
-              // This ensures consistent duplicate detection - the key stays in the set to mark it as "processed"
-            continue;
+              // Found duplicate by customer + service + date
+              // UPDATE the existing job instead of skipping
+              const existingJob = validExistingJobs.find(j => {
+                if (!j.scheduled_date) return false;
+                const existingDate = j.scheduled_date.toString();
+                const existingDateMatch = existingDate.match(/^(\d{4}-\d{2}-\d{2})/);
+                const existingDateNormalized = existingDateMatch ? existingDateMatch[1] : existingDate;
+                return existingDateNormalized === normalizedDate;
+              });
+              
+              if (existingJob) {
+                console.log(`Row ${i + 1}: DUPLICATE detected in database - Job already exists for user ${userId} ONLY, customer ${customerId}, service ${serviceId || job.serviceName}, date ${normalizedDate} - UPDATING existing job`);
+                results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} - updating with new data`);
+                
+                // Store the existing job ID for update
+                job.existingJobId = existingJob.id;
+                job.isUpdate = true;
+                
+                // Continue to build jobData and then update instead of insert
+              } else {
+                // Should not happen, but handle gracefully
+                console.warn(`Row ${i + 1}: Duplicate detected but couldn't find matching job`);
+                results.warnings.push(`Row ${i + 1}: Job already exists for this customer and service on ${normalizedDate} (skipped)`);
+                results.skipped++;
+                continue;
+              }
           }
           }
           
@@ -8935,7 +9002,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           service_intake_questions: job.serviceIntakeQuestions || null
         };
 
-        console.log(`Row ${i + 1}: Creating job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
+        // Check if this is an update or insert
+        const isUpdate = job.isUpdate && job.existingJobId;
+        
+        if (isUpdate) {
+          console.log(`Row ${i + 1}: UPDATING existing job ${job.existingJobId} with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
+        } else {
+          console.log(`Row ${i + 1}: Creating NEW job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
+        }
         
         // Helper function to retry Supabase operations with exponential backoff
         const retrySupabaseOperation = async (operation, maxRetries = 3, delay = 1000) => {
@@ -8970,19 +9044,81 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         let insertError = null;
         
         try {
-          const insertResult = await retrySupabaseOperation(async () => {
-            return await supabase
-          .from('jobs')
-          .insert(jobData)
-          .select()
-          .single();
-          });
-          
-          newJob = insertResult.data;
-          insertError = insertResult.error;
+          if (isUpdate) {
+            // UPDATE existing job
+            const updateResult = await retrySupabaseOperation(async () => {
+              // Remove user_id from update data (shouldn't change)
+              const { user_id, ...updateData } = jobData;
+              return await supabase
+                .from('jobs')
+                .update(updateData)
+                .eq('id', job.existingJobId)
+                .eq('user_id', userId) // Safety check: ensure job belongs to this user
+                .select()
+                .single();
+            });
+            
+            newJob = updateResult.data;
+            insertError = updateResult.error;
+            
+            if (!insertError && newJob) {
+              console.log(`Row ${i + 1}: ✅ Successfully UPDATED job with ID:`, newJob.id);
+              results.imported++; // Count updates as imported
+              
+              // Update team member assignments - delete old ones and create new ones
+              if (teamMemberIds.length > 0) {
+                console.log(`Row ${i + 1}: Updating team assignments for ${teamMemberIds.length} team member(s): [${teamMemberIds.join(', ')}]`);
+                try {
+                  // Delete existing assignments
+                  await retrySupabaseOperation(async () => {
+                    return await supabase
+                      .from('job_team_assignments')
+                      .delete()
+                      .eq('job_id', newJob.id);
+                  });
+                  
+                  // Create new assignments
+                  const assignments = teamMemberIds.map((memberId, index) => ({
+                    job_id: newJob.id,
+                    team_member_id: memberId,
+                    is_primary: index === 0 || memberId === primaryTeamMemberId,
+                    assigned_by: userId
+                  }));
+                  
+                  const assignmentResult = await retrySupabaseOperation(async () => {
+                    return await supabase
+                      .from('job_team_assignments')
+                      .insert(assignments);
+                  });
+                  
+                  if (assignmentResult.error) {
+                    console.error(`Row ${i + 1}: ❌ Failed to update team assignments:`, assignmentResult.error);
+                    results.warnings.push(`Row ${i + 1}: Could not update team member assignments - ${assignmentResult.error.message}`);
+                  } else {
+                    console.log(`Row ${i + 1}: ✅ Successfully updated team member assignments for job ${newJob.id}`);
+                  }
+                } catch (assignmentError) {
+                  console.error(`Row ${i + 1}: ❌ Error updating team assignments:`, assignmentError);
+                  results.warnings.push(`Row ${i + 1}: Could not update team member assignments`);
+                }
+              }
+            }
+          } else {
+            // INSERT new job
+            const insertResult = await retrySupabaseOperation(async () => {
+              return await supabase
+                .from('jobs')
+                .insert(jobData)
+                .select()
+                .single();
+            });
+            
+            newJob = insertResult.data;
+            insertError = insertResult.error;
+          }
         } catch (error) {
           // Catch any unexpected errors (network, timeout, etc.)
-          console.error(`Row ${i + 1}: Unexpected error during job creation:`, error);
+          console.error(`Row ${i + 1}: Unexpected error during job ${isUpdate ? 'update' : 'creation'}:`, error);
           const errorMessage = error.message || String(error);
           // Check if it's an HTML error response
           if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
@@ -8995,7 +9131,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
 
         if (insertError) {
-          console.error(`Row ${i + 1}: Failed to create job:`, insertError);
+          console.error(`Row ${i + 1}: Failed to ${isUpdate ? 'update' : 'create'} job:`, insertError);
           const errorMessage = insertError.message || String(insertError);
           // Check if error is HTML (Cloudflare error page)
           if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
@@ -9004,7 +9140,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             results.errors.push(`Row ${i + 1}: ${errorMessage}`);
           }
           results.skipped++;
-        } else if (newJob) {
+        } else if (newJob && !isUpdate) {
+          // Only log import success for new jobs (updates are logged above)
           console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
           
