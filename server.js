@@ -7085,6 +7085,56 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
   }
 });
 
+// IMPORTANT: /api/leads/tasks must come BEFORE /api/leads/:id to prevent routing conflicts
+// Get all tasks (not tied to a specific lead)
+app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { status, overdue } = req.query;
+    
+    let query = supabase
+      .from('lead_tasks')
+      .select(`
+        *,
+        leads (
+          id,
+          first_name,
+          last_name,
+          company
+        ),
+        team_members (
+          id,
+          first_name,
+          last_name
+        )
+      `)
+      .eq('user_id', userId);
+    
+    if (status) {
+      query = query.eq('status', status);
+    }
+    
+    if (overdue === 'true') {
+      const now = new Date().toISOString();
+      query = query.lt('due_date', now).neq('status', 'completed');
+    }
+    
+    const { data: tasks, error } = await query
+      .order('due_date', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching tasks:', error);
+      return res.status(500).json({ error: 'Failed to fetch tasks' });
+    }
+    
+    res.json({ tasks: tasks || [] });
+  } catch (error) {
+    console.error('Get all tasks error:', error);
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
+});
+
 // Get a single lead
 app.get('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
@@ -7420,54 +7470,9 @@ app.get('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Get all tasks for a user (across all leads)
-app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { status, overdue } = req.query;
-    
-    let query = supabase
-      .from('lead_tasks')
-      .select(`
-        *,
-        leads (
-          id,
-          first_name,
-          last_name,
-          company
-        ),
-        team_members (
-          id,
-          first_name,
-          last_name
-        )
-      `)
-      .eq('user_id', userId);
-    
-    if (status) {
-      query = query.eq('status', status);
-    }
-    
-    if (overdue === 'true') {
-      const now = new Date().toISOString();
-      query = query.lt('due_date', now).neq('status', 'completed');
-    }
-    
-    const { data: tasks, error } = await query
-      .order('due_date', { ascending: true, nullsFirst: true })
-      .order('created_at', { ascending: false });
-    
-    if (error) {
-      console.error('Error fetching tasks:', error);
-      return res.status(500).json({ error: 'Failed to fetch tasks' });
-    }
-    
-    res.json({ tasks: tasks || [] });
-  } catch (error) {
-    console.error('Get all tasks error:', error);
-    res.status(500).json({ error: 'Failed to fetch tasks' });
-  }
-});
+// NOTE: /api/leads/tasks route has been moved above (before /api/leads/:id at line ~7090) to fix routing conflict
+// This prevents /api/leads/tasks from being matched by /api/leads/:id route
+// The route definition is now at line ~7088, before the /api/leads/:id route
 
 // Create a new task for a lead
 app.post('/api/leads/:leadId/tasks', authenticateToken, async (req, res) => {
