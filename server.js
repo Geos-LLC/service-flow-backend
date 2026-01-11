@@ -8549,24 +8549,30 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
           // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
           // We store external IDs in contact_info JSONB field as { external_id: "..." }
-          // Query all jobs with contact_info and check JSONB field for external_id match
-          const { data: jobsWithContactInfo, error: externalIdError } = await supabase
+          // Query ALL jobs for this user (not just those with contact_info) to catch all cases
+          const { data: allUserJobs, error: externalIdError } = await supabase
             .from('jobs')
             .select('id, user_id, contact_info')
-            .eq('user_id', userId)
-            .not('contact_info', 'is', null);
+            .eq('user_id', userId);
           
-          if (!externalIdError && jobsWithContactInfo && jobsWithContactInfo.length > 0) {
+          if (!externalIdError && allUserJobs && allUserJobs.length > 0) {
+            // Normalize external ID for comparison (convert to string, trim whitespace)
+            const normalizedExternalJobId = String(externalJobId).trim();
+            
             // Check if any job has this external ID in contact_info
             // Compare CSV external ID with stored external ID (NOT internal DB ID)
-            const foundByExternalId = jobsWithContactInfo.find(existingJob => {
+            const foundByExternalId = allUserJobs.find(existingJob => {
               if (existingJob.user_id !== userId) return false; // Safety check
               try {
                 const contactInfo = existingJob.contact_info;
                 if (contactInfo && typeof contactInfo === 'object') {
                   // Compare CSV external ID with stored external ID
+                  // Check multiple possible field names and normalize for comparison
                   const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
-                  return storedExternalId === externalJobId; // String comparison
+                  if (storedExternalId) {
+                    const normalizedStoredId = String(storedExternalId).trim();
+                    return normalizedStoredId === normalizedExternalJobId; // Normalized string comparison
+                  }
                 }
                 return false;
               } catch (e) {
