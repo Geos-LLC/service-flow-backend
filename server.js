@@ -8535,13 +8535,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // First, check if this job has an external ID (jobId from source system)
         // IMPORTANT: service_order_custom_service_order is the primary identifier for duplicate detection
         // Also check _id field as it may contain the original job ID
-        const externalJobId = job.jobId || job.service_order_custom_service_order || job._id || job.id || job.externalId || job.external_id || null;
+        // We need to check BOTH values because they can be different
+        const serviceOrderId = job.jobId || job.service_order_custom_service_order || null;
+        const originalId = job._id || null;
+        const externalJobId = serviceOrderId || originalId || job.id || job.externalId || job.external_id || null;
+        
+        // Collect all possible IDs for duplicate checking
+        const allPossibleIds = [];
+        if (serviceOrderId) allPossibleIds.push(String(serviceOrderId).trim());
+        if (originalId) allPossibleIds.push(String(originalId).trim());
         
         if (externalJobId) {
-          // Check if we've already seen this external ID in the current import batch
-          if (batchExternalJobIds.has(externalJobId)) {
-            console.log(`Row ${i + 1}: DUPLICATE in CSV by external ID - Job ID "${externalJobId}" already being imported in this batch`);
-            results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - job ID "${externalJobId}" already exists in this import`);
+          // Check if we've already seen any of these IDs in the current import batch
+          const foundInBatch = allPossibleIds.some(id => batchExternalJobIds.has(id));
+          if (foundInBatch) {
+            const matchedId = allPossibleIds.find(id => batchExternalJobIds.has(id));
+            console.log(`Row ${i + 1}: DUPLICATE in CSV by external ID - Job ID "${matchedId}" already being imported in this batch`);
+            results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - job ID "${matchedId}" already exists in this import`);
             results.skipped++;
             continue;
           }
@@ -8549,7 +8559,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Check if this external ID already exists in the database
           // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
           // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
-          // We store external IDs in contact_info JSONB field as { external_id: "..." }
+          // We store external IDs in contact_info JSONB field as { external_id: "...", _id: "..." }
           // Query ALL jobs for this user (not just those with contact_info) to catch all cases
           const { data: allUserJobs, error: externalIdError } = await supabase
             .from('jobs')
@@ -8557,23 +8567,28 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             .eq('user_id', userId);
           
           if (!externalIdError && allUserJobs && allUserJobs.length > 0) {
-            // Normalize external ID for comparison (convert to string, trim whitespace)
-            const normalizedExternalJobId = String(externalJobId).trim();
+            // Normalize all possible IDs for comparison
+            const normalizedIds = allPossibleIds.map(id => String(id).trim()).filter(id => id);
             
-            // Check if any job has this external ID in contact_info
-            // Compare CSV external ID with stored external ID (NOT internal DB ID)
+            // Check if any job has ANY of these external IDs in contact_info
+            // Compare CSV external IDs with stored external IDs (NOT internal DB ID)
             const foundByExternalId = allUserJobs.find(existingJob => {
               if (existingJob.user_id !== userId) return false; // Safety check
               try {
                 const contactInfo = existingJob.contact_info;
                 if (contactInfo && typeof contactInfo === 'object') {
-                  // Compare CSV external ID with stored external ID
-                  // Check multiple possible field names and normalize for comparison
-                  // Also check _id field as it may contain the original job ID
-                  const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId || contactInfo._id;
-                  if (storedExternalId) {
-                    const normalizedStoredId = String(storedExternalId).trim();
-                    return normalizedStoredId === normalizedExternalJobId; // Normalized string comparison
+                  // Get all stored IDs from contact_info
+                  const storedServiceOrderId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId || contactInfo.service_order_custom_service_order;
+                  const storedOriginalId = contactInfo._id;
+                  
+                  // Check if ANY of the CSV IDs match ANY of the stored IDs
+                  for (const csvId of normalizedIds) {
+                    if (storedServiceOrderId && String(storedServiceOrderId).trim() === csvId) {
+                      return true;
+                    }
+                    if (storedOriginalId && String(storedOriginalId).trim() === csvId) {
+                      return true;
+                    }
                   }
                 }
                 return false;
@@ -8586,23 +8601,35 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Found duplicate: CSV external ID matches stored external ID
               // UPDATE the existing job instead of skipping
               const existingJobId = foundByExternalId.id;
-              console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${existingJobId} (internal DB ID) - UPDATING existing job`);
-              results.warnings.push(`Row ${i + 1}: Job with external ID "${externalJobId}" already exists - updating with new data`);
+              const matchedId = normalizedIds.find(id => {
+                const contactInfo = foundByExternalId.contact_info;
+                if (contactInfo && typeof contactInfo === 'object') {
+                  const storedServiceOrderId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId || contactInfo.service_order_custom_service_order;
+                  const storedOriginalId = contactInfo._id;
+                  return (storedServiceOrderId && String(storedServiceOrderId).trim() === id) ||
+                         (storedOriginalId && String(storedOriginalId).trim() === id);
+                }
+                return false;
+              }) || externalJobId;
+              console.log(`Row ${i + 1}: DUPLICATE detected - CSV ID "${matchedId}" matches stored ID in database job ${existingJobId} (internal DB ID) - UPDATING existing job`);
+              results.warnings.push(`Row ${i + 1}: Job with ID "${matchedId}" already exists - updating with new data`);
               
               // We'll update the job after building jobData below
               // Store the existing job ID for update
               job.existingJobId = existingJobId;
               job.isUpdate = true;
               
-              // Add to batch tracking to prevent re-checking
-              batchExternalJobIds.add(externalJobId);
+              // Add all IDs to batch tracking to prevent re-checking
+              allPossibleIds.forEach(id => batchExternalJobIds.add(id));
               // Continue to build jobData and then update instead of insert
             }
           }
           
-          // Add to batch tracking immediately to prevent duplicates in the same CSV
-          batchExternalJobIds.add(externalJobId);
-          console.log(`Row ${i + 1}: Tracking external job ID: ${externalJobId}`);
+          // Add all IDs to batch tracking immediately to prevent duplicates in the same CSV
+          allPossibleIds.forEach(id => {
+            batchExternalJobIds.add(id);
+            console.log(`Row ${i + 1}: Tracking external job ID: ${id}`);
+          });
           
           // CRITICAL: If we have an external ID, SKIP the fallback duplicate check (customer + service + date)
           // The external ID is the definitive identifier - different external IDs = different jobs
@@ -8804,10 +8831,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
             
             // Add external_id to contact_info if we have one
-            // Store it as both external_id and _id for compatibility
-            if (externalJobId) {
-              parsedContactInfo.external_id = externalJobId;
-              parsedContactInfo._id = externalJobId; // Also store as _id for duplicate detection
+            // Store both service_order_custom_service_order and _id separately if they exist
+            // This ensures we can match duplicates by either ID
+            const serviceOrderId = job.jobId || job.service_order_custom_service_order || null;
+            const originalId = job._id || null;
+            
+            if (serviceOrderId) {
+              parsedContactInfo.external_id = serviceOrderId;
+              parsedContactInfo.service_order_custom_service_order = serviceOrderId;
+            }
+            if (originalId) {
+              parsedContactInfo._id = originalId; // Store _id separately as it's the original unique identifier
+            }
+            // If we only have one ID, store it in both places for backward compatibility
+            if (serviceOrderId && !originalId) {
+              parsedContactInfo._id = serviceOrderId;
+            } else if (originalId && !serviceOrderId) {
+              parsedContactInfo.external_id = originalId;
             }
             
             // Return null if empty, otherwise return the object
