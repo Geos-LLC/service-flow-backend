@@ -8534,7 +8534,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         
         // First, check if this job has an external ID (jobId from source system)
         // IMPORTANT: service_order_custom_service_order is the primary identifier for duplicate detection
-        const externalJobId = job.jobId || job.service_order_custom_service_order || job.id || job.externalId || job.external_id || null;
+        // Also check _id field as it may contain the original job ID
+        const externalJobId = job.jobId || job.service_order_custom_service_order || job._id || job.id || job.externalId || job.external_id || null;
         
         if (externalJobId) {
           // Check if we've already seen this external ID in the current import batch
@@ -8568,7 +8569,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 if (contactInfo && typeof contactInfo === 'object') {
                   // Compare CSV external ID with stored external ID
                   // Check multiple possible field names and normalize for comparison
-                  const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
+                  // Also check _id field as it may contain the original job ID
+                  const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId || contactInfo._id;
                   if (storedExternalId) {
                     const normalizedStoredId = String(storedExternalId).trim();
                     return normalizedStoredId === normalizedExternalJobId; // Normalized string comparison
@@ -8785,8 +8787,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           contact_info: (() => {
             // Store external job ID in contact_info for duplicate detection
             // IMPORTANT: service_order_custom_service_order is the primary identifier
+            // Also check _id field as it may contain the original job ID
             const contactInfo = job.contactInfo || {};
-            const externalJobId = job.jobId || job.service_order_custom_service_order || job.id || job.externalId || job.external_id || null;
+            const externalJobId = job.jobId || job.service_order_custom_service_order || job._id || job.id || job.externalId || job.external_id || null;
             
             // If contactInfo is a string, try to parse it as JSON
             let parsedContactInfo = {};
@@ -8801,8 +8804,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
             
             // Add external_id to contact_info if we have one
+            // Store it as both external_id and _id for compatibility
             if (externalJobId) {
               parsedContactInfo.external_id = externalJobId;
+              parsedContactInfo._id = externalJobId; // Also store as _id for duplicate detection
             }
             
             // Return null if empty, otherwise return the object
