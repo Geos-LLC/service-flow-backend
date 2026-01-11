@@ -8594,11 +8594,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           console.log(`Row ${i + 1}: Tracking job _id: ${normalizedJobId}`);
         }
         
-        // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no external ID was found)
+        // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no _id was found)
         // This is a fallback for jobs imported before contact_info was implemented
-        // IMPORTANT: Only use this check if we DON'T have an external ID, because external IDs are the definitive identifier
-        // If we have an external ID but didn't find a match, it means it's a new job (not a duplicate)
-        if (!job.isUpdate && !externalJobId && job.scheduledDate && customerId) {
+        // IMPORTANT: Only use this check if we DON'T have a _id, because _id is the definitive identifier
+        // If we have a _id but didn't find a match, it means it's a new job (not a duplicate)
+        if (!job.isUpdate && !jobId && job.scheduledDate && customerId) {
           // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no external ID)
         // Only check for duplicates if we have all required fields
         // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
