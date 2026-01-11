@@ -8630,12 +8630,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             batchExternalJobIds.add(id);
             console.log(`Row ${i + 1}: Tracking external job ID: ${id}`);
           });
-          
-          // CRITICAL: If we have an external ID, SKIP the fallback duplicate check (customer + service + date)
-          // The external ID is the definitive identifier - different external IDs = different jobs
-          // even if they have the same customer, service, and date
-          // This prevents legitimate jobs from being flagged as duplicates
-        } else {
+        }
+        
+        // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (fallback if no ID match found)
+        // This is CRITICAL for jobs imported before contact_info was implemented or if contact_info wasn't saved
+        // Only run this check if we haven't already found a duplicate by ID
+        if (!job.isUpdate && job.scheduledDate && customerId) {
           // PRIORITY 2: Check for duplicates by customer, service, and scheduled date (ONLY if no external ID)
         // Only check for duplicates if we have all required fields
         // IMPORTANT: We check service_id/service_name to prevent recurring jobs with different dates
