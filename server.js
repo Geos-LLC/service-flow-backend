@@ -7932,10 +7932,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     }
 
     const results = {
-      imported: 0,
+      imported: 0, // New jobs created
+      updated: 0,  // Existing jobs updated
       skipped: 0,
       errors: [],
-      warnings: [] // Track duplicate warnings separately from errors
+      warnings: [] // Track update warnings separately
     };
 
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
@@ -8943,7 +8944,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             if (!insertError && newJob) {
               console.log(`Row ${i + 1}: ✅ Successfully UPDATED job with ID:`, newJob.id);
-              results.imported++; // Count updates as imported
+              results.updated++; // Count updates separately
               
               // Update team member assignments - delete old ones and create new ones
               if (teamMemberIds.length > 0) {
