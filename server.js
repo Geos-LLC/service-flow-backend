@@ -7941,9 +7941,6 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
     console.log(`🔒 IMPORTANT: All duplicate checks will ONLY look at jobs belonging to user ${userId} - jobs from other users are completely separate`);
     
-    // Track jobs being imported in this batch to detect duplicates within the CSV
-    const batchJobKeys = new Set(); // Format: "userId_customerId_serviceId_date" or "userId_customerId_serviceName_date"
-    
     // Track external job IDs to detect duplicates by external ID (highest priority)
     // Format: { externalJobId: true } - tracks if we've seen this external ID in this batch
     const batchExternalJobIds = new Set(); // Tracks external job IDs in current import batch
@@ -8668,7 +8665,16 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               }
             }
             
-            // Return null if empty, otherwise return the object
+            // RISK #1 FIX: ALWAYS store _id, never return null if jobId exists
+            // This guarantees _id is stored even if contact_info would otherwise be empty
+            // This prevents partial imports from losing _id tracking
+            if (jobId) {
+              parsedContactInfo._id = String(jobId).trim();
+              // ALWAYS return the object if _id exists (never null, even if empty otherwise)
+              return parsedContactInfo;
+            }
+            
+            // Only return null if we have no _id and no other contact info
             return Object.keys(parsedContactInfo).length > 0 ? parsedContactInfo : null;
           })(),
           customer_notes: job.customerNotes || null,
@@ -9019,6 +9025,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
           results.imported++;
           
+          // RISK #3 FIX: Add new job to existingJobIdMap immediately after successful insert
+          // This prevents duplicates within the same CSV if the same _id appears later
+          if (jobId) {
+            const normalizedJobId = String(jobId).trim();
+            existingJobIdMap.set(normalizedJobId, newJob.id);
+            console.log(`Row ${i + 1}: Added job _id "${normalizedJobId}" to duplicate detection map (job ID: ${newJob.id})`);
+          }
+          
           // Create team member assignments in job_team_assignments table for multiple team members
           // IMPORTANT: This must run for ALL team members, including existing ones
           if (teamMemberIds.length > 0) {
@@ -9070,8 +9084,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             console.log(`Row ${i + 1}: ⚠️ No team members to assign - teamMemberIds array is empty`);
           }
           
-          // Note: batchJobKeys.add() was already called earlier to prevent CSV duplicates
-          // No need to add again here - it's already tracked
+          // Duplicate detection is handled by _id checking above
         }
       } catch (error) {
         results.errors.push(`Row ${i + 1}: ${error.message}`);
