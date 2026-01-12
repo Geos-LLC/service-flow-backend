@@ -8032,13 +8032,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           let customer = null;
           let customerFound = false;
           
-          // First, try to find by email if provided
+          // First, try to find by email if provided (exact match required)
           if (job.customerEmail && job.customerEmail.trim()) {
+            const normalizedEmail = job.customerEmail.toLowerCase().trim();
             const { data: foundCustomer, error: emailError } = await supabase
               .from('customers')
-              .select('id')
+              .select('id, email')
               .eq('user_id', userId)
-              .eq('email', job.customerEmail.toLowerCase().trim())
+              .eq('email', normalizedEmail)
               .maybeSingle();
             
             if (emailError) {
@@ -8046,32 +8047,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             } else if (foundCustomer) {
               customer = foundCustomer;
               customerFound = true;
-              console.log(`Row ${i + 1}: Found customer by email:`, foundCustomer.id);
+              console.log(`Row ${i + 1}: ✅ Found customer by email (exact match): ${foundCustomer.id}, Email: "${foundCustomer.email}"`);
+            } else {
+              console.log(`Row ${i + 1}: ❌ No customer match found for email: "${normalizedEmail}"`);
             }
           }
           
-          // If not found by email, try to find by phone first (more reliable)
-          if (!customerFound && job.customerPhone) {
-            const phoneDigits = job.customerPhone.replace(/\D/g, '');
-            if (phoneDigits.length >= 10) {
-              // Try to match by phone - use ilike for partial matches
-              const { data: phoneMatches, error: phoneError } = await supabase
-                .from('customers')
-                .select('id')
-                .eq('user_id', userId)
-                .ilike('phone', `%${phoneDigits.slice(-10)}%`);
-              
-              if (phoneError) {
-                console.error(`Row ${i + 1}: Error searching customer by phone:`, phoneError);
-              } else if (phoneMatches && phoneMatches.length > 0) {
-                customer = phoneMatches[0]; // Take first match
-                customerFound = true;
-                console.log(`Row ${i + 1}: Found customer by phone:`, customer.id);
-              }
-            }
-          }
-          
-          // If not found by email or phone, try to find by name
+          // If not found by email, try to find by name
           if (!customerFound && job.customerName) {
             // Parse customer name into first and last name
             // Normalize whitespace: trim and collapse multiple spaces
