@@ -6506,17 +6506,21 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
       let hasMore = true;
       
       // First, get the total count
-      const countQuery = supabase
+      let countQuery = supabase
         .from('customers')
         .select('*', { count: 'exact', head: true })
         .eq('user_id', userId);
       
+      // Apply status filter - exclude archived customers by default (same as main query)
       if (status && status !== 'all') {
-        countQuery.eq('status', status);
+        countQuery = countQuery.eq('status', status);
+      } else {
+        // Exclude archived customers by default (same as main query)
+        countQuery = countQuery.or('status.is.null,status.neq.archived');
       }
       
       if (search) {
-        countQuery.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+        countQuery = countQuery.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
       }
       
       const { count } = await countQuery;
@@ -6531,9 +6535,12 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
           .eq('user_id', userId)
           .range(offset, offset + pageSize - 1);
         
-        // Apply filters
+        // Apply filters - must match the main query logic
         if (status && status !== 'all') {
           batchQuery = batchQuery.eq('status', status);
+        } else {
+          // Exclude archived customers by default (same as main query)
+          batchQuery = batchQuery.or('status.is.null,status.neq.archived');
         }
         
         if (search) {
@@ -7993,7 +8000,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       try {
         // Log every 10th job for debugging, and always log date for troubleshooting
         if (i === 0 || (i + 1) % 10 === 0) {
-          console.log(`📥 Processing job ${i + 1}/${jobs.length}:`, job.customerName, job.serviceName, `Date: ${job.scheduledDate || 'N/A'}`);
+          console.log(`📥 Processing job ${i + 1}/${jobs.length}: Customer="${job.customerName || 'N/A'}", Email="${job.customerEmail || 'N/A'}", Phone="${job.customerPhone || 'N/A'}", Service="${job.serviceName || 'N/A'}", Date: ${job.scheduledDate || 'N/A'}`);
+        }
+        
+        // Always log customer data for first 5 jobs to debug customer matching
+        if (i < 5) {
+          console.log(`🔍 Row ${i + 1}: Customer data - Name: "${job.customerName || 'MISSING'}", Email: "${job.customerEmail || 'MISSING'}", Phone: "${job.customerPhone || 'MISSING'}"`);
         }
         
         // Debug: Log invoice_fully_paid_boolean field for first few jobs
@@ -8078,25 +8090,37 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               
               if (!nameError && allCustomers && allCustomers.length > 0) {
                 // Find customer by comparing normalized names (trim and collapse whitespace)
+                // IMPORTANT: Handle apostrophes and special characters properly
                 const foundCustomer = allCustomers.find(c => {
                   const dbFirstName = (c.first_name || '').trim().replace(/\s+/g, ' ');
                   const dbLastName = (c.last_name || '').trim().replace(/\s+/g, ' ');
                   
-                  // Match first name (case-insensitive)
-                  const firstNameMatch = dbFirstName.toLowerCase() === firstName.toLowerCase();
+                  // Normalize apostrophes and quotes for comparison (handle different quote styles)
+                  const normalizeForComparison = (str) => {
+                    return str.toLowerCase()
+                      .replace(/[''`]/g, "'") // Normalize all apostrophe/quote variants to standard apostrophe
+                      .trim();
+                  };
                   
-                  // Match last name if provided (case-insensitive, or both empty)
+                  // Match first name (case-insensitive, apostrophe-normalized)
+                  const firstNameMatch = normalizeForComparison(dbFirstName) === normalizeForComparison(firstName);
+                  
+                  // Match last name if provided (case-insensitive, apostrophe-normalized, or both empty)
                   const lastNameMatch = !lastName || !dbLastName 
                     ? (!lastName && !dbLastName) // Both empty
-                    : dbLastName.toLowerCase() === lastName.toLowerCase();
+                    : normalizeForComparison(dbLastName) === normalizeForComparison(lastName);
                   
                   return firstNameMatch && lastNameMatch;
                 });
                 
                 if (foundCustomer) {
                   customer = { id: foundCustomer.id };
-                customerFound = true;
-                  console.log(`Row ${i + 1}: Found customer by name (whitespace-normalized):`, customer.id);
+                  customerFound = true;
+                  const foundFirstName = (foundCustomer.first_name || '').trim();
+                  const foundLastName = (foundCustomer.last_name || '').trim();
+                  console.log(`Row ${i + 1}: ✅ Found customer by name: "${foundFirstName} ${foundLastName}" (ID: ${customer.id})`);
+                } else {
+                  console.log(`Row ${i + 1}: ❌ No customer match found for name: "${firstName} ${lastName}"`);
                 }
               } else if (nameError) {
                 console.error(`Row ${i + 1}: Error searching customer by name:`, nameError);
@@ -8138,9 +8162,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
             
             customerId = createdCustomer.id;
-            console.log(`Row ${i + 1}: Created new customer with ID:`, customerId);
+            console.log(`Row ${i + 1}: ✅ Created new customer with ID: ${customerId}, Name: "${firstName} ${lastName}"`);
           } else {
             customerId = customer.id;
+            console.log(`Row ${i + 1}: ✅ Found existing customer with ID: ${customerId}`);
           }
         }
         
