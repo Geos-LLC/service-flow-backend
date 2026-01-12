@@ -7948,6 +7948,41 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     // Format: { externalJobId: true } - tracks if we've seen this external ID in this batch
     const batchExternalJobIds = new Set(); // Tracks external job IDs in current import batch
     
+    // STEP 1: Load ALL existing _ids ONCE before the loop (prevents Supabase 1000 row limit issue)
+    console.log(`📥 Loading existing jobs for user ${userId} to build duplicate detection map...`);
+    const { data: existingJobs, error: existingJobsError } = await supabase
+      .from('jobs')
+      .select('id, contact_info')
+      .eq('user_id', userId);
+    
+    if (existingJobsError) {
+      console.error('❌ Error loading existing jobs:', existingJobsError);
+      return res.status(500).json({ error: 'Failed to load existing jobs for duplicate detection', details: existingJobsError.message });
+    }
+    
+    // Build a lookup map: _id -> job.id (fast O(1) lookups)
+    const existingJobIdMap = new Map();
+    if (existingJobs && existingJobs.length > 0) {
+      for (const job of existingJobs) {
+        try {
+          const contactInfo = job.contact_info;
+          if (contactInfo && typeof contactInfo === 'object') {
+            const storedId = contactInfo._id;
+            if (storedId) {
+              const normalizedStoredId = String(storedId).trim();
+              existingJobIdMap.set(normalizedStoredId, job.id);
+            }
+          }
+        } catch (e) {
+          // Skip jobs with invalid contact_info
+          continue;
+        }
+      }
+      console.log(`✅ Loaded ${existingJobs.length} existing jobs, found ${existingJobIdMap.size} jobs with _id in contact_info`);
+    } else {
+      console.log(`ℹ️ No existing jobs found for user ${userId}`);
+    }
+    
     // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
     // Format: { externalId: internalId }
     const crewIdMapping = {}; // Maps external crew IDs to team member IDs
@@ -8539,7 +8574,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         if (jobId) {
           const normalizedJobId = String(jobId).trim();
           
-          // Check if we've already seen this _id in the current import batch
+          // CSV-level duplicate check (same _id appears twice in CSV)
           if (batchExternalJobIds.has(normalizedJobId)) {
             console.log(`Row ${i + 1}: DUPLICATE in CSV - Job _id "${normalizedJobId}" already being imported in this batch`);
             results.warnings.push(`Row ${i + 1}: Duplicate job in CSV - _id "${normalizedJobId}" already exists in this import`);
@@ -8547,51 +8582,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             continue;
           }
           
-          // Check if this _id already exists in the database
-          // Query ALL jobs for this user and check contact_info._id
-          const { data: allUserJobs, error: externalIdError } = await supabase
-            .from('jobs')
-            .select('id, user_id, contact_info')
-            .eq('user_id', userId);
-          
-          if (!externalIdError && allUserJobs && allUserJobs.length > 0) {
-            // Find job by _id in contact_info
-            const foundByJobId = allUserJobs.find(existingJob => {
-              if (existingJob.user_id !== userId) return false; // Safety check
-              try {
-                const contactInfo = existingJob.contact_info;
-                if (contactInfo && typeof contactInfo === 'object') {
-                  // Check _id field (primary identifier)
-                  const storedId = contactInfo._id;
-                  if (storedId && String(storedId).trim() === normalizedJobId) {
-                    return true;
-                  }
-                }
-                return false;
-              } catch (e) {
-                return false;
-              }
-            });
+          // DATABASE-level duplicate check (using pre-loaded Map for fast O(1) lookup)
+          if (existingJobIdMap.has(normalizedJobId)) {
+            const existingJobId = existingJobIdMap.get(normalizedJobId);
+            console.log(`Row ${i + 1}: DUPLICATE detected - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job`);
+            results.warnings.push(`Row ${i + 1}: Job with _id "${normalizedJobId}" already exists - updating with new data`);
             
-            if (foundByJobId) {
-              // Found duplicate by _id - UPDATE the existing job
-              const existingJobId = foundByJobId.id;
-              console.log(`Row ${i + 1}: DUPLICATE detected - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job`);
-              results.warnings.push(`Row ${i + 1}: Job with _id "${normalizedJobId}" already exists - updating with new data`);
-              
-              // Store the existing job ID for update
-              job.existingJobId = existingJobId;
-              job.isUpdate = true;
-              
-              // Add to batch tracking to prevent re-checking
-              batchExternalJobIds.add(normalizedJobId);
-              // Continue to build jobData and then update instead of insert
-            }
+            // Store the existing job ID for update
+            job.existingJobId = existingJobId;
+            job.isUpdate = true;
+            
+            // Add to batch tracking to prevent re-checking
+            batchExternalJobIds.add(normalizedJobId);
+            // Continue to build jobData and then update instead of insert
+          } else {
+            // New job - add to batch tracking
+            batchExternalJobIds.add(normalizedJobId);
           }
-          
-          // Add to batch tracking immediately to prevent duplicates in the same CSV
-          batchExternalJobIds.add(normalizedJobId);
-          console.log(`Row ${i + 1}: Tracking job _id: ${normalizedJobId}`);
         }
         
         // NO OTHER DUPLICATE CHECKS - Only use _id as the unique identifier
