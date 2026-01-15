@@ -8606,12 +8606,54 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         }
         
+        // NOTE: Primary duplicate detection uses _id (most reliable), fallback uses customer+service+date
+
+        // Build scheduled_date string for fallback duplicate check (same logic as in jobData)
+        const buildScheduledDate = () => {
+          try {
+            if (job.scheduledDate && job.scheduledTime) {
+              // Combine date and time
+              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
+              const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
+              const combinedDate = `${datePart} ${timePart}`;
+              // Validate the date format
+              if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(combinedDate)) {
+                console.warn(`Row ${i + 1}: Invalid date format: ${combinedDate} (original: ${job.scheduledDate}, time: ${job.scheduledTime})`);
+              }
+              return combinedDate;
+            } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
+              // Already combined format
+              const dateStr = job.scheduledDate.trim();
+              // Validate the date format
+              if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(dateStr)) {
+                console.warn(`Row ${i + 1}: Invalid combined date format: ${dateStr}`);
+              }
+              return dateStr;
+            } else if (job.scheduledDate) {
+              // Only date provided, use default time
+              const dateStr = job.scheduledDate.trim();
+              // Validate the date format (YYYY-MM-DD)
+              if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+                console.warn(`Row ${i + 1}: Invalid date format (expected YYYY-MM-DD): ${dateStr}`);
+              }
+              return `${dateStr} 09:00:00`;
+            } else {
+              return job.scheduled_date || null;
+            }
+          } catch (dateError) {
+            console.error(`Row ${i + 1}: Error parsing scheduled date:`, dateError, `Original value:`, job.scheduledDate);
+            return null;
+          }
+        };
+        
+        const scheduledDateString = buildScheduledDate();
+        
         // FALLBACK DUPLICATE CHECK: If _id is missing or didn't match, check by customer + service + scheduled_date
         // This handles cases where older imports didn't have _id stored, or CSV doesn't have _id column
         // Only run fallback if we haven't already detected a duplicate via _id
         if (!job.isUpdate && (!jobId || !existingJobIdMap.has(String(jobId).trim()))) {
           // Only do fallback check if we don't have _id or _id doesn't match existing jobs
-          if (customerId && serviceId && jobData.scheduled_date) {
+          if (customerId && serviceId && scheduledDateString) {
             // Try to find existing job by customer, service, and scheduled date (exact match)
             const { data: existingByFields, error: fieldCheckError } = await supabase
               .from('jobs')
@@ -8619,11 +8661,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               .eq('user_id', userId)
               .eq('customer_id', customerId)
               .eq('service_id', serviceId)
-              .eq('scheduled_date', jobData.scheduled_date)
+              .eq('scheduled_date', scheduledDateString)
               .maybeSingle();
             
             if (!fieldCheckError && existingByFields) {
-              console.log(`Row ${i + 1}: DUPLICATE detected (fallback) - Job with same customer (${customerId}), service (${serviceId}), and date (${jobData.scheduled_date}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
+              console.log(`Row ${i + 1}: DUPLICATE detected (fallback) - Job with same customer (${customerId}), service (${serviceId}), and date (${scheduledDateString}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
               results.warnings.push(`Row ${i + 1}: Job with same customer, service, and date already exists - updating with new data`);
               
               // Store the existing job ID for update
@@ -8635,8 +8677,6 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
           }
         }
-        
-        // NOTE: Primary duplicate detection uses _id (most reliable), fallback uses customer+service+date
 
         // Create job with all fields
         const jobData = {
@@ -8718,42 +8758,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           customer_notes: job.customerNotes || null,
           // Combine scheduled date and time into scheduled_date field
           // Format: "YYYY-MM-DD HH:MM:SS"
-          scheduled_date: (() => {
-            try {
-              if (job.scheduledDate && job.scheduledTime) {
-                // Combine date and time
-                const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
-                const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
-                const combinedDate = `${datePart} ${timePart}`;
-                // Validate the date format
-                if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(combinedDate)) {
-                  console.warn(`Row ${i + 1}: Invalid date format: ${combinedDate} (original: ${job.scheduledDate}, time: ${job.scheduledTime})`);
-                }
-                return combinedDate;
-              } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
-                // Already combined format
-                const dateStr = job.scheduledDate.trim();
-                // Validate the date format
-                if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(dateStr)) {
-                  console.warn(`Row ${i + 1}: Invalid combined date format: ${dateStr}`);
-                }
-                return dateStr;
-              } else if (job.scheduledDate) {
-                // Only date provided, use default time
-                const dateStr = job.scheduledDate.trim();
-                // Validate the date format (YYYY-MM-DD)
-                if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-                  console.warn(`Row ${i + 1}: Invalid date format (expected YYYY-MM-DD): ${dateStr}`);
-                }
-                return `${dateStr} 09:00:00`;
-              } else {
-                return job.scheduled_date || null;
-              }
-            } catch (dateError) {
-              console.error(`Row ${i + 1}: Error parsing scheduled date:`, dateError, `Original value:`, job.scheduledDate);
-              return null;
-            }
-          })(),
+          // Use the pre-built scheduledDateString to avoid duplicating logic
+          scheduled_date: scheduledDateString,
           scheduled_time: job.scheduledTime || '09:00:00',
           service_address_street: job.serviceAddressStreet || sanitizedServiceAddress,
           service_address_city: job.serviceAddressCity,
