@@ -7955,10 +7955,35 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     
     // STEP 1: Load ALL existing _ids ONCE before the loop (prevents Supabase 1000 row limit issue)
     console.log(`📥 Loading existing jobs for user ${userId} to build duplicate detection map...`);
-    const { data: existingJobs, error: existingJobsError } = await supabase
-      .from('jobs')
-      .select('id, contact_info')
-      .eq('user_id', userId);
+    // IMPORTANT: Supabase has a default limit of 1000 rows. We need to load ALL jobs, so we'll paginate if needed.
+    let existingJobs = [];
+    let page = 0;
+    const pageSize = 1000;
+    let hasMore = true;
+    
+    while (hasMore) {
+      const { data: jobsPage, error: jobsPageError } = await supabase
+        .from('jobs')
+        .select('id, contact_info')
+        .eq('user_id', userId)
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+      
+      if (jobsPageError) {
+        console.error(`❌ Error loading jobs page ${page}:`, jobsPageError);
+        break;
+      }
+      
+      if (jobsPage && jobsPage.length > 0) {
+        existingJobs = existingJobs.concat(jobsPage);
+        console.log(`📥 Loaded page ${page + 1}: ${jobsPage.length} jobs (total so far: ${existingJobs.length})`);
+        hasMore = jobsPage.length === pageSize; // If we got a full page, there might be more
+        page++;
+      } else {
+        hasMore = false;
+      }
+    }
+    
+    const existingJobsError = null; // No error if we got here
     
     if (existingJobsError) {
       console.error('❌ Error loading existing jobs:', existingJobsError);
