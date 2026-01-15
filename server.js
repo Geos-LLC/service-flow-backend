@@ -8679,6 +8679,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               job.existingJobId = existingByFields.id;
               job.isUpdate = true;
               
+              // Store existing contact_info to preserve existing _id (to avoid unique constraint violation)
+              // If the existing job has an _id, we'll preserve it; otherwise we'll add the new one
+              job.existingContactInfo = existingByFields.contact_info;
+              
               // Also store _id in contact_info if we have it now (for future duplicate detection)
               // This ensures future imports can use _id-based detection
             }
@@ -8723,21 +8727,46 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             const contactInfo = job.contactInfo || {};
             const jobId = job._id || null;
             
-            // If contactInfo is a string, try to parse it as JSON
+            // If this is an update, start with existing contact_info to preserve existing _id
+            // This prevents unique constraint violations when updating jobs found by fallback method
             let parsedContactInfo = {};
-            if (typeof contactInfo === 'string') {
-              try {
-                parsedContactInfo = JSON.parse(contactInfo);
-              } catch (e) {
-                parsedContactInfo = {};
+            if (job.isUpdate && job.existingContactInfo) {
+              // Parse existing contact_info
+              if (typeof job.existingContactInfo === 'string') {
+                try {
+                  parsedContactInfo = JSON.parse(job.existingContactInfo);
+                } catch (e) {
+                  parsedContactInfo = {};
+                }
+              } else if (job.existingContactInfo && typeof job.existingContactInfo === 'object') {
+                parsedContactInfo = { ...job.existingContactInfo };
               }
-            } else if (contactInfo && typeof contactInfo === 'object') {
-              parsedContactInfo = { ...contactInfo };
-            }
-            
-            // ALWAYS store _id if we have it - this is the unique identifier
-            if (jobId) {
-              parsedContactInfo._id = String(jobId).trim();
+              
+              // If existing job has an _id, preserve it to avoid unique constraint violation
+              // Only update _id if the existing job doesn't have one
+              if (parsedContactInfo._id && jobId && parsedContactInfo._id !== String(jobId).trim()) {
+                console.log(`Row ${i + 1}: ⚠️ Existing job has _id "${parsedContactInfo._id}", CSV has "${jobId}". Preserving existing _id to avoid constraint violation.`);
+                // Keep existing _id, don't overwrite
+              } else if (!parsedContactInfo._id && jobId) {
+                // Existing job has no _id, add the new one
+                parsedContactInfo._id = String(jobId).trim();
+              }
+            } else {
+              // New job or no existing contact_info - start fresh
+              if (typeof contactInfo === 'string') {
+                try {
+                  parsedContactInfo = JSON.parse(contactInfo);
+                } catch (e) {
+                  parsedContactInfo = {};
+                }
+              } else if (contactInfo && typeof contactInfo === 'object') {
+                parsedContactInfo = { ...contactInfo };
+              }
+              
+              // ALWAYS store _id if we have it - this is the unique identifier
+              if (jobId) {
+                parsedContactInfo._id = String(jobId).trim();
+              }
             }
             
             // Also store service_order_custom_service_order for reference (but _id is primary)
@@ -8753,8 +8782,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // RISK #1 FIX: ALWAYS store _id, never return null if jobId exists
             // This guarantees _id is stored even if contact_info would otherwise be empty
             // This prevents partial imports from losing _id tracking
-            if (jobId) {
-              parsedContactInfo._id = String(jobId).trim();
+            if (parsedContactInfo._id || jobId) {
+              // Ensure _id is set (use existing or new)
+              if (!parsedContactInfo._id && jobId) {
+                parsedContactInfo._id = String(jobId).trim();
+              }
               // ALWAYS return the object if _id exists (never null, even if empty otherwise)
               return parsedContactInfo;
             }
