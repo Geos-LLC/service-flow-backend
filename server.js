@@ -8650,6 +8650,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         
         const scheduledDateString = buildScheduledDate();
         
+        // Debug: Log the scheduled date being built (especially for updates)
+        if (job.isUpdate || job.existingJobId) {
+          console.log(`Row ${i + 1}: 📅 Building scheduled_date for UPDATE - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}", scheduledDateString: "${scheduledDateString}"`);
+        }
+        
         // FALLBACK DUPLICATE CHECK: If _id is missing or didn't match, check by customer + service + scheduled_date
         // This handles cases where older imports didn't have _id stored, or CSV doesn't have _id column
         // Only run fallback if we haven't already detected a duplicate via _id
@@ -8937,7 +8942,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
         
         if (isUpdate) {
-          console.log(`Row ${i + 1}: UPDATING existing job ${job.existingJobId} with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}, status: ${jobData.status}`);
+          console.log(`Row ${i + 1}: UPDATING existing job ${job.existingJobId} with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}, scheduledTime: ${jobData.scheduled_time}, status: ${jobData.status}`);
+          console.log(`Row ${i + 1}: 📅 Date values - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}", scheduledDateString: "${scheduledDateString}", jobData.scheduled_date: "${jobData.scheduled_date}"`);
         } else {
           console.log(`Row ${i + 1}: Creating NEW job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
         }
@@ -8985,12 +8991,24 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               console.log(`Row ${i + 1}: 🔄 Updating job ID ${job.existingJobId} with fields:`, {
                 status: updateData.status,
                 scheduled_date: updateData.scheduled_date,
+                scheduled_time: updateData.scheduled_time,
                 invoice_status: updateData.invoice_status,
                 price: updateData.price,
                 total: updateData.total,
                 customer_id: updateData.customer_id,
                 service_id: updateData.service_id
               });
+              
+              // CRITICAL: Verify scheduled_date is actually in updateData
+              if (!updateData.scheduled_date) {
+                console.error(`Row ${i + 1}: ❌ CRITICAL ERROR: scheduled_date is MISSING from updateData!`);
+                console.error(`Row ${i + 1}: jobData.scheduled_date =`, jobData.scheduled_date);
+                console.error(`Row ${i + 1}: scheduledDateString =`, scheduledDateString);
+                console.error(`Row ${i + 1}: job.scheduledDate =`, job.scheduledDate);
+                console.error(`Row ${i + 1}: job.scheduledTime =`, job.scheduledTime);
+              } else {
+                console.log(`Row ${i + 1}: ✅ scheduled_date is present in updateData: "${updateData.scheduled_date}"`);
+              }
               
               return await supabase
                 .from('jobs')
@@ -9018,7 +9036,16 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             if (!insertError && newJob) {
               console.log(`Row ${i + 1}: ✅ Successfully UPDATED job with ID:`, newJob.id);
-              console.log(`Row ${i + 1}: Updated fields - status: "${newJob.status}", scheduled_date: "${newJob.scheduled_date}", invoice_status: "${newJob.invoice_status}"`);
+              console.log(`Row ${i + 1}: Updated fields - status: "${newJob.status}", scheduled_date: "${newJob.scheduled_date}", scheduled_time: "${newJob.scheduled_time}", invoice_status: "${newJob.invoice_status}"`);
+              
+              // Verify the date was actually updated
+              if (updateData.scheduled_date && newJob.scheduled_date !== updateData.scheduled_date) {
+                console.error(`Row ${i + 1}: ❌ DATE UPDATE FAILED! Expected: "${updateData.scheduled_date}", Got: "${newJob.scheduled_date}"`);
+                results.warnings.push(`Row ${i + 1}: Warning: scheduled_date may not have been updated correctly`);
+              } else if (updateData.scheduled_date) {
+                console.log(`Row ${i + 1}: ✅ Date update verified - scheduled_date was updated from CSV: "${updateData.scheduled_date}"`);
+              }
+              
               results.updated++; // Count updates separately
               
               // Update team member assignments - delete old ones and create new ones
