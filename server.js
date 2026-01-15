@@ -8574,6 +8574,8 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         
         // PRIMARY DUPLICATE DETECTION: Use _id as the unique identifier
         // _id is ALWAYS unique for each job - this is the definitive way to identify duplicates
+        // IMPORTANT: If a job has the same _id but different date/time or other fields, it will be UPDATED
+        // This ensures that when CSV data changes (e.g., rescheduled date), the job gets updated, not duplicated
         const jobId = job._id || null;
         
         if (jobId) {
@@ -8590,7 +8592,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // DATABASE-level duplicate check (using pre-loaded Map for fast O(1) lookup)
           if (existingJobIdMap.has(normalizedJobId)) {
             const existingJobId = existingJobIdMap.get(normalizedJobId);
-            console.log(`Row ${i + 1}: DUPLICATE detected - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job`);
+            console.log(`Row ${i + 1}: DUPLICATE detected - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job with new data (date/time may have changed)`);
             results.warnings.push(`Row ${i + 1}: Job with _id "${normalizedJobId}" already exists - updating with new data`);
             
             // Store the existing job ID for update
@@ -8599,7 +8601,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             // Add to batch tracking to prevent re-checking
             batchExternalJobIds.add(normalizedJobId);
-            // Continue to build jobData and then update instead of insert
+            // Continue to build jobData with NEW values from CSV (including updated date/time) and then update instead of insert
           } else {
             // New job - add to batch tracking
             batchExternalJobIds.add(normalizedJobId);
