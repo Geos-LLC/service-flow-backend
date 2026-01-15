@@ -8983,33 +8983,33 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         try {
           if (isUpdate) {
             // UPDATE existing job
+            // Remove user_id from update data (shouldn't change) - define outside callback for logging
+            const { user_id, ...updateData } = jobData;
+            
+            // Debug: Log what we're about to update
+            console.log(`Row ${i + 1}: 🔄 Updating job ID ${job.existingJobId} with fields:`, {
+              status: updateData.status,
+              scheduled_date: updateData.scheduled_date,
+              scheduled_time: updateData.scheduled_time,
+              invoice_status: updateData.invoice_status,
+              price: updateData.price,
+              total: updateData.total,
+              customer_id: updateData.customer_id,
+              service_id: updateData.service_id
+            });
+            
+            // CRITICAL: Verify scheduled_date is actually in updateData
+            if (!updateData.scheduled_date) {
+              console.error(`Row ${i + 1}: ❌ CRITICAL ERROR: scheduled_date is MISSING from updateData!`);
+              console.error(`Row ${i + 1}: jobData.scheduled_date =`, jobData.scheduled_date);
+              console.error(`Row ${i + 1}: scheduledDateString =`, scheduledDateString);
+              console.error(`Row ${i + 1}: job.scheduledDate =`, job.scheduledDate);
+              console.error(`Row ${i + 1}: job.scheduledTime =`, job.scheduledTime);
+            } else {
+              console.log(`Row ${i + 1}: ✅ scheduled_date is present in updateData: "${updateData.scheduled_date}"`);
+            }
+            
             const updateResult = await retrySupabaseOperation(async () => {
-              // Remove user_id from update data (shouldn't change)
-              const { user_id, ...updateData } = jobData;
-              
-              // Debug: Log what we're about to update
-              console.log(`Row ${i + 1}: 🔄 Updating job ID ${job.existingJobId} with fields:`, {
-                status: updateData.status,
-                scheduled_date: updateData.scheduled_date,
-                scheduled_time: updateData.scheduled_time,
-                invoice_status: updateData.invoice_status,
-                price: updateData.price,
-                total: updateData.total,
-                customer_id: updateData.customer_id,
-                service_id: updateData.service_id
-              });
-              
-              // CRITICAL: Verify scheduled_date is actually in updateData
-              if (!updateData.scheduled_date) {
-                console.error(`Row ${i + 1}: ❌ CRITICAL ERROR: scheduled_date is MISSING from updateData!`);
-                console.error(`Row ${i + 1}: jobData.scheduled_date =`, jobData.scheduled_date);
-                console.error(`Row ${i + 1}: scheduledDateString =`, scheduledDateString);
-                console.error(`Row ${i + 1}: job.scheduledDate =`, job.scheduledDate);
-                console.error(`Row ${i + 1}: job.scheduledTime =`, job.scheduledTime);
-              } else {
-                console.log(`Row ${i + 1}: ✅ scheduled_date is present in updateData: "${updateData.scheduled_date}"`);
-              }
-              
               return await supabase
                 .from('jobs')
                 .update(updateData)
