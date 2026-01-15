@@ -8625,21 +8625,73 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // NOTE: Primary duplicate detection uses _id (most reliable), fallback uses customer+service+date
 
         // Build scheduled_date string for fallback duplicate check (same logic as in jobData)
+        // CRITICAL: This must use the NEW values from CSV (job.scheduledDate, job.scheduledTime)
+        // to ensure updates actually change the date/time
         const buildScheduledDate = () => {
           try {
+            // Debug: Log what we're building from
+            if (job.isUpdate) {
+              console.log(`Row ${i + 1}: 🔧 Building scheduled_date for UPDATE - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}"`);
+            }
+            
             if (job.scheduledDate && job.scheduledTime) {
               // Combine date and time
-              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part
-              const timePart = job.scheduledTime.includes(':') ? job.scheduledTime : `${job.scheduledTime}:00`;
+              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part (handles "2026-01-07" or "2026-01-07, 10:00 AM")
+              let timePart = job.scheduledTime;
+              
+              // Ensure timePart is in HH:MM:SS format
+              if (timePart.includes(':')) {
+                const timeParts = timePart.split(':');
+                if (timeParts.length === 2) {
+                  // HH:MM -> HH:MM:SS
+                  timePart = `${timePart}:00`;
+                } else if (timeParts.length === 3) {
+                  // Already HH:MM:SS
+                  timePart = timePart;
+                }
+              } else {
+                // No colon, assume it's just hours
+                timePart = `${timePart}:00:00`;
+              }
+              
               const combinedDate = `${datePart} ${timePart}`;
+              
               // Validate the date format
               if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(combinedDate)) {
                 console.warn(`Row ${i + 1}: Invalid date format: ${combinedDate} (original: ${job.scheduledDate}, time: ${job.scheduledTime})`);
+              } else if (job.isUpdate) {
+                console.log(`Row ${i + 1}: ✅ Built scheduled_date: "${combinedDate}" from CSV values`);
               }
+              
               return combinedDate;
             } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
-              // Already combined format
+              // Already combined format (e.g., "2026-01-14 10:00 am")
               const dateStr = job.scheduledDate.trim();
+              
+              // If it has time but not in HH:MM:SS format, normalize it
+              if (dateStr.match(/^\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?\s*(am|pm|AM|PM)/i)) {
+                // Has AM/PM, need to convert
+                const timeMatch = dateStr.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|AM|PM)/i);
+                if (timeMatch) {
+                  let hours = parseInt(timeMatch[1]);
+                  const minutes = timeMatch[2];
+                  const ampm = timeMatch[4].toUpperCase();
+                  
+                  if (ampm === 'PM' && hours !== 12) hours += 12;
+                  else if (ampm === 'AM' && hours === 12) hours = 0;
+                  
+                  const datePart = dateStr.split(' ')[0];
+                  const normalizedTime = `${String(hours).padStart(2, '0')}:${minutes}:00`;
+                  const normalizedDate = `${datePart} ${normalizedTime}`;
+                  
+                  if (job.isUpdate) {
+                    console.log(`Row ${i + 1}: ✅ Normalized combined date: "${dateStr}" -> "${normalizedDate}"`);
+                  }
+                  
+                  return normalizedDate;
+                }
+              }
+              
               // Validate the date format
               if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(dateStr)) {
                 console.warn(`Row ${i + 1}: Invalid combined date format: ${dateStr}`);
@@ -9058,14 +9110,30 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               console.log(`Row ${i + 1}: ✅ scheduled_date is present in updateData: "${updateData.scheduled_date}"`);
             }
             
+            // Fetch the job BEFORE update to compare values
+            const { data: jobBeforeUpdate, error: fetchError } = await supabase
+              .from('jobs')
+              .select('id, scheduled_date, scheduled_time, status, invoice_status')
+              .eq('id', job.existingJobId)
+              .eq('user_id', userId)
+              .single();
+            
+            if (jobBeforeUpdate) {
+              console.log(`Row ${i + 1}: 📋 BEFORE UPDATE - scheduled_date: "${jobBeforeUpdate.scheduled_date}", status: "${jobBeforeUpdate.status}", invoice_status: "${jobBeforeUpdate.invoice_status}"`);
+            }
+            
             const updateResult = await retrySupabaseOperation(async () => {
-              return await supabase
+              console.log(`Row ${i + 1}: 🔧 Executing UPDATE query for job ID ${job.existingJobId}...`);
+              const result = await supabase
                 .from('jobs')
                 .update(updateData)
                 .eq('id', job.existingJobId)
                 .eq('user_id', userId) // Safety check: ensure job belongs to this user
                 .select()
                 .single();
+              
+              console.log(`Row ${i + 1}: 🔧 UPDATE query result - error:`, result.error ? result.error.message : 'none', 'data:', result.data ? 'received' : 'none');
+              return result;
             });
             
             newJob = updateResult.data;
@@ -9080,12 +9148,35 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 invoice_status: updateData.invoice_status
               });
             } else if (!newJob) {
-              console.error(`Row ${i + 1}: ❌ Update returned no data for job ID ${job.existingJobId}`);
+              console.error(`Row ${i + 1}: ❌ Update returned no data for job ID ${job.existingJobId} - update may have failed silently`);
             }
             
             if (!insertError && newJob) {
               console.log(`Row ${i + 1}: ✅ Successfully UPDATED job with ID:`, newJob.id);
-              console.log(`Row ${i + 1}: Updated fields - status: "${newJob.status}", scheduled_date: "${newJob.scheduled_date}", scheduled_time: "${newJob.scheduled_time}", invoice_status: "${newJob.invoice_status}"`);
+              console.log(`Row ${i + 1}: 📋 AFTER UPDATE - scheduled_date: "${newJob.scheduled_date}", status: "${newJob.status}", invoice_status: "${newJob.invoice_status}"`);
+              
+              // Compare BEFORE and AFTER
+              if (jobBeforeUpdate) {
+                const dateChanged = jobBeforeUpdate.scheduled_date !== newJob.scheduled_date;
+                const statusChanged = jobBeforeUpdate.status !== newJob.status;
+                const invoiceStatusChanged = jobBeforeUpdate.invoice_status !== newJob.invoice_status;
+                
+                if (dateChanged) {
+                  console.log(`Row ${i + 1}: ✅ DATE CHANGED: "${jobBeforeUpdate.scheduled_date}" → "${newJob.scheduled_date}"`);
+                } else {
+                  console.error(`Row ${i + 1}: ❌ DATE DID NOT CHANGE! Still: "${newJob.scheduled_date}" (expected: "${updateData.scheduled_date}")`);
+                }
+                
+                if (statusChanged) {
+                  console.log(`Row ${i + 1}: ✅ STATUS CHANGED: "${jobBeforeUpdate.status}" → "${newJob.status}"`);
+                } else {
+                  console.log(`Row ${i + 1}: ℹ️ STATUS UNCHANGED: "${newJob.status}"`);
+                }
+                
+                if (invoiceStatusChanged) {
+                  console.log(`Row ${i + 1}: ✅ INVOICE_STATUS CHANGED: "${jobBeforeUpdate.invoice_status}" → "${newJob.invoice_status}"`);
+                }
+              }
               
               // Verify the date was actually updated
               if (updateData.scheduled_date && newJob.scheduled_date !== updateData.scheduled_date) {
