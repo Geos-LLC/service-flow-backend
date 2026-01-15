@@ -8929,8 +8929,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // Check if this is an update or insert
         const isUpdate = job.isUpdate && job.existingJobId;
         
+        // Debug logging to verify update detection
+        if (job.isUpdate || job.existingJobId) {
+          console.log(`Row ${i + 1}: 🔍 Update check - job.isUpdate: ${job.isUpdate}, job.existingJobId: ${job.existingJobId}, isUpdate: ${isUpdate}`);
+        }
+        
         if (isUpdate) {
-          console.log(`Row ${i + 1}: UPDATING existing job ${job.existingJobId} with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
+          console.log(`Row ${i + 1}: UPDATING existing job ${job.existingJobId} with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}, status: ${jobData.status}`);
         } else {
           console.log(`Row ${i + 1}: Creating NEW job with customerId: ${customerId}, serviceId: ${serviceId || 'null'}, scheduledDate: ${jobData.scheduled_date}`);
         }
@@ -8973,6 +8978,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             const updateResult = await retrySupabaseOperation(async () => {
               // Remove user_id from update data (shouldn't change)
               const { user_id, ...updateData } = jobData;
+              
+              // Debug: Log what we're about to update
+              console.log(`Row ${i + 1}: 🔄 Updating job ID ${job.existingJobId} with fields:`, {
+                status: updateData.status,
+                scheduled_date: updateData.scheduled_date,
+                invoice_status: updateData.invoice_status,
+                price: updateData.price,
+                total: updateData.total,
+                customer_id: updateData.customer_id,
+                service_id: updateData.service_id
+              });
+              
               return await supabase
                 .from('jobs')
                 .update(updateData)
@@ -8985,8 +9002,21 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             newJob = updateResult.data;
             insertError = updateResult.error;
             
+            if (insertError) {
+              console.error(`Row ${i + 1}: ❌ Update failed for job ID ${job.existingJobId}:`, insertError);
+              console.error(`Row ${i + 1}: Update data keys:`, Object.keys(updateData));
+              console.error(`Row ${i + 1}: Update data sample (status, scheduled_date):`, {
+                status: updateData.status,
+                scheduled_date: updateData.scheduled_date,
+                invoice_status: updateData.invoice_status
+              });
+            } else if (!newJob) {
+              console.error(`Row ${i + 1}: ❌ Update returned no data for job ID ${job.existingJobId}`);
+            }
+            
             if (!insertError && newJob) {
               console.log(`Row ${i + 1}: ✅ Successfully UPDATED job with ID:`, newJob.id);
+              console.log(`Row ${i + 1}: Updated fields - status: "${newJob.status}", scheduled_date: "${newJob.scheduled_date}", invoice_status: "${newJob.invoice_status}"`);
               results.updated++; // Count updates separately
               
               // Update team member assignments - delete old ones and create new ones
@@ -9060,8 +9090,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // Check if error is HTML (Cloudflare error page)
           if (errorMessage.includes('<!DOCTYPE html>') || errorMessage.includes('Internal server error') || errorMessage.includes('Cloudflare')) {
             results.errors.push(`Row ${i + 1}: Database connection error (Cloudflare timeout) - please try importing this job again`);
-        } else {
+          } else {
             results.errors.push(`Row ${i + 1}: ${errorMessage}`);
+          }
+          // For updates, this is more critical - log it as an error
+          if (isUpdate) {
+            console.error(`Row ${i + 1}: ❌ CRITICAL: Update failed for existing job ID ${job.existingJobId} - job was NOT updated!`);
+            results.errors.push(`Row ${i + 1}: Failed to update existing job (ID: ${job.existingJobId}) - ${errorMessage.substring(0, 100)}`);
           }
           results.skipped++;
         } else if (newJob && !isUpdate) {
