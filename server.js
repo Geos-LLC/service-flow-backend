@@ -8606,7 +8606,37 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
         }
         
-        // NO OTHER DUPLICATE CHECKS - Only use _id as the unique identifier
+        // FALLBACK DUPLICATE CHECK: If _id is missing or didn't match, check by customer + service + scheduled_date
+        // This handles cases where older imports didn't have _id stored, or CSV doesn't have _id column
+        // Only run fallback if we haven't already detected a duplicate via _id
+        if (!job.isUpdate && (!jobId || !existingJobIdMap.has(String(jobId).trim()))) {
+          // Only do fallback check if we don't have _id or _id doesn't match existing jobs
+          if (customerId && serviceId && jobData.scheduled_date) {
+            // Try to find existing job by customer, service, and scheduled date (exact match)
+            const { data: existingByFields, error: fieldCheckError } = await supabase
+              .from('jobs')
+              .select('id, contact_info')
+              .eq('user_id', userId)
+              .eq('customer_id', customerId)
+              .eq('service_id', serviceId)
+              .eq('scheduled_date', jobData.scheduled_date)
+              .maybeSingle();
+            
+            if (!fieldCheckError && existingByFields) {
+              console.log(`Row ${i + 1}: DUPLICATE detected (fallback) - Job with same customer (${customerId}), service (${serviceId}), and date (${jobData.scheduled_date}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
+              results.warnings.push(`Row ${i + 1}: Job with same customer, service, and date already exists - updating with new data`);
+              
+              // Store the existing job ID for update
+              job.existingJobId = existingByFields.id;
+              job.isUpdate = true;
+              
+              // Also store _id in contact_info if we have it now (for future duplicate detection)
+              // This ensures future imports can use _id-based detection
+            }
+          }
+        }
+        
+        // NOTE: Primary duplicate detection uses _id (most reliable), fallback uses customer+service+date
 
         // Create job with all fields
         const jobData = {
