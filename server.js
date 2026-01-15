@@ -7984,6 +7984,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
       }
       console.log(`✅ Loaded ${existingJobs.length} existing jobs, found ${existingJobIdMap.size} jobs with _id in contact_info`);
+      if (existingJobIdMap.size < existingJobs.length) {
+        console.log(`⚠️ WARNING: ${existingJobs.length - existingJobIdMap.size} jobs are missing _id in contact_info - they won't be detected by _id-based duplicate detection`);
+      }
     } else {
       console.log(`ℹ️ No existing jobs found for user ${userId}`);
     }
@@ -8578,6 +8581,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // This ensures that when CSV data changes (e.g., rescheduled date), the job gets updated, not duplicated
         const jobId = job._id || null;
         
+        // Debug: Log _id from CSV
+        if (jobId) {
+          console.log(`Row ${i + 1}: 🔍 CSV job has _id: "${jobId}"`);
+        } else {
+          console.log(`Row ${i + 1}: ⚠️ CSV job has NO _id - will use fallback duplicate detection`);
+        }
+        
         if (jobId) {
           const normalizedJobId = String(jobId).trim();
           
@@ -8592,12 +8602,16 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // DATABASE-level duplicate check (using pre-loaded Map for fast O(1) lookup)
           if (existingJobIdMap.has(normalizedJobId)) {
             const existingJobId = existingJobIdMap.get(normalizedJobId);
-            console.log(`Row ${i + 1}: DUPLICATE detected - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job with new data (date/time may have changed)`);
+            console.log(`Row ${i + 1}: ✅ DUPLICATE detected by _id - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job with new data (date/time may have changed)`);
             results.warnings.push(`Row ${i + 1}: Job with _id "${normalizedJobId}" already exists - updating with new data`);
             
             // Store the existing job ID for update
             job.existingJobId = existingJobId;
             job.isUpdate = true;
+            
+            // IMPORTANT: When updating by _id, we DON'T need to preserve existing contact_info._id
+            // because we're updating the SAME job (same _id). The _id will stay the same.
+            // We only need to preserve it for fallback method updates where we might be updating a different job.
             
             // Add to batch tracking to prevent re-checking
             batchExternalJobIds.add(normalizedJobId);
@@ -8729,8 +8743,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             // If this is an update, start with existing contact_info to preserve existing _id
             // This prevents unique constraint violations when updating jobs found by fallback method
+            // NOTE: When updating by _id match, we don't need existingContactInfo because we're updating the same job
             let parsedContactInfo = {};
-            if (job.isUpdate && job.existingContactInfo) {
+            if (job.isUpdate && job.existingContactInfo && !jobId) {
+              // Only use existingContactInfo for fallback method updates (when we don't have _id match)
+              // This prevents overwriting _id when updating a different job found by customer+service+date
               // Parse existing contact_info
               if (typeof job.existingContactInfo === 'string') {
                 try {
