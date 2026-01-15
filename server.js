@@ -7976,16 +7976,28 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             if (storedId) {
               const normalizedStoredId = String(storedId).trim();
               existingJobIdMap.set(normalizedStoredId, job.id);
+              
+              // Debug: Log first few _ids to verify they're being loaded
+              if (existingJobIdMap.size <= 5) {
+                console.log(`📋 Loaded _id "${normalizedStoredId}" -> job.id ${job.id}`);
+              }
             }
           }
         } catch (e) {
           // Skip jobs with invalid contact_info
+          console.warn(`⚠️ Skipping job ${job.id} - invalid contact_info:`, e.message);
           continue;
         }
       }
       console.log(`✅ Loaded ${existingJobs.length} existing jobs, found ${existingJobIdMap.size} jobs with _id in contact_info`);
       if (existingJobIdMap.size < existingJobs.length) {
         console.log(`⚠️ WARNING: ${existingJobs.length - existingJobIdMap.size} jobs are missing _id in contact_info - they won't be detected by _id-based duplicate detection`);
+      }
+      
+      // Debug: Show sample of loaded _ids
+      if (existingJobIdMap.size > 0) {
+        const sampleIds = Array.from(existingJobIdMap.keys()).slice(0, 5);
+        console.log(`📋 Sample loaded _ids:`, sampleIds);
       }
     } else {
       console.log(`ℹ️ No existing jobs found for user ${userId}`);
@@ -8583,7 +8595,21 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         
         // Debug: Log _id from CSV
         if (jobId) {
-          console.log(`Row ${i + 1}: 🔍 CSV job has _id: "${jobId}"`);
+          const normalizedJobId = String(jobId).trim();
+          console.log(`Row ${i + 1}: 🔍 CSV job has _id: "${normalizedJobId}"`);
+          
+          // Check if this _id exists in our map
+          const existsInMap = existingJobIdMap.has(normalizedJobId);
+          console.log(`Row ${i + 1}: 🔍 Checking _id in map - exists: ${existsInMap}, map size: ${existingJobIdMap.size}`);
+          
+          if (existsInMap) {
+            const existingJobId = existingJobIdMap.get(normalizedJobId);
+            console.log(`Row ${i + 1}: ✅ Found existing job ID: ${existingJobId} for _id: "${normalizedJobId}"`);
+          } else {
+            // Debug: Show what _ids are in the map to help diagnose
+            const sampleIds = Array.from(existingJobIdMap.keys()).slice(0, 3);
+            console.log(`Row ${i + 1}: ⚠️ _id "${normalizedJobId}" NOT found in map. Sample _ids in map:`, sampleIds);
+          }
         } else {
           console.log(`Row ${i + 1}: ⚠️ CSV job has NO _id - will use fallback duplicate detection`);
         }
@@ -8618,6 +8644,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // Continue to build jobData with NEW values from CSV (including updated date/time) and then update instead of insert
           } else {
             // New job - add to batch tracking
+            console.log(`Row ${i + 1}: ℹ️ _id "${normalizedJobId}" not found in existing jobs - will CREATE new job`);
             batchExternalJobIds.add(normalizedJobId);
           }
         }
@@ -9164,7 +9191,22 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 if (dateChanged) {
                   console.log(`Row ${i + 1}: ✅ DATE CHANGED: "${jobBeforeUpdate.scheduled_date}" → "${newJob.scheduled_date}"`);
                 } else {
-                  console.error(`Row ${i + 1}: ❌ DATE DID NOT CHANGE! Still: "${newJob.scheduled_date}" (expected: "${updateData.scheduled_date}")`);
+                  // Check if the dates are actually different (might be same value but different format)
+                  const beforeDate = new Date(jobBeforeUpdate.scheduled_date);
+                  const afterDate = new Date(newJob.scheduled_date);
+                  const expectedDate = new Date(updateData.scheduled_date);
+                  
+                  if (beforeDate.getTime() === afterDate.getTime() && beforeDate.getTime() !== expectedDate.getTime()) {
+                    console.error(`Row ${i + 1}: ❌ DATE DID NOT CHANGE! Still: "${newJob.scheduled_date}" (expected: "${updateData.scheduled_date}")`);
+                    console.error(`Row ${i + 1}: ⚠️ The update query succeeded but the date value didn't change. This might indicate:`);
+                    console.error(`Row ${i + 1}:   1. The database column has a trigger/constraint preventing the update`);
+                    console.error(`Row ${i + 1}:   2. The updateData.scheduled_date format is incorrect`);
+                    console.error(`Row ${i + 1}:   3. The update query is not actually updating the scheduled_date column`);
+                  } else if (beforeDate.getTime() === expectedDate.getTime()) {
+                    console.log(`Row ${i + 1}: ℹ️ Date unchanged because it's already the correct value: "${newJob.scheduled_date}"`);
+                  } else {
+                    console.error(`Row ${i + 1}: ❌ DATE DID NOT CHANGE! Still: "${newJob.scheduled_date}" (expected: "${updateData.scheduled_date}")`);
+                  }
                 }
                 
                 if (statusChanged) {
