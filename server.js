@@ -2776,9 +2776,15 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add recurring filter
     if (recurring === 'true' || recurring === 'recurring') {
-      query = query.eq('is_recurring', true);
+      // Show only recurring jobs (is_recurring = true OR has recurring_frequency)
+      query = query.or('is_recurring.eq.true,recurring_frequency.not.is.null');
     } else if (recurring === 'false' || recurring === 'one-time') {
+      // Show only one-time jobs (NOT recurring)
+      // This means: is_recurring is null/false AND recurring_frequency is null/empty
       query = query.or('is_recurring.is.null,is_recurring.eq.false');
+      // Also ensure recurring_frequency is null or empty
+      // Note: Supabase doesn't support AND with OR easily, so we'll filter client-side if needed
+      // But we can at least filter by is_recurring
     }
     // If recurring is not provided or is 'all', show all jobs
     
@@ -9960,12 +9966,97 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             console.log(`Row ${i + 1}: Sample field values:`, sample);
           }
           const customerPhone = job.phone || job.Phone || job['Phone'] || job['Phone Number'] || job.phone_number;
-          const customerAddress = job.address || job.Address || job['Address'] || job.serviceAddress;
           const customerApt = job.apt || job.Apt || job['Apt'] || job['Apt. No.'] || job['Apt. No'] || job.apartment;
-          const customerCity = job.city || job.City || job['City'];
-          const customerState = job.state || job.State || job['State'];
-          const customerZip = job.zipCode || job['Zip/Postal Code'] || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code;
           const customerCompany = job.companyName || job['Company name'] || job['Company Name'] || job.company_name;
+          
+          // Address recognition: Parse combined address strings or use separate fields
+          // Booking Koala may export addresses as combined strings like "123 Main St, Jacksonville, FL 32254, USA"
+          // or as separate fields: Address, City, State, Zip/Postal Code
+          const parseAddressString = (addressStr) => {
+            if (!addressStr || typeof addressStr !== 'string') {
+              return { street: '', city: '', state: '', zipCode: '', country: 'USA' };
+            }
+            
+            // If address contains commas, it's likely a combined address
+            if (addressStr.includes(',')) {
+              const parts = addressStr.split(',').map(p => p.trim());
+              
+              if (parts.length >= 3) {
+                const street = parts[0] || '';
+                const city = parts[1] || '';
+                // Last part might be "State ZIP Country" or just "State ZIP"
+                const lastPart = parts[parts.length - 1] || '';
+                const secondLastPart = parts.length >= 4 ? parts[parts.length - 2] : '';
+                
+                let state = '';
+                let zipCode = '';
+                let country = 'USA';
+                
+                // Check if last part is country
+                if (lastPart === 'USA' || lastPart === 'United States' || lastPart === 'US') {
+                  country = lastPart === 'US' ? 'USA' : lastPart;
+                  // State and zip should be in second last part
+                  if (secondLastPart) {
+                    const stateZipMatch = secondLastPart.match(/([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
+                    if (stateZipMatch) {
+                      state = stateZipMatch[1];
+                      zipCode = stateZipMatch[2];
+                    } else {
+                      // Just state
+                      state = secondLastPart;
+                    }
+                  }
+                } else {
+                  // Last part might be "State ZIP"
+                  const stateZipMatch = lastPart.match(/([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
+                  if (stateZipMatch) {
+                    state = stateZipMatch[1];
+                    zipCode = stateZipMatch[2];
+                  } else {
+                    // Just state or city
+                    state = lastPart;
+                  }
+                }
+                
+                return { street, city, state, zipCode, country };
+              } else if (parts.length === 2) {
+                // Format: "Street, City State ZIP"
+                const street = parts[0] || '';
+                const cityStateZip = parts[1] || '';
+                const stateZipMatch = cityStateZip.match(/(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
+                if (stateZipMatch) {
+                  return {
+                    street,
+                    city: stateZipMatch[1].trim(),
+                    state: stateZipMatch[2],
+                    zipCode: stateZipMatch[3],
+                    country: 'USA'
+                  };
+                }
+                return { street, city: cityStateZip, state: '', zipCode: '', country: 'USA' };
+              }
+            }
+            
+            // Not a combined address, return as street
+            return { street: addressStr, city: '', state: '', zipCode: '', country: 'USA' };
+          };
+          
+          // Try to get address from combined string first, then separate fields
+          const addressString = job.address || job.Address || job['Address'] || job.serviceAddress || job['Service Address'] || '';
+          const addressComponents = parseAddressString(addressString);
+          
+          // Use parsed components if available, otherwise fall back to separate fields
+          const customerAddress = addressComponents.street || job.address || job.Address || job['Address'] || job.serviceAddress || '';
+          let customerCity = addressComponents.city || job.city || job.City || job['City'] || '';
+          let customerState = addressComponents.state || job.state || job.State || job['State'] || '';
+          let customerZip = addressComponents.zipCode || job.zipCode || job['Zip/Postal Code'] || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code || '';
+          
+          // If we have a combined address string but missing separate fields, use parsed values
+          if (addressString && addressString.includes(',')) {
+            if (!customerCity && addressComponents.city) customerCity = addressComponents.city;
+            if (!customerState && addressComponents.state) customerState = addressComponents.state;
+            if (!customerZip && addressComponents.zipCode) customerZip = addressComponents.zipCode;
+          }
           
           // Check if customer exists in database or was created in this batch
           // Normalize whitespace for matching
@@ -10599,10 +10690,12 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             notes: notes,
             price: priceValue,
             total: priceValue,
-            service_address_street: job.address || job.Address || job.street_address || null,
-            service_address_city: job.city || job.City || null,
-            service_address_state: job.state || job.State || null,
-            service_address_zip: job.zipCode || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code || null,
+            // Use parsed address components (from parseAddressString above) or fallback to separate fields
+            service_address_street: customerAddress || addressComponents.street || job.address || job.Address || job.street_address || null,
+            service_address_city: customerCity || addressComponents.city || job.city || job.City || null,
+            service_address_state: customerState || addressComponents.state || job.state || job.State || null,
+            service_address_zip: customerZip || addressComponents.zipCode || job.zipCode || job['Zip/Postal code'] || job['Zip Code'] || job.zip_code || job.postal_code || null,
+            service_address_country: addressComponents.country || 'USA',
             estimated_duration: duration,
             is_recurring: isRecurring,
             recurring_frequency: recurringFrequency,
