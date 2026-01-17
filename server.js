@@ -2776,17 +2776,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Add recurring filter
     if (recurring === 'true' || recurring === 'recurring') {
-      // Show only recurring jobs (is_recurring = true OR has recurring_frequency)
-      query = query.or('is_recurring.eq.true,recurring_frequency.not.is.null');
+      // Show only recurring jobs (is_recurring = true)
+      query = query.eq('is_recurring', true);
     } else if (recurring === 'false' || recurring === 'one-time') {
       // Show only one-time jobs (NOT recurring)
-      // This means: is_recurring is null/false AND recurring_frequency is null/empty
+      // This means: is_recurring is null or false
       query = query.or('is_recurring.is.null,is_recurring.eq.false');
-      // Also ensure recurring_frequency is null or empty
-      // Note: Supabase doesn't support AND with OR easily, so we'll filter client-side if needed
-      // But we can at least filter by is_recurring
     }
-    // If recurring is not provided or is 'all', show all jobs
+    // If recurring is not provided or is 'all', show all jobs (no filter applied)
     
     // Add team member filter
     // IMPORTANT: We need to check BOTH direct assignment AND job_team_assignments
