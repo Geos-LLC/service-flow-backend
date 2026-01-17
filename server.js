@@ -7928,6 +7928,146 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
 });
 
 
+// Helper function to detect and mark recurring jobs
+// Analyzes jobs with same customer + service to find regular intervals
+async function detectAndMarkRecurringJobs(userId) {
+  try {
+    // Fetch all jobs for this user (including newly imported ones)
+    const { data: allJobs, error: fetchError } = await supabase
+      .from('jobs')
+      .select('id, customer_id, service_id, scheduled_date, is_recurring, recurring_frequency')
+      .eq('user_id', userId)
+      .not('scheduled_date', 'is', null)
+      .order('scheduled_date', { ascending: true });
+    
+    if (fetchError) {
+      console.error('Error fetching jobs for recurring detection:', fetchError);
+      return { detected: 0, updated: 0 };
+    }
+    
+    if (!allJobs || allJobs.length < 3) {
+      console.log('Not enough jobs to detect recurring patterns (need at least 3)');
+      return { detected: 0, updated: 0 };
+    }
+    
+    // Group jobs by customer_id + service_id
+    const jobGroups = new Map();
+    for (const job of allJobs) {
+      if (!job.customer_id || !job.service_id) continue;
+      
+      const key = `${job.customer_id}_${job.service_id}`;
+      if (!jobGroups.has(key)) {
+        jobGroups.set(key, []);
+      }
+      jobGroups.get(key).push(job);
+    }
+    
+    let patternsDetected = 0;
+    let jobsUpdated = 0;
+    
+    // Analyze each group for recurring patterns
+    for (const [key, jobs] of jobGroups.entries()) {
+      if (jobs.length < 3) continue; // Need at least 3 jobs to detect a pattern
+      
+      // Skip if already marked as recurring
+      if (jobs.some(j => j.is_recurring)) continue;
+      
+      // Sort by scheduled_date
+      jobs.sort((a, b) => {
+        const dateA = new Date(a.scheduled_date);
+        const dateB = new Date(b.scheduled_date);
+        return dateA - dateB;
+      });
+      
+      // Calculate intervals between consecutive jobs (in days)
+      const intervals = [];
+      for (let i = 1; i < jobs.length; i++) {
+        const date1 = new Date(jobs[i - 1].scheduled_date);
+        const date2 = new Date(jobs[i].scheduled_date);
+        const diffTime = date2 - date1;
+        const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+        if (diffDays > 0) {
+          intervals.push(diffDays);
+        }
+      }
+      
+      if (intervals.length < 2) continue; // Need at least 2 intervals
+      
+      // Detect pattern: check if intervals are consistent
+      // Calculate average interval
+      const avgInterval = intervals.reduce((sum, val) => sum + val, 0) / intervals.length;
+      
+      // Check if intervals are consistent (within 20% variance)
+      const variance = intervals.reduce((sum, val) => sum + Math.pow(val - avgInterval, 2), 0) / intervals.length;
+      const stdDev = Math.sqrt(variance);
+      const coefficientOfVariation = stdDev / avgInterval;
+      
+      // If variance is low (consistent intervals), it's likely recurring
+      if (coefficientOfVariation < 0.2 && avgInterval >= 1) {
+        // Determine frequency based on average interval
+        // Match the frequency formats used by calculateNextRecurringDate
+        let frequency = 'weekly'; // default
+        if (avgInterval >= 27 && avgInterval <= 33) {
+          // Monthly: use 'monthly' format (system handles this)
+          frequency = 'monthly';
+        } else if (avgInterval >= 13 && avgInterval <= 15) {
+          // Bi-weekly: use 'bi-weekly' format (system handles both 'biweekly' and 'bi-weekly')
+          frequency = 'bi-weekly';
+        } else if (avgInterval >= 6 && avgInterval <= 8) {
+          // Weekly: use 'weekly' format
+          frequency = 'weekly';
+        } else if (avgInterval >= 1 && avgInterval <= 2) {
+          // Daily: use 'daily' format
+          frequency = 'daily';
+        } else if (avgInterval >= 55 && avgInterval <= 65) {
+          // Bi-monthly (every 2 months): approximately 60 days
+          frequency = '2 months';
+        } else if (avgInterval >= 85 && avgInterval <= 95) {
+          // Quarterly (every 3 months): approximately 90 days
+          frequency = '3 months';
+        } else {
+          // Custom frequency - store in format that calculateNextRecurringDate expects
+          if (avgInterval < 27) {
+            // For intervals less than a month, use "X days" format (e.g., "7 days", "10 days")
+            // This matches the regex pattern: /^\d+\s*days?$/
+            frequency = `${Math.round(avgInterval)} days`;
+          } else {
+            // Convert days to approximate months (30 days per month)
+            const months = Math.round(avgInterval / 30);
+            frequency = `${months} months`;
+          }
+        }
+        
+        console.log(`📅 Detected recurring pattern: customer ${jobs[0].customer_id}, service ${jobs[0].service_id}, frequency: ${frequency}, interval: ${avgInterval.toFixed(1)} days`);
+        
+        // Update all jobs in this group to mark as recurring
+        const jobIds = jobs.map(j => j.id);
+        const { error: updateError } = await supabase
+          .from('jobs')
+          .update({
+            is_recurring: true,
+            recurring_frequency: frequency
+          })
+          .in('id', jobIds)
+          .eq('user_id', userId);
+        
+        if (updateError) {
+          console.error(`Error updating jobs for recurring pattern ${key}:`, updateError);
+        } else {
+          patternsDetected++;
+          jobsUpdated += jobIds.length;
+          console.log(`✅ Marked ${jobIds.length} jobs as recurring (${frequency})`);
+        }
+      }
+    }
+    
+    return { detected: patternsDetected, updated: jobsUpdated };
+  } catch (error) {
+    console.error('Error in detectAndMarkRecurringJobs:', error);
+    return { detected: 0, updated: 0 };
+  }
+}
+
 // Jobs import endpoint
 app.post('/api/jobs/import', authenticateToken, async (req, res) => {
   try {
@@ -9412,6 +9552,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       console.log('❌ Errors:', results.errors);
     } else if (results.errors.length > 10) {
       console.log('❌ First 10 errors:', results.errors.slice(0, 10));
+    }
+    
+    // Detect and mark recurring jobs after import
+    try {
+      console.log('🔄 Analyzing imported jobs for recurring patterns...');
+      const recurringDetectionResults = await detectAndMarkRecurringJobs(userId);
+      results.recurringDetected = recurringDetectionResults.detected;
+      results.recurringUpdated = recurringDetectionResults.updated;
+      console.log(`✅ Recurring detection: ${recurringDetectionResults.detected} patterns detected, ${recurringDetectionResults.updated} jobs updated`);
+    } catch (recurringError) {
+      console.error('⚠️ Error detecting recurring jobs:', recurringError);
+      results.warnings.push('Could not detect recurring patterns - jobs imported successfully but recurring status not updated');
     }
     
     res.json(results);
