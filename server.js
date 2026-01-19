@@ -8830,23 +8830,53 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
             
             if (job.scheduledDate && job.scheduledTime) {
-              // Combine date and time
-              const datePart = job.scheduledDate.split(' ')[0]; // Get just the date part (handles "2026-01-07" or "2026-01-07, 10:00 AM")
-              let timePart = job.scheduledTime;
+              // Normalize date to YYYY-MM-DD format
+              let datePart = job.scheduledDate.split(' ')[0].trim(); // Get just the date part
               
-              // Ensure timePart is in HH:MM:SS format
-              if (timePart.includes(':')) {
-                const timeParts = timePart.split(':');
-                if (timeParts.length === 2) {
-                  // HH:MM -> HH:MM:SS
-                  timePart = `${timePart}:00`;
-                } else if (timeParts.length === 3) {
-                  // Already HH:MM:SS
-                  timePart = timePart;
+              // Handle MM/DD/YYYY format (e.g., "12/20/2025")
+              if (datePart.includes('/')) {
+                const dateParts = datePart.split('/');
+                if (dateParts.length === 3) {
+                  const month = parseInt(dateParts[0], 10);
+                  const day = parseInt(dateParts[1], 10);
+                  const year = parseInt(dateParts[2], 10);
+                  if (!isNaN(month) && !isNaN(day) && !isNaN(year)) {
+                    datePart = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                  }
                 }
+              }
+              
+              // Normalize time to HH:MM:SS format (24-hour, no AM/PM)
+              let timePart = job.scheduledTime.trim();
+              
+              // Check if time has AM/PM
+              const ampmMatch = timePart.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|AM|PM)/i);
+              if (ampmMatch) {
+                // Convert AM/PM to 24-hour format
+                let hours = parseInt(ampmMatch[1], 10);
+                const minutes = ampmMatch[2];
+                const seconds = ampmMatch[3] || '00';
+                const ampm = ampmMatch[4].toUpperCase();
+                
+                if (ampm === 'PM' && hours !== 12) hours += 12;
+                else if (ampm === 'AM' && hours === 12) hours = 0;
+                
+                timePart = `${String(hours).padStart(2, '0')}:${minutes}:${seconds}`;
               } else {
-                // No colon, assume it's just hours
-                timePart = `${timePart}:00:00`;
+                // No AM/PM, ensure it's in HH:MM:SS format
+                if (timePart.includes(':')) {
+                  const timeParts = timePart.split(':');
+                  if (timeParts.length === 2) {
+                    // HH:MM -> HH:MM:SS
+                    timePart = `${timePart}:00`;
+                  } else if (timeParts.length === 3) {
+                    // Already HH:MM:SS
+                    timePart = timePart;
+                  }
+                } else {
+                  // No colon, assume it's just hours
+                  timePart = `${timePart}:00:00`;
+                }
               }
               
               const combinedDate = `${datePart} ${timePart}`;
@@ -8860,23 +8890,40 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               
               return combinedDate;
             } else if (job.scheduledDate && job.scheduledDate.includes(' ')) {
-              // Already combined format (e.g., "2026-01-14 10:00 am")
+              // Already combined format (e.g., "2026-01-14 10:00 am" or "12/20/2025 02:00 PM")
               const dateStr = job.scheduledDate.trim();
               
+              // Handle MM/DD/YYYY format dates
+              let datePart = dateStr.split(' ')[0];
+              let timePart = dateStr.split(' ').slice(1).join(' ');
+              
+              // Normalize date to YYYY-MM-DD if it's in MM/DD/YYYY format
+              if (datePart.includes('/')) {
+                const dateParts = datePart.split('/');
+                if (dateParts.length === 3) {
+                  const month = parseInt(dateParts[0], 10);
+                  const day = parseInt(dateParts[1], 10);
+                  const year = parseInt(dateParts[2], 10);
+                  if (!isNaN(month) && !isNaN(day) && !isNaN(year)) {
+                    datePart = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                  }
+                }
+              }
+              
               // If it has time but not in HH:MM:SS format, normalize it
-              if (dateStr.match(/^\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?\s*(am|pm|AM|PM)/i)) {
+              if (timePart && timePart.match(/\d{1,2}:\d{2}(:\d{2})?\s*(am|pm|AM|PM)/i)) {
                 // Has AM/PM, need to convert
-                const timeMatch = dateStr.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|AM|PM)/i);
+                const timeMatch = timePart.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm|AM|PM)/i);
                 if (timeMatch) {
                   let hours = parseInt(timeMatch[1]);
                   const minutes = timeMatch[2];
+                  const seconds = timeMatch[3] || '00';
                   const ampm = timeMatch[4].toUpperCase();
                   
                   if (ampm === 'PM' && hours !== 12) hours += 12;
                   else if (ampm === 'AM' && hours === 12) hours = 0;
                   
-                  const datePart = dateStr.split(' ')[0];
-                  const normalizedTime = `${String(hours).padStart(2, '0')}:${minutes}:00`;
+                  const normalizedTime = `${String(hours).padStart(2, '0')}:${minutes}:${seconds}`;
                   const normalizedDate = `${datePart} ${normalizedTime}`;
                   
                   if (job.isUpdate) {
@@ -8887,11 +8934,18 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 }
               }
               
-              // Validate the date format
-              if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(dateStr)) {
-                console.warn(`Row ${i + 1}: Invalid combined date format: ${dateStr}`);
+              // If no time part or already normalized, validate and return
+              if (timePart) {
+                const combinedDate = `${datePart} ${timePart}`;
+                // Validate the date format
+                if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?/.test(combinedDate)) {
+                  console.warn(`Row ${i + 1}: Invalid combined date format: ${combinedDate}`);
+                }
+                return combinedDate;
+              } else {
+                // No time part, add default time
+                return `${datePart} 09:00:00`;
               }
-              return dateStr;
             } else if (job.scheduledDate) {
               // Only date provided, use default time
               const dateStr = job.scheduledDate.trim();
