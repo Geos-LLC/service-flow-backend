@@ -10024,6 +10024,20 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             }
           }
           
+          // If still no names, try to parse from "Full name" field (Booking Koala format)
+          if ((!customerFirstName || customerFirstName.trim() === '') && 
+              (!customerLastName || customerLastName.trim() === '')) {
+            const fullName = job.customerFullName || job['Full name'] || job['Full Name'] || job.fullName || job.full_name || '';
+            if (fullName && fullName.trim() !== '') {
+              const nameParts = fullName.trim().split(/\s+/).filter(part => part.trim() !== '');
+              if (nameParts.length > 0) {
+                customerFirstName = nameParts[0];
+                customerLastName = nameParts.slice(1).join(' ') || '';
+                console.log(`Row ${i + 1}: Parsed Full name "${fullName}" -> First: "${customerFirstName}", Last: "${customerLastName}"`);
+              }
+            }
+          }
+          
           // Trim whitespace and clean up values (convert to string first to handle any type)
           customerFirstName = (customerFirstName || '').toString().trim();
           customerLastName = (customerLastName || '').toString().trim();
