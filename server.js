@@ -8958,7 +8958,34 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           team_member_id: teamMemberId || null,
           territory_id: territoryId || null,
           notes: sanitizedNotes,
-          status: job.status && job.status.trim() ? job.status.trim() : 'pending',
+          status: (() => {
+            // Normalize status values to handle variations like "cancelled" vs "canceled"
+            if (!job.status || !job.status.trim()) return 'pending';
+            const normalized = job.status.trim().toLowerCase();
+            
+            // Handle cancelled/canceled variations
+            if (normalized === 'canceled' || normalized === 'cancelled' || normalized === 'cancel') {
+              return 'cancelled';
+            }
+            
+            // Handle completed variations
+            if (normalized === 'complete' || normalized === 'completed' || normalized === 'done' || normalized === 'finished') {
+              return 'completed';
+            }
+            
+            // Handle in-progress variations
+            if (normalized === 'in-progress' || normalized === 'in_progress' || normalized === 'inprogress' || normalized === 'started' || normalized === 'enroute') {
+              return 'in_progress';
+            }
+            
+            // Handle confirmed/scheduled variations
+            if (normalized === 'confirmed' || normalized === 'scheduled' || normalized === 'pending') {
+              return normalized === 'pending' ? 'pending' : normalized === 'confirmed' ? 'confirmed' : 'scheduled';
+            }
+            
+            // Return as-is if it's already a recognized status
+            return job.status.trim();
+          })(),
           invoice_status: job.invoiceStatus || 'draft',
           invoice_id: job.invoiceId || null,
           invoice_amount: parseFloat(job.invoiceAmount) || null,
