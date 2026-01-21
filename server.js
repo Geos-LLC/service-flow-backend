@@ -9027,9 +9027,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               return 'completed';
             }
             
-            // Handle in-progress variations
+            // Handle in-progress variations - Supabase enum uses 'in-progress' (with hyphen)
             if (normalized === 'in-progress' || normalized === 'in_progress' || normalized === 'inprogress' || normalized === 'started' || normalized === 'enroute') {
-              return 'in_progress';
+              return 'in-progress'; // Keep hyphen to match Supabase enum
             }
             
             // Handle confirmed/scheduled variations
