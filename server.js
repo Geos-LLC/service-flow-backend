@@ -11167,11 +11167,6 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               } else {
                 console.warn(`Row ${i + 1}: ⚠️ No address data available for territory location`);
               }
-            }
-          }
-        }
-      }
-    }
                 
                 const newTerritory = {
                   user_id: userId,
