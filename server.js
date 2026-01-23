@@ -8858,7 +8858,37 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Found existing territory with this external ID
               territoryId = existingTerritories[0].id;
               territoryIdMapping[externalRegionId] = territoryId; // Store in mapping for this batch
+              
+              // Log address data being processed (even when reusing territory)
               console.log(`Row ${i + 1}: ✅ Found existing territory ${territoryId} in database for external region ID ${externalRegionId}`);
+              console.log(`Row ${i + 1}: Address data for territory ${territoryId} - serviceAddressCity: "${job.serviceAddressCity}", serviceAddressState: "${job.serviceAddressState}", serviceAddress: "${job.serviceAddress || job.address || job.job_address_geographic_address || 'N/A'}"`);
+              
+              // Check if we should update the territory location with better data
+              // Only update if we have parsed city/state and the current location might be wrong
+              if (job.serviceAddressCity && job.serviceAddressState) {
+                const expectedLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+                const { data: currentTerritory } = await supabase
+                  .from('territories')
+                  .select('location')
+                  .eq('id', territoryId)
+                  .single();
+                
+                if (currentTerritory && currentTerritory.location !== expectedLocation) {
+                  // Check if current location looks wrong (contains "FL, USA" or is a street address)
+                  const currentLoc = currentTerritory.location || '';
+                  const looksWrong = currentLoc.includes('FL, USA') || 
+                                    currentLoc.includes(', USA') ||
+                                    (currentLoc.split(',').length > 2 && /\d/.test(currentLoc.split(',')[0])); // Street address pattern
+                  
+                  if (looksWrong) {
+                    console.log(`Row ${i + 1}: 🔄 Updating territory ${territoryId} location from "${currentLoc}" to "${expectedLocation}"`);
+                    await supabase
+                      .from('territories')
+                      .update({ location: expectedLocation })
+                      .eq('id', territoryId);
+                  }
+                }
+              }
             } else {
               console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
               // Use last 6 digits of external ID for display
@@ -10961,7 +10991,37 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               if (!territorySearchError && existingTerritories && existingTerritories.length > 0) {
                 territoryId = existingTerritories[0].id;
                 territoryIdMapping[externalRegionId] = territoryId;
-                console.log(`Row ${i + 1}: Found existing territory ${territoryId} for external location ID ${externalRegionId}`);
+                
+                // Log address data being processed (even when reusing territory)
+                console.log(`Row ${i + 1}: ✅ Found existing territory ${territoryId} for external location ID ${externalRegionId}`);
+                console.log(`Row ${i + 1}: Address data for territory ${territoryId} - serviceAddressCity: "${job.serviceAddressCity}", serviceAddressState: "${job.serviceAddressState}", serviceAddress: "${job.serviceAddress || job.address || job.job_address_geographic_address || 'N/A'}"`);
+                
+                // Check if we should update the territory location with better data
+                // Only update if we have parsed city/state and the current location might be wrong
+                if (job.serviceAddressCity && job.serviceAddressState) {
+                  const expectedLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+                  const { data: currentTerritory } = await supabase
+                    .from('territories')
+                    .select('location')
+                    .eq('id', territoryId)
+                    .single();
+                  
+                  if (currentTerritory && currentTerritory.location !== expectedLocation) {
+                    // Check if current location looks wrong (contains "FL, USA" or is a street address)
+                    const currentLoc = currentTerritory.location || '';
+                    const looksWrong = currentLoc.includes('FL, USA') || 
+                                      currentLoc.includes(', USA') ||
+                                      (currentLoc.split(',').length > 2 && /\d/.test(currentLoc.split(',')[0])); // Street address pattern
+                    
+                    if (looksWrong) {
+                      console.log(`Row ${i + 1}: 🔄 Updating territory ${territoryId} location from "${currentLoc}" to "${expectedLocation}"`);
+                      await supabase
+                        .from('territories')
+                        .update({ location: expectedLocation })
+                        .eq('id', territoryId);
+                    }
+                  }
+                }
               } else {
                 // Create new territory - use last 6 digits for display
                 const displayRegionId = externalRegionId.toString().slice(-6);
@@ -10993,101 +11053,125 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                   
                   console.log(`Row ${i + 1}: Full address available: "${fullAddress}"`);
                   
-                  if (fullAddress) {
-                    // Parse the full address: Could be:
-                    // "1461 Starboard Ct, Orange Park, FL 32003, USA" (with street)
-                    // "Palm Harbor, FL, USA" (city only, no street)
-                    const addressParts = fullAddress.split(',').map(s => s.trim());
-                    
-                    if (addressParts.length >= 3) {
-                      // Check if first part looks like a street address (has numbers or street indicators)
-                      const firstPart = addressParts[0];
-                      const hasStreetIndicators = /\d/.test(firstPart) || 
-                                                 /(St|Street|Ave|Avenue|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Blvd|Boulevard|Way|Pl|Place)/i.test(firstPart);
-                      
-                      // Check if last part is a country
-                      const lastPart = addressParts[addressParts.length - 1];
-                      const isCountry = /^(USA|United States|US)$/i.test(lastPart);
-                      
-                      console.log(`Row ${i + 1}: Address parsing - parts: ${addressParts.length}, hasStreet: ${hasStreetIndicators}, isCountry: ${isCountry}, firstPart: "${firstPart}"`);
-                      
-                      if (hasStreetIndicators) {
-                        // Format: "Street, City, State ZIP, Country"
-                        const city = addressParts[1] || '';
-                        const stateZip = addressParts[2] || '';
-                        // Extract state (first 2 letters) from "FL 32003"
-                        const stateMatch = stateZip.match(/^([A-Z]{2})\s*/);
-                        const state = stateMatch ? stateMatch[1] : '';
-                        
-                        if (city && state) {
-                          territoryLocation = `${city}, ${state}`;
-                          console.log(`Row ${i + 1}: ✅ Extracted city/state from full address (with street): ${territoryLocation}`);
-                        } else if (city) {
-                          territoryLocation = city;
-                          console.log(`Row ${i + 1}: ✅ Extracted city from full address: ${territoryLocation}`);
-                        } else {
-                          territoryLocation = fullAddress;
-                          console.log(`Row ${i + 1}: ⚠️ Using full address as fallback: ${territoryLocation}`);
-                        }
-                      } else if (isCountry) {
-                        // Format: "City, State, Country" (no street address)
-                        const city = firstPart; // First part is the city
-                        const statePart = addressParts[1] || '';
-                        // Extract state (could be "FL" or "FL 34684")
-                        const stateMatch = statePart.match(/^([A-Z]{2})\s*/);
-                        const state = stateMatch ? stateMatch[1] : statePart;
-                        
-                        console.log(`Row ${i + 1}: City-only format detected - city: "${city}", statePart: "${statePart}", state: "${state}"`);
-                        
-                        if (city && state && state.length === 2) {
-                          territoryLocation = `${city}, ${state}`;
-                          console.log(`Row ${i + 1}: ✅ Extracted city/state from city-only address: ${territoryLocation}`);
-                        } else if (city) {
-                          territoryLocation = city;
-                          console.log(`Row ${i + 1}: ✅ Extracted city from city-only address: ${territoryLocation}`);
-                        } else {
-                          territoryLocation = fullAddress;
-                          console.log(`Row ${i + 1}: ⚠️ Using full address as fallback: ${territoryLocation}`);
-                        }
-                      } else {
-                        // Fallback: assume "Street, City, State ZIP" format
-                        const city = addressParts[1] || '';
-                        const stateZip = addressParts[2] || '';
-                        const stateMatch = stateZip.match(/^([A-Z]{2})\s*/);
-                        const state = stateMatch ? stateMatch[1] : '';
-                        
-                        if (city && state) {
-                          territoryLocation = `${city}, ${state}`;
-                          console.log(`Row ${i + 1}: ✅ Extracted city/state (fallback parsing): ${territoryLocation}`);
-                        } else {
-                          territoryLocation = fullAddress;
-                          console.log(`Row ${i + 1}: ⚠️ Using full address as last resort: ${territoryLocation}`);
-                        }
-                      }
-                    } else if (addressParts.length === 2) {
-                      // Format: "City, State ZIP" or "Street, City"
-                      const firstPart = addressParts[0];
-                      const secondPart = addressParts[1];
-                      
-                      // Check if second part has state abbreviation pattern
-                      const stateZipMatch = secondPart.match(/^([A-Z]{2})\s*(.*)$/);
-                      if (stateZipMatch) {
-                        // Format: "City, State ZIP"
-                        territoryLocation = `${firstPart}, ${stateZipMatch[1]}`;
-                        console.log(`Row ${i + 1}: ✅ Extracted city/state from 2-part address: ${territoryLocation}`);
-                      } else {
-                        // Format: "Street, City" (unlikely)
-                        territoryLocation = secondPart || fullAddress;
-                        console.log(`Row ${i + 1}: ⚠️ Using second part as city: ${territoryLocation}`);
-                      }
-                    } else {
-                      territoryLocation = fullAddress;
-                      console.log(`Row ${i + 1}: ⚠️ Using full address as last resort: ${territoryLocation}`);
-                    }
-                  } else {
-                    console.warn(`Row ${i + 1}: ⚠️ No address data available for territory location`);
+              if (fullAddress) {
+                // Improved address parsing - work backwards from most reliable identifiers
+                // Handles: "Street, City, State ZIP, Country", "City, State, Country", "City, State ZIP", "City, State", etc.
+                const addressParts = fullAddress.split(',').map(s => s.trim());
+                
+                // US State abbreviations
+                const stateAbbreviations = new Set([
+                  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                  'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                  'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                  'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                  'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
+                ]);
+                
+                const countryNames = new Set(['USA', 'US', 'United States', 'United States of America']);
+                
+                // Step 1: Identify country (check from the end)
+                let countryIndex = -1;
+                for (let j = addressParts.length - 1; j >= 0; j--) {
+                  if (countryNames.has(addressParts[j].toUpperCase())) {
+                    countryIndex = j;
+                    break;
                   }
                 }
+                
+                // Step 2: Identify state (work backwards from country or end)
+                let stateIndex = -1;
+                let state = '';
+                const searchStart = countryIndex >= 0 ? countryIndex - 1 : addressParts.length - 1;
+                
+                for (let j = searchStart; j >= 0; j--) {
+                  const part = addressParts[j];
+                  // Check if this part contains a state abbreviation
+                  const stateMatch = part.match(/^([A-Z]{2})\s*(.*)$/);
+                  if (stateMatch && stateAbbreviations.has(stateMatch[1].toUpperCase())) {
+                    state = stateMatch[1].toUpperCase();
+                    stateIndex = j;
+                    break;
+                  }
+                  // Also check if the part is just a state (2 letters)
+                  if (part.length === 2 && stateAbbreviations.has(part.toUpperCase())) {
+                    state = part.toUpperCase();
+                    stateIndex = j;
+                    break;
+                  }
+                }
+                
+                // Step 3: Identify city (everything before state, excluding street if present)
+                let city = '';
+                if (stateIndex >= 0) {
+                  const beforeState = addressParts.slice(0, stateIndex);
+                  
+                  if (beforeState.length === 1) {
+                    // Only one part before state - it's the city (no street)
+                    city = beforeState[0];
+                  } else if (beforeState.length > 1) {
+                    // Multiple parts - check if first is street
+                    const firstPart = beforeState[0];
+                    const hasStreetIndicators = /\d/.test(firstPart) || 
+                                               /(St|Street|Ave|Avenue|Rd|Road|Dr|Drive|Ln|Lane|Ct|Court|Blvd|Boulevard|Way|Pl|Place|Terrace|Circle|Hwy|Highway|Route|Rte)/i.test(firstPart);
+                    
+                    if (hasStreetIndicators) {
+                      // Format: "Street, City"
+                      city = beforeState.slice(1).join(', '); // Join remaining as city (handles multi-word cities)
+                    } else {
+                      // Format: "City Name" (multi-word city, no street)
+                      city = beforeState.join(', ');
+                    }
+                  }
+                } else if (countryIndex >= 0) {
+                  // No state found, but we have country - try to extract from before country
+                  const beforeCountry = addressParts.slice(0, countryIndex);
+                  if (beforeCountry.length === 2) {
+                    // "City, State" format - check if second is state
+                    const stateCheck = beforeCountry[1].match(/^([A-Z]{2})\s*(.*)$/);
+                    if (stateCheck && stateAbbreviations.has(stateCheck[1].toUpperCase())) {
+                      city = beforeCountry[0];
+                      state = stateCheck[1].toUpperCase();
+                    } else {
+                      city = beforeCountry[0];
+                    }
+                  } else if (beforeCountry.length === 1) {
+                    city = beforeCountry[0];
+                  }
+                } else if (addressParts.length > 0) {
+                  // No country, no state - assume first part is city
+                  city = addressParts[0];
+                }
+                
+                // Step 4: Fallback - if we still don't have a state, try to find it in any part
+                if (!state) {
+                  for (const part of addressParts) {
+                    const stateMatch = part.match(/^([A-Z]{2})\s*(.*)$/);
+                    if (stateMatch && stateAbbreviations.has(stateMatch[1].toUpperCase())) {
+                      state = stateMatch[1].toUpperCase();
+                      break;
+                    }
+                  }
+                }
+                
+                // Step 5: Build territory location
+                if (city && state) {
+                  territoryLocation = `${city}, ${state}`;
+                  console.log(`Row ${i + 1}: ✅ Extracted city/state: "${territoryLocation}" from address: "${fullAddress}"`);
+                } else if (city) {
+                  territoryLocation = city;
+                  console.log(`Row ${i + 1}: ✅ Extracted city: "${territoryLocation}" from address: "${fullAddress}"`);
+                } else {
+                  territoryLocation = fullAddress;
+                  console.log(`Row ${i + 1}: ⚠️ Using full address as fallback: "${territoryLocation}"`);
+                }
+              } else {
+                console.warn(`Row ${i + 1}: ⚠️ No address data available for territory location`);
+              }
+            }
+          }
+        }
+      }
+    }
                 
                 const newTerritory = {
                   user_id: userId,
