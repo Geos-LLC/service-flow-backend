@@ -6415,6 +6415,165 @@ app.get('/api/jobs/imported/count', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete all jobs for the authenticated user
+app.delete('/api/jobs/all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    console.log(`🗑️ Delete all jobs requested for user ${userId}`);
+    
+    // Step 1: Get all job IDs for this user
+    const pageSize = 1000;
+    let allJobIds = [];
+    let currentPage = 0;
+    let hasMore = true;
+    
+    while (hasMore) {
+      const offset = currentPage * pageSize;
+      
+      const { data: batchJobs, error: fetchError } = await supabase
+        .from('jobs')
+        .select('id')
+        .eq('user_id', userId)
+        .range(offset, offset + pageSize - 1);
+      
+      if (fetchError) {
+        console.error('Error fetching jobs:', fetchError);
+        return res.status(500).json({ error: 'Failed to fetch jobs' });
+      }
+      
+      if (batchJobs && batchJobs.length > 0) {
+        allJobIds = allJobIds.concat(batchJobs.map(job => job.id));
+        hasMore = batchJobs.length === pageSize;
+        currentPage++;
+      } else {
+        hasMore = false;
+      }
+    }
+    
+    if (allJobIds.length === 0) {
+      return res.json({
+        message: 'No jobs found to delete',
+        deleted: 0
+      });
+    }
+    
+    console.log(`🗑️ Found ${allJobIds.length} jobs to delete`);
+    
+    // Step 2: Delete in batches to handle large datasets and avoid timeouts
+    const BATCH_SIZE = 500;
+    let totalDeleted = 0;
+    let errors = [];
+    
+    for (let i = 0; i < allJobIds.length; i += BATCH_SIZE) {
+      const batch = allJobIds.slice(i, i + BATCH_SIZE);
+      
+      try {
+        // Delete related records first (in proper order to avoid foreign key constraints)
+        
+        // 1. Delete job team assignments
+        const { error: assignmentsError } = await supabase
+          .from('job_team_assignments')
+          .delete()
+          .in('job_id', batch);
+        
+        if (assignmentsError) {
+          console.error(`Error deleting job team assignments for batch ${i / BATCH_SIZE + 1}:`, assignmentsError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1} (assignments): ${assignmentsError.message}`);
+        }
+        
+        // 2. Delete transactions related to these jobs
+        const { error: transactionsError } = await supabase
+          .from('transactions')
+          .delete()
+          .in('job_id', batch);
+        
+        if (transactionsError) {
+          console.error(`Error deleting transactions for batch ${i / BATCH_SIZE + 1}:`, transactionsError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1} (transactions): ${transactionsError.message}`);
+        }
+        
+        // 3. Break circular reference: Set invoice_id to NULL in jobs
+        const { error: updateInvoiceError } = await supabase
+          .from('jobs')
+          .update({ invoice_id: null })
+          .in('id', batch);
+        
+        if (updateInvoiceError) {
+          console.error(`Error updating invoice_id for batch ${i / BATCH_SIZE + 1}:`, updateInvoiceError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1} (update invoice): ${updateInvoiceError.message}`);
+        }
+        
+        // 4. Break circular reference: Set job_id to NULL in invoices
+        const { error: updateJobInInvoiceError } = await supabase
+          .from('invoices')
+          .update({ job_id: null })
+          .in('job_id', batch);
+        
+        if (updateJobInInvoiceError) {
+          console.error(`Error updating job_id in invoices for batch ${i / BATCH_SIZE + 1}:`, updateJobInInvoiceError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1} (update invoice job_id): ${updateJobInInvoiceError.message}`);
+        }
+        
+        // 5. Delete job answers if the table exists
+        try {
+          const { error: answersError } = await supabase
+            .from('job_answers')
+            .delete()
+            .in('job_id', batch);
+          
+          if (answersError && !answersError.message.includes('does not exist')) {
+            console.error(`Error deleting job answers for batch ${i / BATCH_SIZE + 1}:`, answersError);
+            errors.push(`Batch ${i / BATCH_SIZE + 1} (answers): ${answersError.message}`);
+          }
+        } catch (answersErr) {
+          // Table might not exist, ignore
+          console.log('Job answers table might not exist, skipping...');
+        }
+        
+        // 6. Finally, delete the jobs themselves
+        const { error: deleteError } = await supabase
+          .from('jobs')
+          .delete()
+          .in('id', batch);
+        
+        if (deleteError) {
+          console.error(`Error deleting jobs batch ${i / BATCH_SIZE + 1}:`, deleteError);
+          errors.push(`Batch ${i / BATCH_SIZE + 1} (jobs): ${deleteError.message}`);
+        } else {
+          totalDeleted += batch.length;
+          console.log(`✅ Deleted batch ${i / BATCH_SIZE + 1}: ${batch.length} jobs`);
+        }
+      } catch (error) {
+        console.error(`Error processing batch ${i / BATCH_SIZE + 1}:`, error);
+        errors.push(`Batch ${i / BATCH_SIZE + 1}: ${error.message}`);
+      }
+    }
+    
+    if (errors.length > 0 && totalDeleted === 0) {
+      console.error('❌ Failed to delete any jobs:', errors);
+      return res.status(500).json({ 
+        error: 'Failed to delete jobs',
+        details: errors
+      });
+    }
+    
+    console.log(`✅ Successfully deleted ${totalDeleted} jobs`);
+    
+    res.json({
+      message: `Successfully deleted ${totalDeleted} job(s)${errors.length > 0 ? ` (${errors.length} batch errors occurred)` : ''}`,
+      deleted: totalDeleted,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('❌ Delete all jobs error:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete all jobs',
+      message: error.message 
+    });
+  }
+});
+
 app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
   // CORS handled by middleware
   
