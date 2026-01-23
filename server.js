@@ -8864,11 +8864,29 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Use last 6 digits of external ID for display
               const displayRegionId = externalRegionId.toString().slice(-6);
               
+            // Use city name for territory location instead of specific street address
+            // This ensures territories represent the city/region, not a specific job location
+            let territoryLocation = 'Unknown';
+            if (job.serviceAddressCity && job.serviceAddressState) {
+              territoryLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+            } else if (job.serviceAddressCity) {
+              territoryLocation = job.serviceAddressCity;
+            } else if (job.serviceAddress) {
+              // Fallback: try to extract city from full address if city field is missing
+              const addressParts = job.serviceAddress.split(',').map(s => s.trim());
+              if (addressParts.length >= 2) {
+                // Usually format is "Street, City, State ZIP"
+                territoryLocation = addressParts[1] || job.serviceAddress;
+              } else {
+                territoryLocation = job.serviceAddress;
+              }
+            }
+            
             const newTerritory = {
               user_id: userId,
               name: `Region ${displayRegionId}`, // Use last 6 digits of external ID
               description: `Imported from external region ID: ${externalRegionId}`,
-              location: job.serviceAddress || 'Unknown',
+              location: territoryLocation,
               zip_codes: job.serviceAddressZip ? [job.serviceAddressZip] : [],
               radius_miles: 25.00,
               timezone: 'America/New_York',
@@ -10846,11 +10864,31 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               } else {
                 // Create new territory - use last 6 digits for display
                 const displayRegionId = externalRegionId.toString().slice(-6);
+                
+                // Use city name for territory location instead of specific street address
+                // This ensures territories represent the city/region, not a specific job location
+                let territoryLocation = 'Unknown';
+                if (job.serviceAddressCity && job.serviceAddressState) {
+                  territoryLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+                } else if (job.serviceAddressCity) {
+                  territoryLocation = job.serviceAddressCity;
+                } else if (job.address || job.serviceAddress) {
+                  const addressStr = job.address || job.serviceAddress;
+                  // Fallback: try to extract city from full address if city field is missing
+                  const addressParts = addressStr.split(',').map(s => s.trim());
+                  if (addressParts.length >= 2) {
+                    // Usually format is "Street, City, State ZIP"
+                    territoryLocation = addressParts[1] || addressStr;
+                  } else {
+                    territoryLocation = addressStr;
+                  }
+                }
+                
                 const newTerritory = {
                   user_id: userId,
                   name: `Region ${displayRegionId}`, // Use last 6 digits for display
                   description: `Imported from external region ID: ${externalRegionId}`,
-                  location: job.address || job.serviceAddress || 'Unknown',
+                  location: territoryLocation,
                   zip_codes: job.zipCode || job.serviceAddressZip ? [job.zipCode || job.serviceAddressZip] : [],
                   radius_miles: 25.00,
                   timezone: 'America/New_York',
