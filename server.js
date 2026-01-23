@@ -8867,18 +8867,51 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // Use city name for territory location instead of specific street address
             // This ensures territories represent the city/region, not a specific job location
             let territoryLocation = 'Unknown';
+            
+            // Priority 1: Use parsed city and state fields (most reliable)
             if (job.serviceAddressCity && job.serviceAddressState) {
               territoryLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+              console.log(`Row ${i + 1}: Using city/state from parsed fields: ${territoryLocation}`);
             } else if (job.serviceAddressCity) {
               territoryLocation = job.serviceAddressCity;
-            } else if (job.serviceAddress) {
-              // Fallback: try to extract city from full address if city field is missing
-              const addressParts = job.serviceAddress.split(',').map(s => s.trim());
-              if (addressParts.length >= 2) {
-                // Usually format is "Street, City, State ZIP"
-                territoryLocation = addressParts[1] || job.serviceAddress;
+              console.log(`Row ${i + 1}: Using city from parsed field: ${territoryLocation}`);
+            } else {
+              // Priority 2: Try to extract from original full address string
+              // Check if we have the original full address in the job data
+              const fullAddress = job.job_address_geographic_address || job.address || job.serviceAddress || '';
+              
+              if (fullAddress) {
+                // Parse the full address: "1461 Starboard Ct, Orange Park, FL 32003, USA"
+                const addressParts = fullAddress.split(',').map(s => s.trim());
+                
+                if (addressParts.length >= 3) {
+                  // Format: "Street, City, State ZIP, Country"
+                  const city = addressParts[1] || '';
+                  const stateZip = addressParts[2] || '';
+                  // Extract state (first 2 letters) from "FL 32003"
+                  const stateMatch = stateZip.match(/^([A-Z]{2})\s*/);
+                  const state = stateMatch ? stateMatch[1] : '';
+                  
+                  if (city && state) {
+                    territoryLocation = `${city}, ${state}`;
+                    console.log(`Row ${i + 1}: Extracted city/state from full address: ${territoryLocation}`);
+                  } else if (city) {
+                    territoryLocation = city;
+                    console.log(`Row ${i + 1}: Extracted city from full address: ${territoryLocation}`);
+                  } else {
+                    territoryLocation = fullAddress;
+                    console.log(`Row ${i + 1}: Using full address as fallback: ${territoryLocation}`);
+                  }
+                } else if (addressParts.length >= 2) {
+                  // Format: "Street, City State ZIP"
+                  territoryLocation = addressParts[1] || fullAddress;
+                  console.log(`Row ${i + 1}: Using second part of address: ${territoryLocation}`);
+                } else {
+                  territoryLocation = fullAddress;
+                  console.log(`Row ${i + 1}: Using full address as last resort: ${territoryLocation}`);
+                }
               } else {
-                territoryLocation = job.serviceAddress;
+                console.warn(`Row ${i + 1}: No address data available for territory location`);
               }
             }
             
@@ -10868,19 +10901,51 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 // Use city name for territory location instead of specific street address
                 // This ensures territories represent the city/region, not a specific job location
                 let territoryLocation = 'Unknown';
+                
+                // Priority 1: Use parsed city and state fields (most reliable)
                 if (job.serviceAddressCity && job.serviceAddressState) {
                   territoryLocation = `${job.serviceAddressCity}, ${job.serviceAddressState}`;
+                  console.log(`Row ${i + 1}: Using city/state from parsed fields: ${territoryLocation}`);
                 } else if (job.serviceAddressCity) {
                   territoryLocation = job.serviceAddressCity;
-                } else if (job.address || job.serviceAddress) {
-                  const addressStr = job.address || job.serviceAddress;
-                  // Fallback: try to extract city from full address if city field is missing
-                  const addressParts = addressStr.split(',').map(s => s.trim());
-                  if (addressParts.length >= 2) {
-                    // Usually format is "Street, City, State ZIP"
-                    territoryLocation = addressParts[1] || addressStr;
+                  console.log(`Row ${i + 1}: Using city from parsed field: ${territoryLocation}`);
+                } else {
+                  // Priority 2: Try to extract from original full address string
+                  // Check if we have the original full address in the job data
+                  const fullAddress = job.job_address_geographic_address || job.address || job.serviceAddress || '';
+                  
+                  if (fullAddress) {
+                    // Parse the full address: "1461 Starboard Ct, Orange Park, FL 32003, USA"
+                    const addressParts = fullAddress.split(',').map(s => s.trim());
+                    
+                    if (addressParts.length >= 3) {
+                      // Format: "Street, City, State ZIP, Country"
+                      const city = addressParts[1] || '';
+                      const stateZip = addressParts[2] || '';
+                      // Extract state (first 2 letters) from "FL 32003"
+                      const stateMatch = stateZip.match(/^([A-Z]{2})\s*/);
+                      const state = stateMatch ? stateMatch[1] : '';
+                      
+                      if (city && state) {
+                        territoryLocation = `${city}, ${state}`;
+                        console.log(`Row ${i + 1}: Extracted city/state from full address: ${territoryLocation}`);
+                      } else if (city) {
+                        territoryLocation = city;
+                        console.log(`Row ${i + 1}: Extracted city from full address: ${territoryLocation}`);
+                      } else {
+                        territoryLocation = fullAddress;
+                        console.log(`Row ${i + 1}: Using full address as fallback: ${territoryLocation}`);
+                      }
+                    } else if (addressParts.length >= 2) {
+                      // Format: "Street, City State ZIP"
+                      territoryLocation = addressParts[1] || fullAddress;
+                      console.log(`Row ${i + 1}: Using second part of address: ${territoryLocation}`);
+                    } else {
+                      territoryLocation = fullAddress;
+                      console.log(`Row ${i + 1}: Using full address as last resort: ${territoryLocation}`);
+                    }
                   } else {
-                    territoryLocation = addressStr;
+                    console.warn(`Row ${i + 1}: No address data available for territory location`);
                   }
                 }
                 
