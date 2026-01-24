@@ -8245,7 +8245,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       updated: 0,  // Existing jobs updated
       skipped: 0,
       errors: [],
-      warnings: [] // Track update warnings separately
+      warnings: [], // Track update warnings separately
+      jobsWithoutId: 0, // Track jobs missing _id (critical for duplicate detection)
+      duplicateDetections: {
+        byId: 0, // Duplicates found by _id
+        byFallback: 0 // Duplicates found by fallback (customer+service+date)
+      }
     };
 
     console.log(`📥 Starting import of ${jobs.length} jobs for user ${userId}`);
@@ -9069,25 +9074,42 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         // This ensures that when CSV data changes (e.g., rescheduled date), the job gets updated, not duplicated
         const jobId = job._id || null;
         
-        // Debug: Log _id from CSV
+        // Debug: Log _id from CSV for all jobs (critical for duplicate detection)
+        const customerNameForDebug = job.customerName || '';
+        
         if (jobId) {
           const normalizedJobId = String(jobId).trim();
-          console.log(`Row ${i + 1}: 🔍 CSV job has _id: "${normalizedJobId}"`);
+          // Log for first 10 jobs and every 100th job to track import progress
+          if (i < 10 || (i + 1) % 100 === 0) {
+            console.log(`Row ${i + 1}: 🔍 CSV job has _id: "${normalizedJobId}" (Customer: "${customerNameForDebug}", Service: "${job.serviceName || 'N/A'}")`);
+          }
           
           // Check if this _id exists in our map
           const existsInMap = existingJobIdMap.has(normalizedJobId);
-          console.log(`Row ${i + 1}: 🔍 Checking _id in map - exists: ${existsInMap}, map size: ${existingJobIdMap.size}`);
+          if (i < 10 || (i + 1) % 100 === 0) {
+            console.log(`Row ${i + 1}: 🔍 Checking _id in map - exists: ${existsInMap}, map size: ${existingJobIdMap.size}`);
+          }
           
           if (existsInMap) {
             const existingJobId = existingJobIdMap.get(normalizedJobId);
-            console.log(`Row ${i + 1}: ✅ Found existing job ID: ${existingJobId} for _id: "${normalizedJobId}"`);
+            console.log(`Row ${i + 1}: ✅ DUPLICATE - Found existing job ID: ${existingJobId} for _id: "${normalizedJobId}" (Customer: "${customerNameForDebug}")`);
           } else {
-            // Debug: Show what _ids are in the map to help diagnose
-            const sampleIds = Array.from(existingJobIdMap.keys()).slice(0, 3);
-            console.log(`Row ${i + 1}: ⚠️ _id "${normalizedJobId}" NOT found in map. Sample _ids in map:`, sampleIds);
+            // New job - log for first 10 to confirm _id-based detection is working
+            if (i < 10) {
+              console.log(`Row ${i + 1}: ✅ NEW JOB - _id "${normalizedJobId}" not in existing jobs (Customer: "${customerNameForDebug}")`);
+            }
           }
         } else {
-          console.log(`Row ${i + 1}: ⚠️ CSV job has NO _id - will use fallback duplicate detection`);
+          // CRITICAL: Missing _id is a problem - log for ALL jobs to catch systemic issues
+          results.jobsWithoutId++;
+          console.warn(`Row ${i + 1}: ⚠️ WARNING - CSV job has NO _id field! Customer: "${customerNameForDebug}", Service: "${job.serviceName || 'N/A'}"`);
+          console.warn(`Row ${i + 1}: ⚠️ This job will use fallback duplicate detection (customer+service+date) which may incorrectly match other jobs`);
+          console.warn(`Row ${i + 1}: ⚠️ Available job keys:`, Object.keys(job).slice(0, 20));
+          
+          // Check if _id might be in a different field
+          if (job.jobId) {
+            console.warn(`Row ${i + 1}: ⚠️ Found jobId field: "${job.jobId}" - but _id is missing. This may cause duplicate detection issues.`);
+          }
         }
         
         if (jobId) {
@@ -9104,6 +9126,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // DATABASE-level duplicate check (using pre-loaded Map for fast O(1) lookup)
           if (existingJobIdMap.has(normalizedJobId)) {
             const existingJobId = existingJobIdMap.get(normalizedJobId);
+            results.duplicateDetections.byId++;
             console.log(`Row ${i + 1}: ✅ DUPLICATE detected by _id - Job _id "${normalizedJobId}" already exists in database (job ID: ${existingJobId}) - UPDATING existing job with new data (date/time may have changed)`);
             results.warnings.push(`Row ${i + 1}: Job with _id "${normalizedJobId}" already exists - updating with new data`);
             
@@ -9278,13 +9301,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           console.log(`Row ${i + 1}: 📅 Building scheduled_date for UPDATE - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}", scheduledDateString: "${scheduledDateString}"`);
         }
         
-        // FALLBACK DUPLICATE CHECK: If _id is missing or didn't match, check by customer + service + scheduled_date
-        // This handles cases where older imports didn't have _id stored, or CSV doesn't have _id column
-        // Only run fallback if we haven't already detected a duplicate via _id
-        if (!job.isUpdate && (!jobId || !existingJobIdMap.has(String(jobId).trim()))) {
-          // Only do fallback check if we don't have _id or _id doesn't match existing jobs
+        // FALLBACK DUPLICATE CHECK: Only if _id is completely missing (not just not found in map)
+        // IMPORTANT: If _id exists in CSV but wasn't found in existing jobs, it's a NEW job - don't use fallback
+        // Fallback should ONLY run when _id is truly missing from the CSV
+        if (!job.isUpdate && !jobId) {
+          // Only do fallback check if we truly don't have _id from CSV
+          // This prevents false matches when _id exists but job is new
           if (customerId && serviceId && scheduledDateString) {
             // Try to find existing job by customer, service, and scheduled date (exact match)
+            // CRITICAL: This must be an exact match including time to avoid false positives
             const { data: existingByFields, error: fieldCheckError } = await supabase
               .from('jobs')
               .select('id, contact_info')
@@ -9295,8 +9320,10 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               .maybeSingle();
             
             if (!fieldCheckError && existingByFields) {
-              console.log(`Row ${i + 1}: DUPLICATE detected (fallback) - Job with same customer (${customerId}), service (${serviceId}), and date (${scheduledDateString}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
-              results.warnings.push(`Row ${i + 1}: Job with same customer, service, and date already exists - updating with new data`);
+              results.duplicateDetections.byFallback++;
+              console.log(`Row ${i + 1}: DUPLICATE detected (fallback - no _id) - Job with same customer (${customerId}), service (${serviceId}), and date (${scheduledDateString}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
+              console.warn(`Row ${i + 1}: ⚠️ WARNING - Using fallback duplicate detection! This job has no _id, so it was matched by customer+service+date. This may incorrectly match different jobs.`);
+              results.warnings.push(`Row ${i + 1}: Job with same customer, service, and date already exists - updating with new data (matched by fallback - no _id)`);
               
               // Store the existing job ID for update
               job.existingJobId = existingByFields.id;
@@ -9309,6 +9336,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Also store _id in contact_info if we have it now (for future duplicate detection)
               // This ensures future imports can use _id-based detection
             }
+          }
+        } else if (jobId && !existingJobIdMap.has(String(jobId).trim())) {
+          // _id exists but not in existing jobs map - this is a NEW job
+          // Log for first 10 jobs to confirm new jobs are being created correctly
+          if (i < 10) {
+            console.log(`Row ${i + 1}: ✅ NEW JOB - _id "${String(jobId).trim()}" not found in existing jobs, will CREATE new job (Customer: "${customerNameForDebug}")`);
           }
         }
 
@@ -9939,7 +9972,23 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       }
     }
 
-    console.log(`📊 Import complete: ${results.imported} imported, ${results.skipped} skipped, ${results.errors.length} errors`);
+    console.log(`📊 Import complete: ${results.imported} imported, ${results.updated} updated, ${results.skipped} skipped, ${results.errors.length} errors`);
+    
+    // CRITICAL: Report jobs missing _id - this is a systemic issue that affects duplicate detection
+    if (results.jobsWithoutId > 0) {
+      console.warn(`⚠️ WARNING: ${results.jobsWithoutId} job(s) were missing _id field!`);
+      console.warn(`⚠️ These jobs used fallback duplicate detection (customer+service+date) which may incorrectly match other jobs.`);
+      console.warn(`⚠️ This could cause jobs to be incorrectly skipped or updated. Please check your CSV export to ensure _id column is included.`);
+    }
+    
+    // Report duplicate detection statistics
+    if (results.duplicateDetections.byId > 0 || results.duplicateDetections.byFallback > 0) {
+      console.log(`📊 Duplicate detection: ${results.duplicateDetections.byId} by _id, ${results.duplicateDetections.byFallback} by fallback (customer+service+date)`);
+      if (results.duplicateDetections.byFallback > 0) {
+        console.warn(`⚠️ ${results.duplicateDetections.byFallback} duplicate(s) detected using fallback method - these may be false matches!`);
+      }
+    }
+    
     if (results.errors.length > 0 && results.errors.length <= 10) {
       console.log('❌ Errors:', results.errors);
     } else if (results.errors.length > 10) {
