@@ -8246,10 +8246,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       skipped: 0,
       errors: [],
       warnings: [], // Track update warnings separately
-      jobsWithoutId: 0, // Track jobs missing _id (critical for duplicate detection)
+      jobsWithoutId: 0, // Track jobs missing _id (for reporting only - these will still be created)
       duplicateDetections: {
-        byId: 0, // Duplicates found by _id
-        byFallback: 0 // Duplicates found by fallback (customer+service+date)
+        byId: 0 // Only track duplicates found by _id (the ONLY method we use)
       }
     };
 
@@ -9064,9 +9063,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         const sanitizedInternalNotes = job.internalNotes ? sanitizeInput(job.internalNotes) : null;
 
         // Check for duplicate jobs
-        // PRIORITY 1: Check by external job ID (if available) - this is the most reliable way
-        // PRIORITY 2: Check by customer, service, and scheduled date (fallback)
-        // CRITICAL: Must filter by user_id to ensure we only check duplicates within the same account
+        // CRITICAL: ONLY use _id for duplicate detection - this is the ONLY reliable method
+        // NO FALLBACK METHODS - if _id is missing, create the job as new
+        // Must filter by user_id to ensure we only check duplicates within the same account
         
         // PRIMARY DUPLICATE DETECTION: Use _id as the unique identifier
         // _id is ALWAYS unique for each job - this is the definitive way to identify duplicates
@@ -9301,48 +9300,19 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           console.log(`Row ${i + 1}: 📅 Building scheduled_date for UPDATE - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}", scheduledDateString: "${scheduledDateString}"`);
         }
         
-        // FALLBACK DUPLICATE CHECK: Only if _id is completely missing (not just not found in map)
-        // IMPORTANT: If _id exists in CSV but wasn't found in existing jobs, it's a NEW job - don't use fallback
-        // Fallback should ONLY run when _id is truly missing from the CSV
-        if (!job.isUpdate && !jobId) {
-          // Only do fallback check if we truly don't have _id from CSV
-          // This prevents false matches when _id exists but job is new
-          if (customerId && serviceId && scheduledDateString) {
-            // Try to find existing job by customer, service, and scheduled date (exact match)
-            // CRITICAL: This must be an exact match including time to avoid false positives
-            const { data: existingByFields, error: fieldCheckError } = await supabase
-              .from('jobs')
-              .select('id, contact_info')
-              .eq('user_id', userId)
-              .eq('customer_id', customerId)
-              .eq('service_id', serviceId)
-              .eq('scheduled_date', scheduledDateString)
-              .maybeSingle();
-            
-            if (!fieldCheckError && existingByFields) {
-              results.duplicateDetections.byFallback++;
-              console.log(`Row ${i + 1}: DUPLICATE detected (fallback - no _id) - Job with same customer (${customerId}), service (${serviceId}), and date (${scheduledDateString}) already exists (job ID: ${existingByFields.id}) - UPDATING existing job`);
-              console.warn(`Row ${i + 1}: ⚠️ WARNING - Using fallback duplicate detection! This job has no _id, so it was matched by customer+service+date. This may incorrectly match different jobs.`);
-              results.warnings.push(`Row ${i + 1}: Job with same customer, service, and date already exists - updating with new data (matched by fallback - no _id)`);
-              
-              // Store the existing job ID for update
-              job.existingJobId = existingByFields.id;
-              job.isUpdate = true;
-              
-              // Store existing contact_info to preserve existing _id (to avoid unique constraint violation)
-              // If the existing job has an _id, we'll preserve it; otherwise we'll add the new one
-              job.existingContactInfo = existingByFields.contact_info;
-              
-              // Also store _id in contact_info if we have it now (for future duplicate detection)
-              // This ensures future imports can use _id-based detection
-            }
-          }
-        } else if (jobId && !existingJobIdMap.has(String(jobId).trim())) {
+        // CRITICAL: ONLY use _id for duplicate detection - NO FALLBACK METHODS
+        // If _id exists but not in existing jobs map, this is a NEW job - create it
+        if (jobId && !existingJobIdMap.has(String(jobId).trim())) {
           // _id exists but not in existing jobs map - this is a NEW job
           // Log for first 10 jobs to confirm new jobs are being created correctly
           if (i < 10) {
             console.log(`Row ${i + 1}: ✅ NEW JOB - _id "${String(jobId).trim()}" not found in existing jobs, will CREATE new job (Customer: "${customerNameForDebug}")`);
           }
+        } else if (!jobId) {
+          // No _id - this is a NEW job (don't try to match it, just create it)
+          // Log warning but still create the job
+          console.warn(`Row ${i + 1}: ⚠️ Job has no _id field - will CREATE as new job (Customer: "${customerNameForDebug}", Service: "${job.serviceName || 'N/A'}")`);
+          console.warn(`Row ${i + 1}: ⚠️ Note: Without _id, we cannot detect if this job already exists. If this job was already imported, it will be created as a duplicate.`);
         }
 
         // Create job with all fields
@@ -9974,19 +9944,16 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
 
     console.log(`📊 Import complete: ${results.imported} imported, ${results.updated} updated, ${results.skipped} skipped, ${results.errors.length} errors`);
     
-    // CRITICAL: Report jobs missing _id - this is a systemic issue that affects duplicate detection
+    // Report jobs missing _id (for informational purposes only)
     if (results.jobsWithoutId > 0) {
       console.warn(`⚠️ WARNING: ${results.jobsWithoutId} job(s) were missing _id field!`);
-      console.warn(`⚠️ These jobs used fallback duplicate detection (customer+service+date) which may incorrectly match other jobs.`);
-      console.warn(`⚠️ This could cause jobs to be incorrectly skipped or updated. Please check your CSV export to ensure _id column is included.`);
+      console.warn(`⚠️ These jobs were created as new jobs. Without _id, we cannot detect if they already exist in the database.`);
+      console.warn(`⚠️ If these jobs were already imported, they will appear as duplicates. Please ensure your CSV export includes the _id column.`);
     }
     
-    // Report duplicate detection statistics
-    if (results.duplicateDetections.byId > 0 || results.duplicateDetections.byFallback > 0) {
-      console.log(`📊 Duplicate detection: ${results.duplicateDetections.byId} by _id, ${results.duplicateDetections.byFallback} by fallback (customer+service+date)`);
-      if (results.duplicateDetections.byFallback > 0) {
-        console.warn(`⚠️ ${results.duplicateDetections.byFallback} duplicate(s) detected using fallback method - these may be false matches!`);
-      }
+    // Report duplicate detection statistics (only by _id now)
+    if (results.duplicateDetections && results.duplicateDetections.byId > 0) {
+      console.log(`📊 Duplicate detection: ${results.duplicateDetections.byId} duplicate(s) found by _id and updated`);
     }
     
     if (results.errors.length > 0 && results.errors.length <= 10) {
