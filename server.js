@@ -7936,6 +7936,168 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
   }
 });
 
+// Find and merge duplicate customers endpoint
+app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { mergeBy = 'phone' } = req.body; // 'phone' or 'name'
+    
+    console.log(`🔍 Finding duplicate customers for user ${userId} by ${mergeBy}`);
+    
+    let duplicates = [];
+    
+    if (mergeBy === 'phone') {
+      // Find duplicates by phone number
+      const { data: customers, error } = await supabase
+        .from('customers')
+        .select('id, first_name, last_name, phone, email, created_at')
+        .eq('user_id', userId)
+        .not('phone', 'is', null)
+        .neq('phone', '');
+      
+      if (error) throw error;
+      
+      // Group by normalized phone (digits only)
+      const phoneGroups = {};
+      customers.forEach(customer => {
+        const normalizedPhone = customer.phone.replace(/\D/g, '');
+        if (!phoneGroups[normalizedPhone]) {
+          phoneGroups[normalizedPhone] = [];
+        }
+        phoneGroups[normalizedPhone].push(customer);
+      });
+      
+      // Find groups with duplicates
+      Object.keys(phoneGroups).forEach(phone => {
+        if (phoneGroups[phone].length > 1) {
+          duplicates.push({
+            key: phone,
+            customers: phoneGroups[phone].sort((a, b) => 
+              new Date(a.created_at) - new Date(b.created_at)
+            ) // Sort by created_at, oldest first
+          });
+        }
+      });
+    } else {
+      // Find duplicates by normalized name
+      const { data: customers, error } = await supabase
+        .from('customers')
+        .select('id, first_name, last_name, phone, email, created_at')
+        .eq('user_id', userId);
+      
+      if (error) throw error;
+      
+      // Group by normalized name
+      const nameGroups = {};
+      customers.forEach(customer => {
+        const normalizeName = (str) => {
+          if (!str) return '';
+          return str.toLowerCase()
+            .replace(/[''`´]/g, "'")
+            .replace(/\s+/g, ' ')
+            .trim();
+        };
+        
+        const normalizedName = normalizeName(customer.first_name) + ' ' + normalizeName(customer.last_name);
+        if (!nameGroups[normalizedName]) {
+          nameGroups[normalizedName] = [];
+        }
+        nameGroups[normalizedName].push(customer);
+      });
+      
+      // Find groups with duplicates
+      Object.keys(nameGroups).forEach(name => {
+        if (nameGroups[name].length > 1) {
+          duplicates.push({
+            key: name,
+            customers: nameGroups[name].sort((a, b) => 
+              new Date(a.created_at) - new Date(b.created_at)
+            ) // Sort by created_at, oldest first
+          });
+        }
+      });
+    }
+    
+    if (duplicates.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No duplicate customers found',
+        duplicates: []
+      });
+    }
+    
+    // Merge duplicates: keep the oldest, update jobs, delete others
+    let merged = 0;
+    let jobsUpdated = 0;
+    const mergeResults = [];
+    
+    for (const duplicate of duplicates) {
+      const customers = duplicate.customers;
+      const keepCustomer = customers[0]; // Oldest customer
+      const deleteCustomers = customers.slice(1); // All others
+      
+      const deleteIds = deleteCustomers.map(c => c.id);
+      
+      // Update all jobs to point to the kept customer
+      const { data: updatedJobs, error: updateError } = await supabase
+        .from('jobs')
+        .update({ customer_id: keepCustomer.id })
+        .in('customer_id', deleteIds)
+        .eq('user_id', userId)
+        .select('id');
+      
+      if (updateError) {
+        console.error(`Error updating jobs for customer ${keepCustomer.id}:`, updateError);
+        mergeResults.push({
+          kept: keepCustomer,
+          deleted: deleteCustomers,
+          error: `Failed to update jobs: ${updateError.message}`
+        });
+        continue;
+      }
+      
+      jobsUpdated += updatedJobs?.length || 0;
+      
+      // Delete duplicate customers
+      const { error: deleteError } = await supabase
+        .from('customers')
+        .delete()
+        .in('id', deleteIds)
+        .eq('user_id', userId);
+      
+      if (deleteError) {
+        console.error(`Error deleting duplicate customers:`, deleteError);
+        mergeResults.push({
+          kept: keepCustomer,
+          deleted: deleteCustomers,
+          error: `Failed to delete: ${deleteError.message}`
+        });
+        continue;
+      }
+      
+      merged++;
+      mergeResults.push({
+        kept: keepCustomer,
+        deleted: deleteCustomers,
+        jobsUpdated: updatedJobs?.length || 0
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: `Merged ${merged} duplicate customer groups, updated ${jobsUpdated} jobs`,
+      duplicatesFound: duplicates.length,
+      merged: merged,
+      jobsUpdated: jobsUpdated,
+      results: mergeResults
+    });
+    
+  } catch (error) {
+    console.error('Error merging duplicate customers:', error);
+    res.status(500).json({ error: 'Failed to merge duplicate customers', details: error.message });
+  }
+});
+
 // Delete all customers endpoint (for testing purposes) - MUST be before /:id route
 app.delete('/api/customers/all', authenticateToken, async (req, res) => {
   try {
@@ -8334,6 +8496,86 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
       console.log(`ℹ️ No existing jobs found for user ${userId}`);
     }
     
+    // STEP 2: Load ALL existing customers ONCE before the loop for fast duplicate detection
+    console.log(`📥 Loading existing customers for user ${userId} to build customer lookup map...`);
+    let existingCustomers = [];
+    page = 0;
+    hasMore = true;
+    
+    while (hasMore) {
+      const { data: customersPage, error: customersPageError } = await supabase
+        .from('customers')
+        .select('id, first_name, last_name, email, phone')
+        .eq('user_id', userId)
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+      
+      if (customersPageError) {
+        console.error(`❌ Error loading customers page ${page}:`, customersPageError);
+        break;
+      }
+      
+      if (customersPage && customersPage.length > 0) {
+        existingCustomers = existingCustomers.concat(customersPage);
+        hasMore = customersPage.length === pageSize;
+        page++;
+      } else {
+        hasMore = false;
+      }
+    }
+    
+    // Build customer lookup maps for fast O(1) matching
+    const customerEmailMap = new Map(); // normalized email -> customer id
+    const customerPhoneMap = new Map(); // normalized phone (digits only) -> customer id
+    const customerNameMap = new Map(); // normalized name -> customer id
+    
+    const normalizePhone = (phone) => {
+      if (!phone) return '';
+      return phone.replace(/\D/g, ''); // Remove all non-digits
+    };
+    
+    const normalizeName = (str) => {
+      if (!str) return '';
+      return str.toLowerCase()
+        .replace(/[''`´]/g, "'") // Normalize apostrophes
+        .replace(/\s+/g, ' ') // Normalize whitespace
+        .trim();
+    };
+    
+    existingCustomers.forEach(customer => {
+      // Email map
+      if (customer.email) {
+        const normalizedEmail = customer.email.toLowerCase().trim();
+        if (normalizedEmail) {
+          customerEmailMap.set(normalizedEmail, customer.id);
+        }
+      }
+      
+      // Phone map (normalized to digits only)
+      if (customer.phone) {
+        const normalizedPhone = normalizePhone(customer.phone);
+        if (normalizedPhone.length >= 10) {
+          // Store first occurrence (oldest customer if sorted by id)
+          if (!customerPhoneMap.has(normalizedPhone)) {
+            customerPhoneMap.set(normalizedPhone, customer.id);
+          }
+        }
+      }
+      
+      // Name map (normalized first + last name)
+      const firstName = normalizeName(customer.first_name || '');
+      const lastName = normalizeName(customer.last_name || '');
+      const fullName = `${firstName} ${lastName}`.trim();
+      if (fullName) {
+        // Store first occurrence
+        if (!customerNameMap.has(fullName)) {
+          customerNameMap.set(fullName, customer.id);
+        }
+      }
+    });
+    
+    console.log(`✅ Loaded ${existingCustomers.length} existing customers`);
+    console.log(`✅ Built lookup maps: ${customerEmailMap.size} emails, ${customerPhoneMap.size} phones, ${customerNameMap.size} names`);
+    
     // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
     // Format: { externalId: internalId }
     const crewIdMapping = {}; // Maps external crew IDs to team member IDs
@@ -8371,103 +8613,78 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           continue;
         }
 
-        // Find or create customer
+        // Find or create customer using pre-loaded lookup maps (FAST O(1) lookups)
         let customerId = job.customerId;
         
         if (!customerId) {
-          let customer = null;
-          let customerFound = false;
+          let customerIdFromMap = null;
           
-          // First, try to find by email if provided (exact match required)
+          // PRIORITY 1: Try to find by email (fast map lookup)
           if (job.customerEmail && job.customerEmail.trim()) {
             const normalizedEmail = job.customerEmail.toLowerCase().trim();
-            const { data: foundCustomer, error: emailError } = await supabase
-              .from('customers')
-              .select('id, email')
-              .eq('user_id', userId)
-              .eq('email', normalizedEmail)
-              .maybeSingle();
-            
-            if (emailError) {
-              console.error(`Row ${i + 1}: Error searching customer by email:`, emailError);
-            } else if (foundCustomer) {
-              customer = foundCustomer;
-              customerFound = true;
-              console.log(`Row ${i + 1}: ✅ Found customer by email (exact match): ${foundCustomer.id}, Email: "${foundCustomer.email}"`);
-            } else {
-              console.log(`Row ${i + 1}: ❌ No customer match found for email: "${normalizedEmail}"`);
+            customerIdFromMap = customerEmailMap.get(normalizedEmail);
+            if (customerIdFromMap) {
+              console.log(`Row ${i + 1}: ✅ Found customer by email (map lookup): ${customerIdFromMap}, Email: "${normalizedEmail}"`);
             }
           }
           
-          // If not found by email, try to find by name
-          if (!customerFound && job.customerName) {
-            // Parse customer name into first and last name
-            // Normalize whitespace: trim and collapse multiple spaces
+          // PRIORITY 2: Try to find by phone number (fast map lookup - handles apostrophe issues)
+          if (!customerIdFromMap && job.customerPhone && job.customerPhone.trim()) {
+            const normalizedPhone = normalizePhone(job.customerPhone);
+            if (normalizedPhone.length >= 10) {
+              customerIdFromMap = customerPhoneMap.get(normalizedPhone);
+              if (customerIdFromMap) {
+                const foundCustomer = existingCustomers.find(c => c.id === customerIdFromMap);
+                console.log(`Row ${i + 1}: ✅ Found customer by phone (map lookup): ${customerIdFromMap}, Phone: "${normalizedPhone}", Name: "${foundCustomer?.first_name || ''} ${foundCustomer?.last_name || ''}"`);
+              }
+            }
+          }
+          
+          // PRIORITY 3: Try to find by normalized name (fast map lookup)
+          if (!customerIdFromMap && job.customerName) {
             const normalizedCustomerName = job.customerName.trim().replace(/\s+/g, ' ');
             const nameParts = normalizedCustomerName.split(/\s+/);
             const firstName = nameParts[0] || '';
             const lastName = nameParts.slice(1).join(' ') || '';
             
             if (firstName) {
-              // Fetch all customers and match by normalized names (handles whitespace differences)
-              // This is more reliable than exact database matches which fail on whitespace differences
-              const { data: allCustomers, error: nameError } = await supabase
-                .from('customers')
-                .select('id, first_name, last_name')
-                .eq('user_id', userId);
+              const normalizedFirstName = normalizeName(firstName);
+              const normalizedLastName = normalizeName(lastName);
+              const fullNameKey = `${normalizedFirstName} ${normalizedLastName}`.trim();
               
-              if (!nameError && allCustomers && allCustomers.length > 0) {
-                // Find customer by comparing normalized names (trim and collapse whitespace)
-                // IMPORTANT: Handle apostrophes and special characters properly
-                const foundCustomer = allCustomers.find(c => {
-                  const dbFirstName = (c.first_name || '').trim().replace(/\s+/g, ' ');
-                  const dbLastName = (c.last_name || '').trim().replace(/\s+/g, ' ');
-                  
-                  // Normalize apostrophes and quotes for comparison (handle different quote styles)
-                  const normalizeForComparison = (str) => {
-                    return str.toLowerCase()
-                      .replace(/[''`]/g, "'") // Normalize all apostrophe/quote variants to standard apostrophe
-                      .trim();
-                  };
-                  
-                  // Match first name (case-insensitive, apostrophe-normalized)
-                  const firstNameMatch = normalizeForComparison(dbFirstName) === normalizeForComparison(firstName);
-                  
-                  // Match last name if provided (case-insensitive, apostrophe-normalized, or both empty)
-                  const lastNameMatch = !lastName || !dbLastName 
-                    ? (!lastName && !dbLastName) // Both empty
-                    : normalizeForComparison(dbLastName) === normalizeForComparison(lastName);
-                  
-                  return firstNameMatch && lastNameMatch;
-                });
-                
-                if (foundCustomer) {
-                  customer = { id: foundCustomer.id };
-                  customerFound = true;
-                  const foundFirstName = (foundCustomer.first_name || '').trim();
-                  const foundLastName = (foundCustomer.last_name || '').trim();
-                  console.log(`Row ${i + 1}: ✅ Found customer by name: "${foundFirstName} ${foundLastName}" (ID: ${customer.id})`);
-                } else {
-                  console.log(`Row ${i + 1}: ❌ No customer match found for name: "${firstName} ${lastName}"`);
+              customerIdFromMap = customerNameMap.get(fullNameKey);
+              if (customerIdFromMap) {
+                const foundCustomer = existingCustomers.find(c => c.id === customerIdFromMap);
+                console.log(`Row ${i + 1}: ✅ Found customer by name (map lookup): ${customerIdFromMap}, Name: "${foundCustomer?.first_name || ''} ${foundCustomer?.last_name || ''}"`);
+              } else {
+                // Debug logging for names with apostrophes that didn't match
+                if (firstName.toLowerCase().includes("'") || lastName.toLowerCase().includes("'")) {
+                  console.log(`Row ${i + 1}: 🔍 Name with apostrophe not found in map - CSV: "${firstName} ${lastName}", Normalized: "${fullNameKey}"`);
+                  console.log(`Row ${i + 1}: 🔍 Available name keys (first 5):`, Array.from(customerNameMap.keys()).slice(0, 5));
                 }
-              } else if (nameError) {
-                console.error(`Row ${i + 1}: Error searching customer by name:`, nameError);
               }
             }
           }
           
+          if (customerIdFromMap) {
+            customerId = customerIdFromMap;
+          }
+          
           // If customer still not found, create a new customer
-          if (!customerFound) {
+          if (!customerId) {
             const nameParts = (job.customerName || '').trim().split(/\s+/);
             const firstName = nameParts[0] || 'Unknown';
             const lastName = nameParts.slice(1).join(' ') || '';
+            
+            // Normalize phone number before storing (remove formatting, keep only digits)
+            const normalizedPhoneForStorage = job.customerPhone ? job.customerPhone.replace(/\D/g, '') : null;
             
             const newCustomer = {
               user_id: userId,
               first_name: sanitizeInput(firstName),
               last_name: sanitizeInput(lastName),
               email: job.customerEmail && job.customerEmail.trim() ? job.customerEmail.toLowerCase().trim() : null,
-              phone: job.customerPhone ? job.customerPhone.trim() : null,
+              phone: normalizedPhoneForStorage || null,
               address: job.serviceAddress || null,
               city: job.serviceAddressCity || null,
               state: job.serviceAddressState || null,
@@ -8491,9 +8708,29 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             customerId = createdCustomer.id;
             console.log(`Row ${i + 1}: ✅ Created new customer with ID: ${customerId}, Name: "${firstName} ${lastName}"`);
-          } else {
-            customerId = customer.id;
-            console.log(`Row ${i + 1}: ✅ Found existing customer with ID: ${customerId}`);
+            
+            // CRITICAL: Add new customer to lookup maps immediately to prevent duplicates in same batch
+            if (newCustomer.email) {
+              customerEmailMap.set(newCustomer.email, customerId);
+            }
+            if (normalizedPhoneForStorage && normalizedPhoneForStorage.length >= 10) {
+              customerPhoneMap.set(normalizedPhoneForStorage, customerId);
+            }
+            const normalizedFirstName = normalizeName(firstName);
+            const normalizedLastName = normalizeName(lastName);
+            const fullNameKey = `${normalizedFirstName} ${normalizedLastName}`.trim();
+            if (fullNameKey) {
+              customerNameMap.set(fullNameKey, customerId);
+            }
+            
+            // Also add to existingCustomers array for future lookups in this batch
+            existingCustomers.push({
+              id: customerId,
+              first_name: firstName,
+              last_name: lastName,
+              email: newCustomer.email,
+              phone: normalizedPhoneForStorage
+            });
           }
         }
         
