@@ -595,7 +595,7 @@ const authLimiter = rateLimit({
 
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200, // limit each IP to 200 requests per windowMs
+  max: 1000, // limit each IP to 1000 requests per windowMs (was 200 - too low for SPA with multiple API calls per page)
   message: 'Too many requests, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -905,9 +905,17 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Apply rate limiting
+// Note: More specific paths must come first. The generalLimiter skips paths
+// that already have their own limiter to avoid double-counting.
 app.use('/api/auth', authLimiter);
-app.use('/api/jobs', apiLimiter); // Higher limit for jobs API
-app.use('/api', generalLimiter);
+app.use('/api/jobs', apiLimiter);
+app.use('/api', (req, res, next) => {
+  // Skip generalLimiter for paths that have their own dedicated limiter
+  if (req.path.startsWith('/auth') || req.path.startsWith('/jobs')) {
+    return next();
+  }
+  return generalLimiter(req, res, next);
+});
 
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
