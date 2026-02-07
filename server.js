@@ -8587,6 +8587,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
     // Track external IDs to internal IDs mapping to prevent duplicate team members and territories
     // Format: { externalId: internalId }
     const crewIdMapping = {}; // Maps external crew IDs to team member IDs
+    // Preload all team members once to avoid repeated DB queries during import
+    const { data: preloadedTeamMembers } = await supabase
+      .from('team_members')
+      .select('id, first_name, email, settings')
+      .eq('user_id', userId);
+    const allTeamMembers = preloadedTeamMembers || [];
     const territoryIdMapping = {}; // Maps external region IDs to territory IDs
     const serviceNameMapping = {}; // Maps normalized service names to service IDs to prevent duplicates
     
@@ -8880,71 +8886,93 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           if (crewIdMapping[externalCrewId]) {
             return crewIdMapping[externalCrewId];
           }
-          
-            // Check if a team member with this external ID already exists in the DATABASE
-          // We store external ID in first_name as "Crew {last6digits}" - use last 6 digits for display
+
           const displayCrewId = externalCrewId.toString().slice(-6);
-          const crewSearchPattern = `Crew ${displayCrewId}`;
-            const { data: existingCrews, error: crewSearchError } = await supabase
-              .from('team_members')
-              .select('id, first_name')
-              .eq('user_id', userId)
-              .eq('first_name', crewSearchPattern)
-              .limit(1);
-            
-            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
-              // Found existing team member with this external ID
-            const foundId = existingCrews[0].id;
-            crewIdMapping[externalCrewId] = foundId; // Store in mapping for this batch
-            console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} in database for external crew ID ${externalCrewId}`);
+          const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+
+          // LOOKUP 1: Match by placeholder email (stable even after renaming the team member)
+          const byEmail = allTeamMembers.find(m => m.email === placeholderEmail);
+          if (byEmail) {
+            const foundId = byEmail.id;
+            crewIdMapping[externalCrewId] = foundId;
+            console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by email for external crew ID ${externalCrewId}`);
+            // Backfill settings.external_crew_id if missing
+            if (!byEmail.settings?.external_crew_id) {
+              const updatedSettings = { ...byEmail.settings, external_crew_id: externalCrewId };
+              await supabase.from('team_members').update({ settings: updatedSettings }).eq('id', foundId);
+              byEmail.settings = updatedSettings; // Update in-memory too
+            }
             return foundId;
           }
-          
-          // Create new team member
-              console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
-            const defaultAvailability = {
-              workingHours: {
-                monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
-                saturday: { enabled: false },
-                sunday: { enabled: false }
-              },
-              customAvailability: []
-            };
-            
-            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
-          const displayCrewIdForNew = externalCrewId.toString().slice(-6);
-            
-            const newTeamMember = {
-              user_id: userId,
-            first_name: `Crew ${displayCrewIdForNew}`, // Use last 6 digits of external ID
-              last_name: '',
+
+          // LOOKUP 2: Match by settings.external_crew_id (for team members that already have it stored)
+          const bySettings = allTeamMembers.find(m => m.settings?.external_crew_id === externalCrewId);
+          if (bySettings) {
+            const foundId = bySettings.id;
+            crewIdMapping[externalCrewId] = foundId;
+            console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by settings.external_crew_id for ${externalCrewId}`);
+            return foundId;
+          }
+
+          // LOOKUP 3: Legacy fallback - match by first_name = "Crew XXXXXX" pattern
+          const crewSearchPattern = `Crew ${displayCrewId}`;
+          const byName = allTeamMembers.find(m => m.first_name === crewSearchPattern);
+          if (byName) {
+            const foundId = byName.id;
+            crewIdMapping[externalCrewId] = foundId;
+            console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by name for external crew ID ${externalCrewId}`);
+            // Backfill settings.external_crew_id so future imports match even after rename
+            const updatedSettings = { ...byName.settings, external_crew_id: externalCrewId };
+            await supabase.from('team_members').update({ settings: updatedSettings }).eq('id', foundId);
+            byName.settings = updatedSettings; // Update in-memory too
+            return foundId;
+          }
+
+          // No match found - create new team member
+          console.log(`Row ${i + 1}: Creating new team member for external crew ID: ${externalCrewId}`);
+          const defaultAvailability = {
+            workingHours: {
+              monday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              tuesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              wednesday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              thursday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              friday: { enabled: true, timeSlots: [{ start: '09:00', end: '18:00', enabled: true }] },
+              saturday: { enabled: false },
+              sunday: { enabled: false }
+            },
+            customAvailability: []
+          };
+
+          const newTeamMember = {
+            user_id: userId,
+            first_name: `Crew ${displayCrewId}`,
+            last_name: '',
             email: placeholderEmail,
-              phone: null,
-              role: 'worker',
-              is_service_provider: true,
-              status: 'active',
-              availability: JSON.stringify(defaultAvailability),
-              territories: [],
-              permissions: {}
-            };
-            
-            const { data: createdTeamMember, error: createTeamError } = await supabase
-              .from('team_members')
-              .insert(newTeamMember)
-              .select('id')
-              .single();
-            
-            if (createTeamError) {
-              console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
-              results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
+            phone: null,
+            role: 'worker',
+            is_service_provider: true,
+            status: 'active',
+            availability: JSON.stringify(defaultAvailability),
+            territories: [],
+            permissions: {},
+            settings: { external_crew_id: externalCrewId }
+          };
+
+          const { data: createdTeamMember, error: createTeamError } = await supabase
+            .from('team_members')
+            .insert(newTeamMember)
+            .select('id')
+            .single();
+
+          if (createTeamError) {
+            console.error(`Row ${i + 1}: Failed to create team member for crew ID ${externalCrewId}:`, createTeamError);
+            results.warnings.push(`Row ${i + 1}: Could not create team member for crew ID ${externalCrewId} - ${createTeamError.message}`);
             return null;
-            } else {
+          } else {
             const newId = createdTeamMember.id;
-            crewIdMapping[externalCrewId] = newId; // Store mapping to prevent duplicates
+            crewIdMapping[externalCrewId] = newId;
+            // Add to preloaded list so subsequent rows can find this member without DB query
+            allTeamMembers.push({ id: newId, first_name: `Crew ${displayCrewId}`, email: placeholderEmail, settings: { external_crew_id: externalCrewId } });
             console.log(`Row ${i + 1}: Created new team member ${newId} for external crew ID ${externalCrewId}`);
             return newId;
           }
