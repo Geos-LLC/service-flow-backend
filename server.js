@@ -8891,6 +8891,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
 
           // LOOKUP 1: Match by placeholder email (stable even after renaming the team member)
+          // Email contains the FULL external ID so this is always unique
           const byEmail = allTeamMembers.find(m => m.email === placeholderEmail);
           if (byEmail) {
             const foundId = byEmail.id;
@@ -8906,6 +8907,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           }
 
           // LOOKUP 2: Match by settings.external_crew_id (for team members that already have it stored)
+          // Uses FULL external ID - no collision risk
           const bySettings = allTeamMembers.find(m => m.settings?.external_crew_id === externalCrewId);
           if (bySettings) {
             const foundId = bySettings.id;
@@ -8914,10 +8916,14 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             return foundId;
           }
 
-          // LOOKUP 3: Legacy fallback - match by first_name = "Crew XXXXXX" pattern
+          // LOOKUP 3: Legacy fallback - match by placeholder email pattern in email field
+          // Also check by first_name but ONLY trust it if there's exactly one match
+          // (slice(-6) can collide between different crew IDs with same last 6 digits)
           const crewSearchPattern = `Crew ${displayCrewId}`;
-          const byName = allTeamMembers.find(m => m.first_name === crewSearchPattern);
-          if (byName) {
+          const byNameMatches = allTeamMembers.filter(m => m.first_name === crewSearchPattern);
+          if (byNameMatches.length === 1) {
+            // Only one match - safe to use
+            const byName = byNameMatches[0];
             const foundId = byName.id;
             crewIdMapping[externalCrewId] = foundId;
             console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by name for external crew ID ${externalCrewId}`);
@@ -8926,6 +8932,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             await supabase.from('team_members').update({ settings: updatedSettings }).eq('id', foundId);
             byName.settings = updatedSettings; // Update in-memory too
             return foundId;
+          } else if (byNameMatches.length > 1) {
+            // Multiple matches with same last 6 digits - name match is ambiguous, skip it
+            console.warn(`Row ${i + 1}: ⚠️ Multiple team members found with name "${crewSearchPattern}" - skipping ambiguous name match for ${externalCrewId}`);
           }
 
           // No match found - create new team member
@@ -8943,9 +8952,11 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             customAvailability: []
           };
 
+          // Use last 10 chars to avoid collisions (last 6 can match between different crew IDs)
+          const uniqueDisplayId = externalCrewId.toString().slice(-10);
           const newTeamMember = {
             user_id: userId,
-            first_name: `Crew ${displayCrewId}`,
+            first_name: `Crew ${uniqueDisplayId}`,
             last_name: '',
             email: placeholderEmail,
             phone: null,
@@ -8972,7 +8983,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             const newId = createdTeamMember.id;
             crewIdMapping[externalCrewId] = newId;
             // Add to preloaded list so subsequent rows can find this member without DB query
-            allTeamMembers.push({ id: newId, first_name: `Crew ${displayCrewId}`, email: placeholderEmail, settings: { external_crew_id: externalCrewId } });
+            allTeamMembers.push({ id: newId, first_name: `Crew ${uniqueDisplayId}`, email: placeholderEmail, settings: { external_crew_id: externalCrewId } });
             console.log(`Row ${i + 1}: Created new team member ${newId} for external crew ID ${externalCrewId}`);
             return newId;
           }
@@ -9168,13 +9179,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               }
             } else {
               console.log(`Row ${i + 1}: Creating new territory for external region ID: ${externalRegionId}`);
-              // Use last 6 digits of external ID for display
-              const displayRegionId = externalRegionId.toString().slice(-6);
-              
+              // Use last 10 digits to avoid collisions (last 6 can match between different IDs)
+              const displayRegionId = externalRegionId.toString().slice(-10);
+
             // Use city name for territory location instead of specific street address
             // This ensures territories represent the city/region, not a specific job location
             let territoryLocation = 'Unknown';
-            
+
             // Debug: Log what we have
             console.log(`Row ${i + 1}: Territory location debug - serviceAddressCity: "${job.serviceAddressCity}", serviceAddressState: "${job.serviceAddressState}", serviceAddress: "${job.serviceAddress}"`);
             
@@ -9292,7 +9303,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             
             const newTerritory = {
               user_id: userId,
-              name: `Region ${displayRegionId}`, // Use last 6 digits of external ID
+              name: `Region ${displayRegionId}`,
               description: `Imported from external region ID: ${externalRegionId}`,
               location: territoryLocation,
               zip_codes: job.serviceAddressZip ? [job.serviceAddressZip] : [],
@@ -11138,25 +11149,67 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             if (crewIdMapping[externalCrewId]) {
               return crewIdMapping[externalCrewId];
             }
-            
-            // Check if a team member with this external ID already exists in the DATABASE
-            // Use last 6 digits for display
+
             const displayCrewId = externalCrewId.toString().slice(-6);
+            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
+
+            // LOOKUP 1: Match by placeholder email (contains FULL external ID - always unique)
+            const { data: byEmailResults, error: emailSearchError } = await supabase
+              .from('team_members')
+              .select('id, first_name, settings')
+              .eq('user_id', userId)
+              .eq('email', placeholderEmail)
+              .limit(1);
+
+            if (!emailSearchError && byEmailResults && byEmailResults.length > 0) {
+              const foundId = byEmailResults[0].id;
+              crewIdMapping[externalCrewId] = foundId;
+              console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by email for external provider ID ${externalCrewId}`);
+              // Backfill settings.external_crew_id if missing
+              if (!byEmailResults[0].settings?.external_crew_id) {
+                const updatedSettings = { ...byEmailResults[0].settings, external_crew_id: externalCrewId };
+                await supabase.from('team_members').update({ settings: updatedSettings }).eq('id', foundId);
+              }
+              return foundId;
+            }
+
+            // LOOKUP 2: Match by settings.external_crew_id (full ID match)
+            const { data: bySettingsResults, error: settingsSearchError } = await supabase
+              .from('team_members')
+              .select('id, first_name, settings')
+              .eq('user_id', userId)
+              .limit(1000);
+
+            if (!settingsSearchError && bySettingsResults) {
+              const bySettings = bySettingsResults.find(m => m.settings?.external_crew_id === externalCrewId);
+              if (bySettings) {
+                const foundId = bySettings.id;
+                crewIdMapping[externalCrewId] = foundId;
+                console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by settings.external_crew_id for ${externalCrewId}`);
+                return foundId;
+              }
+            }
+
+            // LOOKUP 3: Legacy fallback - match by "Crew XXXXXX" name but only if exactly one match
             const crewSearchPattern = `Crew ${displayCrewId}`;
             const { data: existingCrews, error: crewSearchError } = await supabase
               .from('team_members')
-              .select('id, first_name')
+              .select('id, first_name, settings')
               .eq('user_id', userId)
-              .eq('first_name', crewSearchPattern)
-              .limit(1);
-            
-            if (!crewSearchError && existingCrews && existingCrews.length > 0) {
+              .eq('first_name', crewSearchPattern);
+
+            if (!crewSearchError && existingCrews && existingCrews.length === 1) {
               const foundId = existingCrews[0].id;
               crewIdMapping[externalCrewId] = foundId;
-              console.log(`Row ${i + 1}: Found existing team member ${foundId} for external provider ID ${externalCrewId}`);
+              console.log(`Row ${i + 1}: ✅ Found existing team member ${foundId} by name for external provider ID ${externalCrewId}`);
+              // Backfill settings.external_crew_id so future imports use full ID match
+              const updatedSettings = { ...existingCrews[0].settings, external_crew_id: externalCrewId };
+              await supabase.from('team_members').update({ settings: updatedSettings }).eq('id', foundId);
               return foundId;
+            } else if (existingCrews && existingCrews.length > 1) {
+              console.warn(`Row ${i + 1}: ⚠️ Multiple team members found with name "${crewSearchPattern}" - skipping ambiguous name match for ${externalCrewId}`);
             }
-            
+
             // Create new team member
             const defaultAvailability = {
               workingHours: {
@@ -11170,12 +11223,12 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               },
               customAvailability: []
             };
-            
-            const placeholderEmail = `crew-${externalCrewId.replace(/[^a-zA-Z0-9]/g, '-')}@imported.local`;
-            
+
+            // Use last 10 chars to avoid collisions (last 6 can match between different crew IDs)
+            const uniqueDisplayId = externalCrewId.toString().slice(-10);
             const newTeamMember = {
               user_id: userId,
-              first_name: `Crew ${displayCrewId}`, // Use last 6 digits for display
+              first_name: `Crew ${uniqueDisplayId}`,
               last_name: '',
               email: placeholderEmail,
               phone: null,
@@ -11184,15 +11237,16 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               status: 'active',
               availability: JSON.stringify(defaultAvailability),
               territories: [],
-              permissions: {}
+              permissions: {},
+              settings: { external_crew_id: externalCrewId }
             };
-            
+
             const { data: createdTeamMember, error: createTeamError } = await supabase
               .from('team_members')
               .insert(newTeamMember)
               .select('id')
               .single();
-            
+
             if (createTeamError) {
               console.error(`Row ${i + 1}: Failed to create team member for provider ID ${externalCrewId}:`, createTeamError);
               results.jobs.errors.push(`Row ${i + 1}: Could not create team member for provider ID ${externalCrewId}`);
@@ -11312,8 +11366,8 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                   }
                 }
               } else {
-                // Create new territory - use last 6 digits for display
-                const displayRegionId = externalRegionId.toString().slice(-6);
+                // Create new territory - use last 10 digits to avoid collisions
+                const displayRegionId = externalRegionId.toString().slice(-10);
                 
                 // Use city name for territory location instead of specific street address
                 // This ensures territories represent the city/region, not a specific job location
@@ -11460,7 +11514,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 
                 const newTerritory = {
                   user_id: userId,
-                  name: `Region ${displayRegionId}`, // Use last 6 digits for display
+                  name: `Region ${displayRegionId}`,
                   description: `Imported from external region ID: ${externalRegionId}`,
                   location: territoryLocation,
                   zip_codes: job.zipCode || job.serviceAddressZip ? [job.zipCode || job.serviceAddressZip] : [],
