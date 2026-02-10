@@ -10378,7 +10378,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { customers, jobs, importSettings } = req.body;
 
-    const settings = importSettings || { updateExisting: false, skipDuplicates: true };
+    const settings = importSettings || { updateExisting: true, skipDuplicates: true };
     const results = {
       customers: { imported: 0, skipped: 0, errors: [] },
       jobs: { imported: 0, skipped: 0, errors: [] }
@@ -10536,7 +10536,8 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // PRIORITY 1: Check for duplicate by external job ID (if available)
           // Booking Koala jobs might have an ID field - check for it
           const externalJobId = job.jobId || job.id || job.externalId || job.external_id || job['Booking ID'] || job['Booking id'] || job['booking_id'] || null;
-          
+          let existingJobIdForUpdate = null; // Track existing job ID for update instead of insert
+
           if (externalJobId) {
             // Check if we've already seen this external ID in the current import batch
             if (batchExternalJobIds.has(externalJobId)) {
@@ -10545,7 +10546,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               results.jobs.skipped++;
               continue;
             }
-            
+
             // Check if this external ID already exists in the database
             // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
             // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
@@ -10556,7 +10557,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               .select('id, user_id, contact_info')
               .eq('user_id', userId)
               .not('contact_info', 'is', null);
-            
+
             if (!externalIdError && jobsWithContactInfo && jobsWithContactInfo.length > 0) {
               // Check if any job has this external ID in contact_info
               // Compare CSV external ID with stored external ID (NOT internal DB ID)
@@ -10574,13 +10575,14 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                   return false;
                 }
               });
-              
+
               if (foundByExternalId) {
                 // Found duplicate: CSV external ID matches stored external ID
-                // foundByExternalId.id is the internal DB ID (for logging only)
                 console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${foundByExternalId.id} (internal DB ID)`);
                 if (settings.updateExisting) {
-                  // Will update later in the code using foundByExternalId.id
+                  // Store existing job ID so we can UPDATE instead of INSERT later
+                  existingJobIdForUpdate = foundByExternalId.id;
+                  console.log(`Row ${i + 1}: Will UPDATE existing job ${existingJobIdForUpdate} with new data`);
                 } else {
                   results.jobs.skipped++;
                   batchExternalJobIds.add(externalJobId);
@@ -10588,7 +10590,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                 }
               }
             }
-            
+
             // Add to batch tracking immediately to prevent duplicates in the same CSV
             batchExternalJobIds.add(externalJobId);
             console.log(`Row ${i + 1}: Tracking external Booking ID: ${externalJobId}`);
@@ -11651,7 +11653,61 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             })()
           };
 
-          // Check for duplicates if skipDuplicates is enabled
+          // Check if we already detected a duplicate by external ID earlier
+          if (existingJobIdForUpdate) {
+            // UPDATE existing job with new data (schedule, status, etc. may have changed)
+            const { user_id, ...updateData } = mappedJob;
+            console.log(`Row ${i + 1}: 🔄 Updating existing job ${existingJobIdForUpdate} with new data (schedule/time/status may have changed)`);
+
+            const { data: updatedJob, error: updateError } = await supabase
+              .from('jobs')
+              .update(updateData)
+              .eq('id', existingJobIdForUpdate)
+              .eq('user_id', userId)
+              .select()
+              .single();
+
+            if (updateError) {
+              console.error(`Row ${i + 1}: ❌ Update failed for job ${existingJobIdForUpdate}:`, updateError);
+              results.jobs.errors.push(`Row ${i + 1}: Failed to update job - ${updateError.message}`);
+            } else {
+              console.log(`Row ${i + 1}: ✅ Successfully UPDATED job ${existingJobIdForUpdate}`);
+              results.jobs.imported++;
+
+              // Update team member assignments if we have new ones
+              if (teamMemberIds.length > 0) {
+                try {
+                  // Delete old assignments and create new ones
+                  await supabase
+                    .from('job_team_assignments')
+                    .delete()
+                    .eq('job_id', existingJobIdForUpdate);
+
+                  const assignments = teamMemberIds.map((memberId, index) => ({
+                    job_id: existingJobIdForUpdate,
+                    team_member_id: memberId,
+                    is_primary: index === 0 || memberId === primaryTeamMemberId,
+                    assigned_by: userId
+                  }));
+
+                  const { error: assignmentError } = await supabase
+                    .from('job_team_assignments')
+                    .insert(assignments);
+
+                  if (assignmentError) {
+                    console.error(`Row ${i + 1}: Failed to update team assignments:`, assignmentError);
+                  } else {
+                    console.log(`Row ${i + 1}: ✅ Updated ${assignments.length} team member assignment(s) for job ${existingJobIdForUpdate}`);
+                  }
+                } catch (assignmentError) {
+                  console.error(`Row ${i + 1}: Error updating team assignments:`, assignmentError);
+                }
+              }
+            }
+            continue;
+          }
+
+          // Check for duplicates by customer+date+service if skipDuplicates is enabled
           if (settings.skipDuplicates) {
             const { data: existing } = await supabase
               .from('jobs')
@@ -11664,9 +11720,10 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
 
             if (existing) {
               if (settings.updateExisting) {
+                const { user_id, ...updateData } = mappedJob;
                 const { error: updateError } = await supabase
                   .from('jobs')
-                  .update(mappedJob)
+                  .update(updateData)
                   .eq('id', existing.id);
 
                 if (updateError) {
@@ -11692,7 +11749,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             results.jobs.errors.push(`Row ${i + 1}: ${insertError.message}`);
           } else {
             results.jobs.imported++;
-            
+
             // Create team member assignments in job_team_assignments table for multiple team members
             if (teamMemberIds.length > 0) {
               try {
@@ -11702,11 +11759,11 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
                   is_primary: index === 0 || memberId === primaryTeamMemberId, // First one or explicitly primary
                   assigned_by: userId
                 }));
-                
+
                 const { error: assignmentError } = await supabase
                   .from('job_team_assignments')
                   .insert(assignments);
-                
+
                 if (assignmentError) {
                   console.error(`Row ${i + 1}: Failed to create team assignments:`, assignmentError);
                   results.jobs.errors.push(`Row ${i + 1}: Could not assign all team members - ${assignmentError.message}`);
