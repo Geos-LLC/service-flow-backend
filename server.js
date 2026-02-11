@@ -29878,6 +29878,8 @@ app.post('/api/fix-schema', async (req, res) => {
   }
 });
 
+
+
 // Google Geocoding API proxy endpoint for address validation fallback
 
 
