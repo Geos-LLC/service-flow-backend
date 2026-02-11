@@ -1,0 +1,44 @@
+name: Frontend CI
+
+on:
+  pull_request:
+    branches: [ main, production ]
+  push:
+    branches: [ main ]
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # CRA doesn't have a separate "typecheck" script here.
+      # This step is optional; keep it only if you add a typecheck script later.
+      - name: Typecheck (optional)
+        run: npm run typecheck || echo "No typecheck script yet"
+
+      # Your default build is CI=false (won't fail on warnings).
+      # Use build:strict in CI so it behaves like real CI and fails when needed.
+      - name: Build (strict)
+        run: npm run build:strict
+
+      # CRA test command opens watch mode by default.
+      # In CI, force it to run once.
+      - name: Test
+        env:
+          CI: "true"
+        run: npm test -- --watchAll=false
