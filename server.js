@@ -10525,9 +10525,55 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
       const territoryIdMapping = {}; // Maps external location IDs to territory IDs
       const customerIdMapping = {}; // Track customers created in this batch to avoid duplicates
       const serviceNameMapping = {}; // Maps normalized service names to service IDs to prevent duplicates
-      
+
       // Track external job IDs to detect duplicates by external ID (highest priority)
       const batchExternalJobIds = new Set(); // Tracks external job IDs in current import batch
+
+      // PRE-LOAD all existing jobs with contact_info ONCE (avoids N+1 query per job)
+      console.log(`📥 Pre-loading existing jobs for duplicate detection (Booking Koala import)...`);
+      const existingExternalIdMap = new Map(); // Maps external_id -> job.id
+      let bkPage = 0;
+      const bkPageSize = 1000;
+      let bkHasMore = true;
+
+      while (bkHasMore) {
+        const { data: jobsPage, error: jobsPageError } = await supabase
+          .from('jobs')
+          .select('id, user_id, contact_info')
+          .eq('user_id', userId)
+          .not('contact_info', 'is', null)
+          .range(bkPage * bkPageSize, (bkPage + 1) * bkPageSize - 1);
+
+        if (jobsPageError) {
+          console.error(`❌ Error loading jobs page ${bkPage}:`, jobsPageError);
+          break;
+        }
+
+        if (jobsPage && jobsPage.length > 0) {
+          for (const existingJob of jobsPage) {
+            try {
+              const contactInfo = existingJob.contact_info;
+              if (contactInfo && typeof contactInfo === 'object') {
+                const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
+                if (storedExternalId) {
+                  existingExternalIdMap.set(String(storedExternalId), existingJob.id);
+                }
+                // Also check _id for cross-path compatibility
+                if (contactInfo._id) {
+                  existingExternalIdMap.set(String(contactInfo._id), existingJob.id);
+                }
+              }
+            } catch (e) {
+              // Skip jobs with invalid contact_info
+            }
+          }
+          bkHasMore = jobsPage.length === bkPageSize;
+          bkPage++;
+        } else {
+          bkHasMore = false;
+        }
+      }
+      console.log(`✅ Pre-loaded ${existingExternalIdMap.size} external IDs from existing jobs`);
 
       for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
@@ -10547,47 +10593,20 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
               continue;
             }
 
-            // Check if this external ID already exists in the database
-            // IMPORTANT: We compare CSV external ID with stored external ID (NOT internal DB ID)
-            // CSV external ID (e.g., "1733683020919x797049254337314800") vs Database internal ID (e.g., 123)
-            // We store external IDs in contact_info JSONB field as { external_id: "..." }
-            // Query all jobs with contact_info and check JSONB field for external_id match
-            const { data: jobsWithContactInfo, error: externalIdError } = await supabase
-              .from('jobs')
-              .select('id, user_id, contact_info')
-              .eq('user_id', userId)
-              .not('contact_info', 'is', null);
+            // Check if this external ID already exists in the database (using pre-loaded map for O(1) lookup)
+            const existingJobId = existingExternalIdMap.get(String(externalJobId));
 
-            if (!externalIdError && jobsWithContactInfo && jobsWithContactInfo.length > 0) {
-              // Check if any job has this external ID in contact_info
-              // Compare CSV external ID with stored external ID (NOT internal DB ID)
-              const foundByExternalId = jobsWithContactInfo.find(existingJob => {
-                if (existingJob.user_id !== userId) return false; // Safety check
-                try {
-                  const contactInfo = existingJob.contact_info;
-                  if (contactInfo && typeof contactInfo === 'object') {
-                    // Compare CSV external ID with stored external ID
-                    const storedExternalId = contactInfo.external_id || contactInfo.externalId || contactInfo.jobId;
-                    return storedExternalId === externalJobId; // String comparison
-                  }
-                  return false;
-                } catch (e) {
-                  return false;
-                }
-              });
-
-              if (foundByExternalId) {
-                // Found duplicate: CSV external ID matches stored external ID
-                console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches stored external ID in database job ${foundByExternalId.id} (internal DB ID)`);
-                if (settings.updateExisting) {
-                  // Store existing job ID so we can UPDATE instead of INSERT later
-                  existingJobIdForUpdate = foundByExternalId.id;
-                  console.log(`Row ${i + 1}: Will UPDATE existing job ${existingJobIdForUpdate} with new data`);
-                } else {
-                  results.jobs.skipped++;
-                  batchExternalJobIds.add(externalJobId);
-                  continue;
-                }
+            if (existingJobId) {
+              // Found duplicate: CSV external ID matches stored external ID
+              console.log(`Row ${i + 1}: DUPLICATE detected - CSV external ID "${externalJobId}" matches existing job ${existingJobId} (internal DB ID)`);
+              if (settings.updateExisting) {
+                // Store existing job ID so we can UPDATE instead of INSERT later
+                existingJobIdForUpdate = existingJobId;
+                console.log(`Row ${i + 1}: Will UPDATE existing job ${existingJobIdForUpdate} with new data`);
+              } else {
+                results.jobs.skipped++;
+                batchExternalJobIds.add(externalJobId);
+                continue;
               }
             }
 
@@ -11749,6 +11768,11 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             results.jobs.errors.push(`Row ${i + 1}: ${insertError.message}`);
           } else {
             results.jobs.imported++;
+
+            // Add new job's external ID to the map to prevent duplicates within the same batch
+            if (externalJobId && newJob) {
+              existingExternalIdMap.set(String(externalJobId), newJob.id);
+            }
 
             // Create team member assignments in job_team_assignments table for multiple team members
             if (teamMemberIds.length > 0) {
@@ -29877,6 +29901,8 @@ app.post('/api/fix-schema', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
 
 // Google Geocoding API proxy endpoint for address validation fallback
 
