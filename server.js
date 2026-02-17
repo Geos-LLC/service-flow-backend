@@ -5740,8 +5740,8 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
       return res.status(404).json({ error: 'Job not found' });
     }
     
-    // Check if already recurring
-    if (existingJob.is_recurring || existingJob.recurring_job) {
+    // Check if already recurring (only check boolean true, not truthy strings)
+    if (existingJob.is_recurring === true) {
       return res.status(400).json({ error: 'Job is already set as recurring' });
     }
     
@@ -5785,6 +5785,72 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
   } catch (error) {
     console.error('Convert to recurring error:', error);
     res.status(500).json({ error: 'Failed to convert job to recurring' });
+  }
+});
+
+// Update recurring frequency endpoint
+app.put('/api/jobs/:id/recurring-frequency', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { frequency, endDate } = req.body;
+
+    if (!frequency) {
+      return res.status(400).json({ error: 'Recurring frequency is required' });
+    }
+
+    // Check if job exists and belongs to user
+    const { data: existingJob, error: checkError } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (checkError || !existingJob) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (!existingJob.is_recurring) {
+      return res.status(400).json({ error: 'Job is not recurring. Use convert-to-recurring instead.' });
+    }
+
+    // Recalculate next billing date based on new frequency
+    const scheduledDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
+    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
+
+    const updateData = {
+      recurring_frequency: frequency,
+      recurring_end_date: endDate !== undefined ? (endDate || null) : existingJob.recurring_end_date,
+      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : existingJob.next_billing_date
+    };
+
+    console.log(`🔄 Updating recurring frequency for job ${id}: ${existingJob.recurring_frequency} -> ${frequency}`);
+
+    const { data: updatedJob, error: updateError } = await supabase
+      .from('jobs')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('❌ Error updating recurring frequency:', updateError);
+      return res.status(500).json({
+        error: 'Failed to update recurring frequency',
+        details: updateError.message
+      });
+    }
+
+    console.log(`✅ Successfully updated recurring frequency for job ${id}`);
+
+    res.json({
+      message: 'Recurring frequency updated successfully',
+      job: updatedJob
+    });
+  } catch (error) {
+    console.error('Update recurring frequency error:', error);
+    res.status(500).json({ error: 'Failed to update recurring frequency' });
   }
 });
 
