@@ -3519,340 +3519,708 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// SHARED SCHEDULING HELPERS (used by authenticated + public slot endpoints)
+// ============================================================================
+
+// --- Phase 3.1: Location-based driving time ---
+
+// In-memory cache for driving time lookups (origin→destination→minutes)
+// Entries expire after 7 days. Cleared on server restart.
+const drivingTimeCache = new Map();
+const DRIVING_CACHE_TTL_MS = 7 * 24 * 3600 * 1000; // 7 days
+
+/**
+ * Build a full address string from job address fields
+ */
+function buildJobAddress(job) {
+  const parts = [
+    job.service_address_street,
+    job.service_address_city,
+    job.service_address_state,
+    job.service_address_zip
+  ].filter(Boolean);
+  return parts.length >= 2 ? parts.join(', ') : null;
+}
+
+/**
+ * Calculate driving time between two addresses using Google Maps Distance Matrix API.
+ * Returns driving time in minutes. Falls back to `fallbackMinutes` on error.
+ *
+ * Caches results in memory for 7 days keyed by origin+destination.
+ * Uses lat/lng when available, otherwise geocodes the address string.
+ *
+ * @param {string} origin - Origin address string
+ * @param {string} destination - Destination address string
+ * @param {number} fallbackMinutes - Fallback driving time if API fails
+ * @returns {Promise<number>} Driving time in minutes
+ */
+async function calculateDrivingTimeBetween(origin, destination, fallbackMinutes = 0) {
+  if (!origin || !destination) return fallbackMinutes;
+
+  const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+  if (!GOOGLE_API_KEY) return fallbackMinutes;
+
+  // Check cache
+  const cacheKey = `${origin}|||${destination}`;
+  const cached = drivingTimeCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < DRIVING_CACHE_TTL_MS) {
+    return cached.minutes;
+  }
+
+  try {
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin)}&destinations=${encodeURIComponent(destination)}&mode=driving&key=${GOOGLE_API_KEY}`;
+    const response = await axios.get(url, { timeout: 5000 });
+
+    const element = response.data?.rows?.[0]?.elements?.[0];
+    if (element?.status === 'OK' && element.duration?.value) {
+      const minutes = Math.ceil(element.duration.value / 60); // seconds → minutes, round up
+      drivingTimeCache.set(cacheKey, { minutes, timestamp: Date.now() });
+      // Also cache the reverse direction (same driving time as approximation)
+      const reverseKey = `${destination}|||${origin}`;
+      if (!drivingTimeCache.has(reverseKey)) {
+        drivingTimeCache.set(reverseKey, { minutes, timestamp: Date.now() });
+      }
+      return minutes;
+    }
+
+    console.warn(`Distance Matrix API returned status: ${element?.status} for ${origin} → ${destination}`);
+    return fallbackMinutes;
+  } catch (err) {
+    console.error(`Distance Matrix API error: ${err.message}`);
+    return fallbackMinutes;
+  }
+}
+
+/**
+ * Get per-job driving times between a new customer address and each existing job.
+ * Returns a Map of jobId → { drivingBefore, drivingAfter } in minutes.
+ *
+ * For each existing job, calculates:
+ * - Time to drive FROM that job's location TO the new customer address
+ * - Time to drive FROM the new customer address TO that job's location
+ *
+ * Falls back to the global drivingTimeMinutes if address is unavailable.
+ *
+ * @param {Array} existingJobs - Jobs for the day (must include address fields)
+ * @param {string|null} customerAddress - The new booking's customer address
+ * @param {number} fallbackMinutes - Global driving time fallback
+ * @returns {Promise<Map>} Map of job.id → driving minutes
+ */
+async function getPerJobDrivingTimes(existingJobs, customerAddress, fallbackMinutes) {
+  const perJobTimes = new Map();
+
+  if (!customerAddress || !process.env.GOOGLE_MAPS_API_KEY) {
+    // No address or no API key — use global fallback for all jobs
+    return perJobTimes;
+  }
+
+  // Calculate driving times in parallel (with concurrency limit)
+  const promises = existingJobs.map(async (job) => {
+    const jobAddress = buildJobAddress(job);
+    if (!jobAddress) {
+      perJobTimes.set(job.id, fallbackMinutes);
+      return;
+    }
+
+    // Calculate driving time from existing job to new customer location
+    const drivingMinutes = await calculateDrivingTimeBetween(jobAddress, customerAddress, fallbackMinutes);
+    perJobTimes.set(job.id, drivingMinutes);
+  });
+
+  await Promise.all(promises);
+  return perJobTimes;
+}
+
+// --- End Phase 3.1 helpers ---
+
+// Convert time string (HH:MM or HH:MM:SS) to minutes from midnight
+function schedTimeToMinutes(timeStr) {
+  if (!timeStr) return 0;
+  const parts = timeStr.split(':');
+  const hours = parseInt(parts[0]) || 0;
+  const minutes = parseInt(parts[1]) || 0;
+  return hours * 60 + minutes;
+}
+
+// Convert minutes from midnight to HH:MM:SS string
+function minutesToTimeStr(totalMinutes) {
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:00`;
+}
+
+// Check if a job is assigned to a specific worker
+function isJobAssignedToWorker(job, workerId) {
+  if (job.team_member_id && parseInt(job.team_member_id) === parseInt(workerId)) {
+    return true;
+  }
+  if (job.job_team_assignments && Array.isArray(job.job_team_assignments)) {
+    return job.job_team_assignments.some(a =>
+      a.team_member_id && parseInt(a.team_member_id) === parseInt(workerId)
+    );
+  }
+  return false;
+}
+
+// Check if a worker is available at a specific time based on their availability settings
+function isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime, dateStr, requestedDate) {
+  if (!worker.availability) return true; // No availability set → assume available
+
+  try {
+    let avail = worker.availability;
+    if (typeof avail === 'string') avail = JSON.parse(avail);
+
+    const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const dayName = dayNames[requestedDate.getDay()];
+
+    const cleanDateStr = dateStr.includes('T') ? dateStr.split('T')[0] : dateStr;
+    const workingHours = avail.workingHours || avail;
+    const customAvailability = avail.customAvailability || [];
+
+    // Check date-specific override first
+    const dateOverride = customAvailability.find(item => item.date === cleanDateStr);
+    if (dateOverride) {
+      if (dateOverride.available === false) return false;
+      if (dateOverride.hours && Array.isArray(dateOverride.hours) && dateOverride.hours.length > 0) {
+        const sStart = schedTimeToMinutes(slotStartTime);
+        const sEnd = schedTimeToMinutes(slotEndTime);
+        return dateOverride.hours.some(h => {
+          const hStart = schedTimeToMinutes(h.start || h.startTime);
+          const hEnd = schedTimeToMinutes(h.end || h.endTime);
+          return sStart >= hStart && sEnd <= hEnd;
+        });
+      }
+    }
+
+    const dayHours = workingHours[dayName];
+    if (!dayHours) return false;
+
+    const isDayEnabled = dayHours.enabled !== false && dayHours.available !== false;
+    if (!isDayEnabled) return false;
+
+    const sStart = schedTimeToMinutes(slotStartTime);
+    const sEnd = schedTimeToMinutes(slotEndTime);
+
+    // Format 1: { start, end } with optional timeSlots
+    if (dayHours.start && dayHours.end) {
+      const dStart = schedTimeToMinutes(dayHours.start);
+      const dEnd = schedTimeToMinutes(dayHours.end);
+      if (sStart < dStart || sEnd > dEnd) return false;
+      if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
+        return dayHours.timeSlots.some(ts => {
+          const tsStart = schedTimeToMinutes(ts.start || ts.startTime);
+          const tsEnd = schedTimeToMinutes(ts.end || ts.endTime);
+          return sStart >= tsStart && sEnd <= tsEnd;
+        });
+      }
+      return true;
+    }
+
+    // Format 2: { hours: "9:00 AM - 6:00 PM" }
+    if (dayHours.hours && typeof dayHours.hours === 'string') {
+      const m = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+      if (m) {
+        let sh = parseInt(m[1]), eh = parseInt(m[4]);
+        if (m[3] && m[3].toUpperCase() === 'PM' && sh !== 12) sh += 12;
+        if (m[3] && m[3].toUpperCase() === 'AM' && sh === 12) sh = 0;
+        if (m[6] && m[6].toUpperCase() === 'PM' && eh !== 12) eh += 12;
+        if (m[6] && m[6].toUpperCase() === 'AM' && eh === 12) eh = 0;
+        const dStart = sh * 60 + parseInt(m[2]);
+        const dEnd = eh * 60 + parseInt(m[5]);
+        return sStart >= dStart && sEnd <= dEnd;
+      }
+    }
+
+    // Format 3: timeSlots array only
+    if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
+      return dayHours.timeSlots.some(ts => {
+        const tsStart = schedTimeToMinutes(ts.start || ts.startTime);
+        const tsEnd = schedTimeToMinutes(ts.end || ts.endTime);
+        return sStart >= tsStart && sEnd <= tsEnd;
+      });
+    }
+
+    // Fallback: assume 9AM-5PM
+    return sStart >= 540 && sEnd <= 1020;
+  } catch (err) {
+    console.error(`Error parsing availability for worker ${worker.id}:`, err.message);
+    return true; // Fallback to available on parse error
+  }
+}
+
+// Check if a time slot is free of conflicts for a specific worker (with driving buffer)
+// perJobDrivingTimes: optional Map of job.id → location-based driving minutes (Phase 3.1)
+function isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes) {
+  // First check worker's schedule availability
+  if (!isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime, dateStr, requestedDate)) {
+    return false;
+  }
+
+  // Then check for job conflicts with driving time buffer
+  const slotStartMin = schedTimeToMinutes(slotStartTime);
+  const slotEndMin = schedTimeToMinutes(slotEndTime);
+
+  for (const job of existingJobs) {
+    if (!isJobAssignedToWorker(job, worker.id)) continue;
+
+    const jobStartMin = schedTimeToMinutes(job.scheduled_time);
+    const jobDuration = job.duration || durationMinutes;
+    const jobEndMin = jobStartMin + jobDuration;
+
+    // Use per-job location-based driving time if available, else global fallback
+    const jobDrivingBuffer = (perJobDrivingTimes && perJobDrivingTimes.has(job.id))
+      ? perJobDrivingTimes.get(job.id)
+      : drivingTimeMinutes;
+
+    // Apply driving buffer before AND after the existing job
+    const effectiveJobStart = jobStartMin - jobDrivingBuffer;
+    const effectiveJobEnd = jobEndMin + jobDrivingBuffer;
+
+    // The new slot also needs driving buffer after it
+    const effectiveSlotEnd = slotEndMin + jobDrivingBuffer;
+
+    // Conflict if: slotStart < effectiveJobEnd AND effectiveSlotEnd > effectiveJobStart
+    if (slotStartMin < effectiveJobEnd && effectiveSlotEnd > effectiveJobStart) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Fetch business hours from DB for a specific day, with service-level overrides
+async function fetchSchedulingConfig(userId, serviceId, dateStr) {
+  const requestedDate = new Date(dateStr + 'T12:00:00');
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const dayName = dayNames[requestedDate.getDay()];
+
+  let startMinutes = 9 * 60;  // 9 AM default
+  let endMinutes = 17 * 60;   // 5 PM default
+  let slotInterval = 30;      // 30 min default
+  let drivingTimeMinutes = 0;
+  let workersNeeded = 1;
+  let minimumBookingNotice = 0;   // hours
+  let maximumBookingAdvance = 365; // days
+  let skillsRequired = [];
+
+  try {
+    // 1) Fetch user-level business hours + driving time
+    const { data: userAvail } = await supabase
+      .from('user_availability')
+      .select('business_hours, timeslot_templates')
+      .eq('user_id', userId)
+      .not('business_hours', 'is', null)
+      .limit(1);
+
+    if (userAvail && userAvail.length > 0) {
+      let bh = userAvail[0].business_hours;
+      if (typeof bh === 'string') bh = JSON.parse(bh);
+
+      // Extract driving time (stored as businessHours.drivingTime)
+      drivingTimeMinutes = parseInt(bh.drivingTime) || 0;
+
+      // Extract hours for the requested day
+      const dayConfig = bh[dayName];
+      if (dayConfig) {
+        const isEnabled = dayConfig.enabled !== false && dayConfig.available !== false;
+        if (!isEnabled) {
+          // Business is closed this day
+          return { startMinutes: 0, endMinutes: 0, slotInterval, drivingTimeMinutes, workersNeeded, minimumBookingNotice, maximumBookingAdvance, skillsRequired, closed: true };
+        }
+        if (dayConfig.start && dayConfig.end) {
+          startMinutes = schedTimeToMinutes(dayConfig.start);
+          endMinutes = schedTimeToMinutes(dayConfig.end);
+        } else if (dayConfig.hours && typeof dayConfig.hours === 'string') {
+          const m = dayConfig.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+          if (m) {
+            let sh = parseInt(m[1]), eh = parseInt(m[4]);
+            if (m[3] && m[3].toUpperCase() === 'PM' && sh !== 12) sh += 12;
+            if (m[3] && m[3].toUpperCase() === 'AM' && sh === 12) sh = 0;
+            if (m[6] && m[6].toUpperCase() === 'PM' && eh !== 12) eh += 12;
+            if (m[6] && m[6].toUpperCase() === 'AM' && eh === 12) eh = 0;
+            startMinutes = sh * 60 + parseInt(m[2]);
+            endMinutes = eh * 60 + parseInt(m[5]);
+          }
+        }
+      }
+    }
+
+    // 2) Fetch service-level overrides if serviceId provided
+    if (serviceId) {
+      // Get service config (workers_needed, skills_required, duration)
+      const { data: serviceData } = await supabase
+        .from('services')
+        .select('workers, skills_required, duration')
+        .eq('id', serviceId)
+        .single();
+
+      if (serviceData) {
+        workersNeeded = parseInt(serviceData.workers) || 1;
+        if (serviceData.skills_required) {
+          skillsRequired = Array.isArray(serviceData.skills_required)
+            ? serviceData.skills_required
+            : (typeof serviceData.skills_required === 'string' ? JSON.parse(serviceData.skills_required) : []);
+        }
+      }
+
+      // Get service availability settings
+      const { data: svcAvail } = await supabase
+        .from('service_availability')
+        .select('business_hours_override, booking_interval, minimum_booking_notice, maximum_booking_advance')
+        .eq('service_id', serviceId)
+        .maybeSingle();
+
+      if (svcAvail) {
+        if (svcAvail.booking_interval) slotInterval = parseInt(svcAvail.booking_interval) || 30;
+        if (svcAvail.minimum_booking_notice != null) minimumBookingNotice = parseInt(svcAvail.minimum_booking_notice) || 0;
+        if (svcAvail.maximum_booking_advance != null) maximumBookingAdvance = parseInt(svcAvail.maximum_booking_advance) || 365;
+
+        // Service-specific business hours override
+        if (svcAvail.business_hours_override) {
+          let override = svcAvail.business_hours_override;
+          if (typeof override === 'string') override = JSON.parse(override);
+          const dayOverride = override[dayName];
+          if (dayOverride) {
+            if (dayOverride.enabled === false || dayOverride.available === false) {
+              return { startMinutes: 0, endMinutes: 0, slotInterval, drivingTimeMinutes, workersNeeded, minimumBookingNotice, maximumBookingAdvance, skillsRequired, closed: true };
+            }
+            if (dayOverride.start && dayOverride.end) {
+              startMinutes = schedTimeToMinutes(dayOverride.start);
+              endMinutes = schedTimeToMinutes(dayOverride.end);
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error fetching scheduling config:', err.message);
+    // Fall through with defaults
+  }
+
+  return { startMinutes, endMinutes, slotInterval, drivingTimeMinutes, workersNeeded, minimumBookingNotice, maximumBookingAdvance, skillsRequired, closed: false };
+}
+
+// Check service scheduling rules (blackout dates, capacity limits)
+async function checkSchedulingRules(serviceId, dateStr) {
+  if (!serviceId) return { blocked: false, capacityLimit: null };
+
+  try {
+    const { data: rules } = await supabase
+      .from('service_scheduling_rules')
+      .select('*')
+      .eq('service_id', serviceId);
+
+    if (!rules || rules.length === 0) return { blocked: false, capacityLimit: null };
+
+    const requestedDate = new Date(dateStr + 'T12:00:00');
+    const dayOfWeek = requestedDate.getDay();
+    let capacityLimit = null;
+
+    for (const rule of rules) {
+      // Check if rule applies to this date
+      const ruleStartDate = rule.start_date ? new Date(rule.start_date + 'T00:00:00') : null;
+      const ruleEndDate = rule.end_date ? new Date(rule.end_date + 'T23:59:59') : null;
+
+      if (ruleStartDate && requestedDate < ruleStartDate) continue;
+      if (ruleEndDate && requestedDate > ruleEndDate) continue;
+
+      // Check day-of-week filter
+      if (rule.days_of_week) {
+        const daysArray = Array.isArray(rule.days_of_week) ? rule.days_of_week : JSON.parse(rule.days_of_week);
+        if (daysArray.length > 0 && !daysArray.includes(dayOfWeek)) continue;
+      }
+
+      if (rule.rule_type === 'blackout') {
+        return { blocked: true, reason: rule.reason || 'Blackout date', capacityLimit: null };
+      }
+
+      if (rule.rule_type === 'capacity' && rule.capacity_limit != null) {
+        capacityLimit = (capacityLimit == null) ? rule.capacity_limit : Math.min(capacityLimit, rule.capacity_limit);
+      }
+    }
+
+    return { blocked: false, capacityLimit };
+  } catch (err) {
+    console.error('Error checking scheduling rules:', err.message);
+    return { blocked: false, capacityLimit: null };
+  }
+}
+
+// Main shared slot generation function
+// customerAddress (optional, Phase 3.1): customer's address for location-based driving time
+async function generateAvailableSlots({ userId, dateStr, durationMinutes, serviceId, workerId, customerAddress }) {
+  const requestedDate = new Date(dateStr + 'T12:00:00');
+  if (isNaN(requestedDate.getTime())) {
+    return { error: 'Invalid date format', slots: [] };
+  }
+
+  // 1) Fetch scheduling config (business hours, driving time, workers needed, etc.)
+  const config = await fetchSchedulingConfig(userId, serviceId, dateStr);
+  if (config.closed) {
+    return { slots: [], config };
+  }
+
+  // 2) Check scheduling rules (blackout dates, capacity)
+  const rules = await checkSchedulingRules(serviceId, dateStr);
+  if (rules.blocked) {
+    return { slots: [], config, blocked: true, reason: rules.reason };
+  }
+
+  // 3) Enforce minimum booking notice and maximum advance
+  const now = new Date();
+  const requestedDateTime = new Date(dateStr + 'T00:00:00');
+  if (config.minimumBookingNotice > 0) {
+    const minNoticeDate = new Date(now.getTime() + config.minimumBookingNotice * 3600000);
+    if (requestedDateTime < minNoticeDate) {
+      return { slots: [], config, reason: `Minimum ${config.minimumBookingNotice} hours booking notice required` };
+    }
+  }
+  if (config.maximumBookingAdvance < 365) {
+    const maxAdvanceDate = new Date(now.getTime() + config.maximumBookingAdvance * 86400000);
+    if (requestedDateTime > maxAdvanceDate) {
+      return { slots: [], config, reason: `Bookings cannot be made more than ${config.maximumBookingAdvance} days in advance` };
+    }
+  }
+
+  // 4) Fetch existing jobs for the date (include address fields for location-based driving time)
+  const { data: existingJobs, error: jobsError } = await supabase
+    .from('jobs')
+    .select(`
+      scheduled_time, duration, team_member_id, status, id,
+      service_address_street, service_address_city, service_address_state, service_address_zip,
+      job_team_assignments!left(team_member_id, is_primary)
+    `)
+    .eq('user_id', userId)
+    .eq('scheduled_date', dateStr)
+    .not('status', 'in', '(cancelled)');
+
+  if (jobsError) {
+    console.error('Error fetching existing jobs:', jobsError);
+    return { error: 'Failed to fetch existing jobs', slots: [] };
+  }
+
+  // 4b) Calculate per-job driving times using Google Maps if customer address provided (Phase 3.1)
+  const perJobDrivingTimes = customerAddress
+    ? await getPerJobDrivingTimes(existingJobs || [], customerAddress, drivingTimeMinutes)
+    : null;
+
+  // 5) Fetch team members
+  let tmQuery = supabase
+    .from('team_members')
+    .select('id, first_name, last_name, availability, skills')
+    .eq('user_id', userId)
+    .eq('status', 'active');
+  if (workerId) tmQuery = tmQuery.eq('id', workerId);
+
+  const { data: teamMembers, error: tmError } = await tmQuery;
+  if (tmError) {
+    console.error('Error fetching team members:', tmError);
+    return { error: 'Failed to fetch team members', slots: [] };
+  }
+
+  // 6) Filter workers by required skills (Phase 3.2)
+  let eligibleWorkers = teamMembers || [];
+  if (config.skillsRequired && config.skillsRequired.length > 0) {
+    eligibleWorkers = eligibleWorkers.filter(w => {
+      const workerSkills = w.skills || [];
+      const skillsArr = Array.isArray(workerSkills) ? workerSkills : [];
+      return config.skillsRequired.every(s => skillsArr.includes(s));
+    });
+  }
+
+  // 7) Generate slots
+  const slots = [];
+  const { startMinutes, endMinutes, slotInterval, drivingTimeMinutes, workersNeeded } = config;
+  let currentMinutes = startMinutes;
+
+  while (currentMinutes < endMinutes) {
+    const slotStartTime = minutesToTimeStr(currentMinutes);
+    const slotEndMinutes = currentMinutes + durationMinutes;
+
+    // Skip if slot would extend beyond business hours
+    if (slotEndMinutes > endMinutes) {
+      currentMinutes += slotInterval;
+      continue;
+    }
+
+    // Skip past time slots (for today)
+    const todayStr = now.toISOString().split('T')[0];
+    if (dateStr === todayStr) {
+      const nowMinutes = now.getHours() * 60 + now.getMinutes();
+      if (currentMinutes <= nowMinutes) {
+        currentMinutes += slotInterval;
+        continue;
+      }
+    }
+
+    const slotEndTime = minutesToTimeStr(slotEndMinutes);
+
+    // Count available workers for this slot
+    let availableCount = 0;
+    if (workerId) {
+      const worker = eligibleWorkers.find(w => w.id === parseInt(workerId));
+      if (worker && isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+        availableCount = 1;
+      }
+    } else {
+      for (const worker of eligibleWorkers) {
+        if (isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+          availableCount++;
+        }
+      }
+    }
+
+    // Apply capacity limit from scheduling rules
+    if (rules.capacityLimit != null && availableCount > rules.capacityLimit) {
+      availableCount = rules.capacityLimit;
+    }
+
+    // Include slot only if enough workers available (Phase 2.1: enforce workers_needed)
+    if (availableCount >= workersNeeded) {
+      slots.push({
+        time: slotStartTime.substring(0, 5),
+        endTime: slotEndTime.substring(0, 5),
+        availableWorkers: availableCount
+      });
+    }
+
+    currentMinutes += slotInterval;
+  }
+
+  return { slots, config };
+}
+
+// Validate a specific booking slot (for server-side booking validation)
+async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, teamMemberId, serviceId, customerAddress }) {
+  const warnings = [];
+
+  const config = await fetchSchedulingConfig(userId, serviceId, dateStr);
+  if (config.closed) {
+    return { valid: false, error: 'Business is closed on this day' };
+  }
+
+  // Check scheduling rules
+  const rules = await checkSchedulingRules(serviceId, dateStr);
+  if (rules.blocked) {
+    return { valid: false, error: rules.reason || 'This date is blocked' };
+  }
+
+  // Check minimum booking notice
+  const now = new Date();
+  const bookingDateTime = new Date(`${dateStr}T${timeStr}`);
+  if (config.minimumBookingNotice > 0) {
+    const minNoticeDate = new Date(now.getTime() + config.minimumBookingNotice * 3600000);
+    if (bookingDateTime < minNoticeDate) {
+      return { valid: false, error: `Minimum ${config.minimumBookingNotice} hours booking notice required` };
+    }
+  }
+
+  // Check if time is within business hours
+  const slotStartMin = schedTimeToMinutes(timeStr);
+  const slotEndMin = slotStartMin + durationMinutes;
+  if (slotStartMin < config.startMinutes || slotEndMin > config.endMinutes) {
+    warnings.push('Booking is outside business hours');
+  }
+
+  // If no team member assigned, just check basic validity
+  if (!teamMemberId) {
+    return { valid: true, warnings };
+  }
+
+  // Fetch the team member
+  const { data: worker } = await supabase
+    .from('team_members')
+    .select('id, first_name, last_name, availability, skills')
+    .eq('id', teamMemberId)
+    .single();
+
+  if (!worker) {
+    return { valid: false, error: 'Team member not found' };
+  }
+
+  // Check skill requirements
+  if (config.skillsRequired && config.skillsRequired.length > 0) {
+    const workerSkills = Array.isArray(worker.skills) ? worker.skills : [];
+    const missing = config.skillsRequired.filter(s => !workerSkills.includes(s));
+    if (missing.length > 0) {
+      warnings.push(`Worker missing required skills: ${missing.join(', ')}`);
+    }
+  }
+
+  const requestedDate = new Date(dateStr + 'T12:00:00');
+  const slotStartTime = timeStr.length === 5 ? timeStr + ':00' : timeStr;
+  const slotEndTime = minutesToTimeStr(slotEndMin);
+
+  // Check worker availability
+  if (!isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime, dateStr, requestedDate)) {
+    warnings.push('Worker is not available at this time');
+  }
+
+  // Check job conflicts (include address fields for location-based driving time)
+  const { data: existingJobs } = await supabase
+    .from('jobs')
+    .select(`
+      scheduled_time, duration, team_member_id, status, id,
+      service_address_street, service_address_city, service_address_state, service_address_zip,
+      job_team_assignments!left(team_member_id, is_primary)
+    `)
+    .eq('user_id', userId)
+    .eq('scheduled_date', dateStr)
+    .not('status', 'in', '(cancelled)');
+
+  if (existingJobs && existingJobs.length > 0) {
+    // Calculate per-job driving times if customer address available (Phase 3.1)
+    const perJobDrivingTimes = customerAddress
+      ? await getPerJobDrivingTimes(existingJobs, customerAddress, config.drivingTimeMinutes)
+      : null;
+
+    if (!isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, config.drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+      warnings.push('Conflicts with an existing job (including driving time buffer)');
+    }
+  }
+
+  // If there are warnings, the slot is technically invalid but can be force-booked
+  if (warnings.length > 0) {
+    return { valid: false, warnings, canForceBook: true };
+  }
+
+  return { valid: true, warnings: [] };
+}
+
+// ============================================================================
+// END SHARED SCHEDULING HELPERS
+// ============================================================================
+
 // Get available time slots for scheduling
 // IMPORTANT: This must be BEFORE /api/jobs/:id route
 app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { date, duration = 120, workerId, serviceId } = req.query;
+    const { date, duration = 120, workerId, serviceId, customerAddress } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date parameter is required' });
     }
 
-    // Parse the date
-    const requestedDate = new Date(date);
-    if (isNaN(requestedDate.getTime())) {
-      return res.status(400).json({ error: 'Invalid date format' });
-    }
-
-    // Convert duration to integer
     const durationMinutes = parseInt(duration);
+    const result = await generateAvailableSlots({
+      userId,
+      dateStr: date,
+      durationMinutes,
+      serviceId: serviceId || null,
+      workerId: workerId || null,
+      customerAddress: customerAddress || null
+    });
 
-    // Get business hours (TODO: Fetch from business settings table)
-    const businessStartHour = 9; // 9 AM
-    const businessEndHour = 17; // 5 PM
-    const slotInterval = 30; // 30 minutes between slot starts for flexibility
-
-    // Get all jobs for the requested date
-    // IMPORTANT: Also fetch job_team_assignments to check all assigned team members
-    const { data: existingJobs, error: jobsError } = await supabase
-      .from('jobs')
-      .select(`
-        scheduled_time, 
-        duration, 
-        team_member_id, 
-        status,
-        id,
-        job_team_assignments!left(team_member_id, is_primary)
-      `)
-      .eq('user_id', userId)
-      .eq('scheduled_date', date)
-      .not('status', 'in', '(cancelled)'); // Exclude cancelled jobs
-
-    if (jobsError) {
-      console.error('Error fetching existing jobs:', jobsError);
-      return res.status(500).json({ error: 'Failed to fetch existing jobs' });
+    if (result.error) {
+      return res.status(500).json({ error: result.error });
     }
 
-    // Get all team members (or specific worker if provided) WITH their availability
-    let teamMembersQuery = supabase
-      .from('team_members')
-      .select('id, first_name, last_name, availability')
-      .eq('user_id', userId)
-      .eq('status', 'active');
-
-    if (workerId) {
-      teamMembersQuery = teamMembersQuery.eq('id', workerId);
+    if (result.blocked) {
+      return res.json({ slots: [], reason: result.reason });
     }
 
-    const { data: teamMembers, error: teamError } = await teamMembersQuery;
-
-    if (teamError) {
-      console.error('Error fetching team members:', teamError);
-      return res.status(500).json({ error: 'Failed to fetch team members' });
-    }
-
-    // Helper function to check if a team member is available at a specific time based on their availability settings
-    const isWorkerAvailableAtTime = (worker, slotStartTime, slotEndTime) => {
-      if (!worker.availability) {
-        // If no availability set, assume available during business hours
-        console.log(`✅ Worker ${worker.id} (${worker.first_name}): No availability set, defaulting to available`);
-        return true;
-      }
-
-      try {
-        let availabilityData = worker.availability;
-        if (typeof availabilityData === 'string') {
-          availabilityData = JSON.parse(availabilityData);
-        }
-
-        const dayOfWeek = requestedDate.getDay(); // 0 = Sunday, 6 = Saturday
-        const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-        const dayName = dayNames[dayOfWeek];
-        
-        console.log(`🔍 Checking availability for worker ${worker.id} (${worker.first_name}) on ${dayName} at ${slotStartTime}-${slotEndTime}`);
-
-        // Check for date-specific custom availability override
-        // Handle both "YYYY-MM-DD" and "YYYY-MM-DDTHH:MM:SS" formats
-        const dateStr = date.includes('T') ? date.split('T')[0] : date; // YYYY-MM-DD
-        let workingHours = availabilityData.workingHours || availabilityData;
-        let customAvailability = availabilityData.customAvailability || [];
-
-        // Check for date-specific override first
-        const dateOverride = customAvailability.find(item => item.date === dateStr);
-        if (dateOverride) {
-          if (dateOverride.available === false) {
-            return false; // Day is explicitly unavailable
-          }
-          if (dateOverride.hours && Array.isArray(dateOverride.hours) && dateOverride.hours.length > 0) {
-            // Check if slot falls within any of the custom hours
-            const slotStartMinutes = timeToMinutes(slotStartTime);
-            const slotEndMinutes = timeToMinutes(slotEndTime);
-            
-            return dateOverride.hours.some(hourSlot => {
-              const hourStart = timeToMinutes(hourSlot.start || hourSlot.startTime);
-              const hourEnd = timeToMinutes(hourSlot.end || hourSlot.endTime);
-              return slotStartMinutes >= hourStart && slotEndMinutes <= hourEnd;
-            });
-          }
-        }
-
-        // Check regular working hours for the day
-        const dayHours = workingHours[dayName];
-        
-        // Handle different availability formats:
-        // Format 1: { enabled: true, start: "09:00", end: "17:00" }
-        // Format 2: { available: true, hours: "9:00 AM - 6:00 PM" }
-        // Format 3: { available: true, timeSlots: [...] }
-        
-        if (!dayHours) {
-          console.log(`❌ Worker ${worker.id}: No availability configured for ${dayName}`);
-          return false; // Day not configured
-        }
-
-        // Check if day is enabled/available
-        const isDayEnabled = dayHours.enabled !== false && dayHours.available !== false;
-        if (!isDayEnabled) {
-          console.log(`❌ Worker ${worker.id}: ${dayName} is disabled (enabled: ${dayHours.enabled}, available: ${dayHours.available})`);
-          return false; // Day is explicitly disabled
-        }
-        
-        console.log(`✅ Worker ${worker.id}: ${dayName} is enabled, checking hours...`);
-
-        const slotStartMinutes = timeToMinutes(slotStartTime);
-        const slotEndMinutes = timeToMinutes(slotEndTime);
-
-        // Format 1: Check if day has start/end times directly
-        if (dayHours.start && dayHours.end) {
-        const dayStartMinutes = timeToMinutes(dayHours.start);
-        const dayEndMinutes = timeToMinutes(dayHours.end);
-
-        // Check if slot is within working hours
-        if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
-          return false;
-        }
-
-        // If day has time slots, check if slot falls within any time slot
-        if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
-          return dayHours.timeSlots.some(timeSlot => {
-            const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
-            const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
-            return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
-          });
-        }
-
-        return true; // Available within working hours
-        }
-        
-        // Format 2: Parse hours string like "9:00 AM - 6:00 PM"
-        if (dayHours.hours && typeof dayHours.hours === 'string') {
-          const hoursMatch = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
-          if (hoursMatch) {
-            let startHour = parseInt(hoursMatch[1]);
-            let startMin = hoursMatch[2];
-            let endHour = parseInt(hoursMatch[4]);
-            let endMin = hoursMatch[5];
-            
-            // Convert to 24-hour format if AM/PM is present
-            if (hoursMatch[3]) {
-              if (hoursMatch[3].toUpperCase() === 'PM' && startHour !== 12) startHour += 12;
-              if (hoursMatch[3].toUpperCase() === 'AM' && startHour === 12) startHour = 0;
-            }
-            if (hoursMatch[6]) {
-              if (hoursMatch[6].toUpperCase() === 'PM' && endHour !== 12) endHour += 12;
-              if (hoursMatch[6].toUpperCase() === 'AM' && endHour === 12) endHour = 0;
-            }
-            
-            const dayStartMinutes = startHour * 60 + parseInt(startMin);
-            const dayEndMinutes = endHour * 60 + parseInt(endMin);
-            
-            // Check if slot is within working hours
-            if (slotStartMinutes < dayStartMinutes || slotEndMinutes > dayEndMinutes) {
-              return false;
-            }
-            
-            return true; // Available within working hours
-          }
-        }
-        
-        // Format 3: Check timeSlots array
-        if (dayHours.timeSlots && Array.isArray(dayHours.timeSlots) && dayHours.timeSlots.length > 0) {
-          return dayHours.timeSlots.some(timeSlot => {
-            const slotStart = timeToMinutes(timeSlot.start || timeSlot.startTime);
-            const slotEnd = timeToMinutes(timeSlot.end || timeSlot.endTime);
-            return slotStartMinutes >= slotStart && slotEndMinutes <= slotEnd;
-          });
-        }
-        
-        // If day is enabled but no specific hours, assume available during business hours (9 AM - 5 PM)
-        // This handles cases where availability is set to "open" without specific hours
-        const defaultStartMinutes = 9 * 60; // 9 AM
-        const defaultEndMinutes = 17 * 60; // 5 PM
-        
-        if (slotStartMinutes >= defaultStartMinutes && slotEndMinutes <= defaultEndMinutes) {
-          return true;
-        }
-        
-        console.log(`❌ Worker ${worker.id}: Slot ${slotStartTime}-${slotEndTime} not within any available hours for ${dayName}`);
-        return false; // Not within any available hours
-      } catch (error) {
-        console.error(`❌ Error parsing availability for worker ${worker.id} (${worker.first_name}):`, error);
-        console.error(`   Availability data:`, worker.availability);
-        // On error, assume available (fallback to business hours) to avoid blocking scheduling
-        console.log(`⚠️ Worker ${worker.id}: Error parsing availability, defaulting to available`);
-        return true;
-      }
-    };
-
-    // Helper function to convert time string (HH:MM or HH:MM:SS) to minutes from midnight
-    const timeToMinutes = (timeStr) => {
-      if (!timeStr) return 0;
-      const parts = timeStr.split(':');
-      const hours = parseInt(parts[0]) || 0;
-      const minutes = parseInt(parts[1]) || 0;
-      return hours * 60 + minutes;
-    };
-
-    // Helper function to check if a job is assigned to a specific worker
-    const isJobAssignedToWorker = (job, workerId) => {
-      // Check direct assignment (team_member_id field)
-      if (job.team_member_id && parseInt(job.team_member_id) === parseInt(workerId)) {
-        return true;
-      }
-      
-      // Check job_team_assignments table (for jobs with multiple assignments)
-      if (job.job_team_assignments && Array.isArray(job.job_team_assignments)) {
-        return job.job_team_assignments.some(assignment => 
-          assignment.team_member_id && parseInt(assignment.team_member_id) === parseInt(workerId)
-        );
-      }
-      
-      return false;
-    };
-
-    // Helper function to check if a time slot overlaps with existing jobs AND if worker is available
-    const isSlotAvailable = (slotStartTime, slotEndTime, worker) => {
-      // First check if worker is available at this time based on their availability settings
-      if (!isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime)) {
-        return false;
-      }
-
-      // Then check for job conflicts - ONLY for jobs assigned to THIS specific worker
-      const slotStart = new Date(`${date}T${slotStartTime}`);
-      const slotEnd = new Date(`${date}T${slotEndTime}`);
-
-      for (const job of existingJobs) {
-        // CRITICAL: Only check conflicts for jobs assigned to THIS worker
-        // If job is assigned to a different worker, skip it completely
-        // This allows multiple workers to be available at the same time
-        if (!isJobAssignedToWorker(job, worker.id)) {
-          continue; // This job is assigned to someone else, so it doesn't block this worker
-        }
-
-        // This job IS assigned to this worker, so check for time overlap
-        const jobStart = new Date(`${date}T${job.scheduled_time}`);
-        const jobEnd = new Date(jobStart.getTime() + (job.duration || durationMinutes) * 60000);
-
-        // Check for overlap
-        if (slotStart < jobEnd && slotEnd > jobStart) {
-          return false; // This worker has a conflict
-        }
-      }
-      return true; // No conflicts for this worker
-    };
-
-    // Generate time slots with 30-minute intervals
-    const slots = [];
-    
-    // Start from business hours and create 30-minute interval slots
-    let currentMinutes = businessStartHour * 60; // Convert to minutes from midnight
-    const endMinutes = businessEndHour * 60;
-    
-    while (currentMinutes < endMinutes) {
-      const slotHour = Math.floor(currentMinutes / 60);
-      const slotMinute = currentMinutes % 60;
-      const slotStartTime = `${slotHour.toString().padStart(2, '0')}:${slotMinute.toString().padStart(2, '0')}:00`;
-      
-      const slotStartDate = new Date(`${date}T${slotStartTime}`);
-      const slotEndDate = new Date(slotStartDate.getTime() + durationMinutes * 60000);
-      
-      // Calculate end time in minutes
-      const slotEndMinutes = currentMinutes + durationMinutes;
-      
-      // Skip if slot would extend beyond business hours
-      if (slotEndMinutes > endMinutes) {
-        currentMinutes += slotInterval;
-        continue;
-      }
-
-      const slotEndHour = Math.floor(slotEndMinutes / 60);
-      const slotEndMinute = slotEndMinutes % 60;
-      const slotEndTime = `${slotEndHour.toString().padStart(2, '0')}:${slotEndMinute.toString().padStart(2, '0')}:00`;
-
-      // Count available workers for this slot
-      // IMPORTANT: Check each team member INDIVIDUALLY - if one is unavailable, others can still show slots
-      let availableWorkers = 0;
-      
-      if (workerId) {
-        // Check specific worker
-        const worker = teamMembers.find(w => w.id === parseInt(workerId));
-        if (worker && isSlotAvailable(slotStartTime, slotEndTime, worker)) {
-          availableWorkers = 1;
-        }
-      } else {
-        // Check each team member individually - each member's availability is independent
-        for (const worker of teamMembers) {
-          if (isSlotAvailable(slotStartTime, slotEndTime, worker)) {
-            availableWorkers++;
-          }
-        }
-      }
-
-      // Only include slot if at least one worker is available
-      if (availableWorkers > 0) {
-        slots.push({
-          time: slotStartTime.substring(0, 5), // Format as HH:MM
-          endTime: slotEndTime.substring(0, 5), // Format as HH:MM
-          availableWorkers: availableWorkers
-        });
-      }
-      
-      // Move to next 30-minute interval
-      currentMinutes += slotInterval;
-    }
-
-    res.json({ slots });
+    res.json({ slots: result.slots });
   } catch (error) {
     console.error('Error fetching available slots:', error);
     res.status(500).json({ error: 'Failed to fetch available slots' });
@@ -4474,10 +4842,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       qualityCheck = true,
       serviceModifiers,
       serviceIntakeQuestions,
-      intakeQuestionIdMapping
+      intakeQuestionIdMapping,
+      forceBook = false
     } = req.body;
 
-    
+
     // Combine scheduled date and time - save exactly as user chose
     let fullScheduledDate;
     if (scheduledDate && scheduledTime) {
@@ -4485,6 +4854,43 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       fullScheduledDate = `${scheduledDate} ${scheduledTime}:00`;
    } else {
       fullScheduledDate = scheduledDate;
+    }
+
+    // Server-side booking validation (unless forceBook override is set)
+    let bookingWarnings = [];
+    if (scheduledDate && scheduledTime && !forceBook) {
+      const durationForValidation = parseFloat(duration) || 120;
+      // Build customer address string for location-based driving time
+      const validationAddress = serviceAddress
+        ? [serviceAddress.street, serviceAddress.city, serviceAddress.state, serviceAddress.zipCode].filter(Boolean).join(', ')
+        : null;
+
+      const validation = await validateBookingSlot({
+        userId,
+        dateStr: scheduledDate,
+        timeStr: scheduledTime,
+        durationMinutes: durationForValidation,
+        teamMemberId: teamMemberId || null,
+        serviceId: serviceId || null,
+        customerAddress: validationAddress
+      });
+
+      if (!validation.valid) {
+        if (validation.canForceBook) {
+          // Return warnings so admin UI can show confirmation dialog
+          return res.status(409).json({
+            error: 'Scheduling conflict detected',
+            warnings: validation.warnings,
+            canForceBook: true,
+            message: 'Set forceBook=true to override and create the booking anyway'
+          });
+        }
+        return res.status(400).json({
+          error: validation.error || 'Invalid booking slot',
+          warnings: validation.warnings || []
+        });
+      }
+      bookingWarnings = validation.warnings || [];
     }
 
     // Process modifiers and intake questions to calculate final price and duration
@@ -5280,7 +5686,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       
       res.status(201).json({
         message: 'Job created successfully',
-        job: createdJob[0]
+        job: createdJob[0],
+        warnings: bookingWarnings.length > 0 ? bookingWarnings : undefined
       });
   } catch (error) {
     console.error('Create job error:', error);
@@ -12505,65 +12912,35 @@ app.get('/api/public/services', async (req, res) => {
 
 app.get('/api/public/availability', async (req, res) => {
   try {
-    const { userId = 1, date } = req.query;
+    const { userId = 1, date, serviceId, duration = 120, customerAddress } = req.query;
 
     if (!date) {
       return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
     }
 
-    // Get availability settings
-    const { data: availabilitySettings, error: availabilityError } = await supabase
-      .from('user_availability')
-      .select('business_hours, timeslot_templates')
-      .eq('user_id', userId)
-      .maybeSingle(); // fetch one row
-
-    if (availabilityError) {
-      console.error('Error fetching availability settings:', availabilityError);
-      return res.status(500).json({ error: 'Failed to fetch availability settings' });
-    }
-
-    // Get existing bookings
-    const { data: existingBookings, error: bookingsError } = await supabase
-      .from('jobs')
-      .select('scheduled_date')
-      .eq('user_id', userId)
-      .gte('scheduled_date', `${date} 00:00:00`)
-      .lte('scheduled_date', `${date} 23:59:59`);
-
-    if (bookingsError) {
-      console.error('Error fetching existing bookings:', bookingsError);
-      return res.status(500).json({ error: 'Failed to fetch existing bookings' });
-    }
-
-    // Normalize booked times to "HH:MM" - extract directly from string to avoid timezone conversion
-    const bookedSlots = (existingBookings || []).map(booking => {
-      // Extract time directly from string format "2025-10-07 09:00:00"
-      if (booking.scheduled_date && booking.scheduled_date.includes(' ')) {
-        return booking.scheduled_date.split(' ')[1]?.substring(0, 5) || '09:00';
-      }
-      return '09:00'; // fallback
+    const durationMinutes = parseInt(duration);
+    const result = await generateAvailableSlots({
+      userId: parseInt(userId),
+      dateStr: date,
+      durationMinutes,
+      serviceId: serviceId || null,
+      workerId: null,
+      customerAddress: customerAddress || null
     });
 
-    // Generate available slots (9 AM - 5 PM, 30 mins)
-    const availableSlots = [];
-    const startHour = 9;
-    const endHour = 17;
-
-    for (let hour = startHour; hour < endHour; hour++) {
-      for (let minute = 0; minute < 60; minute += 30) {
-        const time = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-        if (!bookedSlots.includes(time)) {
-          availableSlots.push(time);
-        }
-      }
+    if (result.error) {
+      return res.status(500).json({ error: result.error });
     }
+
+    // Return both the new format (slots array) and legacy format (availableSlots string array) for backward compatibility
+    const availableSlots = result.slots.map(s => s.time);
 
     res.json({
       date,
       userId,
+      slots: result.slots,
       availableSlots,
-      settings: availabilitySettings || {}
+      settings: {}
     });
 
   } catch (error) {
@@ -12575,7 +12952,7 @@ app.get('/api/public/availability', async (req, res) => {
 
 app.post('/api/public/bookings', async (req, res) => {
   try {
-    const { 
+    const {
       userId = 1,
       customerData,
       services,
@@ -12585,11 +12962,35 @@ app.post('/api/public/bookings', async (req, res) => {
       notes,
       intakeAnswers = {} // New field for intake question answers
     } = req.body;
-    
+
     if (!customerData || !services || !scheduledDate || !scheduledTime || !totalAmount) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    
+
+    // Validate booking slot before creating
+    try {
+      const serviceId = services && services.length > 0 ? services[0].id : null;
+      const publicBookingAddress = customerData?.address || customerData?.serviceAddress || null;
+      const validation = await validateBookingSlot({
+        userId: parseInt(userId),
+        dateStr: scheduledDate,
+        timeStr: scheduledTime,
+        durationMinutes: parseInt(services?.[0]?.duration) || 120,
+        teamMemberId: null,
+        serviceId,
+        customerAddress: publicBookingAddress
+      });
+
+      if (!validation.valid && !validation.canForceBook) {
+        return res.status(400).json({
+          error: validation.error || 'This time slot is no longer available',
+          warnings: validation.warnings || []
+        });
+      }
+    } catch (valErr) {
+      console.error('Booking validation error (non-blocking):', valErr.message);
+    }
+
     const connection = await pool.getConnection();
     
     try {
@@ -20815,62 +21216,32 @@ app.get('/api/public/services/:userId', async (req, res) => {
 app.get('/api/public/availability/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { date } = req.query;
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get business hours for the user
-      const [availability] = await connection.query(`
-        SELECT business_hours FROM user_availability WHERE user_id = ?
-      `, [userId]);
-      
-      // Generate time slots based on business hours
-      const businessHours = availability[0]?.business_hours || {
-        monday: { start: '09:00', end: '17:00' },
-        tuesday: { start: '09:00', end: '17:00' },
-        wednesday: { start: '09:00', end: '17:00' },
-        thursday: { start: '09:00', end: '17:00' },
-        friday: { start: '09:00', end: '17:00' },
-        saturday: { start: '09:00', end: '17:00' },
-        sunday: { start: '09:00', end: '17:00' }
-      };
-      
-      // Get existing bookings for the date
-      const [bookings] = await connection.query(`
-        SELECT scheduled_date FROM jobs 
-        WHERE user_id = ? AND DATE(scheduled_date) = ? AND status != 'cancelled'
-      `, [userId, date]);
-      
-      const bookedTimes = bookings.map(booking => {
-        // Extract time directly from string format "2025-10-07 09:00:00" to avoid timezone conversion
-        if (booking.scheduled_date && booking.scheduled_date.includes(' ')) {
-          return booking.scheduled_date.split(' ')[1]?.substring(0, 5) || '09:00';
-        }
-        return '09:00'; // fallback
-      });
-      
-      // Generate available time slots
-      const dayOfWeek = new Date(date).toLocaleDateString('en-US', { weekday: 'lowercase' });
-      const hours = businessHours[dayOfWeek];
-      
-      const availableSlots = [];
-      if (hours) {
-        const startTime = new Date(`2000-01-01T${hours.start}`);
-        const endTime = new Date(`2000-01-01T${hours.end}`);
-        
-        while (startTime < endTime) {
-          const timeSlot = startTime.toTimeString().slice(0, 5);
-          if (!bookedTimes.includes(timeSlot)) {
-            availableSlots.push(timeSlot);
-          }
-          startTime.setMinutes(startTime.getMinutes() + 30);
-        }
-      }
-      
-      res.json({ availableSlots });
-    } finally {
-      connection.release();
+    const { date, serviceId, duration = 120, customerAddress } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date is required (YYYY-MM-DD)' });
     }
+
+    const durationMinutes = parseInt(duration);
+    const result = await generateAvailableSlots({
+      userId: parseInt(userId),
+      dateStr: date,
+      durationMinutes,
+      serviceId: serviceId || null,
+      workerId: null,
+      customerAddress: customerAddress || null
+    });
+
+    if (result.error) {
+      return res.status(500).json({ error: result.error });
+    }
+
+    const availableSlots = result.slots.map(s => s.time);
+
+    res.json({
+      slots: result.slots,
+      availableSlots
+    });
   } catch (error) {
     console.error('Get public availability error:', error);
     res.status(500).json({ error: 'Failed to fetch availability' });
@@ -22349,19 +22720,44 @@ app.post('/api/public/business/:businessSlug/book', async (req, res) => {
   try {
     const { businessSlug } = req.params;
     const bookingData = req.body;
-    
+
     // Find user by business slug
     const [users] = await pool.query(
       'SELECT id FROM users WHERE LOWER(REPLACE(business_name, " ", "")) = ?',
       [businessSlug.toLowerCase()]
     );
-    
+
     if (users.length === 0) {
       return res.status(404).json({ error: 'Business not found' });
     }
-    
+
     const userId = users[0].id;
-    
+
+    // Validate booking slot before creating
+    if (bookingData.date && bookingData.time) {
+      try {
+        const validation = await validateBookingSlot({
+          userId,
+          dateStr: bookingData.date,
+          timeStr: bookingData.time,
+          durationMinutes: parseInt(bookingData.duration) || 120,
+          teamMemberId: null,
+          serviceId: bookingData.service || null,
+          customerAddress: bookingData.address || bookingData.customerAddress || null
+        });
+
+        if (!validation.valid && !validation.canForceBook) {
+          return res.status(400).json({
+            error: validation.error || 'This time slot is no longer available',
+            warnings: validation.warnings || []
+          });
+        }
+      } catch (valErr) {
+        console.error('Booking validation error (non-blocking):', valErr.message);
+        // Non-blocking: allow booking to proceed if validation itself fails
+      }
+    }
+
     // First, create or find customer
     let customerId;
     const [existingCustomers] = await pool.query(
@@ -29967,8 +30363,6 @@ app.post('/api/fix-schema', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-
 
 // Google Geocoding API proxy endpoint for address validation fallback
 
