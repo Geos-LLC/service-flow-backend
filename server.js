@@ -4091,7 +4091,8 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
 }
 
 // Validate a specific booking slot (for server-side booking validation)
-async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, teamMemberId, serviceId, customerAddress }) {
+// excludeJobId: when updating an existing job, pass its ID to avoid self-conflict
+async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, teamMemberId, serviceId, customerAddress, excludeJobId }) {
   const warnings = [];
 
   const config = await fetchSchedulingConfig(userId, serviceId, dateStr);
@@ -4157,7 +4158,7 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
   }
 
   // Check job conflicts (include address fields for location-based driving time)
-  const { data: existingJobs } = await supabase
+  let jobsQuery = supabase
     .from('jobs')
     .select(`
       scheduled_time, duration, team_member_id, status, id,
@@ -4167,6 +4168,13 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
     .eq('user_id', userId)
     .eq('scheduled_date', dateStr)
     .not('status', 'in', '(cancelled)');
+
+  // Exclude the current job when validating an update (avoid self-conflict)
+  if (excludeJobId) {
+    jobsQuery = jobsQuery.neq('id', excludeJobId);
+  }
+
+  const { data: existingJobs } = await jobsQuery;
 
   if (existingJobs && existingJobs.length > 0) {
     // Calculate per-job driving times if customer address available (Phase 3.1)
@@ -4381,25 +4389,53 @@ async function checkWorkerAvailabilityForOffer(worker, job) {
       }
     }
 
-    // Check for conflicts with existing jobs assigned to this worker
-    const { data: existingJobs, error: jobsError } = await supabase
+    // Fetch driving time setting for the job's owner
+    let drivingBuffer = 0;
+    try {
+      const { data: jobOwner } = await supabase
+        .from('jobs')
+        .select('user_id')
+        .eq('id', job.id)
+        .single();
+
+      if (jobOwner) {
+        const config = await fetchSchedulingConfig(jobOwner.user_id, job.service_id || null, dateStr);
+        drivingBuffer = config.drivingTimeMinutes || 0;
+      }
+    } catch (err) {
+      // Fall back to 0 driving time if config fetch fails
+    }
+
+    // Check for conflicts with existing jobs assigned to this worker (with driving buffer)
+    // Exclude the job being claimed to avoid self-conflict
+    let offerJobsQuery = supabase
       .from('jobs')
-      .select('scheduled_date, scheduled_time, duration')
+      .select('id, scheduled_date, scheduled_time, duration')
       .eq('team_member_id', worker.id)
       .eq('scheduled_date', dateStr)
       .not('status', 'in', '(cancelled)');
 
+    if (job.id) {
+      offerJobsQuery = offerJobsQuery.neq('id', job.id);
+    }
+
+    const { data: existingJobs, error: jobsError } = await offerJobsQuery;
+
     if (!jobsError && existingJobs) {
       for (const existingJob of existingJobs) {
-        const existingStart = new Date(`${dateStr}T${existingJob.scheduled_time || '09:00'}`);
+        const existingStartMin = timeToMinutesForOffers(existingJob.scheduled_time || '09:00');
         const existingDuration = existingJob.duration || 120;
-        const existingEnd = new Date(existingStart.getTime() + existingDuration * 60000);
-        
-        const jobStart = new Date(`${dateStr}T${jobTime}`);
-        const jobEnd = new Date(jobStart.getTime() + jobDuration * 60000);
-        
-        if (jobStart < existingEnd && jobEnd > existingStart) {
-          return false; // Conflict found
+        const existingEndMin = existingStartMin + existingDuration;
+
+        // Apply driving buffer before AND after the existing job
+        const effectiveExistingStart = existingStartMin - drivingBuffer;
+        const effectiveExistingEnd = existingEndMin + drivingBuffer;
+
+        // The new job also needs driving buffer after it
+        const effectiveJobEnd = jobEndMinutes + drivingBuffer;
+
+        if (jobStartMinutes < effectiveExistingEnd && effectiveJobEnd > effectiveExistingStart) {
+          return false; // Conflict found (including driving time)
         }
       }
     }
@@ -6433,10 +6469,10 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     const updateData = req.body;
 
   
-    // Check if job exists and belongs to user
+    // Check if job exists and belongs to user (fetch scheduling fields for validation)
     const { data: existingJob, error: checkError } = await supabase
       .from('jobs')
-      .select('id')
+      .select('id, scheduled_date, scheduled_time, duration, team_member_id, service_id, service_address_street, service_address_city, service_address_state, service_address_zip')
       .eq('id', id)
       .eq('user_id', userId)
       .limit(1);
@@ -6449,6 +6485,8 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
     if (!existingJob || existingJob.length === 0) {
       return res.status(404).json({ error: 'Job not found' });
     }
+
+    const forceBook = updateData.forceBook || false;
 
     // Build update data object
     const updateDataToSend = {};
@@ -6635,6 +6673,77 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
         // Add calculated total to update data
         updateDataToSend.total = newTotal;
         updateDataToSend.total_amount = newTotal;
+      }
+    }
+
+    // --- Driving time validation for schedule/assignment changes ---
+    const currentJob = existingJob[0];
+    const isScheduleChange = updateData.scheduledDate || updateData.scheduledTime ||
+      updateData.scheduled_date || updateData.scheduled_time;
+    const isAssignmentChange = updateData.teamMemberId !== undefined || updateData.teamMemberIds !== undefined;
+
+    if ((isScheduleChange || isAssignmentChange) && !forceBook) {
+      try {
+        // Determine the effective date/time/worker after this update
+        let effectiveDate = currentJob.scheduled_date;
+        let effectiveTime = currentJob.scheduled_time;
+
+        if (updateData.scheduledDate) {
+          // scheduledDate may contain datetime like "2025-02-18T14:00:00"
+          const dtParts = updateData.scheduledDate.split('T');
+          effectiveDate = dtParts[0];
+          if (dtParts[1]) effectiveTime = dtParts[1].substring(0, 8);
+        }
+        if (updateData.scheduled_date) effectiveDate = updateData.scheduled_date;
+        if (updateData.scheduledTime) effectiveTime = updateData.scheduledTime;
+        if (updateData.scheduled_time) effectiveTime = updateData.scheduled_time;
+        if (effectiveDate && effectiveDate.includes('T')) {
+          const parts = effectiveDate.split('T');
+          effectiveDate = parts[0];
+          if (!effectiveTime && parts[1]) effectiveTime = parts[1].substring(0, 8);
+        }
+
+        const effectiveTeamMemberId = updateData.teamMemberId || currentJob.team_member_id;
+        const effectiveDuration = updateData.duration || currentJob.duration || 120;
+        const effectiveServiceId = updateData.serviceId || currentJob.service_id;
+
+        // Build address for location-based driving time
+        const addr = updateData.serviceAddress || {};
+        const effectiveAddress = addr.street
+          ? [addr.street, addr.city, addr.state, addr.zipCode].filter(Boolean).join(', ')
+          : [currentJob.service_address_street, currentJob.service_address_city, currentJob.service_address_state, currentJob.service_address_zip].filter(Boolean).join(', ') || null;
+
+        if (effectiveDate && effectiveTime && effectiveTeamMemberId) {
+          const validation = await validateBookingSlot({
+            userId,
+            dateStr: effectiveDate,
+            timeStr: effectiveTime,
+            durationMinutes: parseFloat(effectiveDuration),
+            teamMemberId: effectiveTeamMemberId,
+            serviceId: effectiveServiceId || null,
+            customerAddress: effectiveAddress,
+            excludeJobId: parseInt(id)
+          });
+
+          if (!validation.valid) {
+            if (validation.canForceBook) {
+              return res.status(409).json({
+                error: 'Scheduling conflict detected',
+                warnings: validation.warnings,
+                canForceBook: true,
+                jobId: id,
+                message: 'Set forceBook=true to override'
+              });
+            }
+            return res.status(400).json({
+              error: validation.error || 'Invalid schedule change',
+              warnings: validation.warnings || []
+            });
+          }
+        }
+      } catch (valErr) {
+        console.error('Job update validation error (non-blocking):', valErr.message);
+        // Non-blocking: allow update to proceed if validation itself fails
       }
     }
 
@@ -23364,16 +23473,16 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
 // Assign multiple team members to a job
 app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res) => {
   // CORS handled by middleware
-  
+
   try {
     const { jobId } = req.params;
-    const { teamMemberIds, primaryMemberId } = req.body;
+    const { teamMemberIds, primaryMemberId, forceBook = false } = req.body;
     const userId = req.user.userId;
-    
-      // Check if job exists and belongs to user
+
+      // Check if job exists and belongs to user (include schedule fields for validation)
     const { data: jobCheck, error: jobError } = await supabase
       .from('jobs')
-      .select('id, user_id')
+      .select('id, user_id, scheduled_date, scheduled_time, duration, service_id, service_address_street, service_address_city, service_address_state, service_address_zip')
       .eq('id', jobId)
       .limit(1);
     
@@ -23410,7 +23519,52 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
     if (!memberChecks || memberChecks.length !== teamMemberIds.length) {
       return res.status(404).json({ error: 'One or more team members not found' });
       }
-      
+
+      // --- Driving time validation for each assigned worker ---
+      const jobData = jobCheck[0];
+      if (jobData.scheduled_date && jobData.scheduled_time && !forceBook) {
+        try {
+          const dateStr = typeof jobData.scheduled_date === 'string' && jobData.scheduled_date.includes('T')
+            ? jobData.scheduled_date.split('T')[0]
+            : String(jobData.scheduled_date).substring(0, 10);
+          const timeStr = jobData.scheduled_time;
+          const durationMinutes = jobData.duration || 120;
+          const customerAddress = [jobData.service_address_street, jobData.service_address_city, jobData.service_address_state, jobData.service_address_zip].filter(Boolean).join(', ') || null;
+
+          const conflictWarnings = [];
+          for (const memberId of teamMemberIds) {
+            const validation = await validateBookingSlot({
+              userId,
+              dateStr,
+              timeStr,
+              durationMinutes,
+              teamMemberId: parseInt(memberId),
+              serviceId: jobData.service_id || null,
+              customerAddress,
+              excludeJobId: parseInt(jobId)
+            });
+
+            if (!validation.valid && validation.warnings && validation.warnings.length > 0) {
+              // Fetch worker name for the warning message
+              const member = memberChecks.find(m => m.id === parseInt(memberId));
+              const memberLabel = member ? `Worker #${memberId}` : `Worker #${memberId}`;
+              conflictWarnings.push({ memberId: parseInt(memberId), memberLabel, warnings: validation.warnings });
+            }
+          }
+
+          if (conflictWarnings.length > 0) {
+            return res.status(409).json({
+              error: 'Scheduling conflicts detected for assigned workers',
+              conflicts: conflictWarnings,
+              canForceBook: true,
+              message: 'Set forceBook=true to override and assign anyway'
+            });
+          }
+        } catch (valErr) {
+          console.error('Assignment validation error (non-blocking):', valErr.message);
+        }
+      }
+
       // Remove existing assignments for this job
     const { error: deleteError } = await supabase
       .from('job_team_assignments')
