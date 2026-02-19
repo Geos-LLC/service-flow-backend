@@ -65,7 +65,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 // Default to production URL if not set
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 
   (process.env.NODE_ENV === 'production' 
-    ? 'https://service-flow-backend-production-4568.up.railway.app/api/auth/google/callback'
+    ? 'https://service-flow-backend-staging.up.railway.app/api/auth/google/callback'
     : 'http://localhost:3001/api/auth/google/callback');
 
 // Google Calendar and Sheets Configuration
@@ -1444,7 +1444,7 @@ app.get('/api/auth/google/authorize', authenticateToken, async (req, res) => {
     if (!redirectUri || redirectUri.includes('localhost')) {
       // Use the request's protocol and host to construct the correct production URL
       const protocol = req.protocol || 'https';
-      const host = req.get('host') || 'service-flow-backend-production-4568.up.railway.app';
+      const host = req.get('host') || 'service-flow-backend-staging.up.railway.app';
       redirectUri = `${protocol}://${host}/api/auth/google/callback`;
     }
     console.log('🔗 Using redirect URI:', redirectUri);
@@ -1509,7 +1509,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     if (!redirectUri || redirectUri.includes('localhost')) {
       // Use the request's protocol and host to construct the correct production URL
       const protocol = req.protocol || 'https';
-      const host = req.get('host') || 'service-flow-backend-production-4568.up.railway.app';
+      const host = req.get('host') || 'service-flow-backend-staging.up.railway.app';
       redirectUri = `${protocol}://${host}/api/auth/google/callback`;
     }
 
