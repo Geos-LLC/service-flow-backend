@@ -4228,7 +4228,10 @@ app.get('/api/jobs/available-slots', authenticateToken, async (req, res) => {
       return res.json({ slots: [], reason: result.reason });
     }
 
-    res.json({ slots: result.slots });
+    res.json({
+      slots: result.slots,
+      drivingTimeMinutes: result.config?.drivingTimeMinutes || 0
+    });
   } catch (error) {
     console.error('Error fetching available slots:', error);
     res.status(500).json({ error: 'Failed to fetch available slots' });
