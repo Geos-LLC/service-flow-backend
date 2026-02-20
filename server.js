@@ -25963,13 +25963,15 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
     
     // Calculate totals
     const totalPaid = transactions?.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0) || 0;
+    const totalTips = transactions?.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0) || 0;
     const transactionCount = transactions?.length || 0;
-    
-    console.log('💳 Payment summary:', { totalPaid, transactionCount });
-    
+
+    console.log('💳 Payment summary:', { totalPaid, totalTips, transactionCount });
+
     res.json({
       hasPayment: transactionCount > 0,
       totalPaid,
+      totalTips,
       transactionCount,
       transactions: transactions || []
     });
@@ -25983,10 +25985,11 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
 // Record manual payment
 app.post('/api/transactions/record-payment', authenticateToken, async (req, res) => {
   try {
-    const { jobId, invoiceId, customerId, amount, paymentMethod, paymentDate, notes } = req.body;
+    const { jobId, invoiceId, customerId, amount, tipAmount, paymentMethod, paymentDate, notes } = req.body;
     const userId = req.user.userId;
-    
-    console.log('💳 Recording manual payment:', { jobId, invoiceId, customerId, amount, paymentMethod, paymentDate, notes, userId });
+    const parsedTip = parseFloat(tipAmount) || 0;
+
+    console.log('💳 Recording manual payment:', { jobId, invoiceId, customerId, amount, tipAmount: parsedTip, paymentMethod, paymentDate, notes, userId });
     
     if (!jobId || !amount || !paymentMethod) {
       return res.status(400).json({ error: 'Missing required fields: jobId, amount, and paymentMethod are required' });
@@ -26077,23 +26080,37 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       customer_id: customerId || null,
       job_id: jobId,
       amount: paymentAmount,
+      tip_amount: parsedTip > 0 ? parsedTip : 0,
+      notes: notes || null,
       payment_intent_id: `manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       status: 'completed',
       payment_method: paymentMethod,
       created_at: paymentDate ? new Date(paymentDate).toISOString() : new Date().toISOString()
     };
     
-    // Note: The transactions table doesn't have a 'notes' column
-    // If notes are needed, they could be stored in a separate table or added to the schema later
-    
     console.log('💳 Inserting transaction:', transactionData);
-    
-    const { data: transaction, error: transactionError } = await supabase
+
+    let transaction;
+    let transactionError;
+
+    // Try inserting with tip_amount and notes columns
+    ({ data: transaction, error: transactionError } = await supabase
       .from('transactions')
       .insert(transactionData)
       .select()
-      .single();
-    
+      .single());
+
+    // If columns don't exist yet, retry without them
+    if (transactionError && transactionError.message && transactionError.message.includes('column')) {
+      console.warn('⚠️ tip_amount/notes columns may not exist in transactions table, retrying without them');
+      const { tip_amount, notes: _notes, ...fallbackData } = transactionData;
+      ({ data: transaction, error: transactionError } = await supabase
+        .from('transactions')
+        .insert(fallbackData)
+        .select()
+        .single());
+    }
+
     if (transactionError) {
       console.error('❌ Error creating transaction:', transactionError);
       return res.status(500).json({ error: 'Failed to record payment: ' + transactionError.message });
@@ -26133,20 +26150,46 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       }
     }
     
-    // Update job invoice status
-    await supabase
+    // Update job invoice status and accumulate tip
+    const jobUpdate = {
+      invoice_status: 'paid',
+      updated_at: new Date().toISOString()
+    };
+
+    if (parsedTip > 0) {
+      // Get current tip_amount from job and add new tip
+      try {
+        const { data: currentJob } = await supabase
+          .from('jobs')
+          .select('tip_amount')
+          .eq('id', jobId)
+          .single();
+
+        const currentTip = parseFloat(currentJob?.tip_amount || 0);
+        jobUpdate.tip_amount = currentTip + parsedTip;
+      } catch (tipErr) {
+        console.warn('⚠️ Could not read tip_amount from jobs table (column may not exist):', tipErr.message);
+      }
+    }
+
+    const { error: jobUpdateError } = await supabase
       .from('jobs')
-      .update({ 
-        invoice_status: 'paid',
-        updated_at: new Date().toISOString()
-      })
+      .update(jobUpdate)
       .eq('id', jobId);
-    
-    console.log('✅ Payment recorded successfully:', transaction.id);
-    
+
+    // If tip_amount column doesn't exist, retry without it
+    if (jobUpdateError && jobUpdateError.message && jobUpdateError.message.includes('column')) {
+      console.warn('⚠️ tip_amount column may not exist in jobs table, retrying without it');
+      const { tip_amount, ...fallbackJobUpdate } = jobUpdate;
+      await supabase.from('jobs').update(fallbackJobUpdate).eq('id', jobId);
+    }
+
+    console.log('✅ Payment recorded successfully:', transaction.id, parsedTip > 0 ? `(tip: $${parsedTip})` : '');
+
     res.json({
       success: true,
       transaction: transaction,
+      tipAmount: parsedTip,
       message: 'Payment recorded successfully'
     });
     
