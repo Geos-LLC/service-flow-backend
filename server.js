@@ -3749,6 +3749,21 @@ function isWorkerAvailableAtTime(worker, slotStartTime, slotEndTime, dateStr, re
   }
 }
 
+// Get driving time for a worker: per-worker availability.drivingTime overrides company default
+function getWorkerDrivingTimeMinutes(worker, companyDrivingTimeMinutes) {
+  if (!worker) return companyDrivingTimeMinutes || 0;
+  try {
+    const avail = worker.availability
+      ? (typeof worker.availability === 'string' ? JSON.parse(worker.availability) : worker.availability)
+      : null;
+    if (avail && (avail.drivingTime !== undefined && avail.drivingTime !== null)) {
+      const v = parseInt(avail.drivingTime, 10);
+      return Number.isFinite(v) ? v : (companyDrivingTimeMinutes || 0);
+    }
+  } catch (e) { /* ignore */ }
+  return companyDrivingTimeMinutes || 0;
+}
+
 // Check if a time slot is free of conflicts for a specific worker (with driving buffer)
 // perJobDrivingTimes: optional Map of job.id → location-based driving minutes (Phase 3.1)
 function isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes) {
@@ -4055,16 +4070,18 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
 
     const slotEndTime = minutesToTimeStr(slotEndMinutes);
 
-    // Count available workers for this slot
+    // Count available workers for this slot (use per-worker driving time when set, else company default)
     let availableCount = 0;
     if (workerId) {
       const worker = eligibleWorkers.find(w => w.id === parseInt(workerId));
-      if (worker && isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+      const workerDriving = getWorkerDrivingTimeMinutes(worker, drivingTimeMinutes);
+      if (worker && isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, workerDriving, requestedDate, perJobDrivingTimes)) {
         availableCount = 1;
       }
     } else {
       for (const worker of eligibleWorkers) {
-        if (isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+        const workerDriving = getWorkerDrivingTimeMinutes(worker, drivingTimeMinutes);
+        if (isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, workerDriving, requestedDate, perJobDrivingTimes)) {
           availableCount++;
         }
       }
@@ -4182,7 +4199,8 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
       ? await getPerJobDrivingTimes(existingJobs, customerAddress, config.drivingTimeMinutes)
       : null;
 
-    if (!isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, config.drivingTimeMinutes, requestedDate, perJobDrivingTimes)) {
+    const workerDriving = getWorkerDrivingTimeMinutes(worker, config.drivingTimeMinutes);
+    if (!isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, dateStr, durationMinutes, workerDriving, requestedDate, perJobDrivingTimes)) {
       warnings.push('Conflicts with an existing job (including driving time buffer)');
     }
   }
@@ -25985,11 +26003,12 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
 // Record manual payment
 app.post('/api/transactions/record-payment', authenticateToken, async (req, res) => {
   try {
-    const { jobId, invoiceId, customerId, amount, tipAmount, paymentMethod, paymentDate, notes } = req.body;
+    const { jobId, invoiceId, customerId, amount, tipAmount, discount, paymentMethod, paymentDate, notes } = req.body;
     const userId = req.user.userId;
     const parsedTip = parseFloat(tipAmount) || 0;
+    const parsedDiscount = parseFloat(discount) || 0;
 
-    console.log('💳 Recording manual payment:', { jobId, invoiceId, customerId, amount, tipAmount: parsedTip, paymentMethod, paymentDate, notes, userId });
+    console.log('💳 Recording manual payment:', { jobId, invoiceId, customerId, amount, tipAmount: parsedTip, discount: parsedDiscount, paymentMethod, paymentDate, notes, userId });
     
     if (!jobId || !amount || !paymentMethod) {
       return res.status(400).json({ error: 'Missing required fields: jobId, amount, and paymentMethod are required' });
@@ -26081,6 +26100,7 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       job_id: jobId,
       amount: paymentAmount,
       tip_amount: parsedTip > 0 ? parsedTip : 0,
+      discount: parsedDiscount > 0 ? parsedDiscount : 0,
       notes: notes || null,
       payment_intent_id: `manual_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       status: 'completed',
@@ -26102,8 +26122,8 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
 
     // If columns don't exist yet, retry without them
     if (transactionError && transactionError.message && transactionError.message.includes('column')) {
-      console.warn('⚠️ tip_amount/notes columns may not exist in transactions table, retrying without them');
-      const { tip_amount, notes: _notes, ...fallbackData } = transactionData;
+      console.warn('⚠️ tip_amount/notes/discount columns may not exist in transactions table, retrying without them');
+      const { tip_amount, notes: _notes, discount: _discount, ...fallbackData } = transactionData;
       ({ data: transaction, error: transactionError } = await supabase
         .from('transactions')
         .insert(fallbackData)
@@ -26172,24 +26192,41 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       }
     }
 
+    if (parsedDiscount > 0) {
+      // Get current discount from job and add new discount
+      try {
+        const { data: currentJob } = await supabase
+          .from('jobs')
+          .select('discount')
+          .eq('id', jobId)
+          .single();
+
+        const currentDiscount = parseFloat(currentJob?.discount || 0);
+        jobUpdate.discount = currentDiscount + parsedDiscount;
+      } catch (discountErr) {
+        console.warn('⚠️ Could not read discount from jobs table (column may not exist):', discountErr.message);
+      }
+    }
+
     const { error: jobUpdateError } = await supabase
       .from('jobs')
       .update(jobUpdate)
       .eq('id', jobId);
 
-    // If tip_amount column doesn't exist, retry without it
+    // If tip_amount/discount column doesn't exist, retry without them
     if (jobUpdateError && jobUpdateError.message && jobUpdateError.message.includes('column')) {
-      console.warn('⚠️ tip_amount column may not exist in jobs table, retrying without it');
-      const { tip_amount, ...fallbackJobUpdate } = jobUpdate;
+      console.warn('⚠️ tip_amount/discount columns may not exist in jobs table, retrying without them');
+      const { tip_amount, discount: _disc, ...fallbackJobUpdate } = jobUpdate;
       await supabase.from('jobs').update(fallbackJobUpdate).eq('id', jobId);
     }
 
-    console.log('✅ Payment recorded successfully:', transaction.id, parsedTip > 0 ? `(tip: $${parsedTip})` : '');
+    console.log('✅ Payment recorded successfully:', transaction.id, parsedTip > 0 ? `(tip: $${parsedTip})` : '', parsedDiscount > 0 ? `(discount: $${parsedDiscount})` : '');
 
     res.json({
       success: true,
       transaction: transaction,
       tipAmount: parsedTip,
+      discountAmount: parsedDiscount,
       message: 'Payment recorded successfully'
     });
     
