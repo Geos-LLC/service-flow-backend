@@ -19305,7 +19305,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           directJobsQuery = directJobsQuery.gte('scheduled_date', startDate);
         }
         if (endDate) {
-          directJobsQuery = directJobsQuery.lte('scheduled_date', `${endDate} 23:59:59`);
+          // Inclusive end date: use next calendar day so all of endDate is included
+          const [y, m, d] = endDate.split('-').map(Number);
+          const nextDay = new Date(y, m - 1, d + 1);
+          const nextDayStr = nextDay.getFullYear() + '-' + String(nextDay.getMonth() + 1).padStart(2, '0') + '-' + String(nextDay.getDate()).padStart(2, '0');
+          directJobsQuery = directJobsQuery.lt('scheduled_date', nextDayStr);
         }
 
         const { data: directJobs, error: directJobsError } = await directJobsQuery;
@@ -19355,15 +19359,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               if (!job) return false;
               if (job.user_id !== userId) return false;
               
-              // Filter by date range if provided
+              // Filter by date range: compare date-only (YYYY-MM-DD) to avoid timezone issues
               if (startDate || endDate) {
-                const jobDate = new Date(job.scheduled_date);
-                if (startDate && jobDate < new Date(startDate)) return false;
-                if (endDate) {
-                  const endDateObj = new Date(endDate);
-                  endDateObj.setHours(23, 59, 59, 999);
-                  if (jobDate > endDateObj) return false;
-                }
+                const raw = job.scheduled_date ? String(job.scheduled_date) : '';
+                const jobDateStr = raw.split('T')[0].split(' ')[0];
+                if (!jobDateStr) return false;
+                if (startDate && jobDateStr < startDate) return false;
+                if (endDate && jobDateStr > endDate) return false;
               }
               
               return true;
