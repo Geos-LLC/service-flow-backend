@@ -19552,19 +19552,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       })
     );
 
-    const grandTotal = (payrollData || []).reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
-    const grandTotalHours = (payrollData || []).reduce((sum, item) => sum + (item?.totalHours || 0), 0);
-    const grandTotalHourlySalary = (payrollData || []).reduce((sum, item) => sum + (item?.hourlySalary || 0), 0);
-    const grandTotalCommission = (payrollData || []).reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
+    // Only include team members who have at least one job in the date range; sort by job count (most jobs first)
+    const withJobsInRange = (payrollData || []).filter(item => (item?.jobCount || 0) > 0);
+    const sortedTeamMembers = withJobsInRange.slice().sort((a, b) => (b?.jobCount || 0) - (a?.jobCount || 0));
+
+    const grandTotal = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
+    const grandTotalHours = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalHours || 0), 0);
+    const grandTotalHourlySalary = sortedTeamMembers.reduce((sum, item) => sum + (item?.hourlySalary || 0), 0);
+    const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
 
     res.json({
       period: {
         startDate: startDate || null,
         endDate: endDate || null
       },
-      teamMembers: payrollData,
+      teamMembers: sortedTeamMembers,
       summary: {
-        totalTeamMembers: payrollData.length,
+        totalTeamMembers: sortedTeamMembers.length,
         totalHours: parseFloat(grandTotalHours.toFixed(2)),
         totalHourlySalary: parseFloat(grandTotalHourlySalary.toFixed(2)),
         totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
