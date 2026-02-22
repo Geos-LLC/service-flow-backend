@@ -7387,7 +7387,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 app.post('/api/customers', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { firstName, lastName, email, phone, address, suite, notes, city, state, zipCode } = req.body;
+    const { firstName, lastName, email, phone, address, suite, notes, city, state, zipCode, source } = req.body;
     
     // Input validation
     if (!validateName(firstName)) {
@@ -7417,6 +7417,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
     const sanitizedCity = city ? sanitizeInput(city) : null;
     const sanitizedState = state ? sanitizeInput(state) : null;
     const sanitizedZipCode = zipCode ? sanitizeInput(zipCode) : null;
+    const sanitizedSource = source ? sanitizeInput(String(source).trim()) : null;
     
     // Note: Multiple customers can have the same email address
     // No email uniqueness check needed
@@ -7436,6 +7437,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         city: sanitizedCity,
         state: sanitizedState,
         zip_code: sanitizedZipCode,
+        source: sanitizedSource,
         status: 'active'
       })
       .select()
@@ -7530,7 +7532,7 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { firstName, lastName, email, phone, address, suite, notes, status, city, state, zipCode } = req.body;
+    const { firstName, lastName, email, phone, address, suite, notes, status, city, state, zipCode, source } = req.body;
     
     // Input validation
     if (!validateName(firstName)) {
@@ -7560,6 +7562,7 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
     const sanitizedCity = city ? sanitizeInput(city) : null;
     const sanitizedState = state ? sanitizeInput(state) : null;
     const sanitizedZipCode = zipCode ? sanitizeInput(zipCode) : null;
+    const sanitizedSource = source !== undefined && source !== null ? sanitizeInput(String(source).trim()) : null;
     
     // Check if customer exists and belongs to user
     const { data: existingCustomers, error: checkError } = await supabase
@@ -7578,22 +7581,24 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Customer not found' });
     }
     
-    // Update customer
+    // Update customer (include source so lead source is editable on customer card)
+    const updatePayload = {
+      first_name: sanitizedFirstName,
+      last_name: sanitizedLastName,
+      email: sanitizedEmail,
+      phone: sanitizedPhone,
+      address: sanitizedAddress,
+      suite: sanitizedSuite,
+      notes: sanitizedNotes,
+      status: status,
+      city: sanitizedCity,
+      state: sanitizedState,
+      zip_code: sanitizedZipCode
+    };
+    if (source !== undefined) updatePayload.source = sanitizedSource;
     const { data: updatedCustomer, error: updateError } = await supabase
       .from('customers')
-      .update({
-        first_name: sanitizedFirstName,
-        last_name: sanitizedLastName,
-        email: sanitizedEmail,
-        phone: sanitizedPhone,
-        address: sanitizedAddress,
-        suite: sanitizedSuite,
-        notes: sanitizedNotes,
-        status: status,
-        city: sanitizedCity,
-        state: sanitizedState,
-        zip_code: sanitizedZipCode
-      })
+      .update(updatePayload)
       .eq('id', id)
       .eq('user_id', userId)
       .select()
@@ -8457,7 +8462,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Lead already converted' });
     }
     
-    // Create customer from lead
+    // Create customer from lead (include source so it is available on customer card and for jobs)
     const { data: customer, error: customerError } = await supabase
       .from('customers')
       .insert({
@@ -8466,8 +8471,9 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
         last_name: lead.last_name,
         email: lead.email,
         phone: lead.phone,
-        address: lead.address || null, // Include address from lead
-        notes: lead.notes || `Converted from lead: ${lead.source || 'Unknown source'}`
+        address: lead.address || null,
+        source: lead.source || null,
+        notes: lead.notes || (lead.source ? `Converted from lead (${lead.source})` : 'Converted from lead')
       })
       .select()
       .single();
