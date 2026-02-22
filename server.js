@@ -14575,6 +14575,16 @@ app.get('/api/user/availability', authenticateToken, async (req, res) => {
 
 app.put('/api/user/availability', authenticateToken, async (req, res) => {
   try {
+    // Team members (workers) must only update their own availability via PUT /api/team-members/:id/availability.
+    // Prevent them from overwriting the account owner's user_availability (business hours / timeslot templates).
+    const role = (req.user?.role || '').toLowerCase();
+    const isAccountOwnerOrManager = !role || role === 'owner' || role === 'account owner' || role === 'admin' || role === 'manager';
+    if (req.user?.teamMemberId && !isAccountOwnerOrManager) {
+      return res.status(403).json({
+        error: 'Team members must update their availability from the Availability page (team member schedule), not business settings.'
+      });
+    }
+
     // Use authenticated user's ID from token instead of body
     const userId = req.user?.userId || req.body?.userId;
     const { businessHours, timeslotTemplates } = req.body;
