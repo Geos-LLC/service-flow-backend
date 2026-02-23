@@ -4834,13 +4834,27 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         }
       }
 
+      // $0 total jobs are considered free — treat as paid so no payment is required
+      const jobTotal = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.price) || 0;
+      const invoiceStatus = jobTotal === 0 ? 'paid' : (job.invoice_status || job.invoiceStatus);
+
       const jobData = {
         ...job,
+        invoice_status: invoiceStatus,
         team_assignments: teamAssignments,
         intake_answers: parsedIntakeAnswers,
         service_intake_questions: intakeQuestionsAndAnswers // Use the questions from job_answers table
       };
-      
+
+      // When job is marked paid (e.g. from import) but has no payment records, show amount paid = job total
+      // so "Amount paid" is not $0 for a non-zero paid job
+      if (invoiceStatus === 'paid' && jobTotal > 0) {
+        const currentPaid = parseFloat(job.total_paid_amount ?? job.totalPaidAmount) || 0;
+        if (currentPaid <= 0) {
+          jobData.total_paid_amount = jobTotal;
+        }
+      }
+
       res.json(jobData);
     } catch (error) {
       console.error('Get job error:', error);
