@@ -19393,8 +19393,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             }
           });
         }
-        
-        const jobs = allJobs;
+
+        // Exclude cancelled jobs from payroll (count, hours, commission)
+        const isCancelled = (job) => {
+          const s = (job?.status || '').toLowerCase();
+          return s === 'cancelled' || s === 'canceled' || s === 'cancel';
+        };
+        const jobs = (allJobs || []).filter(job => !isCancelled(job));
         
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
         if (jobs.length > 0) {
