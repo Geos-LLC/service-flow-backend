@@ -2764,8 +2764,30 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       try {
         // Escape special characters in search term
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
-        // Search in joined tables using the correct syntax
-        query = query.or(`service_name.ilike.%${escapedSearch}%,customers.first_name.ilike.%${escapedSearch}%,customers.last_name.ilike.%${escapedSearch}%`);
+
+        // Build OR conditions for:
+        // - job/service name
+        // - customer first name
+        // - customer last name
+        // And also for individual tokens when the user types "First Last"
+        const orConditions = [
+          `service_name.ilike.%${escapedSearch}%`,
+          `customers.first_name.ilike.%${escapedSearch}%`,
+          `customers.last_name.ilike.%${escapedSearch}%`,
+        ];
+
+        // If the search has spaces (e.g. "Karen Rice"), also search by each part
+        const tokens = search.split(/\s+/).map(t => t.trim()).filter(Boolean);
+        if (tokens.length > 1) {
+          tokens.forEach(token => {
+            const tokenEscaped = token.replace(/[%_\\]/g, '\\$&');
+            orConditions.push(`customers.first_name.ilike.%${tokenEscaped}%`);
+            orConditions.push(`customers.last_name.ilike.%${tokenEscaped}%`);
+          });
+        }
+
+        // Apply OR filter across all conditions
+        query = query.or(orConditions.join(','));
       } catch (searchError) {
         console.error('🔄 Backend: Search query error:', searchError);
         // Continue without search filter if there's an error
@@ -4721,7 +4743,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       .from('jobs')
       .select(`
         *,
-        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code, source),
         services!left(name, price, duration),
         team_members!left(first_name, last_name, email)
       `)
