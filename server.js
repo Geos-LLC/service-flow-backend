@@ -6569,7 +6569,9 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       photosRequired: 'photos_required',
       qualityCheck: 'quality_check',
       serviceModifiers: 'service_modifiers',
-      serviceIntakeQuestions: 'service_intake_questions'
+      serviceIntakeQuestions: 'service_intake_questions',
+      tipAmount: 'tip_amount',
+      tip_amount: 'tip_amount'
     };
 
     
@@ -10263,8 +10265,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           invoice_amount: parseFloat(job.invoiceAmount) || null,
           invoice_date: job.invoiceDate || null,
           payment_date: job.paymentDate || null,
-          is_recurring: job.isRecurring || false,
-          recurring_frequency: job.recurringFrequency || 'weekly',
+          // Mark as recurring if import sends isRecurring and/or recurringFrequency (so schedule "Recurring" filter shows them)
+          is_recurring: !!(job.isRecurring || job.recurringFrequency),
+          recurring_frequency: job.recurringFrequency || (job.isRecurring ? 'weekly' : null),
           next_billing_date: job.nextBillingDate || null,
           stripe_payment_intent_id: job.stripePaymentIntentId || null,
           duration: parseFloat(job.duration) || 360,
