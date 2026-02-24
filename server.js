@@ -2772,8 +2772,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         // And also for individual tokens when the user types "First Last"
         const orConditions = [
           `service_name.ilike.%${escapedSearch}%`,
-          `customers.first_name.ilike.%${escapedSearch}%`,
-          `customers.last_name.ilike.%${escapedSearch}%`,
+          `customer_first_name.ilike.%${escapedSearch}%`,
+          `customer_last_name.ilike.%${escapedSearch}%`,
         ];
 
         // If the search has spaces (e.g. "Karen Rice"), also search by each part
@@ -2781,8 +2781,8 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         if (tokens.length > 1) {
           tokens.forEach(token => {
             const tokenEscaped = token.replace(/[%_\\]/g, '\\$&');
-            orConditions.push(`customers.first_name.ilike.%${tokenEscaped}%`);
-            orConditions.push(`customers.last_name.ilike.%${tokenEscaped}%`);
+            orConditions.push(`customer_first_name.ilike.%${tokenEscaped}%`);
+            orConditions.push(`customer_last_name.ilike.%${tokenEscaped}%`);
           });
         }
 
