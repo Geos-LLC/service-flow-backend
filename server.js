@@ -2760,33 +2760,42 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     }
     
     // Add search filter
+    // customer_first_name / customer_last_name don't exist on the jobs table —
+    // customer data lives in the related customers table. So we first look up
+    // matching customer IDs, then filter jobs by service_name OR customer_id.
     if (search) {
       try {
-        // Escape special characters in search term
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
 
-        // Build OR conditions for:
-        // - job/service name
-        // - customer first name
-        // - customer last name
-        // And also for individual tokens when the user types "First Last"
-        const orConditions = [
-          `service_name.ilike.%${escapedSearch}%`,
-          `customer_first_name.ilike.%${escapedSearch}%`,
-          `customer_last_name.ilike.%${escapedSearch}%`,
+        // Find customers whose name matches the search term
+        const customerOrConditions = [
+          `first_name.ilike.%${escapedSearch}%`,
+          `last_name.ilike.%${escapedSearch}%`,
         ];
-
-        // If the search has spaces (e.g. "Karen Rice"), also search by each part
+        // If multi-word search (e.g. "Karen Rice"), also match each token
         const tokens = search.split(/\s+/).map(t => t.trim()).filter(Boolean);
         if (tokens.length > 1) {
           tokens.forEach(token => {
             const tokenEscaped = token.replace(/[%_\\]/g, '\\$&');
-            orConditions.push(`customer_first_name.ilike.%${tokenEscaped}%`);
-            orConditions.push(`customer_last_name.ilike.%${tokenEscaped}%`);
+            customerOrConditions.push(`first_name.ilike.%${tokenEscaped}%`);
+            customerOrConditions.push(`last_name.ilike.%${tokenEscaped}%`);
           });
         }
 
-        // Apply OR filter across all conditions
+        const { data: matchingCustomers } = await supabase
+          .from('customers')
+          .select('id')
+          .eq('user_id', userId)
+          .or(customerOrConditions.join(','));
+
+        const matchingCustomerIds = (matchingCustomers || []).map(c => c.id);
+
+        // Build OR conditions on the jobs table
+        const orConditions = [`service_name.ilike.%${escapedSearch}%`];
+        if (matchingCustomerIds.length > 0) {
+          orConditions.push(`customer_id.in.(${matchingCustomerIds.join(',')})`);
+        }
+
         query = query.or(orConditions.join(','));
       } catch (searchError) {
         console.error('🔄 Backend: Search query error:', searchError);
