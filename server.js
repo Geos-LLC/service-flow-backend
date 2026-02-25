@@ -26476,6 +26476,7 @@ const deleteTransactionHandler = async (req, res) => {
       console.warn('⚠️ Some job columns may not exist when updating after delete:', updateJobError.message);
       const fallbackUpdate = {
         invoice_status: jobUpdate.invoice_status,
+        payment_status: jobUpdate.payment_status,
         updated_at: jobUpdate.updated_at
       };
       ({ error: updateJobError } = await supabase
