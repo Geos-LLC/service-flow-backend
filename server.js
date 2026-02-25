@@ -26245,9 +26245,29 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       }
     }
     
-    // Update job invoice status and accumulate tip
+    // Update job: invoice_status, payment_status, total_paid_amount (so job shows as Paid in DB and UI)
+    const { data: jobTx, error: jobTxErr } = await supabase
+      .from('transactions')
+      .select('amount, tip_amount')
+      .eq('job_id', jobId)
+      .eq('status', 'completed');
+    const totalPaidForJob = jobTxErr || !jobTx?.length
+      ? parseFloat(amount) || 0
+      : jobTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0);
+    const { data: jobRow } = await supabase
+      .from('jobs')
+      .select('total, total_amount, price, tip_amount')
+      .eq('id', jobId)
+      .single();
+    const jobTotal = parseFloat(jobRow?.total ?? jobRow?.total_amount ?? jobRow?.price) || 0;
+    const jobTip = parseFloat(jobRow?.tip_amount) || 0;
+    const expectedTotal = jobTotal + jobTip;
+    const isFullyPaid = totalPaidForJob >= expectedTotal - 0.01;
+
     const jobUpdate = {
-      invoice_status: 'paid',
+      invoice_status: isFullyPaid ? 'paid' : (jobTotal > 0 ? 'invoiced' : 'draft'),
+      payment_status: isFullyPaid ? 'paid' : 'pending',
+      total_paid_amount: totalPaidForJob,
       updated_at: new Date().toISOString()
     };
 
@@ -26288,11 +26308,14 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
       .update(jobUpdate)
       .eq('id', jobId);
 
-    // If tip_amount/discount column doesn't exist, retry without them
+    // If some columns don't exist, retry with only safe fields
     if (jobUpdateError && jobUpdateError.message && jobUpdateError.message.includes('column')) {
-      console.warn('⚠️ tip_amount/discount columns may not exist in jobs table, retrying without them');
-      const { tip_amount, discount: _disc, ...fallbackJobUpdate } = jobUpdate;
-      await supabase.from('jobs').update(fallbackJobUpdate).eq('id', jobId);
+      console.warn('⚠️ Some job columns may not exist when updating after record-payment:', jobUpdateError.message);
+      const fallback = {
+        invoice_status: jobUpdate.invoice_status,
+        updated_at: jobUpdate.updated_at
+      };
+      await supabase.from('jobs').update(fallback).eq('id', jobId);
     }
 
     console.log('✅ Payment recorded successfully:', transaction.id, parsedTip > 0 ? `(tip: $${parsedTip})` : '', parsedDiscount > 0 ? `(discount: $${parsedDiscount})` : '');
@@ -26368,17 +26391,20 @@ const deleteTransactionHandler = async (req, res) => {
       .eq('job_id', jobId)
       .eq('status', 'completed');
 
-    const newTotalPaid = remainingError || !remainingTx?.length
-      ? 0
-      : remainingTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0);
-    const newTotalTips = remainingError || !remainingTx?.length
-      ? 0
-      : remainingTx.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0);
+    const hasRemainingPayments = !remainingError && Array.isArray(remainingTx) && remainingTx.length > 0;
+
+    const newTotalPaid = hasRemainingPayments
+      ? remainingTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0)
+      : 0;
+    const newTotalTips = hasRemainingPayments
+      ? remainingTx.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0)
+      : 0;
 
     const jobTotal = parseFloat(job.total ?? job.total_amount ?? job.price) || 0;
     const jobTip = parseFloat(job.tip_amount) || 0;
     const expectedTotal = jobTotal + jobTip;
-    const isFullyPaid = newTotalPaid >= expectedTotal - 0.01;
+    // If there are no remaining completed transactions, always treat the job as not fully paid
+    const isFullyPaid = hasRemainingPayments && newTotalPaid >= expectedTotal - 0.01;
 
     // Try to update all known fields first
     const jobUpdate = {
