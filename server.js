@@ -26061,6 +26061,58 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
 
     console.log('💳 Payment summary:', { totalPaid, totalTips, transactionCount });
 
+    // Self-heal: if there are no completed transactions left but the job is still marked paid/partial,
+    // normalize the job's payment_status back to pending (and invoice_status accordingly).
+    try {
+      if (transactionCount === 0) {
+        const { data: jobRow, error: jobError } = await supabase
+          .from('jobs')
+          .select('id, total, total_amount, price, tip_amount, payment_status, invoice_status')
+          .eq('id', jobId)
+          .single();
+
+        if (jobError) {
+          console.error('❌ Error fetching job during payment check:', jobError);
+        } else if (jobRow) {
+          const jobTotal = parseFloat(jobRow.total ?? jobRow.total_amount ?? jobRow.price) || 0;
+          const jobTip = parseFloat(jobRow.tip_amount) || 0;
+          const expectedTotal = jobTotal + jobTip;
+
+          // Only adjust if the job is marked as paid/partial but there is no money recorded
+          if (['paid', 'partial'].includes(jobRow.payment_status)) {
+            const newPaymentStatus = 'pending';
+            const newInvoiceStatus = jobTotal > 0 ? 'invoiced' : 'draft';
+
+            console.log('💳 Normalizing job payment status based on transactions:', {
+              jobId,
+              oldPaymentStatus: jobRow.payment_status,
+              oldInvoiceStatus: jobRow.invoice_status,
+              newPaymentStatus,
+              newInvoiceStatus,
+              expectedTotal,
+              totalPaid
+            });
+
+            const { error: updateJobError } = await supabase
+              .from('jobs')
+              .update({
+                payment_status: newPaymentStatus,
+                invoice_status: newInvoiceStatus,
+                total_paid_amount: 0,
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', jobId);
+
+            if (updateJobError) {
+              console.error('❌ Error normalizing job after payment check:', updateJobError);
+            }
+          }
+        }
+      }
+    } catch (normalizeError) {
+      console.error('❌ Error normalizing job payment status from transactions endpoint:', normalizeError);
+    }
+
     res.json({
       hasPayment: transactionCount > 0,
       totalPaid,
