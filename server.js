@@ -26344,10 +26344,10 @@ const deleteTransactionHandler = async (req, res) => {
       return res.status(400).json({ error: 'Transaction ID is required' });
     }
 
-    // Fetch transaction to find related job
+    // Fetch transaction to find related job/invoice
     const { data: transaction, error: txError } = await supabase
       .from('transactions')
-      .select('id, job_id')
+      .select('id, job_id, invoice_id')
       .eq('id', id)
       .single();
 
@@ -26434,6 +26434,66 @@ const deleteTransactionHandler = async (req, res) => {
 
     if (updateJobError) {
       console.error('❌ Error updating job after transaction delete (final):', updateJobError);
+    }
+
+    // Recompute invoice payment status as well (so invoices don't stay "paid" with no payments)
+    const invoiceId = transaction.invoice_id;
+
+    if (invoiceId) {
+      // Get remaining completed transactions for this invoice
+      const { data: invoiceTx, error: invoiceTxErr } = await supabase
+        .from('transactions')
+        .select('amount')
+        .eq('invoice_id', invoiceId)
+        .eq('status', 'completed');
+
+      if (invoiceTxErr) {
+        console.error('❌ Error fetching remaining transactions for invoice after delete:', invoiceTxErr);
+      } else {
+        const totalPaidForInvoice = Array.isArray(invoiceTx) && invoiceTx.length
+          ? invoiceTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0)
+          : 0;
+
+        // Get invoice total to determine proper status
+        const { data: invoiceRow, error: invoiceErr } = await supabase
+          .from('invoices')
+          .select('total_amount')
+          .eq('id', invoiceId)
+          .single();
+
+        if (invoiceErr) {
+          console.error('❌ Error fetching invoice when updating status after transaction delete:', invoiceErr);
+        } else if (invoiceRow) {
+          const invoiceTotal = parseFloat(invoiceRow.total_amount || 0);
+
+          // Mirror logic from manual payment recording:
+          // - 0 paid  -> 'sent' (back to unpaid)
+          // - 0 < paid < total -> 'partial'
+          // - paid >= total -> 'paid'
+          let newInvoiceStatus = 'sent';
+          if (invoiceTotal > 0) {
+            if (totalPaidForInvoice >= invoiceTotal - 0.01) {
+              newInvoiceStatus = 'paid';
+            } else if (totalPaidForInvoice > 0) {
+              newInvoiceStatus = 'partial';
+            } else {
+              newInvoiceStatus = 'sent';
+            }
+          }
+
+          const { error: updateInvoiceError } = await supabase
+            .from('invoices')
+            .update({
+              status: newInvoiceStatus,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', invoiceId);
+
+          if (updateInvoiceError) {
+            console.error('❌ Error updating invoice after transaction delete:', updateInvoiceError);
+          }
+        }
+      }
     }
 
     return res.json({ success: true });
