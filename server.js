@@ -26380,6 +26380,7 @@ const deleteTransactionHandler = async (req, res) => {
     const expectedTotal = jobTotal + jobTip;
     const isFullyPaid = newTotalPaid >= expectedTotal - 0.01;
 
+    // Try to update all known fields first
     const jobUpdate = {
       total_paid_amount: newTotalPaid,
       invoice_status: isFullyPaid ? 'paid' : (jobTotal > 0 ? 'invoiced' : 'draft'),
@@ -26387,15 +26388,26 @@ const deleteTransactionHandler = async (req, res) => {
       updated_at: new Date().toISOString()
     };
 
-    const { error: updateJobError } = await supabase
+    let { error: updateJobError } = await supabase
       .from('jobs')
       .update(jobUpdate)
       .eq('id', jobId);
 
+    // If some columns don't exist (older schema), fall back to updating at least invoice_status
     if (updateJobError && updateJobError.message && updateJobError.message.includes('column')) {
-      console.warn('⚠️ Some job columns may not exist, skipping job status update:', updateJobError.message);
-    } else if (updateJobError) {
-      console.error('❌ Error updating job after transaction delete:', updateJobError);
+      console.warn('⚠️ Some job columns may not exist when updating after delete:', updateJobError.message);
+      const fallbackUpdate = {
+        invoice_status: jobUpdate.invoice_status,
+        updated_at: jobUpdate.updated_at
+      };
+      ({ error: updateJobError } = await supabase
+        .from('jobs')
+        .update(fallbackUpdate)
+        .eq('id', jobId));
+    }
+
+    if (updateJobError) {
+      console.error('❌ Error updating job after transaction delete (final):', updateJobError);
     }
 
     return res.json({ success: true });
