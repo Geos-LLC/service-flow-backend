@@ -26311,6 +26311,65 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
   }
 });
 
+// Delete a recorded payment/transaction (handler shared for both path styles)
+const deleteTransactionHandler = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    if (!id) {
+      return res.status(400).json({ error: 'Transaction ID is required' });
+    }
+
+    // Fetch transaction to find related job
+    const { data: transaction, error: txError } = await supabase
+      .from('transactions')
+      .select('id, job_id')
+      .eq('id', id)
+      .single();
+
+    if (txError || !transaction) {
+      console.error('❌ Error fetching transaction for delete:', txError);
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    // Ensure the job belongs to the current user for safety
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', transaction.job_id)
+      .single();
+
+    if (jobError || !job) {
+      console.error('❌ Error fetching job for transaction delete:', jobError);
+      return res.status(404).json({ error: 'Job not found for this transaction' });
+    }
+
+    if (job.user_id !== userId) {
+      return res.status(403).json({ error: 'You are not authorized to delete this payment' });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('transactions')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) {
+      console.error('❌ Error deleting transaction:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete payment' });
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Unexpected error deleting transaction:', error);
+    return res.status(500).json({ error: 'Failed to delete payment' });
+  }
+};
+
+app.delete('/api/transactions/:id', authenticateToken, deleteTransactionHandler);
+// Support path without /api prefix (e.g. when baseURL is the server root)
+app.delete('/transactions/:id', authenticateToken, deleteTransactionHandler);
+
 // Helper function to generate receipt HTML
 function generateReceiptHtml(invoice, paymentIntentId, amount) {
   return `
