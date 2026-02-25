@@ -26333,11 +26333,13 @@ const deleteTransactionHandler = async (req, res) => {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 
+    const jobId = transaction.job_id;
+
     // Ensure the job belongs to the current user for safety
     const { data: job, error: jobError } = await supabase
       .from('jobs')
-      .select('id, user_id')
-      .eq('id', transaction.job_id)
+      .select('id, user_id, total, total_amount, price, tip_amount, discount')
+      .eq('id', jobId)
       .single();
 
     if (jobError || !job) {
@@ -26357,6 +26359,43 @@ const deleteTransactionHandler = async (req, res) => {
     if (deleteError) {
       console.error('❌ Error deleting transaction:', deleteError);
       return res.status(500).json({ error: 'Failed to delete payment' });
+    }
+
+    // Recompute total paid from remaining transactions and update job status
+    const { data: remainingTx, error: remainingError } = await supabase
+      .from('transactions')
+      .select('amount, tip_amount')
+      .eq('job_id', jobId)
+      .eq('status', 'completed');
+
+    const newTotalPaid = remainingError || !remainingTx?.length
+      ? 0
+      : remainingTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0);
+    const newTotalTips = remainingError || !remainingTx?.length
+      ? 0
+      : remainingTx.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0);
+
+    const jobTotal = parseFloat(job.total ?? job.total_amount ?? job.price) || 0;
+    const jobTip = parseFloat(job.tip_amount) || 0;
+    const expectedTotal = jobTotal + jobTip;
+    const isFullyPaid = newTotalPaid >= expectedTotal - 0.01;
+
+    const jobUpdate = {
+      total_paid_amount: newTotalPaid,
+      invoice_status: isFullyPaid ? 'paid' : (jobTotal > 0 ? 'invoiced' : 'draft'),
+      payment_status: isFullyPaid ? 'paid' : 'pending',
+      updated_at: new Date().toISOString()
+    };
+
+    const { error: updateJobError } = await supabase
+      .from('jobs')
+      .update(jobUpdate)
+      .eq('id', jobId);
+
+    if (updateJobError && updateJobError.message && updateJobError.message.includes('column')) {
+      console.warn('⚠️ Some job columns may not exist, skipping job status update:', updateJobError.message);
+    } else if (updateJobError) {
+      console.error('❌ Error updating job after transaction delete:', updateJobError);
     }
 
     return res.json({ success: true });
