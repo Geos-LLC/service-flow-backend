@@ -19348,7 +19348,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name, tip_amount')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name, tip_amount, incentive_amount')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19390,7 +19390,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               status,
               service_name,
               user_id,
-              tip_amount
+              tip_amount,
+              incentive_amount
             )
           `)
           .eq('team_member_id', member.id);
@@ -19561,34 +19562,65 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Get per-member tips and incentives from job_team_assignments for jobs in the date range
         const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
         if (jobIds.length > 0) {
-          const { data: tipAssignments, error: tipError } = await supabase
+          // Try fetching both tip_amount and incentive_amount from assignments
+          let tipAssignments = null;
+          let tipQueryFailed = false;
+          const { data: taData, error: taError } = await supabase
             .from('job_team_assignments')
             .select('tip_amount, incentive_amount, job_id')
             .eq('team_member_id', member.id)
             .in('job_id', jobIds);
 
-          if (!tipError && tipAssignments) {
+          if (taError) {
+            console.error(`[Payroll] Error fetching assignments for member ${member.id}:`, taError.message);
+            tipQueryFailed = true;
+            // Fallback: try without incentive_amount in case column doesn't exist yet
+            const { data: taFallback } = await supabase
+              .from('job_team_assignments')
+              .select('tip_amount, job_id')
+              .eq('team_member_id', member.id)
+              .in('job_id', jobIds);
+            tipAssignments = taFallback;
+          } else {
+            tipAssignments = taData;
+          }
+
+          if (tipAssignments) {
             tipAssignments.forEach(ta => {
               totalTips += parseFloat(ta.tip_amount) || 0;
               totalIncentives += parseFloat(ta.incentive_amount) || 0;
             });
           }
 
-          // For jobs where this member has no per-member tip but the job has a tip_amount,
-          // split the job-level tip evenly among assigned members (fallback/default tip)
+          // Fallback for tips: split job-level tip among members if no per-member tip
           const memberTippedJobIds = new Set((tipAssignments || []).filter(ta => parseFloat(ta.tip_amount) > 0).map(ta => ta.job_id));
           const jobsWithoutMemberTip = jobs.filter(j => !memberTippedJobIds.has(j.id));
 
           for (const job of jobsWithoutMemberTip) {
             const jobTip = parseFloat(job.tip_amount) || 0;
             if (jobTip > 0) {
-              // Count total assigned members for this job to split evenly
               const { data: assignmentCount } = await supabase
                 .from('job_team_assignments')
                 .select('team_member_id')
                 .eq('job_id', job.id);
               const memberCount = assignmentCount ? assignmentCount.length : 1;
               totalTips += jobTip / Math.max(1, memberCount);
+            }
+          }
+
+          // Fallback for incentives: use job-level incentive_amount if per-member query failed or returned 0
+          const memberIncentiveJobIds = new Set((tipAssignments || []).filter(ta => parseFloat(ta.incentive_amount) > 0).map(ta => ta.job_id));
+          const jobsWithoutMemberIncentive = jobs.filter(j => !memberIncentiveJobIds.has(j.id));
+
+          for (const job of jobsWithoutMemberIncentive) {
+            const jobIncentive = parseFloat(job.incentive_amount) || 0;
+            if (jobIncentive > 0) {
+              const { data: assignmentCount } = await supabase
+                .from('job_team_assignments')
+                .select('team_member_id')
+                .eq('job_id', job.id);
+              const memberCount = assignmentCount ? assignmentCount.length : 1;
+              totalIncentives += jobIncentive / Math.max(1, memberCount);
             }
           }
         }
