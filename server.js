@@ -4820,18 +4820,21 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         .select(`
           team_member_id,
           is_primary,
+          tip_amount,
+          incentive_amount,
           team_members!left(first_name, last_name, email)
         `)
         .eq('job_id', id)
         .order('is_primary', { ascending: false })
         .order('assigned_at', { ascending: true });
-      
+
       if (assignmentsError) {
         console.error('Error fetching team assignments:', assignmentsError);
       } else {
         teamAssignments = (assignmentsResult || []).map(assignment => ({
           team_member_id: assignment.team_member_id,
           is_primary: assignment.is_primary,
+          tip_amount: assignment.tip_amount || 0,
           first_name: assignment.team_members?.first_name,
           last_name: assignment.team_members?.last_name,
           email: assignment.team_members?.email
@@ -19345,7 +19348,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name, tip_amount')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19386,7 +19389,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               price,
               status,
               service_name,
-              user_id
+              user_id,
+              tip_amount
             )
           `)
           .eq('team_member_id', member.id);
@@ -19550,8 +19554,49 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         console.log(`[Payroll] Total salary: $${(hourlySalary + commissionSalary).toFixed(2)}`);
         console.log(`[Payroll] ==========================================`);
 
-        // Total salary is sum of hourly + commission (hybrid model)
-        const totalSalary = hourlySalary + commissionSalary;
+        // Calculate tips and incentives for this team member
+        let totalTips = 0;
+        let totalIncentives = 0;
+
+        // Get per-member tips and incentives from job_team_assignments for jobs in the date range
+        const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
+        if (jobIds.length > 0) {
+          const { data: tipAssignments, error: tipError } = await supabase
+            .from('job_team_assignments')
+            .select('tip_amount, incentive_amount, job_id')
+            .eq('team_member_id', member.id)
+            .in('job_id', jobIds);
+
+          if (!tipError && tipAssignments) {
+            tipAssignments.forEach(ta => {
+              totalTips += parseFloat(ta.tip_amount) || 0;
+              totalIncentives += parseFloat(ta.incentive_amount) || 0;
+            });
+          }
+
+          // For jobs where this member has no per-member tip but the job has a tip_amount,
+          // split the job-level tip evenly among assigned members (fallback/default tip)
+          const memberTippedJobIds = new Set((tipAssignments || []).filter(ta => parseFloat(ta.tip_amount) > 0).map(ta => ta.job_id));
+          const jobsWithoutMemberTip = jobs.filter(j => !memberTippedJobIds.has(j.id));
+
+          for (const job of jobsWithoutMemberTip) {
+            const jobTip = parseFloat(job.tip_amount) || 0;
+            if (jobTip > 0) {
+              // Count total assigned members for this job to split evenly
+              const { data: assignmentCount } = await supabase
+                .from('job_team_assignments')
+                .select('team_member_id')
+                .eq('job_id', job.id);
+              const memberCount = assignmentCount ? assignmentCount.length : 1;
+              totalTips += jobTip / Math.max(1, memberCount);
+            }
+          }
+        }
+
+        console.log(`[Payroll] Member ${member.id}: Total tips = $${totalTips.toFixed(2)}, Total incentives = $${totalIncentives.toFixed(2)}`);
+
+        // Total salary is sum of hourly + commission + tips + incentives
+        const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
 
         return {
           teamMember: {
@@ -19564,15 +19609,17 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalHours: parseFloat(totalHours.toFixed(2)),
           hourlySalary: parseFloat(hourlySalary.toFixed(2)),
           commissionSalary: parseFloat(commissionSalary.toFixed(2)),
+          totalTips: parseFloat(totalTips.toFixed(2)),
+          totalIncentives: parseFloat(totalIncentives.toFixed(2)),
           totalSalary: parseFloat(totalSalary.toFixed(2)),
           hasHourlyRate: !!member.hourly_rate,
           hasCommission: !!member.commission_percentage,
-          paymentMethod: member.hourly_rate && member.commission_percentage 
-            ? 'hybrid' 
-            : member.hourly_rate 
-              ? 'hourly' 
-              : member.commission_percentage 
-                ? 'commission' 
+          paymentMethod: member.hourly_rate && member.commission_percentage
+            ? 'hybrid'
+            : member.hourly_rate
+              ? 'hourly'
+              : member.commission_percentage
+                ? 'commission'
                 : 'none'
         };
         } catch (memberError) {
@@ -19589,6 +19636,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             totalHours: 0,
             hourlySalary: 0,
             commissionSalary: 0,
+            totalTips: 0,
+            totalIncentives: 0,
             totalSalary: 0,
             hasHourlyRate: !!member.hourly_rate,
             hasCommission: !!member.commission_percentage,
@@ -19613,6 +19662,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalHours = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalHours || 0), 0);
     const grandTotalHourlySalary = sortedTeamMembers.reduce((sum, item) => sum + (item?.hourlySalary || 0), 0);
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
+    const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
+    const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
 
     res.json({
       period: {
@@ -19625,6 +19676,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalHours: parseFloat(grandTotalHours.toFixed(2)),
         totalHourlySalary: parseFloat(grandTotalHourlySalary.toFixed(2)),
         totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
+        totalTips: parseFloat(grandTotalTips.toFixed(2)),
+        totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2))
       }
     });
@@ -23563,6 +23616,165 @@ app.get('/api/jobs/:jobId/assignments', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get team assignments error:', error);
     res.status(500).json({ error: 'Failed to get team assignments' });
+  }
+});
+
+// Update tip amount for a specific team member assignment
+app.put('/api/jobs/:jobId/team-tip', authenticateToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { teamMemberId, tipAmount } = req.body;
+    const userId = req.user.userId;
+
+    if (tipAmount === undefined || tipAmount === null || isNaN(parseFloat(tipAmount))) {
+      return res.status(400).json({ error: 'Valid tip amount is required' });
+    }
+    if (!teamMemberId) {
+      return res.status(400).json({ error: 'Team member ID is required' });
+    }
+
+    // Check if job exists and belongs to user
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
+    }
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Update the tip_amount on the specific assignment
+    const { data: updatedAssignment, error: updateError } = await supabase
+      .from('job_team_assignments')
+      .update({ tip_amount: parseFloat(tipAmount) })
+      .eq('job_id', jobId)
+      .eq('team_member_id', teamMemberId)
+      .select('team_member_id, tip_amount, is_primary');
+
+    if (updateError) {
+      console.error('Error updating team member tip:', updateError);
+      return res.status(500).json({ error: 'Failed to update tip' });
+    }
+    if (!updatedAssignment || updatedAssignment.length === 0) {
+      return res.status(404).json({ error: 'Team member assignment not found for this job' });
+    }
+
+    // Recompute job-level tip_amount as SUM of all per-member tips
+    const { data: allAssignments, error: sumError } = await supabase
+      .from('job_team_assignments')
+      .select('tip_amount')
+      .eq('job_id', jobId);
+
+    if (sumError) {
+      console.error('Error fetching assignment tips:', sumError);
+      return res.status(500).json({ error: 'Failed to recompute job tip total' });
+    }
+
+    const jobTipTotal = (allAssignments || []).reduce((sum, a) => sum + (parseFloat(a.tip_amount) || 0), 0);
+
+    const { error: jobUpdateError } = await supabase
+      .from('jobs')
+      .update({ tip_amount: jobTipTotal })
+      .eq('id', jobId);
+
+    if (jobUpdateError) {
+      console.error('Error updating job tip total:', jobUpdateError);
+      return res.status(500).json({ error: 'Failed to update job tip total' });
+    }
+
+    res.json({
+      assignment: updatedAssignment[0],
+      jobTipTotal
+    });
+  } catch (error) {
+    console.error('Update team member tip error:', error);
+    res.status(500).json({ error: 'Failed to update team member tip' });
+  }
+});
+
+// Update incentive amount for a specific team member assignment
+app.put('/api/jobs/:jobId/team-incentive', authenticateToken, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { teamMemberId, incentiveAmount } = req.body;
+    const userId = req.user.userId;
+
+    if (incentiveAmount === undefined || incentiveAmount === null || isNaN(parseFloat(incentiveAmount))) {
+      return res.status(400).json({ error: 'Valid incentive amount is required' });
+    }
+    if (!teamMemberId) {
+      return res.status(400).json({ error: 'Team member ID is required' });
+    }
+
+    const { data: jobCheck, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .limit(1);
+
+    if (jobError) {
+      console.error('Error checking job:', jobError);
+      return res.status(500).json({ error: 'Failed to check job' });
+    }
+    if (!jobCheck || jobCheck.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    if (jobCheck[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { data: updatedAssignment, error: updateError } = await supabase
+      .from('job_team_assignments')
+      .update({ incentive_amount: parseFloat(incentiveAmount) })
+      .eq('job_id', jobId)
+      .eq('team_member_id', teamMemberId)
+      .select('team_member_id, incentive_amount, is_primary');
+
+    if (updateError) {
+      console.error('Error updating team member incentive:', updateError);
+      return res.status(500).json({ error: 'Failed to update incentive' });
+    }
+    if (!updatedAssignment || updatedAssignment.length === 0) {
+      return res.status(404).json({ error: 'Team member assignment not found for this job' });
+    }
+
+    const { data: allAssignments, error: sumError } = await supabase
+      .from('job_team_assignments')
+      .select('incentive_amount')
+      .eq('job_id', jobId);
+
+    if (sumError) {
+      console.error('Error fetching assignment incentives:', sumError);
+      return res.status(500).json({ error: 'Failed to recompute job incentive total' });
+    }
+
+    const jobIncentiveTotal = (allAssignments || []).reduce((sum, a) => sum + (parseFloat(a.incentive_amount) || 0), 0);
+
+    const { error: jobUpdateError } = await supabase
+      .from('jobs')
+      .update({ incentive_amount: jobIncentiveTotal })
+      .eq('id', jobId);
+
+    if (jobUpdateError) {
+      console.error('Error updating job incentive total:', jobUpdateError);
+      return res.status(500).json({ error: 'Failed to update job incentive total' });
+    }
+
+    res.json({
+      assignment: updatedAssignment[0],
+      jobIncentiveTotal
+    });
+  } catch (error) {
+    console.error('Update team member incentive error:', error);
+    res.status(500).json({ error: 'Failed to update team member incentive' });
   }
 });
 
