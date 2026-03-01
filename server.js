@@ -19630,6 +19630,50 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Total salary is sum of hourly + commission + tips + incentives
         const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
 
+        // Build per-job detail for the response
+        // Create a map of per-member tips/incentives by job_id
+        const tipsByJob = {};
+        if (tipAssignments) {
+          tipAssignments.forEach(ta => {
+            tipsByJob[ta.job_id] = {
+              tip: parseFloat(ta.tip_amount) || 0,
+              incentive: parseFloat(ta.incentive_amount) || 0
+            };
+          });
+        }
+
+        const jobDetails = (jobs || []).map(job => {
+          // Calculate hours for this job (same logic as above)
+          let hours = 0;
+          if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
+            hours = parseFloat(job.hours_worked);
+          } else if (job.start_time && job.end_time) {
+            const diffMs = new Date(job.end_time) - new Date(job.start_time);
+            if (diffMs > 0) hours = diffMs / (1000 * 60 * 60);
+          } else {
+            const dur = job.duration || job.estimated_duration || 0;
+            if (dur > 0) hours = dur / 60;
+          }
+
+          const revenue = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || parseFloat(job.price) || 0;
+          const jobCommission = commissionPercentage > 0 ? revenue * (commissionPercentage / 100) : 0;
+          const jobHourlySalary = hourlyRate > 0 ? hours * hourlyRate : 0;
+          const perMember = tipsByJob[job.id] || {};
+
+          return {
+            id: job.id,
+            scheduledDate: job.scheduled_date,
+            serviceName: job.service_name || 'Unknown Service',
+            status: job.status,
+            hours: parseFloat(hours.toFixed(2)),
+            revenue: parseFloat(revenue.toFixed(2)),
+            hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
+            commission: parseFloat(jobCommission.toFixed(2)),
+            tip: parseFloat((perMember.tip || 0).toFixed(2)),
+            incentive: parseFloat((perMember.incentive || 0).toFixed(2))
+          };
+        });
+
         return {
           teamMember: {
             id: member.id,
@@ -19652,7 +19696,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               ? 'hourly'
               : member.commission_percentage
                 ? 'commission'
-                : 'none'
+                : 'none',
+          jobs: jobDetails
         };
         } catch (memberError) {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
