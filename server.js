@@ -19558,12 +19558,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Calculate tips and incentives for this team member
         let totalTips = 0;
         let totalIncentives = 0;
+        let tipAssignments = null;
 
         // Get per-member tips and incentives from job_team_assignments for jobs in the date range
         const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
         if (jobIds.length > 0) {
           // Try fetching both tip_amount and incentive_amount from assignments
-          let tipAssignments = null;
           let tipQueryFailed = false;
           const { data: taData, error: taError } = await supabase
             .from('job_team_assignments')
