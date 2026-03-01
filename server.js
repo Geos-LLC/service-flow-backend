@@ -19559,6 +19559,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         let totalTips = 0;
         let totalIncentives = 0;
         let tipAssignments = null;
+        // Track per-job tip/incentive for detail view (includes fallback amounts)
+        const tipsByJob = {};
 
         // Get per-member tips and incentives from job_team_assignments for jobs in the date range
         const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
@@ -19587,8 +19589,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
           if (tipAssignments) {
             tipAssignments.forEach(ta => {
-              totalTips += parseFloat(ta.tip_amount) || 0;
-              totalIncentives += parseFloat(ta.incentive_amount) || 0;
+              const tip = parseFloat(ta.tip_amount) || 0;
+              const incentive = parseFloat(ta.incentive_amount) || 0;
+              totalTips += tip;
+              totalIncentives += incentive;
+              if (tip > 0 || incentive > 0) {
+                tipsByJob[ta.job_id] = { tip, incentive };
+              }
             });
           }
 
@@ -19604,7 +19611,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                 .select('team_member_id')
                 .eq('job_id', job.id);
               const memberCount = assignmentCount ? assignmentCount.length : 1;
-              totalTips += jobTip / Math.max(1, memberCount);
+              const memberTip = jobTip / Math.max(1, memberCount);
+              totalTips += memberTip;
+              // Track for detail view
+              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
+              tipsByJob[job.id].tip = memberTip;
             }
           }
 
@@ -19620,7 +19631,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                 .select('team_member_id')
                 .eq('job_id', job.id);
               const memberCount = assignmentCount ? assignmentCount.length : 1;
-              totalIncentives += jobIncentive / Math.max(1, memberCount);
+              const memberIncentive = jobIncentive / Math.max(1, memberCount);
+              totalIncentives += memberIncentive;
+              // Track for detail view
+              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
+              tipsByJob[job.id].incentive = memberIncentive;
             }
           }
         }
@@ -19629,18 +19644,6 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
         // Total salary is sum of hourly + commission + tips + incentives
         const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
-
-        // Build per-job detail for the response
-        // Create a map of per-member tips/incentives by job_id
-        const tipsByJob = {};
-        if (tipAssignments) {
-          tipAssignments.forEach(ta => {
-            tipsByJob[ta.job_id] = {
-              tip: parseFloat(ta.tip_amount) || 0,
-              incentive: parseFloat(ta.incentive_amount) || 0
-            };
-          });
-        }
 
         const jobDetails = (jobs || []).map(job => {
           // Calculate hours for this job (same logic as above)
