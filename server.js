@@ -3223,31 +3223,40 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           }
         }
         
-        // Fetch team assignments from job_team_assignments table
+        // Fetch team assignments from job_team_assignments table (no embedded join to avoid FK ambiguity)
         const { data: assignmentsData, error: assignmentsError } = await supabase
           .from('job_team_assignments')
-          .select(`
-            job_id,
-            team_member_id,
-            is_primary,
-            team_members!left(first_name, last_name, email)
-          `)
+          .select('job_id, team_member_id, is_primary')
           .in('job_id', jobIds)
           .order('is_primary', { ascending: false })
           .order('assigned_at', { ascending: true });
-        
-        if (!assignmentsError && assignmentsData) {
+
+        // Fetch team member details separately
+        if (!assignmentsError && assignmentsData && assignmentsData.length > 0) {
+          const assignedMemberIds = [...new Set(assignmentsData.map(a => a.team_member_id).filter(Boolean))];
+          let memberMap = {};
+          if (assignedMemberIds.length > 0) {
+            const { data: memberDetails } = await supabase
+              .from('team_members')
+              .select('id, first_name, last_name, email')
+              .in('id', assignedMemberIds);
+            if (memberDetails) {
+              memberDetails.forEach(m => { memberMap[m.id] = m; });
+            }
+          }
+
           // Group by job_id
           assignmentsData.forEach(assignment => {
             if (!allTeamAssignments[assignment.job_id]) {
               allTeamAssignments[assignment.job_id] = [];
             }
+            const member = memberMap[assignment.team_member_id] || {};
             allTeamAssignments[assignment.job_id].push({
               team_member_id: assignment.team_member_id,
               is_primary: assignment.is_primary,
-              first_name: assignment.team_members?.first_name,
-              last_name: assignment.team_members?.last_name,
-              email: assignment.team_members?.email
+              first_name: member.first_name || null,
+              last_name: member.last_name || null,
+              email: member.email || null
             });
           });
         }
@@ -4815,32 +4824,44 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     // Get team assignments for this job
     let teamAssignments = [];
     try {
+      // Fetch assignments without embedded join (avoids PostgREST FK ambiguity)
       const { data: assignmentsResult, error: assignmentsError } = await supabase
         .from('job_team_assignments')
-        .select(`
-          team_member_id,
-          is_primary,
-          tip_amount,
-          incentive_amount,
-          team_members!left(first_name, last_name, email)
-        `)
+        .select('team_member_id, is_primary, tip_amount, incentive_amount')
         .eq('job_id', id)
         .order('is_primary', { ascending: false })
         .order('assigned_at', { ascending: true });
 
       if (assignmentsError) {
-        console.error(`[GET job ${id}] Error fetching team assignments:`, assignmentsError.message, assignmentsError.details);
-      } else {
-        console.log(`[GET job ${id}] team_assignments raw count: ${assignmentsResult?.length || 0}`, JSON.stringify(assignmentsResult));
-        teamAssignments = (assignmentsResult || []).map(assignment => ({
-          team_member_id: assignment.team_member_id,
-          is_primary: assignment.is_primary,
-          tip_amount: assignment.tip_amount || 0,
-          incentive_amount: assignment.incentive_amount || 0,
-          first_name: assignment.team_members?.first_name,
-          last_name: assignment.team_members?.last_name,
-          email: assignment.team_members?.email
-        }));
+        console.error(`[GET job ${id}] Error fetching team assignments:`, assignmentsError.message);
+      }
+
+      if (!assignmentsError && assignmentsResult && assignmentsResult.length > 0) {
+        // Fetch team member details separately to avoid FK ambiguity
+        const assignedMemberIds = [...new Set(assignmentsResult.map(a => a.team_member_id).filter(Boolean))];
+        let memberDetailsMap = {};
+        if (assignedMemberIds.length > 0) {
+          const { data: memberDetails } = await supabase
+            .from('team_members')
+            .select('id, first_name, last_name, email')
+            .in('id', assignedMemberIds);
+          if (memberDetails) {
+            memberDetails.forEach(m => { memberDetailsMap[m.id] = m; });
+          }
+        }
+
+        teamAssignments = assignmentsResult.map(assignment => {
+          const member = memberDetailsMap[assignment.team_member_id] || {};
+          return {
+            team_member_id: assignment.team_member_id,
+            is_primary: assignment.is_primary,
+            tip_amount: assignment.tip_amount || 0,
+            incentive_amount: assignment.incentive_amount || 0,
+            first_name: member.first_name || null,
+            last_name: member.last_name || null,
+            email: member.email || null
+          };
+        });
       }
     } catch (error) {
       console.error('Error processing team assignments:', error);
@@ -19373,11 +19394,46 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           allJobs = [...(directJobs || [])];
         }
         
-        // NOTE: Method 2 (job_team_assignments join) was removed because CSV-imported data
-        // left stale entries in job_team_assignments, causing jobs to appear in wrong members'
-        // payrolls and inflating member counts. The jobs.team_member_id field (used by Method 1)
-        // is the authoritative assignment source. Multi-member payroll splitting can be re-enabled
-        // once job_team_assignments data is validated/cleaned.
+        // Method 2: Get jobs from job_team_assignments table
+        let assignmentsQuery = supabase
+          .from('job_team_assignments')
+          .select(`
+            jobs!inner(
+              id, scheduled_date, start_time, end_time, hours_worked,
+              duration, estimated_duration, total, total_amount, invoice_amount,
+              price, status, service_name, user_id, tip_amount, incentive_amount, customer_id
+            )
+          `)
+          .eq('team_member_id', member.id);
+
+        const { data: assignments, error: assignmentsError } = await assignmentsQuery;
+
+        if (assignmentsError) {
+          console.error(`Error fetching assigned jobs for member ${member.id}:`, assignmentsError);
+        } else if (assignments) {
+          const assignedJobs = assignments
+            .map(assignment => assignment.jobs)
+            .filter(job => {
+              if (!job) return false;
+              if (job.user_id !== userId) return false;
+              if (startDate || endDate) {
+                const raw = job.scheduled_date ? String(job.scheduled_date) : '';
+                const jobDateStr = raw.split('T')[0].split(' ')[0];
+                if (!jobDateStr) return false;
+                if (startDate && jobDateStr < startDate) return false;
+                if (endDate && jobDateStr > endDate) return false;
+              }
+              return true;
+            });
+
+          // Merge with direct jobs, avoiding duplicates
+          const existingJobIds = new Set(allJobs.map(j => j.id));
+          assignedJobs.forEach(job => {
+            if (!existingJobIds.has(job.id)) {
+              allJobs.push(job);
+            }
+          });
+        }
 
         // Exclude cancelled jobs from payroll (count, hours, commission)
         const isCancelled = (job) => {
@@ -19401,10 +19457,26 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
         }
 
-        // memberCountByJob is not computed from job_team_assignments because that table
-        // has unreliable stale data from CSV imports. With Method 1 only (jobs.team_member_id),
-        // each job belongs to exactly one member, so mc is always 1.
-        const memberCountByJob = {};
+        // Get member count per job for splitting hours/revenue/commission
+        const allJobIds = jobs.map(j => j.id).filter(Boolean);
+        let memberCountByJob = {};
+        if (allJobIds.length > 0) {
+          const { data: allAssignments } = await supabase
+            .from('job_team_assignments')
+            .select('job_id, team_member_id')
+            .in('job_id', allJobIds);
+          if (allAssignments) {
+            const memberSets = {};
+            allAssignments.forEach(a => {
+              if (!a.team_member_id) return;
+              if (!memberSets[a.job_id]) memberSets[a.job_id] = new Set();
+              memberSets[a.job_id].add(a.team_member_id);
+            });
+            Object.entries(memberSets).forEach(([jobId, members]) => {
+              memberCountByJob[jobId] = members.size;
+            });
+          }
+        }
 
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
 
@@ -19447,7 +19519,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
           
           if (hours > 0) {
-            totalHours += hours;
+            const mc = memberCountByJob[job.id] || 1;
+            totalHours += hours / mc;
           }
         });
         
@@ -19490,7 +19563,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                           parseFloat(job.total_amount) ||
                           parseFloat(job.invoice_amount) ||
                           parseFloat(job.price) || 0;
-          const commission = jobTotal * (commissionPercentage / 100);
+          const mc = memberCountByJob[job.id] || 1;
+          const splitRevenue = jobTotal / mc;
+          const commission = splitRevenue * (commissionPercentage / 100);
           commissionSalary += commission;
           console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
         });
@@ -19607,8 +19682,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
 
           const revenue = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || parseFloat(job.price) || 0;
-          const jobCommission = commissionPercentage > 0 ? revenue * (commissionPercentage / 100) : 0;
-          const jobHourlySalary = hourlyRate > 0 ? hours * hourlyRate : 0;
+          const mc = memberCountByJob[job.id] || 1;
+          const splitHours = hours / mc;
+          const splitRevenue = revenue / mc;
+          const jobCommission = commissionPercentage > 0 ? splitRevenue * (commissionPercentage / 100) : 0;
+          const jobHourlySalary = hourlyRate > 0 ? splitHours * hourlyRate : 0;
           const perMember = tipsByJob[job.id] || {};
 
           return {
@@ -19617,8 +19695,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             serviceName: job.service_name || 'Unknown Service',
             customerName: customerMap[job.customer_id] || '',
             status: job.status,
-            hours: parseFloat(hours.toFixed(2)),
-            revenue: parseFloat(revenue.toFixed(2)),
+            memberCount: mc,
+            hours: parseFloat(splitHours.toFixed(2)),
+            revenue: parseFloat(splitRevenue.toFixed(2)),
             hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
             commission: parseFloat(jobCommission.toFixed(2)),
             tip: parseFloat((perMember.tip || 0).toFixed(2)),
