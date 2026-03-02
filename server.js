@@ -4829,12 +4829,14 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         .order('assigned_at', { ascending: true });
 
       if (assignmentsError) {
-        console.error('Error fetching team assignments:', assignmentsError);
+        console.error(`[GET job ${id}] Error fetching team assignments:`, assignmentsError.message, assignmentsError.details);
       } else {
+        console.log(`[GET job ${id}] team_assignments raw count: ${assignmentsResult?.length || 0}`, JSON.stringify(assignmentsResult));
         teamAssignments = (assignmentsResult || []).map(assignment => ({
           team_member_id: assignment.team_member_id,
           is_primary: assignment.is_primary,
           tip_amount: assignment.tip_amount || 0,
+          incentive_amount: assignment.incentive_amount || 0,
           first_name: assignment.team_members?.first_name,
           last_name: assignment.team_members?.last_name,
           email: assignment.team_members?.email
@@ -23913,7 +23915,7 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
       
       // Create new assignments
     const assignments = teamMemberIds.map(memberId => {
-        const isPrimary = memberId === primaryMemberId || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
+        const isPrimary = Number(memberId) === Number(primaryMemberId) || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
       return {
         job_id: parseInt(jobId),
         team_member_id: parseInt(memberId),
@@ -23921,29 +23923,48 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
         assigned_by: userId
       };
     });
-    
-    const { error: insertError } = await supabase
+
+    console.log(`[assign-multiple] Job ${jobId}: Inserting ${assignments.length} assignments:`, JSON.stringify(assignments));
+
+    const { data: insertedData, error: insertError } = await supabase
       .from('job_team_assignments')
-      .insert(assignments);
-    
+      .insert(assignments)
+      .select();
+
     if (insertError) {
       console.error('Error inserting assignments:', insertError);
       return res.status(500).json({ error: 'Failed to create assignments' });
       }
-      
+
+    console.log(`[assign-multiple] Job ${jobId}: Insert returned ${insertedData?.length || 0} rows:`, JSON.stringify(insertedData));
+
+    // Verify: read back all assignments for this job
+    const { data: verifyData, error: verifyError } = await supabase
+      .from('job_team_assignments')
+      .select('job_id, team_member_id, is_primary')
+      .eq('job_id', jobId);
+
+    console.log(`[assign-multiple] Job ${jobId}: Verification query returned ${verifyData?.length || 0} rows:`, JSON.stringify(verifyData));
+    if (verifyError) {
+      console.error(`[assign-multiple] Job ${jobId}: Verification error:`, verifyError);
+    }
+
       // Update the job with the primary team member (for backward compatibility)
       const primaryId = primaryMemberId || teamMemberIds[0];
     const { error: updateError } = await supabase
       .from('jobs')
       .update({ team_member_id: parseInt(primaryId) })
       .eq('id', jobId);
-    
+
     if (updateError) {
       console.error('Error updating job team_member_id:', updateError);
-      // Don't fail the request if this update fails, it's just for backward compatibility
     }
-      
-     res.json({ message: 'Team members assigned successfully' });
+
+     res.json({
+       message: 'Team members assigned successfully',
+       assignedCount: insertedData?.length || assignments.length,
+       assignments: verifyData || insertedData || assignments
+     });
   } catch (error) {
     console.error('Multiple team assignment error:', error);
     res.status(500).json({ error: 'Failed to assign team members' });
