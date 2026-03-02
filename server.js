@@ -4844,12 +4844,13 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const assignedMemberIds = [...new Set(assignmentsResult.map(a => a.team_member_id).filter(Boolean))];
         let memberDetailsMap = {};
         if (assignedMemberIds.length > 0) {
-          const { data: memberDetails } = await supabase
+          const { data: memberDetails, error: memberError } = await supabase
             .from('team_members')
             .select('id, first_name, last_name, email')
             .in('id', assignedMemberIds);
+          console.log(`[GET job ${id}] Member IDs to lookup:`, assignedMemberIds, 'Found members:', memberDetails?.length || 0, 'error:', memberError?.message || 'none');
           if (memberDetails) {
-            memberDetails.forEach(m => { memberDetailsMap[m.id] = m; });
+            memberDetails.forEach(m => { memberDetailsMap[String(m.id)] = m; });
           }
         }
 
@@ -4858,7 +4859,8 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const memberCount = assignmentsResult.length;
 
         teamAssignments = assignmentsResult.map(assignment => {
-          const member = memberDetailsMap[assignment.team_member_id] || {};
+          const member = memberDetailsMap[String(assignment.team_member_id)] || {};
+          console.log(`[GET job ${id}] Assignment member_id=${assignment.team_member_id}, found in map: ${!!memberDetailsMap[String(assignment.team_member_id)]}, name: ${member.first_name} ${member.last_name}`);
           return {
             team_member_id: assignment.team_member_id,
             is_primary: assignment.is_primary,
