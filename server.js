@@ -19371,68 +19371,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           allJobs = [...(directJobs || [])];
         }
         
-        // Method 2: Get jobs from job_team_assignments table
-        let assignmentsQuery = supabase
-          .from('job_team_assignments')
-          .select(`
-            jobs!inner(
-              id,
-              scheduled_date,
-              start_time,
-              end_time,
-              hours_worked,
-              duration,
-              estimated_duration,
-              total,
-              total_amount,
-              invoice_amount,
-              price,
-              status,
-              service_name,
-              user_id,
-              tip_amount,
-              incentive_amount,
-              customer_id
-            )
-          `)
-          .eq('team_member_id', member.id);
-
-        if (startDate || endDate) {
-          // We'll filter by date after getting the jobs
-        }
-
-        const { data: assignments, error: assignmentsError } = await assignmentsQuery;
-        
-        if (assignmentsError) {
-          console.error(`Error fetching assigned jobs for member ${member.id}:`, assignmentsError);
-        } else if (assignments) {
-          // Extract jobs from assignments and filter by user_id and date
-          const assignedJobs = assignments
-            .map(assignment => assignment.jobs)
-            .filter(job => {
-              if (!job) return false;
-              if (job.user_id !== userId) return false;
-              
-              // Filter by date range: compare date-only (YYYY-MM-DD) to avoid timezone issues
-              if (startDate || endDate) {
-                const raw = job.scheduled_date ? String(job.scheduled_date) : '';
-                const jobDateStr = raw.split('T')[0].split(' ')[0];
-                if (!jobDateStr) return false;
-                if (startDate && jobDateStr < startDate) return false;
-                if (endDate && jobDateStr > endDate) return false;
-              }
-              
-              return true;
-            });
-          
-          // Merge with direct jobs, avoiding duplicates
-          const existingJobIds = new Set(allJobs.map(j => j.id));
-          assignedJobs.forEach(job => {
-            if (!existingJobIds.has(job.id)) {
-              allJobs.push(job);
-            }
-          });
-        }
+        // NOTE: Method 2 (job_team_assignments join) was removed because CSV-imported data
+        // left stale entries in job_team_assignments, causing jobs to appear in wrong members'
+        // payrolls and inflating member counts. The jobs.team_member_id field (used by Method 1)
+        // is the authoritative assignment source. Multi-member payroll splitting can be re-enabled
+        // once job_team_assignments data is validated/cleaned.
 
         // Exclude cancelled jobs from payroll (count, hours, commission)
         const isCancelled = (job) => {
@@ -19456,34 +19399,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
         }
 
-        // Get member count per job for splitting hours/revenue/commission
-        // Only count ACTIVE team members (filter out stale entries for deleted/inactive members)
-        const activeTeamMemberIds = new Set((teamMembers || []).map(m => m.id));
-        const allJobIds = jobs.map(j => j.id).filter(Boolean);
-        let memberCountByJob = {};
-        if (allJobIds.length > 0) {
-          const { data: allAssignments } = await supabase
-            .from('job_team_assignments')
-            .select('job_id, team_member_id')
-            .in('job_id', allJobIds);
-          if (allAssignments) {
-            const memberSets = {};
-            allAssignments.forEach(a => {
-              if (!a.team_member_id) return; // skip null entries
-              if (!activeTeamMemberIds.has(a.team_member_id)) return; // skip deleted/inactive members
-              if (!memberSets[a.job_id]) memberSets[a.job_id] = new Set();
-              memberSets[a.job_id].add(a.team_member_id);
-            });
-            Object.entries(memberSets).forEach(([jobId, members]) => {
-              memberCountByJob[jobId] = members.size;
-            });
-          }
-        }
-        // Log member counts for debugging
-        const countsAboveOne = Object.entries(memberCountByJob).filter(([, c]) => c > 1);
-        if (countsAboveOne.length > 0) {
-          console.log(`[Payroll] Member ${member.id}: Jobs with multiple members:`, countsAboveOne.map(([jid, c]) => `job ${jid}=${c}`).join(', '));
-        }
+        // memberCountByJob is not computed from job_team_assignments because that table
+        // has unreliable stale data from CSV imports. With Method 1 only (jobs.team_member_id),
+        // each job belongs to exactly one member, so mc is always 1.
+        const memberCountByJob = {};
 
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
 
@@ -19526,11 +19445,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
           
           if (hours > 0) {
-            const mc = memberCountByJob[job.id] || 1;
-            if (mc > 1) {
-              console.log(`[Payroll] Job ${job.id}: Splitting ${hours.toFixed(2)} hours by ${mc} members → ${(hours / mc).toFixed(2)} hours each`);
-            }
-            totalHours += hours / mc;
+            totalHours += hours;
           }
         });
         
@@ -19568,17 +19483,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
         
         jobsWithRevenue.forEach(job => {
-          // Use the first available revenue field, split by member count
+          // Use the first available revenue field
           const jobTotal = parseFloat(job.total) ||
                           parseFloat(job.total_amount) ||
                           parseFloat(job.invoice_amount) ||
                           parseFloat(job.price) || 0;
-          const mc = memberCountByJob[job.id] || 1;
-          if (mc > 1) {
-            console.log(`[Payroll] Job ${job.id}: Splitting $${jobTotal.toFixed(2)} revenue by ${mc} members → $${(jobTotal / mc).toFixed(2)} each`);
-          }
-          const splitRevenue = jobTotal / mc;
-          const commission = splitRevenue * (commissionPercentage / 100);
+          const commission = jobTotal * (commissionPercentage / 100);
           commissionSalary += commission;
           console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
         });
@@ -19695,14 +19605,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
 
           const revenue = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || parseFloat(job.price) || 0;
-          const mc = memberCountByJob[job.id] || 1;
-          if (mc > 1) {
-            console.log(`[Payroll] JobDetail ${job.id}: mc=${mc}, hours ${hours.toFixed(2)}→${(hours/mc).toFixed(2)}, revenue $${revenue.toFixed(2)}→$${(revenue/mc).toFixed(2)}`);
-          }
-          const splitHours = hours / mc;
-          const splitRevenue = revenue / mc;
-          const jobCommission = commissionPercentage > 0 ? splitRevenue * (commissionPercentage / 100) : 0;
-          const jobHourlySalary = hourlyRate > 0 ? splitHours * hourlyRate : 0;
+          const jobCommission = commissionPercentage > 0 ? revenue * (commissionPercentage / 100) : 0;
+          const jobHourlySalary = hourlyRate > 0 ? hours * hourlyRate : 0;
           const perMember = tipsByJob[job.id] || {};
 
           return {
@@ -19711,9 +19615,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             serviceName: job.service_name || 'Unknown Service',
             customerName: customerMap[job.customer_id] || '',
             status: job.status,
-            memberCount: mc,
-            hours: parseFloat(splitHours.toFixed(2)),
-            revenue: parseFloat(splitRevenue.toFixed(2)),
+            hours: parseFloat(hours.toFixed(2)),
+            revenue: parseFloat(revenue.toFixed(2)),
             hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
             commission: parseFloat(jobCommission.toFixed(2)),
             tip: parseFloat((perMember.tip || 0).toFixed(2)),
