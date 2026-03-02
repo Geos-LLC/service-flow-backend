@@ -19456,6 +19456,21 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
         }
 
+        // Get member count per job for splitting hours/revenue/commission
+        const allJobIds = jobs.map(j => j.id).filter(Boolean);
+        let memberCountByJob = {};
+        if (allJobIds.length > 0) {
+          const { data: allAssignments } = await supabase
+            .from('job_team_assignments')
+            .select('job_id')
+            .in('job_id', allJobIds);
+          if (allAssignments) {
+            allAssignments.forEach(a => {
+              memberCountByJob[a.job_id] = (memberCountByJob[a.job_id] || 0) + 1;
+            });
+          }
+        }
+
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
 
         // Calculate hourly-based salary
@@ -19497,7 +19512,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
           
           if (hours > 0) {
-            totalHours += hours;
+            const mc = memberCountByJob[job.id] || 1;
+            totalHours += hours / mc;
           }
         });
         
@@ -19535,12 +19551,14 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
         
         jobsWithRevenue.forEach(job => {
-          // Use the first available revenue field
-          const jobTotal = parseFloat(job.total) || 
-                          parseFloat(job.total_amount) || 
-                          parseFloat(job.invoice_amount) || 
+          // Use the first available revenue field, split by member count
+          const jobTotal = parseFloat(job.total) ||
+                          parseFloat(job.total_amount) ||
+                          parseFloat(job.invoice_amount) ||
                           parseFloat(job.price) || 0;
-          const commission = jobTotal * (commissionPercentage / 100);
+          const mc = memberCountByJob[job.id] || 1;
+          const splitRevenue = jobTotal / mc;
+          const commission = splitRevenue * (commissionPercentage / 100);
           commissionSalary += commission;
           console.log(`[Payroll] Job ${job.id}: $${jobTotal.toFixed(2)} revenue × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
         });
@@ -19663,8 +19681,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
 
           const revenue = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || parseFloat(job.price) || 0;
-          const jobCommission = commissionPercentage > 0 ? revenue * (commissionPercentage / 100) : 0;
-          const jobHourlySalary = hourlyRate > 0 ? hours * hourlyRate : 0;
+          const mc = memberCountByJob[job.id] || 1;
+          const splitHours = hours / mc;
+          const splitRevenue = revenue / mc;
+          const jobCommission = commissionPercentage > 0 ? splitRevenue * (commissionPercentage / 100) : 0;
+          const jobHourlySalary = hourlyRate > 0 ? splitHours * hourlyRate : 0;
           const perMember = tipsByJob[job.id] || {};
 
           return {
@@ -19673,8 +19694,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             serviceName: job.service_name || 'Unknown Service',
             customerName: customerMap[job.customer_id] || '',
             status: job.status,
-            hours: parseFloat(hours.toFixed(2)),
-            revenue: parseFloat(revenue.toFixed(2)),
+            hours: parseFloat(splitHours.toFixed(2)),
+            revenue: parseFloat(splitRevenue.toFixed(2)),
             hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
             commission: parseFloat(jobCommission.toFixed(2)),
             tip: parseFloat((perMember.tip || 0).toFixed(2)),
