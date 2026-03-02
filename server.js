@@ -4825,9 +4825,10 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
     let teamAssignments = [];
     try {
       // Fetch assignments without embedded join (avoids PostgREST FK ambiguity)
+      // Only select columns that definitely exist: team_member_id, is_primary, incentive_amount
       const { data: assignmentsResult, error: assignmentsError } = await supabase
         .from('job_team_assignments')
-        .select('team_member_id, is_primary, tip_amount, incentive_amount')
+        .select('team_member_id, is_primary, incentive_amount')
         .eq('job_id', id)
         .order('is_primary', { ascending: false })
         .order('assigned_at', { ascending: true });
@@ -4835,6 +4836,8 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       if (assignmentsError) {
         console.error(`[GET job ${id}] Error fetching team assignments:`, assignmentsError.message);
       }
+
+      console.log(`[GET job ${id}] Team assignments query result:`, JSON.stringify(assignmentsResult), 'error:', assignmentsError?.message || 'none');
 
       if (!assignmentsError && assignmentsResult && assignmentsResult.length > 0) {
         // Fetch team member details separately to avoid FK ambiguity
@@ -4850,12 +4853,16 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
           }
         }
 
+        // Get tip amount from the job itself (tips are on the jobs table, not per-assignment)
+        const jobTipAmount = job.tip_amount || 0;
+        const memberCount = assignmentsResult.length;
+
         teamAssignments = assignmentsResult.map(assignment => {
           const member = memberDetailsMap[assignment.team_member_id] || {};
           return {
             team_member_id: assignment.team_member_id,
             is_primary: assignment.is_primary,
-            tip_amount: assignment.tip_amount || 0,
+            tip_amount: memberCount > 0 ? parseFloat((jobTipAmount / memberCount).toFixed(2)) : 0,
             incentive_amount: assignment.incentive_amount || 0,
             first_name: member.first_name || null,
             last_name: member.last_name || null,
