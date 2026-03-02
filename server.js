@@ -19457,18 +19457,32 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
 
         // Get member count per job for splitting hours/revenue/commission
+        // Only count ACTIVE team members (filter out stale entries for deleted/inactive members)
+        const activeTeamMemberIds = new Set((teamMembers || []).map(m => m.id));
         const allJobIds = jobs.map(j => j.id).filter(Boolean);
         let memberCountByJob = {};
         if (allJobIds.length > 0) {
           const { data: allAssignments } = await supabase
             .from('job_team_assignments')
-            .select('job_id')
+            .select('job_id, team_member_id')
             .in('job_id', allJobIds);
           if (allAssignments) {
+            const memberSets = {};
             allAssignments.forEach(a => {
-              memberCountByJob[a.job_id] = (memberCountByJob[a.job_id] || 0) + 1;
+              if (!a.team_member_id) return; // skip null entries
+              if (!activeTeamMemberIds.has(a.team_member_id)) return; // skip deleted/inactive members
+              if (!memberSets[a.job_id]) memberSets[a.job_id] = new Set();
+              memberSets[a.job_id].add(a.team_member_id);
+            });
+            Object.entries(memberSets).forEach(([jobId, members]) => {
+              memberCountByJob[jobId] = members.size;
             });
           }
+        }
+        // Log member counts for debugging
+        const countsAboveOne = Object.entries(memberCountByJob).filter(([, c]) => c > 1);
+        if (countsAboveOne.length > 0) {
+          console.log(`[Payroll] Member ${member.id}: Jobs with multiple members:`, countsAboveOne.map(([jid, c]) => `job ${jid}=${c}`).join(', '));
         }
 
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
@@ -19513,6 +19527,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           
           if (hours > 0) {
             const mc = memberCountByJob[job.id] || 1;
+            if (mc > 1) {
+              console.log(`[Payroll] Job ${job.id}: Splitting ${hours.toFixed(2)} hours by ${mc} members → ${(hours / mc).toFixed(2)} hours each`);
+            }
             totalHours += hours / mc;
           }
         });
@@ -19557,6 +19574,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                           parseFloat(job.invoice_amount) ||
                           parseFloat(job.price) || 0;
           const mc = memberCountByJob[job.id] || 1;
+          if (mc > 1) {
+            console.log(`[Payroll] Job ${job.id}: Splitting $${jobTotal.toFixed(2)} revenue by ${mc} members → $${(jobTotal / mc).toFixed(2)} each`);
+          }
           const splitRevenue = jobTotal / mc;
           const commission = splitRevenue * (commissionPercentage / 100);
           commissionSalary += commission;
@@ -19628,11 +19648,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           for (const job of jobsWithoutMemberTip) {
             const jobTip = parseFloat(job.tip_amount) || 0;
             if (jobTip > 0) {
-              const { data: assignmentCount } = await supabase
-                .from('job_team_assignments')
-                .select('team_member_id')
-                .eq('job_id', job.id);
-              const memberCount = assignmentCount ? assignmentCount.length : 1;
+              // Reuse memberCountByJob (already filters by active team members)
+              const memberCount = memberCountByJob[job.id] || 1;
               const memberTip = jobTip / Math.max(1, memberCount);
               totalTips += memberTip;
               // Track for detail view
@@ -19648,11 +19665,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           for (const job of jobsWithoutMemberIncentive) {
             const jobIncentive = parseFloat(job.incentive_amount) || 0;
             if (jobIncentive > 0) {
-              const { data: assignmentCount } = await supabase
-                .from('job_team_assignments')
-                .select('team_member_id')
-                .eq('job_id', job.id);
-              const memberCount = assignmentCount ? assignmentCount.length : 1;
+              // Reuse memberCountByJob (already filters by active team members)
+              const memberCount = memberCountByJob[job.id] || 1;
               const memberIncentive = jobIncentive / Math.max(1, memberCount);
               totalIncentives += memberIncentive;
               // Track for detail view
@@ -19682,6 +19696,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
           const revenue = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || parseFloat(job.price) || 0;
           const mc = memberCountByJob[job.id] || 1;
+          if (mc > 1) {
+            console.log(`[Payroll] JobDetail ${job.id}: mc=${mc}, hours ${hours.toFixed(2)}→${(hours/mc).toFixed(2)}, revenue $${revenue.toFixed(2)}→$${(revenue/mc).toFixed(2)}`);
+          }
           const splitHours = hours / mc;
           const splitRevenue = revenue / mc;
           const jobCommission = commissionPercentage > 0 ? splitRevenue * (commissionPercentage / 100) : 0;
@@ -19694,6 +19711,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             serviceName: job.service_name || 'Unknown Service',
             customerName: customerMap[job.customer_id] || '',
             status: job.status,
+            memberCount: mc,
             hours: parseFloat(splitHours.toFixed(2)),
             revenue: parseFloat(splitRevenue.toFixed(2)),
             hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
