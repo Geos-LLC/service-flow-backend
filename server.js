@@ -19348,7 +19348,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name, tip_amount, incentive_amount')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, status, service_name, tip_amount, incentive_amount, customer_id')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19391,7 +19391,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               service_name,
               user_id,
               tip_amount,
-              incentive_amount
+              incentive_amount,
+              customer_id
             )
           `)
           .eq('team_member_id', member.id);
@@ -19439,20 +19440,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           return s === 'cancelled' || s === 'canceled' || s === 'cancel';
         };
         const jobs = (allJobs || []).filter(job => !isCancelled(job));
-        
-        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
-        if (jobs.length > 0) {
-          console.log(`[Payroll] Sample job data:`, {
-            id: jobs[0].id,
-            hasStartTime: !!jobs[0].start_time,
-            hasEndTime: !!jobs[0].end_time,
-            hoursWorked: jobs[0].hours_worked,
-            total: jobs[0].total,
-            totalAmount: jobs[0].total_amount,
-            invoiceAmount: jobs[0].invoice_amount,
-            price: jobs[0].price
-          });
+
+        // Fetch customer names for all jobs in one query
+        const customerIds = [...new Set(jobs.map(j => j.customer_id).filter(Boolean))];
+        let customerMap = {};
+        if (customerIds.length > 0) {
+          const { data: customers } = await supabase
+            .from('customers')
+            .select('id, first_name, last_name')
+            .in('id', customerIds);
+          if (customers) {
+            customers.forEach(c => {
+              customerMap[c.id] = `${c.first_name || ''} ${c.last_name || ''}`.trim();
+            });
+          }
         }
+
+        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
 
         // Calculate hourly-based salary
         let totalHours = 0;
@@ -19667,6 +19671,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             id: job.id,
             scheduledDate: job.scheduled_date,
             serviceName: job.service_name || 'Unknown Service',
+            customerName: customerMap[job.customer_id] || '',
             status: job.status,
             hours: parseFloat(hours.toFixed(2)),
             revenue: parseFloat(revenue.toFixed(2)),
