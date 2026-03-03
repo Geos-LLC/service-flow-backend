@@ -19709,6 +19709,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
             const totalPaid = parseFloat(job.total_paid_amount) || 0;
             const overpayment = Math.max(0, totalPaid - totalDue);
+            console.log(`[Payroll] Job ${job.id} overpayment check: svcPrice=${svcPrice}, discount=${disc}, totalDue=${totalDue}, total_paid_amount=${totalPaid}, raw_total_paid=${job.total_paid_amount}, overpayment=${overpayment}`);
             if (overpayment <= 0) continue;
 
             // Get total assigned tips for this job (all members, not just current)
