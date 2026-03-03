@@ -4859,9 +4859,16 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const jobTipStored = parseFloat(job.tip_amount) || 0;
 
         // Calculate overpayment (amount paid beyond total due)
-        const jobTotal = parseFloat(job.total) || 0;
+        // Must calculate totalDue the same way frontend does: service_price - discount + fees + taxes
+        const svcPrice = parseFloat(job.service_price) || 0;
+        const jobDiscount = parseFloat(job.discount) || 0;
+        const jobFees = parseFloat(job.additional_fees) || 0;
+        const jobTaxes = parseFloat(job.taxes) || 0;
+        const totalDue = svcPrice > 0 ? (svcPrice - jobDiscount + jobFees + jobTaxes) : (parseFloat(job.total) || 0);
         const totalPaid = parseFloat(job.total_paid_amount) || 0;
-        const overpayment = Math.max(0, totalPaid - jobTotal);
+        const overpayment = Math.max(0, totalPaid - totalDue);
+
+        console.log(`[GET job ${id}] Overpayment calc: svcPrice=${svcPrice}, discount=${jobDiscount}, fees=${jobFees}, taxes=${jobTaxes}, totalDue=${totalDue}, totalPaid=${totalPaid}, overpayment=${overpayment}`);
 
         // Sum up manually assigned per-member tips
         // Note: incentive_amount is fetched from assignments, but tip_amount is NOT a column
@@ -19412,7 +19419,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, status, service_name, tip_amount, incentive_amount, customer_id')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, discount, additional_fees, taxes, status, service_name, tip_amount, incentive_amount, customer_id')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19442,7 +19449,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             jobs!inner(
               id, scheduled_date, start_time, end_time, hours_worked,
               duration, estimated_duration, total, total_amount, invoice_amount,
-              price, service_price, status, service_name, user_id, tip_amount, incentive_amount, customer_id
+              price, service_price, discount, additional_fees, taxes, status, service_name, user_id, tip_amount, incentive_amount, customer_id
             )
           `)
           .eq('team_member_id', member.id);
@@ -19694,9 +19701,14 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           // Overpayment tip splitting: if customer paid more than total due,
           // the excess beyond assigned tips is split among team members
           for (const job of jobs) {
-            const jobTotal = parseFloat(job.total) || 0;
+            // Calculate totalDue from components (same as frontend) to avoid using job.total which may include tip
+            const svcPrice = parseFloat(job.service_price) || 0;
+            const disc = parseFloat(job.discount) || 0;
+            const fees = parseFloat(job.additional_fees) || 0;
+            const taxes = parseFloat(job.taxes) || 0;
+            const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
             const totalPaid = parseFloat(job.total_paid_amount) || 0;
-            const overpayment = Math.max(0, totalPaid - jobTotal);
+            const overpayment = Math.max(0, totalPaid - totalDue);
             if (overpayment <= 0) continue;
 
             // Get total assigned tips for this job (all members, not just current)
