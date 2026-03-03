@@ -4854,17 +4854,49 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
           }
         }
 
-        // Get tip amount from the job itself (tips are on the jobs table, not per-assignment)
-        const jobTipAmount = job.tip_amount || 0;
+        // Calculate tips: per-member assigned tips + split of unassigned overpayment
         const memberCount = assignmentsResult.length;
+        const jobTipStored = parseFloat(job.tip_amount) || 0;
+
+        // Calculate overpayment (amount paid beyond total due)
+        const jobTotal = parseFloat(job.total) || 0;
+        const totalPaid = parseFloat(job.total_paid_amount) || 0;
+        const overpayment = Math.max(0, totalPaid - jobTotal);
+
+        // Sum up manually assigned per-member tips
+        // Note: incentive_amount is fetched from assignments, but tip_amount is NOT a column
+        // on job_team_assignments (per earlier discovery), so we fetch from a separate query
+        let perMemberTips = {};
+        let totalAssignedTips = 0;
+        if (memberCount > 0) {
+          const { data: tipData } = await supabase
+            .from('job_team_assignments')
+            .select('team_member_id, tip_amount')
+            .eq('job_id', id);
+          if (tipData) {
+            tipData.forEach(t => {
+              const tip = parseFloat(t.tip_amount) || 0;
+              perMemberTips[String(t.team_member_id)] = tip;
+              totalAssignedTips += tip;
+            });
+          }
+        }
+
+        // Unassigned overpayment = overpayment beyond what's already assigned as tips
+        const unassignedOverpayment = Math.max(0, overpayment - totalAssignedTips);
+        const overpaymentPerMember = memberCount > 0 ? unassignedOverpayment / memberCount : 0;
+
+        console.log(`[GET job ${id}] Tips: stored=${jobTipStored}, totalPaid=${totalPaid}, jobTotal=${jobTotal}, overpayment=${overpayment}, assignedTips=${totalAssignedTips}, unassignedOverpayment=${unassignedOverpayment}, perMember=${overpaymentPerMember}`);
 
         teamAssignments = assignmentsResult.map(assignment => {
           const member = memberDetailsMap[String(assignment.team_member_id)] || {};
-          console.log(`[GET job ${id}] Assignment member_id=${assignment.team_member_id}, found in map: ${!!memberDetailsMap[String(assignment.team_member_id)]}, name: ${member.first_name} ${member.last_name}`);
+          const assignedTip = perMemberTips[String(assignment.team_member_id)] || 0;
+          const memberTip = assignedTip + overpaymentPerMember;
+          console.log(`[GET job ${id}] Assignment member_id=${assignment.team_member_id}, found in map: ${!!memberDetailsMap[String(assignment.team_member_id)]}, name: ${member.first_name} ${member.last_name}, tip: ${assignedTip} + ${overpaymentPerMember.toFixed(2)} overpayment = ${memberTip.toFixed(2)}`);
           return {
             team_member_id: assignment.team_member_id,
             is_primary: assignment.is_primary,
-            tip_amount: memberCount > 0 ? parseFloat((jobTipAmount / memberCount).toFixed(2)) : 0,
+            tip_amount: parseFloat(memberTip.toFixed(2)),
             incentive_amount: assignment.incentive_amount || 0,
             first_name: member.first_name || null,
             last_name: member.last_name || null,
@@ -19380,7 +19412,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, status, service_name, tip_amount, incentive_amount, customer_id')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, total_paid_amount, status, service_name, tip_amount, incentive_amount, customer_id')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19410,7 +19442,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             jobs!inner(
               id, scheduled_date, start_time, end_time, hours_worked,
               duration, estimated_duration, total, total_amount, invoice_amount,
-              price, service_price, status, service_name, user_id, tip_amount, incentive_amount, customer_id
+              price, service_price, total_paid_amount, status, service_name, user_id, tip_amount, incentive_amount, customer_id
             )
           `)
           .eq('team_member_id', member.id);
@@ -19642,6 +19674,33 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               // Track for detail view
               if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
               tipsByJob[job.id].tip = memberTip;
+            }
+          }
+
+          // Overpayment tip splitting: if customer paid more than total due,
+          // the excess beyond assigned tips is split among team members
+          for (const job of jobs) {
+            const jobTotal = parseFloat(job.total) || 0;
+            const totalPaid = parseFloat(job.total_paid_amount) || 0;
+            const overpayment = Math.max(0, totalPaid - jobTotal);
+            if (overpayment <= 0) continue;
+
+            // Get total assigned tips for this job (all members, not just current)
+            const mc = memberCountByJob[job.id] || 1;
+            // Fetch total assigned tips for all members on this job
+            const { data: allJobTips } = await supabase
+              .from('job_team_assignments')
+              .select('tip_amount')
+              .eq('job_id', job.id);
+            const totalAssignedTips = (allJobTips || []).reduce((sum, t) => sum + (parseFloat(t.tip_amount) || 0), 0);
+
+            const unassignedOverpayment = Math.max(0, overpayment - totalAssignedTips);
+            if (unassignedOverpayment > 0) {
+              const overpaymentShare = unassignedOverpayment / mc;
+              totalTips += overpaymentShare;
+              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
+              tipsByJob[job.id].tip = (tipsByJob[job.id].tip || 0) + overpaymentShare;
+              console.log(`[Payroll] Job ${job.id}: Overpayment=$${overpayment.toFixed(2)}, assignedTips=$${totalAssignedTips.toFixed(2)}, unassigned=$${unassignedOverpayment.toFixed(2)}, share=$${overpaymentShare.toFixed(2)}`);
             }
           }
 
