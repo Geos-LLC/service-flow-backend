@@ -4882,7 +4882,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const overpayment = Math.max(0, totalPaid - totalDue);
         const overpaymentPerMember = memberCount > 0 ? overpayment / memberCount : 0;
         const tipPerMember = memberCount > 0 ? jobTipStored / memberCount : 0;
-        const totalTipPerMember = tipPerMember + overpaymentPerMember;
+        const totalTipPerMember = Math.max(tipPerMember, overpaymentPerMember);
 
         teamAssignments = assignmentsResult.map(assignment => {
           const member = memberDetailsMap[String(assignment.team_member_id)] || {};
@@ -19658,20 +19658,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
         const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
         if (jobIds.length > 0) {
-          // Tips: always split job-level tip_amount equally among team members
+          // Tips: use the higher of job-level tip or overpayment, split equally among team members
           for (const job of jobs) {
             const jobTip = parseFloat(job.tip_amount) || 0;
-            if (jobTip > 0) {
-              const memberCount = memberCountByJob[job.id] || 1;
-              const memberTip = jobTip / Math.max(1, memberCount);
-              totalTips += memberTip;
-              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
-              tipsByJob[job.id].tip = memberTip;
-            }
-          }
+            const mc = memberCountByJob[job.id] || 1;
+            const tipShare = jobTip / Math.max(1, mc);
 
-          // Overpayment: split full overpayment equally among team members
-          for (const job of jobs) {
+            // Calculate overpayment
             const svcPrice = parseFloat(job.service_price) || 0;
             const disc = parseFloat(job.discount) || 0;
             const fees = parseFloat(job.additional_fees) || 0;
@@ -19679,14 +19672,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
             const totalPaid = parseFloat(job.total_paid_amount) || 0;
             const overpayment = Math.max(0, totalPaid - totalDue);
-            if (overpayment <= 0) continue;
-
-            const mc = memberCountByJob[job.id] || 1;
             const overpaymentShare = overpayment / mc;
-            totalTips += overpaymentShare;
-            if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
-            tipsByJob[job.id].tip = (tipsByJob[job.id].tip || 0) + overpaymentShare;
-            console.log(`[Payroll] Job ${job.id}: Overpayment=$${overpayment.toFixed(2)}, share=$${overpaymentShare.toFixed(2)}`);
+
+            // Use whichever is higher
+            const memberTip = Math.max(tipShare, overpaymentShare);
+            if (memberTip > 0) {
+              totalTips += memberTip;
+              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
+              tipsByJob[job.id].tip = memberTip;
+            }
           }
 
           // Incentives: always split job-level incentive_amount equally among team members
