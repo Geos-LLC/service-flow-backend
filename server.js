@@ -4893,7 +4893,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const unassignedOverpayment = Math.max(0, overpayment - totalAssignedTips);
         const overpaymentPerMember = memberCount > 0 ? unassignedOverpayment / memberCount : 0;
 
-        console.log(`[GET job ${id}] Tips: stored=${jobTipStored}, totalPaid=${totalPaid}, jobTotal=${jobTotal}, overpayment=${overpayment}, assignedTips=${totalAssignedTips}, unassignedOverpayment=${unassignedOverpayment}, perMember=${overpaymentPerMember}`);
+        console.log(`[GET job ${id}] Tips: stored=${jobTipStored}, totalPaid=${totalPaid}, totalDue=${totalDue}, overpayment=${overpayment}, assignedTips=${totalAssignedTips}, unassignedOverpayment=${unassignedOverpayment}, perMember=${overpaymentPerMember}`);
 
         teamAssignments = assignmentsResult.map(assignment => {
           const member = memberDetailsMap[String(assignment.team_member_id)] || {};
