@@ -19412,7 +19412,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Method 1: Get jobs with direct team_member_id
         let directJobsQuery = supabase
           .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, total_paid_amount, status, service_name, tip_amount, incentive_amount, customer_id')
+          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, status, service_name, tip_amount, incentive_amount, customer_id')
           .eq('team_member_id', member.id)
           .eq('user_id', userId);
 
@@ -19442,7 +19442,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             jobs!inner(
               id, scheduled_date, start_time, end_time, hours_worked,
               duration, estimated_duration, total, total_amount, invoice_amount,
-              price, service_price, total_paid_amount, status, service_name, user_id, tip_amount, incentive_amount, customer_id
+              price, service_price, status, service_name, user_id, tip_amount, incentive_amount, customer_id
             )
           `)
           .eq('team_member_id', member.id);
@@ -19495,6 +19495,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             customers.forEach(c => {
               customerMap[c.id] = `${c.first_name || ''} ${c.last_name || ''}`.trim();
             });
+          }
+        }
+
+        // Fetch total_paid_amount separately (avoids breaking main job queries if column missing)
+        const paymentJobIds = jobs.map(j => j.id).filter(Boolean);
+        if (paymentJobIds.length > 0) {
+          const { data: paymentData } = await supabase
+            .from('jobs')
+            .select('id, total_paid_amount')
+            .in('id', paymentJobIds);
+          if (paymentData) {
+            const paymentMap = {};
+            paymentData.forEach(p => { paymentMap[p.id] = parseFloat(p.total_paid_amount) || 0; });
+            jobs.forEach(j => { j.total_paid_amount = paymentMap[j.id] || 0; });
           }
         }
 
