@@ -4865,7 +4865,23 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         const jobFees = parseFloat(job.additional_fees) || 0;
         const jobTaxes = parseFloat(job.taxes) || 0;
         const totalDue = svcPrice > 0 ? (svcPrice - jobDiscount + jobFees + jobTaxes) : (parseFloat(job.total) || 0);
-        const totalPaid = parseFloat(job.total_paid_amount) || 0;
+        let totalPaid = parseFloat(job.total_paid_amount) || 0;
+
+        // Fallback: compute total_paid from completed transactions when jobs column is 0/missing
+        if (totalPaid <= 0) {
+          const { data: txData } = await supabase
+            .from('transactions')
+            .select('amount')
+            .eq('job_id', id)
+            .eq('status', 'completed');
+          if (txData && txData.length > 0) {
+            totalPaid = txData.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
+            // Also persist so future lookups don't need this fallback
+            await supabase.from('jobs').update({ total_paid_amount: totalPaid }).eq('id', id);
+            console.log(`[GET job ${id}] Computed total_paid_amount from transactions: $${totalPaid.toFixed(2)}`);
+          }
+        }
+
         const overpayment = Math.max(0, totalPaid - totalDue);
 
         console.log(`[GET job ${id}] Overpayment calc: svcPrice=${svcPrice}, discount=${jobDiscount}, fees=${jobFees}, taxes=${jobTaxes}, totalDue=${totalDue}, totalPaid=${totalPaid}, overpayment=${overpayment}`);
@@ -19505,18 +19521,45 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
         }
 
-        // Fetch total_paid_amount separately (avoids breaking main job queries if column missing)
+        // Fetch total_paid_amount: first from jobs table, then fallback to transactions
         const paymentJobIds = jobs.map(j => j.id).filter(Boolean);
         if (paymentJobIds.length > 0) {
           const { data: paymentData } = await supabase
             .from('jobs')
             .select('id, total_paid_amount')
             .in('id', paymentJobIds);
+          const paymentMap = {};
           if (paymentData) {
-            const paymentMap = {};
             paymentData.forEach(p => { paymentMap[p.id] = parseFloat(p.total_paid_amount) || 0; });
-            jobs.forEach(j => { j.total_paid_amount = paymentMap[j.id] || 0; });
           }
+
+          // For jobs where total_paid_amount is 0/missing, compute from completed transactions
+          const jobsMissingPaid = paymentJobIds.filter(id => !paymentMap[id] || paymentMap[id] <= 0);
+          if (jobsMissingPaid.length > 0) {
+            const { data: txData } = await supabase
+              .from('transactions')
+              .select('job_id, amount')
+              .in('job_id', jobsMissingPaid)
+              .eq('status', 'completed');
+            if (txData) {
+              const txSums = {};
+              txData.forEach(tx => {
+                txSums[tx.job_id] = (txSums[tx.job_id] || 0) + (parseFloat(tx.amount) || 0);
+              });
+              Object.entries(txSums).forEach(([jobId, total]) => {
+                paymentMap[jobId] = total;
+              });
+              // Persist computed values so future lookups don't need this fallback
+              for (const [jobId, total] of Object.entries(txSums)) {
+                if (total > 0) {
+                  supabase.from('jobs').update({ total_paid_amount: total }).eq('id', jobId).then(() => {});
+                }
+              }
+            }
+            console.log(`[Payroll] Computed total_paid from transactions for ${jobsMissingPaid.length} jobs missing total_paid_amount`);
+          }
+
+          jobs.forEach(j => { j.total_paid_amount = paymentMap[j.id] || 0; });
         }
 
         // Get member count per job for splitting hours/revenue/commission
