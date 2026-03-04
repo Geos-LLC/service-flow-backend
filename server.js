@@ -10683,9 +10683,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               invoice_status: updateData.invoice_status,
               price: updateData.price,
               total: updateData.total,
+              taxes: updateData.taxes,
+              service_price: updateData.service_price,
               customer_id: updateData.customer_id,
               service_id: updateData.service_id
             });
+            console.log(`Row ${i + 1}: 💰 Tax debug - job.taxes="${job.taxes}", parsed=${parseFloat(job.taxes)}, jobData.taxes=${jobData.taxes}, updateData.taxes=${updateData.taxes}`);
             
             // CRITICAL: Verify scheduled_date is actually in updateData
             if (!updateData.scheduled_date) {
