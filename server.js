@@ -10367,8 +10367,36 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           price: parseFloat(job.price) || 0,
           discount: parseFloat(job.discount) || 0,
           additional_fees: parseFloat(job.additionalFees) || 0,
-          taxes: parseFloat(job.taxes) || 0,
-          total: parseFloat(job.total) || parseFloat(job.price) || 0,
+          taxes: (() => {
+            // If frontend sent taxes, use it
+            if (job.taxes && parseFloat(job.taxes) > 0) return parseFloat(job.taxes);
+            // Calculate tax from price fields: price_number (total with tax) vs pretax_total_number (pre-tax)
+            // Frontend sends: job.price = price_number, job.total = pretax_total_number (or vice versa)
+            const priceVal = parseFloat(job.price) || 0;
+            const totalVal = parseFloat(job.total) || 0;
+            const servicePriceVal = parseFloat(job.servicePrice) || 0;
+            // Try servicePrice vs price first
+            if (priceVal > 0 && servicePriceVal > 0 && priceVal > servicePriceVal) {
+              return parseFloat((priceVal - servicePriceVal).toFixed(2));
+            }
+            // Try price vs total (price_number vs pretax_total_number)
+            if (priceVal > 0 && totalVal > 0 && priceVal > totalVal) {
+              return parseFloat((priceVal - totalVal).toFixed(2));
+            }
+            // Try total vs price (in case total > price)
+            if (totalVal > 0 && priceVal > 0 && totalVal > priceVal) {
+              return parseFloat((totalVal - priceVal).toFixed(2));
+            }
+            return 0;
+          })(),
+          total: (() => {
+            const priceVal = parseFloat(job.price) || 0;
+            const totalVal = parseFloat(job.total) || 0;
+            if (priceVal > 0 && totalVal > 0 && priceVal !== totalVal) {
+              return Math.max(priceVal, totalVal);
+            }
+            return totalVal || priceVal || 0;
+          })(),
           payment_method: job.paymentMethod || null,
           territory: job.territory || null,
           schedule_type: job.scheduleType || 'one-time',
@@ -10468,8 +10496,28 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           bathroom_count: job.bathroomCount || null,
           workers_needed: parseInt(job.workersNeeded) || 1,
           skills: job.skills || null,
-          service_price: parseFloat(job.servicePrice) || parseFloat(job.price) || 0,
-          total_amount: parseFloat(job.totalAmount) || parseFloat(job.total) || parseFloat(job.price) || 0,
+          service_price: (() => {
+            // service_price should be the pre-tax amount (the lower of price and total)
+            if (job.servicePrice && parseFloat(job.servicePrice) > 0) return parseFloat(job.servicePrice);
+            const priceVal = parseFloat(job.price) || 0;
+            const totalVal = parseFloat(job.total) || 0;
+            // If both exist and differ, use the lower one (pre-tax amount)
+            if (priceVal > 0 && totalVal > 0 && priceVal !== totalVal) {
+              return Math.min(priceVal, totalVal);
+            }
+            return priceVal || totalVal || 0;
+          })(),
+          total_amount: (() => {
+            // total_amount should be the total with tax (the higher of price and total)
+            const priceVal = parseFloat(job.price) || 0;
+            const totalVal = parseFloat(job.total) || 0;
+            const totalAmountVal = parseFloat(job.totalAmount) || 0;
+            if (totalAmountVal > 0) return totalAmountVal;
+            if (priceVal > 0 && totalVal > 0 && priceVal !== totalVal) {
+              return Math.max(priceVal, totalVal);
+            }
+            return priceVal || totalVal || 0;
+          })(),
           estimated_duration: parseFloat(job.estimatedDuration) || parseFloat(job.duration) || null,
           special_instructions: job.specialInstructions || null,
           // Determine payment status - check multiple possible field names and values
