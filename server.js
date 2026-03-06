@@ -2768,25 +2768,29 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         const escapedSearch = search.replace(/[%_\\]/g, '\\$&');
 
         // Find customers whose name matches the search term
-        const customerOrConditions = [
-          `first_name.ilike.%${escapedSearch}%`,
-          `last_name.ilike.%${escapedSearch}%`,
-        ];
-        // If multi-word search (e.g. "Karen Rice"), also match each token
         const tokens = search.split(/\s+/).map(t => t.trim()).filter(Boolean);
-        if (tokens.length > 1) {
-          tokens.forEach(token => {
-            const tokenEscaped = token.replace(/[%_\\]/g, '\\$&');
-            customerOrConditions.push(`first_name.ilike.%${tokenEscaped}%`);
-            customerOrConditions.push(`last_name.ilike.%${tokenEscaped}%`);
-          });
-        }
+        let matchingCustomers;
 
-        const { data: matchingCustomers } = await supabase
-          .from('customers')
-          .select('id')
-          .eq('user_id', userId)
-          .or(customerOrConditions.join(','));
+        if (tokens.length > 1) {
+          // Multi-word search (e.g. "Everton Smith"): match first_name AND last_name together
+          // Try both orderings: "Everton Smith" and "Smith Everton"
+          const firstEscaped = tokens[0].replace(/[%_\\]/g, '\\$&');
+          const restEscaped = tokens.slice(1).join(' ').replace(/[%_\\]/g, '\\$&');
+          const { data } = await supabase
+            .from('customers')
+            .select('id')
+            .eq('user_id', userId)
+            .or(`and(first_name.ilike.%${firstEscaped}%,last_name.ilike.%${restEscaped}%),and(first_name.ilike.%${restEscaped}%,last_name.ilike.%${firstEscaped}%)`);
+          matchingCustomers = data;
+        } else {
+          // Single word search: match against first_name or last_name
+          const { data } = await supabase
+            .from('customers')
+            .select('id')
+            .eq('user_id', userId)
+            .or(`first_name.ilike.%${escapedSearch}%,last_name.ilike.%${escapedSearch}%`);
+          matchingCustomers = data;
+        }
 
         const matchingCustomerIds = (matchingCustomers || []).map(c => c.id);
 
