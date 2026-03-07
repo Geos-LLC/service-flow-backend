@@ -14749,9 +14749,13 @@ app.get('/api/user/availability', authenticateToken, async (req, res) => {
       timeslotTemplates = [];
     }
     
+    // Extract customAvailability from businessHours if stored there
+    const customAvailability = businessHours?.customAvailability || [];
+
     res.json({
       businessHours: businessHours,
-      timeslotTemplates: timeslotTemplates
+      timeslotTemplates: timeslotTemplates,
+      customAvailability: customAvailability
     });
   } catch (error) {
     console.error('Get availability error:', error);
@@ -14778,8 +14782,8 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
 
     // Use authenticated user's ID from token instead of body
     const userId = req.user?.userId || req.body?.userId;
-    const { businessHours, timeslotTemplates } = req.body;
-    
+    const { businessHours, timeslotTemplates, customAvailability } = req.body;
+
     if (!userId) {
       console.error('No userId provided for availability update');
       return res.status(400).json({ error: 'User ID is required' });
@@ -14813,7 +14817,12 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
     } else {
       businessHoursJson = businessHours; // Pass object directly
     }
-    
+
+    // Store customAvailability inside businessHours JSONB so it persists
+    if (customAvailability && Array.isArray(customAvailability)) {
+      businessHoursJson = { ...businessHoursJson, customAvailability };
+    }
+
     let timeslotTemplatesJson;
     if (timeslotTemplates) {
       if (typeof timeslotTemplates === 'string') {
@@ -14900,28 +14909,40 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
         .limit(1);
       
       if (!teamMemberError && teamMember && teamMember.length > 0) {
+        // Fetch existing team member availability to preserve customAvailability and timeslotTemplates
+        const { data: existingTM } = await supabase
+          .from('team_members')
+          .select('availability')
+          .eq('id', teamMember[0].id)
+          .single();
+
+        let existingAvail = {};
+        if (existingTM?.availability) {
+          existingAvail = typeof existingTM.availability === 'string'
+            ? JSON.parse(existingTM.availability)
+            : existingTM.availability;
+        }
+
         // Convert businessHours to team member availability format
         const workingHours = {};
         const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-        
+
         days.forEach(day => {
           const dayHours = businessHoursJson[day];
           if (dayHours && dayHours.enabled) {
-            // Convert 24-hour format to 12-hour format for display
             const startTime = dayHours.start || '09:00';
             const endTime = dayHours.end || '17:00';
-            
-            // Convert to 12-hour format
+
             const [startH, startM] = startTime.split(':');
             const [endH, endM] = endTime.split(':');
             const startHour = parseInt(startH);
             const endHour = parseInt(endH);
-            
+
             const startPeriod = startHour >= 12 ? 'PM' : 'AM';
             const endPeriod = endHour >= 12 ? 'PM' : 'AM';
             const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
             const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
-            
+
             workingHours[day] = {
               available: true,
               hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
@@ -14933,12 +14954,14 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
             };
           }
         });
-        
+
         const teamMemberAvailability = JSON.stringify({
           workingHours,
-          customAvailability: []
+          customAvailability: customAvailability || existingAvail.customAvailability || [],
+          timeslotTemplates: existingAvail.timeslotTemplates || [],
+          drivingTime: existingAvail.drivingTime || 0
         });
-        
+
         // Update team_members.availability
         await supabase
           .from('team_members')
@@ -19454,6 +19477,71 @@ app.get('/api/team-members/:id/salary', authenticateToken, async (req, res) => {
   }
 });
 
+// Helper: calculate scheduled working hours from team member availability for a date range
+function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, endDateStr) {
+  if (!availabilityRaw || !startDateStr || !endDateStr) return 0;
+
+  let avail = availabilityRaw;
+  if (typeof avail === 'string') {
+    try { avail = JSON.parse(avail); } catch (e) { return 0; }
+  }
+
+  const workingHours = avail.workingHours || avail;
+  const customAvailability = avail.customAvailability || [];
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+  const toMinutes = (timeStr) => {
+    if (!timeStr) return 0;
+    const parts = timeStr.split(':');
+    return parseInt(parts[0]) * 60 + parseInt(parts[1] || 0);
+  };
+
+  let totalHours = 0;
+  const start = new Date(startDateStr + 'T00:00:00');
+  const end = new Date(endDateStr + 'T00:00:00');
+
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const dateStr = d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0');
+    const dayName = dayNames[d.getDay()];
+
+    // Check customAvailability override for this date first
+    const override = customAvailability.find(item => item.date === dateStr);
+    if (override) {
+      if (override.available === false) continue; // day off
+      if (override.hours && Array.isArray(override.hours) && override.hours.length > 0) {
+        override.hours.forEach(h => {
+          const hStart = toMinutes(h.start || h.startTime || '09:00');
+          const hEnd = toMinutes(h.end || h.endTime || '17:00');
+          if (hEnd > hStart) totalHours += (hEnd - hStart) / 60;
+        });
+        continue;
+      }
+      // available === true with no custom hours -> fall through to regular schedule
+    }
+
+    // Use regular workingHours for this day of week
+    const dayHrs = workingHours[dayName];
+    if (!dayHrs) continue;
+    const isDayEnabled = dayHrs.enabled !== false && dayHrs.available !== false;
+    if (!isDayEnabled) continue;
+
+    if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+      dayHrs.timeSlots.forEach(ts => {
+        const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
+        const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
+        if (tsEnd > tsStart) totalHours += (tsEnd - tsStart) / 60;
+      });
+    } else if (dayHrs.start && dayHrs.end) {
+      const dStart = toMinutes(dayHrs.start);
+      const dEnd = toMinutes(dayHrs.end);
+      if (dEnd > dStart) totalHours += (dEnd - dStart) / 60;
+    }
+  }
+  return totalHours;
+}
+
 // Get payroll summary for all team members
 app.get('/api/payroll', authenticateToken, async (req, res) => {
   try {
@@ -19463,7 +19551,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Get all team members (including those without hourly rates or commission)
     const { data: teamMembers, error: membersError } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, hourly_rate, commission_percentage, status')
+      .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability')
       .eq('user_id', userId)
       .eq('status', 'active'); // Only show active team members
 
@@ -19677,7 +19765,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         });
         
         hourlySalary = totalHours * hourlyRate;
-        console.log(`[Payroll] Member ${member.id}: Total hours = ${totalHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}`);
+
+        // Calculate scheduled working hours from availability settings
+        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
+        const scheduledHourlySalary = scheduledHours * hourlyRate;
+
+        console.log(`[Payroll] Member ${member.id}: Job hours = ${totalHours.toFixed(2)}, Scheduled hours = ${scheduledHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}, Scheduled salary = ${scheduledHourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
         let commissionSalary = 0;
@@ -19826,6 +19919,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           },
           jobCount: (jobs || []).length,
           totalHours: parseFloat(totalHours.toFixed(2)),
+          scheduledHours: parseFloat(scheduledHours.toFixed(2)),
+          scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
           hourlySalary: parseFloat(hourlySalary.toFixed(2)),
           commissionSalary: parseFloat(commissionSalary.toFixed(2)),
           totalTips: parseFloat(totalTips.toFixed(2)),
@@ -19844,7 +19939,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         };
         } catch (memberError) {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
-          // Return default values for this member so the rest of the payroll can still be calculated
+          const errScheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
+          const errHourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
           return {
             teamMember: {
               id: member.id,
@@ -19854,6 +19950,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             },
             jobCount: 0,
             totalHours: 0,
+            scheduledHours: parseFloat(errScheduledHours.toFixed(2)),
+            scheduledHourlySalary: parseFloat((errScheduledHours * errHourlyRate).toFixed(2)),
             hourlySalary: 0,
             commissionSalary: 0,
             totalTips: 0,
@@ -19861,12 +19959,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             totalSalary: 0,
             hasHourlyRate: !!member.hourly_rate,
             hasCommission: !!member.commission_percentage,
-            paymentMethod: member.hourly_rate && member.commission_percentage 
-              ? 'hybrid' 
-              : member.hourly_rate 
-                ? 'hourly' 
-                : member.commission_percentage 
-                  ? 'commission' 
+            paymentMethod: member.hourly_rate && member.commission_percentage
+              ? 'hybrid'
+              : member.hourly_rate
+                ? 'hourly'
+                : member.commission_percentage
+                  ? 'commission'
                   : 'none',
             error: `Failed to calculate payroll for this member: ${memberError.message}`
           };
@@ -19874,12 +19972,14 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       })
     );
 
-    // Only include team members who have at least one job in the date range; sort by job count (most jobs first)
-    const withJobsInRange = (payrollData || []).filter(item => (item?.jobCount || 0) > 0);
-    const sortedTeamMembers = withJobsInRange.slice().sort((a, b) => (b?.jobCount || 0) - (a?.jobCount || 0));
+    // Include team members who have jobs OR scheduled working hours in the date range
+    const withActivity = (payrollData || []).filter(item => (item?.jobCount || 0) > 0 || (item?.scheduledHours || 0) > 0);
+    const sortedTeamMembers = withActivity.slice().sort((a, b) => (b?.jobCount || 0) - (a?.jobCount || 0));
 
     const grandTotal = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
     const grandTotalHours = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalHours || 0), 0);
+    const grandTotalScheduledHours = sortedTeamMembers.reduce((sum, item) => sum + (item?.scheduledHours || 0), 0);
+    const grandTotalScheduledHourlySalary = sortedTeamMembers.reduce((sum, item) => sum + (item?.scheduledHourlySalary || 0), 0);
     const grandTotalHourlySalary = sortedTeamMembers.reduce((sum, item) => sum + (item?.hourlySalary || 0), 0);
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
@@ -19894,6 +19994,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       summary: {
         totalTeamMembers: sortedTeamMembers.length,
         totalHours: parseFloat(grandTotalHours.toFixed(2)),
+        totalScheduledHours: parseFloat(grandTotalScheduledHours.toFixed(2)),
+        totalScheduledHourlySalary: parseFloat(grandTotalScheduledHourlySalary.toFixed(2)),
         totalHourlySalary: parseFloat(grandTotalHourlySalary.toFixed(2)),
         totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
         totalTips: parseFloat(grandTotalTips.toFixed(2)),
