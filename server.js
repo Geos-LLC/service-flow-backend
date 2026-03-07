@@ -8984,45 +8984,67 @@ app.delete('/api/customers/:id', authenticateToken, async (req, res) => {
 // Analyzes jobs with same customer + service to find regular intervals
 async function detectAndMarkRecurringJobs(userId) {
   try {
-    // Fetch all jobs for this user (including newly imported ones)
-    const { data: allJobs, error: fetchError } = await supabase
-      .from('jobs')
-      .select('id, customer_id, service_id, scheduled_date, is_recurring, recurring_frequency')
-      .eq('user_id', userId)
-      .not('scheduled_date', 'is', null)
-      .order('scheduled_date', { ascending: true });
-    
-    if (fetchError) {
-      console.error('Error fetching jobs for recurring detection:', fetchError);
-      return { detected: 0, updated: 0 };
+    // Fetch all jobs for this user with pagination (Supabase defaults to 1000 rows)
+    let allJobs = [];
+    let page = 0;
+    const pageSize = 1000;
+    let hasMore = true;
+
+    while (hasMore) {
+      const { data: jobsPage, error: fetchError } = await supabase
+        .from('jobs')
+        .select('id, customer_id, service_id, service_name, scheduled_date, is_recurring, recurring_frequency')
+        .eq('user_id', userId)
+        .not('scheduled_date', 'is', null)
+        .order('scheduled_date', { ascending: true })
+        .range(page * pageSize, (page + 1) * pageSize - 1);
+
+      if (fetchError) {
+        console.error('Error fetching jobs for recurring detection:', fetchError);
+        return { detected: 0, updated: 0 };
+      }
+
+      if (jobsPage && jobsPage.length > 0) {
+        allJobs = allJobs.concat(jobsPage);
+        hasMore = jobsPage.length === pageSize;
+        page++;
+      } else {
+        hasMore = false;
+      }
     }
-    
-    if (!allJobs || allJobs.length < 3) {
+
+    console.log(`🔄 Recurring detection: loaded ${allJobs.length} jobs across ${page} page(s)`);
+
+    if (allJobs.length < 3) {
       console.log('Not enough jobs to detect recurring patterns (need at least 3)');
       return { detected: 0, updated: 0 };
     }
-    
-    // Group jobs by customer_id + service_id
+
+    // Group jobs by customer_id + service_id (or service_name if service_id is missing)
     const jobGroups = new Map();
     for (const job of allJobs) {
-      if (!job.customer_id || !job.service_id) continue;
-      
-      const key = `${job.customer_id}_${job.service_id}`;
+      if (!job.customer_id) continue;
+      // Use service_id if available, fall back to normalized service_name
+      const serviceKey = job.service_id || (job.service_name ? `name:${job.service_name.trim().toLowerCase()}` : null);
+      if (!serviceKey) continue;
+
+      const key = `${job.customer_id}_${serviceKey}`;
       if (!jobGroups.has(key)) {
         jobGroups.set(key, []);
       }
       jobGroups.get(key).push(job);
     }
-    
+
     let patternsDetected = 0;
     let jobsUpdated = 0;
-    
+
     // Analyze each group for recurring patterns
     for (const [key, jobs] of jobGroups.entries()) {
       if (jobs.length < 3) continue; // Need at least 3 jobs to detect a pattern
-      
-      // Skip if already marked as recurring
-      if (jobs.some(j => j.is_recurring)) continue;
+
+      // Find jobs not yet marked as recurring (update only those)
+      const nonRecurringJobs = jobs.filter(j => !j.is_recurring);
+      if (nonRecurringJobs.length === 0) continue; // All already marked
       
       // Sort by scheduled_date
       jobs.sort((a, b) => {
@@ -9090,25 +9112,25 @@ async function detectAndMarkRecurringJobs(userId) {
           }
         }
         
-        console.log(`📅 Detected recurring pattern: customer ${jobs[0].customer_id}, service ${jobs[0].service_id}, frequency: ${frequency}, interval: ${avgInterval.toFixed(1)} days`);
-        
-        // Update all jobs in this group to mark as recurring
-        const jobIds = jobs.map(j => j.id);
+        console.log(`📅 Detected recurring pattern: customer ${jobs[0].customer_id}, service ${jobs[0].service_id || jobs[0].service_name}, frequency: ${frequency}, interval: ${avgInterval.toFixed(1)} days, total jobs: ${jobs.length}, not yet marked: ${nonRecurringJobs.length}`);
+
+        // Update only non-recurring jobs in this group
+        const jobIdsToUpdate = nonRecurringJobs.map(j => j.id);
         const { error: updateError } = await supabase
           .from('jobs')
           .update({
             is_recurring: true,
             recurring_frequency: frequency
           })
-          .in('id', jobIds)
+          .in('id', jobIdsToUpdate)
           .eq('user_id', userId);
-        
+
         if (updateError) {
           console.error(`Error updating jobs for recurring pattern ${key}:`, updateError);
         } else {
           patternsDetected++;
-          jobsUpdated += jobIds.length;
-          console.log(`✅ Marked ${jobIds.length} jobs as recurring (${frequency})`);
+          jobsUpdated += jobIdsToUpdate.length;
+          console.log(`✅ Marked ${jobIdsToUpdate.length} jobs as recurring (${frequency})`);
         }
       }
     }
