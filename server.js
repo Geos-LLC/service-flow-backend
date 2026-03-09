@@ -19560,197 +19560,182 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
 
-    // Fetch total business revenue for the period (used for commission-based managers/owners)
     let totalBusinessRevenue = 0;
-    try {
-      let revenueQuery = supabase
-        .from('jobs')
-        .select('service_price, price, total, total_amount, invoice_amount, status')
-        .eq('user_id', userId);
 
-      if (startDate) {
-        revenueQuery = revenueQuery.gte('scheduled_date', startDate);
-      }
-      if (endDate) {
-        const [y, m, d] = endDate.split('-').map(Number);
-        const nextDay = new Date(y, m - 1, d + 1);
-        const nextDayStr = nextDay.getFullYear() + '-' + String(nextDay.getMonth() + 1).padStart(2, '0') + '-' + String(nextDay.getDate()).padStart(2, '0');
-        revenueQuery = revenueQuery.lt('scheduled_date', nextDayStr);
-      }
+    // ===== BATCH: Fetch ALL jobs and assignments for this user/period ONCE =====
+    const jobFields = 'id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, discount, additional_fees, taxes, status, service_name, tip_amount, incentive_amount, customer_id, team_member_id';
+    let endDateNextDay = null;
+    if (endDate) {
+      const [ey, em, ed] = endDate.split('-').map(Number);
+      const nd = new Date(ey, em - 1, ed + 1);
+      endDateNextDay = nd.getFullYear() + '-' + String(nd.getMonth() + 1).padStart(2, '0') + '-' + String(nd.getDate()).padStart(2, '0');
+    }
 
-      const { data: allBusinessJobs } = await revenueQuery;
-      if (allBusinessJobs) {
-        allBusinessJobs.forEach(job => {
-          const s = (job.status || '').toLowerCase();
-          if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-          const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
-          totalBusinessRevenue += rev;
+    // Fetch all jobs for this business owner in the date range
+    let allDirectJobsQuery = supabase
+      .from('jobs')
+      .select(jobFields)
+      .eq('user_id', userId);
+    if (startDate) allDirectJobsQuery = allDirectJobsQuery.gte('scheduled_date', startDate);
+    if (endDateNextDay) allDirectJobsQuery = allDirectJobsQuery.lt('scheduled_date', endDateNextDay);
+
+    const { data: allDirectJobs, error: allDirectJobsError } = await allDirectJobsQuery;
+    if (allDirectJobsError) console.error('[Payroll] Error fetching all jobs:', allDirectJobsError);
+
+    // Build map: team_member_id -> jobs (from direct assignment)
+    const directJobsByMember = {};
+    const allJobsById = {};
+    (allDirectJobs || []).forEach(job => {
+      allJobsById[job.id] = job;
+      if (job.team_member_id) {
+        if (!directJobsByMember[job.team_member_id]) directJobsByMember[job.team_member_id] = [];
+        directJobsByMember[job.team_member_id].push(job);
+      }
+    });
+
+    // Fetch ALL job_team_assignments for members in this user's team
+    const teamMemberIds = (teamMembers || []).map(m => m.id);
+    let assignmentJobsByMember = {};
+    if (teamMemberIds.length > 0) {
+      // Batch in chunks of 100 to avoid Supabase .in() limits
+      for (let i = 0; i < teamMemberIds.length; i += 100) {
+        const chunk = teamMemberIds.slice(i, i + 100);
+        const { data: assignData, error: assignErr } = await supabase
+          .from('job_team_assignments')
+          .select('team_member_id, job_id')
+          .in('team_member_id', chunk);
+        if (assignErr) {
+          console.error('[Payroll] Error fetching assignments batch:', assignErr);
+        } else if (assignData) {
+          assignData.forEach(a => {
+            if (!assignmentJobsByMember[a.team_member_id]) assignmentJobsByMember[a.team_member_id] = new Set();
+            assignmentJobsByMember[a.team_member_id].add(a.job_id);
+          });
+        }
+      }
+    }
+
+    // Fetch jobs referenced by assignments that weren't in the direct query (edge case: job assigned but team_member_id not set on job)
+    const assignmentJobIds = new Set();
+    Object.values(assignmentJobsByMember).forEach(idSet => idSet.forEach(id => assignmentJobIds.add(id)));
+    const missingJobIds = [...assignmentJobIds].filter(id => !allJobsById[id]);
+    if (missingJobIds.length > 0) {
+      for (let i = 0; i < missingJobIds.length; i += 100) {
+        const chunk = missingJobIds.slice(i, i + 100);
+        const { data: extraJobs } = await supabase
+          .from('jobs')
+          .select(jobFields)
+          .in('id', chunk)
+          .eq('user_id', userId);
+        if (extraJobs) {
+          extraJobs.forEach(job => {
+            // Apply date filter
+            if (startDate || endDate) {
+              const raw = job.scheduled_date ? String(job.scheduled_date) : '';
+              const jobDateStr = raw.split('T')[0].split(' ')[0];
+              if (!jobDateStr) return;
+              if (startDate && jobDateStr < startDate) return;
+              if (endDate && jobDateStr > endDate) return;
+            }
+            allJobsById[job.id] = job;
+          });
+        }
+      }
+    }
+
+    // Build global member count per job (for splitting hours/revenue/commission)
+    const globalMemberCountByJob = {};
+    Object.entries(assignmentJobsByMember).forEach(([memberId, jobIdSet]) => {
+      jobIdSet.forEach(jobId => {
+        if (!globalMemberCountByJob[jobId]) globalMemberCountByJob[jobId] = new Set();
+        globalMemberCountByJob[jobId].add(Number(memberId));
+      });
+    });
+    // Also count direct assignments
+    (allDirectJobs || []).forEach(job => {
+      if (job.team_member_id) {
+        if (!globalMemberCountByJob[job.id]) globalMemberCountByJob[job.id] = new Set();
+        globalMemberCountByJob[job.id].add(job.team_member_id);
+      }
+    });
+    const memberCountByJobMap = {};
+    Object.entries(globalMemberCountByJob).forEach(([jobId, memberSet]) => {
+      memberCountByJobMap[jobId] = memberSet.size;
+    });
+
+    // Fetch ALL customer names at once
+    const allCustomerIds = [...new Set(Object.values(allJobsById).map(j => j.customer_id).filter(Boolean))];
+    let globalCustomerMap = {};
+    if (allCustomerIds.length > 0) {
+      for (let i = 0; i < allCustomerIds.length; i += 100) {
+        const chunk = allCustomerIds.slice(i, i + 100);
+        const { data: custs } = await supabase.from('customers').select('id, first_name, last_name').in('id', chunk);
+        if (custs) custs.forEach(c => { globalCustomerMap[c.id] = `${c.first_name || ''} ${c.last_name || ''}`.trim(); });
+      }
+    }
+
+    // Fetch total_paid_amount for ALL jobs at once
+    const allPaymentJobIds = Object.keys(allJobsById).filter(Boolean);
+    if (allPaymentJobIds.length > 0) {
+      for (let i = 0; i < allPaymentJobIds.length; i += 100) {
+        const chunk = allPaymentJobIds.slice(i, i + 100);
+        const { data: paymentData } = await supabase.from('jobs').select('id, total_paid_amount').in('id', chunk);
+        if (paymentData) paymentData.forEach(p => {
+          if (allJobsById[p.id]) allJobsById[p.id].total_paid_amount = parseFloat(p.total_paid_amount) || 0;
         });
       }
-      console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}`);
-    } catch (revenueError) {
-      console.error('[Payroll] Error fetching total business revenue:', revenueError);
+      // Fallback: compute from transactions for jobs missing total_paid_amount
+      const jobsMissingPaid = allPaymentJobIds.filter(id => !allJobsById[id]?.total_paid_amount || allJobsById[id].total_paid_amount <= 0);
+      if (jobsMissingPaid.length > 0) {
+        for (let i = 0; i < jobsMissingPaid.length; i += 100) {
+          const chunk = jobsMissingPaid.slice(i, i + 100);
+          const { data: txData } = await supabase.from('transactions').select('job_id, amount').in('job_id', chunk).eq('status', 'completed');
+          if (txData) {
+            const txSums = {};
+            txData.forEach(tx => { txSums[tx.job_id] = (txSums[tx.job_id] || 0) + (parseFloat(tx.amount) || 0); });
+            Object.entries(txSums).forEach(([jobId, total]) => {
+              if (allJobsById[jobId]) allJobsById[jobId].total_paid_amount = total;
+            });
+          }
+        }
+      }
     }
+
+    // Also compute totalBusinessRevenue from the fetched jobs (no extra query needed)
+    totalBusinessRevenue = 0;
+    Object.values(allJobsById).forEach(job => {
+      const s = (job.status || '').toLowerCase();
+      if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      totalBusinessRevenue += rev;
+    });
+    console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}, Total jobs: ${Object.keys(allJobsById).length}`);
+
+    // ===== END BATCH =====
 
     const payrollData = await Promise.all(
       (teamMembers || []).map(async (member) => {
         try {
-        // Get jobs for this team member
-        // Check both direct team_member_id and job_team_assignments table
-        let allJobs = [];
-        
-        // Method 1: Get jobs with direct team_member_id
-        let directJobsQuery = supabase
-          .from('jobs')
-          .select('id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, discount, additional_fees, taxes, status, service_name, tip_amount, incentive_amount, customer_id')
-          .eq('team_member_id', member.id)
-          .eq('user_id', userId);
-
-        if (startDate) {
-          directJobsQuery = directJobsQuery.gte('scheduled_date', startDate);
-        }
-        if (endDate) {
-          // Inclusive end date: use next calendar day so all of endDate is included
-          const [y, m, d] = endDate.split('-').map(Number);
-          const nextDay = new Date(y, m - 1, d + 1);
-          const nextDayStr = nextDay.getFullYear() + '-' + String(nextDay.getMonth() + 1).padStart(2, '0') + '-' + String(nextDay.getDate()).padStart(2, '0');
-          directJobsQuery = directJobsQuery.lt('scheduled_date', nextDayStr);
-        }
-
-        const { data: directJobs, error: directJobsError } = await directJobsQuery;
-        
-        if (directJobsError) {
-          console.error(`Error fetching direct jobs for member ${member.id}:`, directJobsError);
-        } else {
-          allJobs = [...(directJobs || [])];
-        }
-        
-        // Method 2: Get jobs from job_team_assignments table
-        let assignmentsQuery = supabase
-          .from('job_team_assignments')
-          .select(`
-            jobs!inner(
-              id, scheduled_date, start_time, end_time, hours_worked,
-              duration, estimated_duration, total, total_amount, invoice_amount,
-              price, service_price, discount, additional_fees, taxes, status, service_name, user_id, tip_amount, incentive_amount, customer_id
-            )
-          `)
-          .eq('team_member_id', member.id);
-
-        const { data: assignments, error: assignmentsError } = await assignmentsQuery;
-
-        if (assignmentsError) {
-          console.error(`Error fetching assigned jobs for member ${member.id}:`, assignmentsError);
-        } else if (assignments) {
-          const assignedJobs = assignments
-            .map(assignment => assignment.jobs)
-            .filter(job => {
-              if (!job) return false;
-              if (job.user_id !== userId) return false;
-              if (startDate || endDate) {
-                const raw = job.scheduled_date ? String(job.scheduled_date) : '';
-                const jobDateStr = raw.split('T')[0].split(' ')[0];
-                if (!jobDateStr) return false;
-                if (startDate && jobDateStr < startDate) return false;
-                if (endDate && jobDateStr > endDate) return false;
-              }
-              return true;
-            });
-
-          // Merge with direct jobs, avoiding duplicates
-          const existingJobIds = new Set(allJobs.map(j => j.id));
-          assignedJobs.forEach(job => {
-            if (!existingJobIds.has(job.id)) {
-              allJobs.push(job);
-            }
-          });
-        }
-
-        // Exclude cancelled jobs from payroll (count, hours, commission)
+        // Build this member's job list from pre-fetched data
         const isCancelled = (job) => {
           const s = (job?.status || '').toLowerCase();
           return s === 'cancelled' || s === 'canceled' || s === 'cancel';
         };
-        const jobs = (allJobs || []).filter(job => !isCancelled(job));
 
-        // Fetch customer names for all jobs in one query
-        const customerIds = [...new Set(jobs.map(j => j.customer_id).filter(Boolean))];
-        let customerMap = {};
-        if (customerIds.length > 0) {
-          const { data: customers } = await supabase
-            .from('customers')
-            .select('id, first_name, last_name')
-            .in('id', customerIds);
-          if (customers) {
-            customers.forEach(c => {
-              customerMap[c.id] = `${c.first_name || ''} ${c.last_name || ''}`.trim();
-            });
-          }
-        }
+        const memberJobIds = new Set();
+        // From direct team_member_id on jobs
+        (directJobsByMember[member.id] || []).forEach(j => memberJobIds.add(j.id));
+        // From job_team_assignments
+        (assignmentJobsByMember[member.id] || new Set()).forEach(id => memberJobIds.add(id));
 
-        // Fetch total_paid_amount: first from jobs table, then fallback to transactions
-        const paymentJobIds = jobs.map(j => j.id).filter(Boolean);
-        if (paymentJobIds.length > 0) {
-          const { data: paymentData } = await supabase
-            .from('jobs')
-            .select('id, total_paid_amount')
-            .in('id', paymentJobIds);
-          const paymentMap = {};
-          if (paymentData) {
-            paymentData.forEach(p => { paymentMap[p.id] = parseFloat(p.total_paid_amount) || 0; });
-          }
+        const jobs = [...memberJobIds]
+          .map(id => allJobsById[id])
+          .filter(j => j && !isCancelled(j));
 
-          // For jobs where total_paid_amount is 0/missing, compute from completed transactions
-          const jobsMissingPaid = paymentJobIds.filter(id => !paymentMap[id] || paymentMap[id] <= 0);
-          if (jobsMissingPaid.length > 0) {
-            const { data: txData } = await supabase
-              .from('transactions')
-              .select('job_id, amount')
-              .in('job_id', jobsMissingPaid)
-              .eq('status', 'completed');
-            if (txData) {
-              const txSums = {};
-              txData.forEach(tx => {
-                txSums[tx.job_id] = (txSums[tx.job_id] || 0) + (parseFloat(tx.amount) || 0);
-              });
-              Object.entries(txSums).forEach(([jobId, total]) => {
-                paymentMap[jobId] = total;
-              });
-              // Persist computed values so future lookups don't need this fallback
-              for (const [jobId, total] of Object.entries(txSums)) {
-                if (total > 0) {
-                  supabase.from('jobs').update({ total_paid_amount: total }).eq('id', jobId).then(() => {});
-                }
-              }
-            }
-            console.log(`[Payroll] Computed total_paid from transactions for ${jobsMissingPaid.length} jobs missing total_paid_amount`);
-          }
+        const customerMap = globalCustomerMap;
+        const memberCountByJob = memberCountByJobMap;
 
-          jobs.forEach(j => { j.total_paid_amount = paymentMap[j.id] || 0; });
-        }
-
-        // Get member count per job for splitting hours/revenue/commission
-        const allJobIds = jobs.map(j => j.id).filter(Boolean);
-        let memberCountByJob = {};
-        if (allJobIds.length > 0) {
-          const { data: allAssignments } = await supabase
-            .from('job_team_assignments')
-            .select('job_id, team_member_id')
-            .in('job_id', allJobIds);
-          if (allAssignments) {
-            const memberSets = {};
-            allAssignments.forEach(a => {
-              if (!a.team_member_id) return;
-              if (!memberSets[a.job_id]) memberSets[a.job_id] = new Set();
-              memberSets[a.job_id].add(a.team_member_id);
-            });
-            Object.entries(memberSets).forEach(([jobId, members]) => {
-              memberCountByJob[jobId] = members.size;
-            });
-          }
-        }
-
-        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs, ${customerIds.length} customers`);
+        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
 
         // Calculate hourly-based salary
         let totalHours = 0;
@@ -19860,7 +19845,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // Final summary for this member
         console.log(`[Payroll] === Member ${member.id} (${member.first_name}) Summary ===`);
         console.log(`[Payroll] Total jobs: ${jobs.length}`);
-        console.log(`[Payroll] Jobs with revenue: ${jobsWithRevenue.length}`);
+        console.log(`[Payroll] Commission revenue base: $${commissionRevenueBase.toFixed(2)}`);
         console.log(`[Payroll] Hourly rate: ${hourlyRate ? `$${hourlyRate}/hr` : 'Not set'}`);
         console.log(`[Payroll] Commission %: ${commissionPercentage ? `${commissionPercentage}%` : 'Not set'}`);
         console.log(`[Payroll] Total hours: ${totalHours.toFixed(2)}`);
