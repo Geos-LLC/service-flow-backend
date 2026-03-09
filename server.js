@@ -19551,13 +19551,45 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Get all team members (including those without hourly rates or commission)
     const { data: teamMembers, error: membersError } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability')
+      .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role')
       .eq('user_id', userId)
       .eq('status', 'active'); // Only show active team members
 
     if (membersError) {
       console.error('Error fetching team members:', membersError);
       return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    // Fetch total business revenue for the period (used for commission-based managers/owners)
+    let totalBusinessRevenue = 0;
+    try {
+      let revenueQuery = supabase
+        .from('jobs')
+        .select('service_price, price, total, total_amount, invoice_amount, status')
+        .eq('user_id', userId);
+
+      if (startDate) {
+        revenueQuery = revenueQuery.gte('scheduled_date', startDate);
+      }
+      if (endDate) {
+        const [y, m, d] = endDate.split('-').map(Number);
+        const nextDay = new Date(y, m - 1, d + 1);
+        const nextDayStr = nextDay.getFullYear() + '-' + String(nextDay.getMonth() + 1).padStart(2, '0') + '-' + String(nextDay.getDate()).padStart(2, '0');
+        revenueQuery = revenueQuery.lt('scheduled_date', nextDayStr);
+      }
+
+      const { data: allBusinessJobs } = await revenueQuery;
+      if (allBusinessJobs) {
+        allBusinessJobs.forEach(job => {
+          const s = (job.status || '').toLowerCase();
+          if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+          const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+          totalBusinessRevenue += rev;
+        });
+      }
+      console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}`);
+    } catch (revenueError) {
+      console.error('[Payroll] Error fetching total business revenue:', revenueError);
     }
 
     const payrollData = await Promise.all(
@@ -19764,48 +19796,65 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
         });
         
-        hourlySalary = totalHours * hourlyRate;
+        // Determine role type
+        const memberRole = (member.role || '').toLowerCase();
+        const isManagerOrOwner = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
         // Calculate scheduled working hours from availability settings
         const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
         const scheduledHourlySalary = scheduledHours * hourlyRate;
 
+        // For managers/schedulers: hourly salary uses scheduled working hours
+        // For cleaners/workers: hourly salary uses actual job hours
+        if (isManagerOrOwner && hourlyRate > 0) {
+          hourlySalary = scheduledHours * hourlyRate;
+          console.log(`[Payroll] Member ${member.id} (${memberRole}): Using SCHEDULED hours for hourly salary: ${scheduledHours.toFixed(2)}h × $${hourlyRate} = $${hourlySalary.toFixed(2)}`);
+        } else {
+          hourlySalary = totalHours * hourlyRate;
+        }
+
         console.log(`[Payroll] Member ${member.id}: Job hours = ${totalHours.toFixed(2)}, Scheduled hours = ${scheduledHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}, Scheduled salary = ${scheduledHourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
         let commissionSalary = 0;
+        let commissionRevenueBase = 0;
         const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
-        
-        console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%`);
-        
-        // Filter jobs with revenue for commission calculation
-        // Use service_price (pre-discount) as the revenue base for commission
-        const jobsWithRevenue = (jobs || []).filter(job => {
-          const revenue = parseFloat(job.service_price) ||
-                         parseFloat(job.price) ||
-                         parseFloat(job.total) ||
-                         parseFloat(job.total_amount) ||
-                         parseFloat(job.invoice_amount) || 0;
-          return revenue > 0;
-        });
 
-        console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue out of ${jobs.length} total jobs`);
+        console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%, role = ${member.role}, isManagerOrOwner = ${isManagerOrOwner}`);
 
-        jobsWithRevenue.forEach(job => {
-          // Use service_price (pre-discount) as revenue base for commission
-          // Fallback chain: service_price → price → total → total_amount → invoice_amount
-          const jobTotal = parseFloat(job.service_price) ||
-                          parseFloat(job.price) ||
-                          parseFloat(job.total) ||
-                          parseFloat(job.total_amount) ||
-                          parseFloat(job.invoice_amount) || 0;
-          const mc = memberCountByJob[job.id] || 1;
-          const splitRevenue = jobTotal / mc;
-          const commission = splitRevenue * (commissionPercentage / 100);
-          commissionSalary += commission;
-          console.log(`[Payroll] Job ${job.id}: service_price=$${jobTotal.toFixed(2)} / ${mc} members = $${splitRevenue.toFixed(2)} × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
-        });
-        
+        if (commissionPercentage > 0 && isManagerOrOwner) {
+          // Managers/owners: commission is based on TOTAL business revenue for the period
+          commissionRevenueBase = totalBusinessRevenue;
+          commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
+          console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from total business revenue $${totalBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
+        } else if (commissionPercentage > 0) {
+          // Service providers: commission is based on their assigned jobs' revenue
+          const jobsWithRevenue = (jobs || []).filter(job => {
+            const revenue = parseFloat(job.service_price) ||
+                           parseFloat(job.price) ||
+                           parseFloat(job.total) ||
+                           parseFloat(job.total_amount) ||
+                           parseFloat(job.invoice_amount) || 0;
+            return revenue > 0;
+          });
+
+          console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue out of ${jobs.length} total jobs`);
+
+          jobsWithRevenue.forEach(job => {
+            const jobTotal = parseFloat(job.service_price) ||
+                            parseFloat(job.price) ||
+                            parseFloat(job.total) ||
+                            parseFloat(job.total_amount) ||
+                            parseFloat(job.invoice_amount) || 0;
+            const mc = memberCountByJob[job.id] || 1;
+            const splitRevenue = jobTotal / mc;
+            const commission = splitRevenue * (commissionPercentage / 100);
+            commissionSalary += commission;
+            commissionRevenueBase += splitRevenue;
+            console.log(`[Payroll] Job ${job.id}: service_price=$${jobTotal.toFixed(2)} / ${mc} members = $${splitRevenue.toFixed(2)} × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
+          });
+        }
+
         console.log(`[Payroll] Member ${member.id}: Total commission = $${commissionSalary.toFixed(2)}`);
         
         // Final summary for this member
@@ -19915,7 +19964,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             id: member.id,
             name: `${member.first_name} ${member.last_name}`,
             hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
-            commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null
+            commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null,
+            role: member.role || 'Service Provider'
           },
           jobCount: (jobs || []).length,
           totalHours: parseFloat(totalHours.toFixed(2)),
@@ -19923,11 +19973,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
           hourlySalary: parseFloat(hourlySalary.toFixed(2)),
           commissionSalary: parseFloat(commissionSalary.toFixed(2)),
+          commissionRevenueBase: parseFloat(commissionRevenueBase.toFixed(2)),
           totalTips: parseFloat(totalTips.toFixed(2)),
           totalIncentives: parseFloat(totalIncentives.toFixed(2)),
           totalSalary: parseFloat(totalSalary.toFixed(2)),
           hasHourlyRate: !!member.hourly_rate,
           hasCommission: !!member.commission_percentage,
+          isManagerOrOwner,
           paymentMethod: member.hourly_rate && member.commission_percentage
             ? 'hybrid'
             : member.hourly_rate
@@ -19941,12 +19993,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
           const errScheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
           const errHourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
+          const errRole = (member.role || '').toLowerCase();
+          const errIsManagerOrOwner = errRole === 'account owner' || errRole === 'owner' || errRole === 'manager' || errRole === 'admin' || errRole === 'scheduler';
           return {
             teamMember: {
               id: member.id,
               name: `${member.first_name} ${member.last_name}`,
               hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
-              commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null
+              commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null,
+              role: member.role || 'Service Provider'
             },
             jobCount: 0,
             totalHours: 0,
@@ -19954,11 +20009,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             scheduledHourlySalary: parseFloat((errScheduledHours * errHourlyRate).toFixed(2)),
             hourlySalary: 0,
             commissionSalary: 0,
+            commissionRevenueBase: 0,
             totalTips: 0,
             totalIncentives: 0,
             totalSalary: 0,
             hasHourlyRate: !!member.hourly_rate,
             hasCommission: !!member.commission_percentage,
+            isManagerOrOwner: errIsManagerOrOwner,
             paymentMethod: member.hourly_rate && member.commission_percentage
               ? 'hybrid'
               : member.hourly_rate
@@ -19972,8 +20029,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       })
     );
 
-    // Include team members who have jobs OR scheduled working hours in the date range
-    const withActivity = (payrollData || []).filter(item => (item?.jobCount || 0) > 0 || (item?.scheduledHours || 0) > 0);
+    // Include team members who have jobs, scheduled working hours, or are managers/owners with commission
+    const withActivity = (payrollData || []).filter(item =>
+      (item?.jobCount || 0) > 0 ||
+      (item?.scheduledHours || 0) > 0 ||
+      (item?.isManagerOrOwner && item?.hasCommission)
+    );
     const sortedTeamMembers = withActivity.slice().sort((a, b) => (b?.jobCount || 0) - (a?.jobCount || 0));
 
     const grandTotal = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
@@ -19990,6 +20051,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         startDate: startDate || null,
         endDate: endDate || null
       },
+      totalBusinessRevenue: parseFloat(totalBusinessRevenue.toFixed(2)),
       teamMembers: sortedTeamMembers,
       summary: {
         totalTeamMembers: sortedTeamMembers.length,
