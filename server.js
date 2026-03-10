@@ -346,7 +346,7 @@ cron.schedule('0 9 * * *', async () => {
       .eq('status', 'completed');
 
     if (error) {
-      console.error('❌ Error fetching recurring all jobs:', error);
+      console.error('❌ Error fetching recurring jobs:', error);
       return;
     }
 
@@ -19919,7 +19919,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           }
 
           // Use total (pre-tax) as revenue for commission
-          const revenue = parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+          const revenue =  parseFloat(job.price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
           const mc = memberCountByJob[job.id] || 1;
           const splitHours = hours / mc;
           const splitRevenue = revenue / mc;
