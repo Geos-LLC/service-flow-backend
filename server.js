@@ -817,11 +817,11 @@ const publicRoutes = [
   '/api/user/staff-locations-setting',
   '/api/user/payment-methods',
   '/api/user/payment-methods/:id',
-  '/api/user/payment-processor/setup',
+  '/api/user/payment-procjobsessor/setup',
   '/api/user/availability',
   '/api/user/service-areas',
   '/api/jobs',
-  '/api/jobs/:id',
+  '/api//:id',
   '/api/jobs/:jobId/assign',
   '/api/jobs/:jobId/assign/:teamMemberId',
   '/api/jobs/:jobId/assignments',
@@ -19706,7 +19706,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     Object.values(allJobsById).forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      const rev = parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      const rev = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
       totalBusinessRevenue += rev;
     });
     console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}, Total jobs: ${Object.keys(allJobsById).length}`);
@@ -19815,9 +19815,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         } else if (commissionPercentage > 0) {
           // Service providers: commission is based on their assigned jobs' revenue
           const jobsWithRevenue = (jobs || []).filter(job => {
-            const revenue = parseFloat(job.total) ||
-                           parseFloat(job.service_price) ||
+            const revenue = parseFloat(job.service_price) ||
                            parseFloat(job.price) ||
+                           parseFloat(job.total) ||
                            parseFloat(job.total_amount) ||
                            parseFloat(job.invoice_amount) || 0;
             return revenue > 0;
@@ -19826,9 +19826,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue out of ${jobs.length} total jobs`);
 
           jobsWithRevenue.forEach(job => {
-            const jobTotal = parseFloat(job.total) ||
-                            parseFloat(job.service_price) ||
+            const jobTotal = parseFloat(job.service_price) ||
                             parseFloat(job.price) ||
+                            parseFloat(job.total) ||
                             parseFloat(job.total_amount) ||
                             parseFloat(job.invoice_amount) || 0;
             const mc = memberCountByJob[job.id] || 1;
@@ -19918,8 +19918,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             if (dur > 0) hours = dur / 60;
           }
 
-          // Use total (pre-tax) as revenue for commission
-          const revenue =  parseFloat(job.price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+          // Use service_price as revenue for cleaner job details
+          const revenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
           const mc = memberCountByJob[job.id] || 1;
           const splitHours = hours / mc;
           const splitRevenue = revenue / mc;
