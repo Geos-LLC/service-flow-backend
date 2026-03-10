@@ -346,7 +346,7 @@ cron.schedule('0 9 * * *', async () => {
       .eq('status', 'completed');
 
     if (error) {
-      console.error('❌ Error fetching recurring jobs:', error);
+      console.error('❌ Error fetching recurring all jobs:', error);
       return;
     }
 
