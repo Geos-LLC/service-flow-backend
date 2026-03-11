@@ -3489,7 +3489,7 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
       .eq('user_id', userId);
 
     // Apply filters
-    if (status) {
+    if (status && status !== 'daterange') {
       const statusArray = status.split(',');
       const mappedStatusArray = statusArray.map(s => {
         switch (s) {
@@ -3505,7 +3505,11 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
     }
 
     if (dateTo) {
-      query = query.lte('scheduled_date', dateTo);
+      // Use < next day to include all jobs on dateTo regardless of time component
+      const [ty, tm, td] = dateTo.split('-').map(Number);
+      const nextDay = new Date(ty, tm - 1, td + 1);
+      const nextDayStr = nextDay.getFullYear() + '-' + String(nextDay.getMonth() + 1).padStart(2, '0') + '-' + String(nextDay.getDate()).padStart(2, '0');
+      query = query.lt('scheduled_date', nextDayStr);
     }
 
     if (customerId) {
@@ -3543,12 +3547,49 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
       // Generate CSV with all fields
       const csvHeader = 'Job ID,Customer ID,Customer Name,Customer Email,Customer Phone,Service ID,Service Name,Service Price,Team Member ID,Team Member Name,Territory ID,Territory,Notes,Status,Invoice Status,Invoice ID,Invoice Amount,Invoice Date,Payment Date,Is Recurring,Recurring Frequency,Next Billing Date,Stripe Payment Intent ID,Duration,Workers,Skills Required,Price,Discount,Additional Fees,Taxes,Total,Payment Method,Schedule Type,Let Customer Schedule,Offer To Providers,Internal Notes,Customer Notes,Scheduled Date,Scheduled Time,Service Address Street,Service Address City,Service Address State,Service Address Zip,Service Address Country,Service Address Lat,Service Address Lng,Service Name,Bathroom Count,Workers Needed,Skills,Service Price,Total Amount,Estimated Duration,Special Instructions,Payment Status,Priority,Quality Check,Photos Required,Customer Signature,Auto Invoice,Auto Reminders,Recurring End Date,Tags,Intake Question Answers,Service Modifiers,Service Intake Questions,Created At,Updated At\n';
       
+      const esc = (val) => String(val ?? '').replace(/"/g, '""');
+      // Extract just the date part (YYYY-MM-DD) from timestamps to avoid timezone shift
+      const escDate = (val) => {
+        if (!val) return '';
+        const str = String(val);
+        // If it looks like a timestamp, extract just the date
+        const match = str.match(/^(\d{4}-\d{2}-\d{2})/);
+        return match ? match[1] : str;
+      };
       const csvRows = (jobs || []).map(job => {
         const customer = job.customers || {};
         const service = job.services || {};
         const teamMember = job.team_members || {};
-        
-        return `"${job.id || ''}","${job.customer_id || ''}","${customer.first_name || ''} ${customer.last_name || ''}","${customer.email || ''}","${customer.phone || ''}","${job.service_id || ''}","${job.service_name || service.name || ''}","${job.service_price || service.price || ''}","${job.team_member_id || ''}","${teamMember.first_name || ''} ${teamMember.last_name || ''}","${job.territory_id || ''}","${job.territory || ''}","${job.notes || ''}","${job.status || ''}","${job.invoice_status || ''}","${job.invoice_id || ''}","${job.invoice_amount || ''}","${job.invoice_date || ''}","${job.payment_date || ''}","${job.is_recurring || false}","${job.recurring_frequency || ''}","${job.next_billing_date || ''}","${job.stripe_payment_intent_id || ''}","${job.duration || ''}","${job.workers || ''}","${job.skills_required || ''}","${job.price || ''}","${job.discount || ''}","${job.additional_fees || ''}","${job.taxes || ''}","${job.total || ''}","${job.payment_method || ''}","${job.schedule_type || ''}","${job.let_customer_schedule || false}","${job.offer_to_providers || false}","${job.internal_notes || ''}","${job.customer_notes || ''}","${job.scheduled_date || ''}","${job.scheduled_time || ''}","${job.service_address_street || ''}","${job.service_address_city || ''}","${job.service_address_state || ''}","${job.service_address_zip || ''}","${job.service_address_country || ''}","${job.service_address_lat || ''}","${job.service_address_lng || ''}","${job.service_name || ''}","${job.bathroom_count || ''}","${job.workers_needed || ''}","${job.skills || ''}","${job.service_price || ''}","${job.total_amount || ''}","${job.estimated_duration || ''}","${job.special_instructions || ''}","${job.payment_status || ''}","${job.priority || ''}","${job.quality_check || true}","${job.photos_required || false}","${job.customer_signature || false}","${job.auto_invoice || true}","${job.auto_reminders || true}","${job.recurring_end_date || ''}","${job.tags || ''}","${job.intake_question_answers || ''}","${job.service_modifiers || ''}","${job.service_intake_questions || ''}","${job.created_at || ''}","${job.updated_at || ''}"`;
+
+        const fields = [
+          esc(job.id), esc(job.customer_id),
+          esc((customer.first_name || '') + ' ' + (customer.last_name || '')),
+          esc(customer.email), esc(customer.phone),
+          esc(job.service_id), esc(job.service_name || service.name), esc(job.service_price || service.price),
+          esc(job.team_member_id), esc((teamMember.first_name || '') + ' ' + (teamMember.last_name || '')),
+          esc(job.territory_id), esc(job.territory), esc(job.notes), esc(job.status),
+          esc(job.invoice_status), esc(job.invoice_id), esc(job.invoice_amount),
+          escDate(job.invoice_date), escDate(job.payment_date),
+          esc(job.is_recurring), esc(job.recurring_frequency), escDate(job.next_billing_date),
+          esc(job.stripe_payment_intent_id), esc(job.duration), esc(job.workers), esc(job.skills_required),
+          esc(job.price), esc(job.discount), esc(job.additional_fees), esc(job.taxes), esc(job.total),
+          esc(job.payment_method), esc(job.schedule_type), esc(job.let_customer_schedule), esc(job.offer_to_providers),
+          esc(job.internal_notes), esc(job.customer_notes),
+          escDate(job.scheduled_date), esc(job.scheduled_time),
+          esc(job.service_address_street), esc(job.service_address_city), esc(job.service_address_state),
+          esc(job.service_address_zip), esc(job.service_address_country),
+          esc(job.service_address_lat), esc(job.service_address_lng),
+          esc(job.service_name), esc(job.bathroom_count), esc(job.workers_needed), esc(job.skills),
+          esc(job.service_price), esc(job.total_amount), esc(job.estimated_duration), esc(job.special_instructions),
+          esc(job.payment_status), esc(job.priority), esc(job.quality_check),
+          esc(job.photos_required), esc(job.customer_signature), esc(job.auto_invoice), esc(job.auto_reminders),
+          escDate(job.recurring_end_date), esc(job.tags),
+          esc(typeof job.intake_question_answers === 'object' ? JSON.stringify(job.intake_question_answers) : job.intake_question_answers),
+          esc(typeof job.service_modifiers === 'object' ? JSON.stringify(job.service_modifiers) : job.service_modifiers),
+          esc(typeof job.service_intake_questions === 'object' ? JSON.stringify(job.service_intake_questions) : job.service_intake_questions),
+          escDate(job.created_at), escDate(job.updated_at)
+        ];
+        return fields.map(f => `"${f}"`).join(',');
       }).join('\n');
         
       res.setHeader('Content-Type', 'text/csv');
