@@ -19703,13 +19703,26 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     // Also compute totalBusinessRevenue from the fetched jobs (no extra query needed)
     totalBusinessRevenue = 0;
+    const revenueJobsList = [];
     Object.values(allJobsById).forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
       const rev = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
       totalBusinessRevenue += rev;
+      if (rev > 0) {
+        revenueJobsList.push({
+          id: job.id,
+          scheduledDate: job.scheduled_date,
+          serviceName: job.service_name || 'Unknown Service',
+          customerName: globalCustomerMap[job.customer_id] || '',
+          status: job.status,
+          revenue: parseFloat(rev.toFixed(2))
+        });
+      }
     });
-    console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}, Total jobs: ${Object.keys(allJobsById).length}`);
+    // Sort revenue jobs by date
+    revenueJobsList.sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
+    console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}, Revenue jobs: ${revenueJobsList.length}`);
 
     // ===== END BATCH =====
 
@@ -19972,7 +19985,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               : member.commission_percentage
                 ? 'commission'
                 : 'none',
-          jobs: jobDetails
+          jobs: jobDetails,
+          revenueJobs: isManagerOrOwner ? revenueJobsList : undefined
         };
         } catch (memberError) {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
