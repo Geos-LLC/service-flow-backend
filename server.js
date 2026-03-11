@@ -19743,12 +19743,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     }
 
     // Also compute totalBusinessRevenue from the fetched jobs (no extra query needed)
+    // Revenue = price - taxes (base price before tax)
     totalBusinessRevenue = 0;
     const revenueJobsList = [];
     Object.values(allJobsById).forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      const rev = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      const taxes = parseFloat(job.taxes) || 0;
+      const rev = Math.max(0, grossPrice - taxes);
       totalBusinessRevenue += rev;
       if (rev > 0) {
         revenueJobsList.push({
@@ -19757,7 +19760,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           serviceName: job.service_name || 'Unknown Service',
           customerName: globalCustomerMap[job.customer_id] || '',
           status: job.status,
-          revenue: parseFloat(rev.toFixed(2))
+          revenue: parseFloat(rev.toFixed(2)),
+          taxes: parseFloat(taxes.toFixed(2)),
+          grossPrice: parseFloat(grossPrice.toFixed(2))
         });
       }
     });
