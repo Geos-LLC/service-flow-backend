@@ -664,8 +664,9 @@ const attachmentUpload = multer({
 // CORS configuration - Simplified and more permissive for production
 const corsOptions = {
   origin: [
-    'https://www.service-flow.pro', 
+    'https://www.service-flow.pro',
     'https://service-flow.pro',
+    'https://staging.service-flow.pro',
     'https://service-flow-frontend.vercel.app',
     'https://service-flow.vercel.app',
     'http://localhost:3000',
