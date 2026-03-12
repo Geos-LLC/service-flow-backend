@@ -29,6 +29,15 @@ const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const twilio = require('twilio');
 require('dotenv').config();
+const logger = require('./logger');
+
+// Global error handlers — capture crashes and forward to LogHub
+process.on('uncaughtException', (err) => {
+  logger.error(`Uncaught Exception: ${err.message}`, { error: err.stack });
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error(`Unhandled Rejection: ${reason}`, { error: reason?.stack || String(reason) });
+});
 
 // Email configuration - SendGrid only
 
@@ -31368,17 +31377,17 @@ module.exports = app;
 // Start server
 if (require.main === module) {
 app.listen(PORT, async () => {
-  console.log(`Serviceflow API server running on port ${PORT}`);
-  console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
-  console.log('🔍 Branding endpoints registered: /api/user/branding (GET, PUT)');
-  console.log('🔍 Test endpoint available: /api/test-branding');
-  
+  logger.log(`Serviceflow API server running on port ${PORT}`);
+  logger.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
+  logger.log('Branding endpoints registered: /api/user/branding (GET, PUT)');
+  logger.log('Test endpoint available: /api/test-branding');
+
   // Initialize database schema
   try {
     await initializeDatabase();
   } catch (error) {
-    console.error('❌ Database initialization failed:', error);
-    console.log('⚠️ Server will continue without database initialization');
+    logger.error(`Database initialization failed: ${error.message}`, { error: error.stack });
+    logger.warn('Server will continue without database initialization');
   }
 });
 } // end if (require.main === module)
