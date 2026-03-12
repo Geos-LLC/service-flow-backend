@@ -12,7 +12,7 @@ function createMockClient() {
   console.log('⚠️  Creating mock Supabase client due to connection issues');
   
   return {
-    from: (table) => ({
+    from: (_table) => ({
       select: () => ({ eq: () => ({ limit: () => ({ data: [], error: null }) }) }),
       insert: () => ({ select: () => ({ data: [], error: null }) }),
       update: () => ({ eq: () => ({ select: () => ({ data: [], error: null }) }) }),
@@ -46,7 +46,7 @@ async function testSupabaseConnection() {
     // Test basic connectivity first
     console.log('Testing basic connectivity...');
     
-    const { data, error } = await supabase
+    const { data: _data, error } = await supabase
       .from('users')
       .select('count')
       .limit(1);
@@ -102,7 +102,7 @@ async function testSupabaseConnection() {
 }
 
 // Database helper functions to replace MySQL queries
-db = {
+const db = {
   // Generic query function
   async query(table, options = {}) {
     const { select = '*', where = {}, orderBy = null, limit = null, offset = null } = options;

@@ -507,13 +507,13 @@ async function sendEmail({ to, subject, html, text }) {
     if (error.code === 401) {
       console.error('❌ The SendGrid API key is invalid or expired');
       console.error('❌ Please check your SendGrid API key configuration');
-      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
+      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.', { cause: error });
     }
     if (error.code === 403) {
       console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
       console.error('❌ Make sure your SendGrid API key has mail.send permissions');
       console.error('❌ Verify your sender email is verified in SendGrid');
-      throw new Error('SendGrid API key lacks permissions. Please check your SendGrid account settings.');
+      throw new Error('SendGrid API key lacks permissions. Please check your SendGrid account settings.', { cause: error });
     }
     throw error;
   }
@@ -556,15 +556,15 @@ async function sendTeamMemberEmail({ to, subject, html, text }) {
       console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
       console.error('❌ The SendGrid API key is invalid or expired');
       console.error('❌ Please check your SendGrid API key configuration');
-      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.');
+      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.', { cause: error });
     }
     if (error.code === 403) {
       console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
       console.error('❌ Make sure your SendGrid API key has mail.send permissions');
       console.error('❌ Verify your sender email is verified in SendGrid');
-      throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.');
+      throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.', { cause: error });
     } else {
-      throw new Error(`SendGrid email failed: ${error.message}`);
+      throw new Error(`SendGrid email failed: ${error.message}`, { cause: error });
     }
   }
 }
@@ -1641,7 +1641,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?success=${successParam}`);
   } catch (error) {
     console.error('❌ Error in Google OAuth callback:', error);
-    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/${redirectPath}?error=callback_failed`);
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/settings/google-sheets?error=callback_failed`);
   }
 });
 
@@ -2554,8 +2554,9 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
         modifiersToStore = null;
       }
     } else {
+      // ignored
        }
-    
+
     // Build update object with only provided fields
     const updateData = {
       name: sanitizedName,
@@ -2572,12 +2573,14 @@ app.put('/api/services/:id', authenticateToken, async (req, res) => {
     if (modifiers !== undefined) {
       updateData.modifiers = modifiersToStore;
     } else {
+      // ignored
     }
-    
+
     // Only update intake_questions if provided
     if (intake_questions !== undefined) {
       updateData.intake_questions = intake_questions;
     } else {
+      // ignored
     }
     
     
@@ -2700,7 +2703,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     
     // Use userId from query if provided, otherwise use token userId
     // But verify they match if both are provided
-    let userId = queryUserId || tokenUserId;
+    const userId = queryUserId || tokenUserId;
     
     if (!userId) {
       console.log('❌ Jobs API: No userId found in query or token');
@@ -3142,6 +3145,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           count = retryResult.count;
           
           if (!error) {
+            // ignored
              }
         } catch (retryError) {
           console.error('🔄 Backend: Retry also failed:', retryError);
@@ -3157,9 +3161,9 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     }
       
       // Fetch status history for all jobs
-      const jobIds = (jobs || []).map(job => job.id);
-      let allStatusHistory = {};
-      let allTeamAssignments = {};
+      let jobIds = (jobs || []).map(job => job.id);
+      const allStatusHistory = {};
+      const allTeamAssignments = {};
       
       if (jobIds.length > 0) {
         // Fetch status history
@@ -3238,7 +3242,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
         // Fetch team member details separately
         if (!assignmentsError && assignmentsData && assignmentsData.length > 0) {
           const assignedMemberIds = [...new Set(assignmentsData.map(a => a.team_member_id).filter(Boolean))];
-          let memberMap = {};
+          const memberMap = {};
           if (assignedMemberIds.length > 0) {
             const { data: memberDetails } = await supabase
               .from('team_members')
@@ -4887,7 +4891,7 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       if (!assignmentsError && assignmentsResult && assignmentsResult.length > 0) {
         // Fetch team member details separately to avoid FK ambiguity
         const assignedMemberIds = [...new Set(assignmentsResult.map(a => a.team_member_id).filter(Boolean))];
-        let memberDetailsMap = {};
+        const memberDetailsMap = {};
         if (assignedMemberIds.length > 0) {
           const { data: memberDetails, error: memberError } = await supabase
             .from('team_members')
@@ -5048,11 +5052,12 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       photosRequired = false,
       qualityCheck = true,
       serviceModifiers,
-      serviceIntakeQuestions,
+      serviceIntakeQuestions: serviceIntakeQuestionsInput,
       intakeQuestionIdMapping,
       forceBook = false
     } = req.body;
 
+    let serviceIntakeQuestions = serviceIntakeQuestionsInput;
 
     // Combine scheduled date and time - save exactly as user chose
     let fullScheduledDate;
@@ -5101,13 +5106,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
     }
 
     // Process modifiers and intake questions to calculate final price and duration
-    let finalPrice = parseFloat(price) || 0;
+    const finalPrice = parseFloat(price) || 0;
     let finalDuration = parseFloat(duration) || 0;
     let processedModifiers = [];
     let processedIntakeQuestions = [];
     
     // Use the total from frontend if provided (it already includes modifiers)
-    let finalTotal = parseFloat(total) || finalPrice;
+    const finalTotal = parseFloat(total) || finalPrice;
   
     // Process selected modifiers to calculate price and duration
     if (serviceModifiers && Array.isArray(serviceModifiers)) {
@@ -5117,7 +5122,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
        
         let modifierPrice = 0;
         let modifierDuration = 0;
-        let selectedOptionsData = [];
+        const selectedOptionsData = [];
 
         if (modifier.selectionType === 'quantity') {
           // Handle quantity selection - selectedModifierData.quantities contains {optionId: quantity}
@@ -5232,9 +5237,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         };
       });
     } else {
+      // ignored
    }
 
-    
     // If we have modifiers but no processed modifiers, log a warning
     if (serviceModifiers && Array.isArray(serviceModifiers) && serviceModifiers.length > 0 && processedModifiers.length === 0) {
      
@@ -5242,6 +5247,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       const hasSelectedModifiers = req.body.selectedModifiers && Object.keys(req.body.selectedModifiers).length > 0;
      
       if (!hasSelectedModifiers) {
+        // ignored
      } else {
        serviceModifiers.forEach(modifier => {
           const hasMatch = req.body.selectedModifiers[modifier.id];
@@ -5672,24 +5678,27 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   })}. We'll see you soon! - ${businessName}`;
 
                   // Send SMS using user's Twilio Connect account
+                  let smsResult;
                   try {
-                    const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
+                    smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
                     console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
                   } catch (smsError) {
                     console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
                     // Continue without failing the job creation
                   }
-                  
+
                   // Update job with SMS notification status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      sms_sent: true,
-                      sms_sent_at: new Date().toISOString(),
-                      sms_phone: customerData.phone,
-                      sms_sid: smsResult.sid
-                    })
-                    .eq('id', result.id);
+                  if (smsResult) {
+                    await supabase
+                      .from('jobs')
+                      .update({
+                        sms_sent: true,
+                        sms_sent_at: new Date().toISOString(),
+                        sms_phone: customerData.phone,
+                        sms_sid: smsResult.sid
+                      })
+                      .eq('id', result.id);
+                  }
                   
                 } catch (smsError) {
                   console.error('❌ Error sending automatic confirmation SMS:', smsError);
@@ -5746,6 +5755,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             if (assignmentError) {
               console.error('Error creating primary team assignment:', assignmentError);
             } else {
+              // ignored
              }
           }
           
@@ -5764,6 +5774,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               if (assignmentError) {
                 console.error('Error creating additional team assignment:', assignmentError);
               } else {
+                // ignored
                }
             }
           }
@@ -5795,12 +5806,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 if (answerError) {
                   console.error('Error inserting job answer:', answerError);
                 } else {
+                  // ignored
                  }
               } catch (insertError) {
                 console.error('Error inserting job answer:', insertError);
                 // Continue processing other answers even if one fails
               }
             } else {
+              // ignored
              }
           }
         } catch (error) {
@@ -5808,6 +5821,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           // Don't fail the entire operation if intake questions processing fails
         }
       } else {
+        // ignored
         }
 
       // Insert initial status into job_status_history table
@@ -6280,24 +6294,27 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
               }
 
               // Send SMS using user's Twilio Connect account
+              let smsResult;
               try {
-                const result = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage);
-                console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', result.sid);
+                smsResult = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage);
+                console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', smsResult.sid);
               } catch (smsError) {
                 console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
                 // Continue without failing the status update
               }
-              
+
               // Update job with SMS notification status
-              await supabase
-                .from('jobs')
-                .update({
-                  sms_sent: true,
-                  sms_sent_at: new Date().toISOString(),
-                  sms_phone: jobData.customers.phone,
-                  sms_sid: result.sid
-                })
-                .eq('id', id);
+              if (smsResult) {
+                await supabase
+                  .from('jobs')
+                  .update({
+                    sms_sent: true,
+                    sms_sent_at: new Date().toISOString(),
+                    sms_phone: jobData.customers.phone,
+                    sms_sid: smsResult.sid
+                  })
+                  .eq('id', id);
+              }
               
             } catch (smsError) {
               console.error(`❌ Error sending automatic ${status} SMS notification:`, smsError);
@@ -7049,7 +7066,7 @@ app.delete('/api/jobs/delete-imported', authenticateToken, async (req, res) => {
     // For large batches, delete in chunks to avoid timeout
     const BATCH_SIZE = 500;
     let totalDeleted = 0;
-    let errors = [];
+    const errors = [];
     
     for (let i = 0; i < jobIds.length; i += BATCH_SIZE) {
       const batch = jobIds.slice(i, i + BATCH_SIZE);
@@ -7226,7 +7243,7 @@ app.delete('/api/jobs/all', authenticateToken, async (req, res) => {
     // Step 2: Delete in batches to handle large datasets and avoid timeouts
     const BATCH_SIZE = 500;
     let totalDeleted = 0;
-    let errors = [];
+    const errors = [];
     
     for (let i = 0; i < allJobIds.length; i += BATCH_SIZE) {
       const batch = allJobIds.slice(i, i + BATCH_SIZE);
@@ -7781,7 +7798,7 @@ app.get('/api/leads/pipeline', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     
     // Check if user has a default pipeline
-    let { data: pipelines, error } = await supabase
+    const { data: pipelines, error } = await supabase
       .from('lead_pipelines')
       .select('*')
       .eq('user_id', userId)
@@ -8713,7 +8730,7 @@ app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) 
     
     console.log(`🔍 Finding duplicate customers for user ${userId} by ${mergeBy}`);
     
-    let duplicates = [];
+    const duplicates = [];
     
     if (mergeBy === 'phone') {
       // Find duplicates by phone number
@@ -9567,7 +9584,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           const normalizeServiceName = (name) => {
             if (!name || typeof name !== 'string') return '';
             // First decode HTML entities (e.g., "Move in&#x2F;out" -> "Move in/out")
-            let normalized = decodeHtmlEntities(name);
+            const normalized = decodeHtmlEntities(name);
             return normalized
               .trim()                                    // Remove leading/trailing spaces
               .toLowerCase()                             // Case insensitive
@@ -9660,7 +9677,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         }
 
         // Handle team member assignment - support multiple team members
-        let teamMemberIds = []; // Array to store all team member IDs
+        const teamMemberIds = []; // Array to store all team member IDs
         let primaryTeamMemberId = null; // Primary team member ID
         
         // Helper function to find or create team member from external ID
@@ -10268,7 +10285,6 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                     timePart = `${timePart}:00`;
                   } else if (timeParts.length === 3) {
                     // Already HH:MM:SS
-                    timePart = timePart;
                   }
                 } else {
                   // No colon, assume it's just hours
@@ -10292,7 +10308,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               
               // Handle MM/DD/YYYY format dates
               let datePart = dateStr.split(' ')[0];
-              let timePart = dateStr.split(' ').slice(1).join(' ');
+              const timePart = dateStr.split(' ').slice(1).join(' ');
               
               // Normalize date to YYYY-MM-DD if it's in MM/DD/YYYY format
               if (datePart.includes('/')) {
@@ -10418,7 +10434,6 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             // Return as-is if it's already a recognized status
             return job.status.trim();
           })(),
-          invoice_status: job.invoiceStatus || 'draft',
           invoice_id: job.invoiceId || null,
           invoice_amount: parseFloat(job.invoiceAmount) || null,
           invoice_date: job.invoiceDate || null,
@@ -11865,7 +11880,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
             
             // Check if the entire string is just the pattern (like ", + -1 more" or "* , + -1 more")
             // If so, this is an invalid service name and should be skipped
-            const isOnlyPattern = /^[\*\s]*,\s*\+\s*-?\d+\s*(more|other)\s*$/gi.test(cleaned);
+            const isOnlyPattern = /^[*\s]*,\s*\+\s*-?\d+\s*(more|other)\s*$/gi.test(cleaned);
             if (isOnlyPattern) {
               return null; // Return null to indicate invalid service name
             }
@@ -11996,7 +12011,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           const serviceNameForJob = finalServiceName;
 
           // Handle team member assignment - support multiple team members (from Provider details)
-          let teamMemberIds = []; // Array to store all team member IDs
+          const teamMemberIds = []; // Array to store all team member IDs
           let primaryTeamMemberId = null; // Primary team member ID
           
           // Helper function to find or create team member from external ID
@@ -13165,7 +13180,9 @@ app.post('/api/estimates/:id/send', async (req, res) => {
         emailErrorMsg = err.message;
       }
     } else if (estimate.customers?.email) {
+      // ignored
    } else {
+      // ignored
    }
 
     res.json({
@@ -14216,7 +14233,7 @@ app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (
   try {
     switch (event.type) {
       case 'customer.subscription.updated':
-      case 'customer.subscription.deleted':
+      case 'customer.subscription.deleted': {
         const subscription = event.data.object;
         await supabase
           .from('user_billing')
@@ -14225,14 +14242,17 @@ app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (
           })
           .eq('stripe_subscription_id', subscription.id);
         break;
+      }
 
-      case 'invoice.payment_succeeded':
+      case 'invoice.payment_succeeded': {
         const invoice = event.data.object;
-       break;
+        break;
+      }
 
-      case 'invoice.payment_failed':
+      case 'invoice.payment_failed': {
         const failedInvoice = event.data.object;
-      break;
+        break;
+      }
 
       default:
     }
@@ -15150,7 +15170,7 @@ app.get('/api/territories', authenticateToken, async (req, res) => {
     
     // Use userId from query if provided, otherwise use token userId
     // But verify they match if both are provided
-    let userId = queryUserId || tokenUserId;
+    const userId = queryUserId || tokenUserId;
     
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
@@ -15470,31 +15490,31 @@ app.post('/api/territories/detect', async (req, res) => {
         if (customerAddress && territoryRadius > 0 && process.env.GOOGLE_MAPS_API_KEY) {
           try {
             // Get coordinates for customer address
-            const customerGeocodeResponse = await fetch(
+            const customerGeocodeResponse = await axios.get(
               `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(customerAddress)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
             )
-            
-            if (!customerGeocodeResponse.ok) {
+
+            if (customerGeocodeResponse.status !== 200) {
               console.warn('Google Maps API request failed for customer address');
               continue;
             }
-            
-            const customerGeocodeData = await customerGeocodeResponse.json()
+
+            const customerGeocodeData = customerGeocodeResponse.data
             
             if (customerGeocodeData.results && customerGeocodeData.results.length > 0) {
               const customerCoords = customerGeocodeData.results[0].geometry.location
               
               // Get coordinates for territory center (using location field)
-              const territoryGeocodeResponse = await fetch(
+              const territoryGeocodeResponse = await axios.get(
                 `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(territory.location)}&key=${process.env.GOOGLE_MAPS_API_KEY}`
               )
-              
-              if (!territoryGeocodeResponse.ok) {
+
+              if (territoryGeocodeResponse.status !== 200) {
                 console.warn('Google Maps API request failed for territory location');
                 continue;
               }
-              
-              const territoryGeocodeData = await territoryGeocodeResponse.json()
+
+              const territoryGeocodeData = territoryGeocodeResponse.data
               
               if (territoryGeocodeData.results && territoryGeocodeData.results.length > 0) {
                 const territoryCoords = territoryGeocodeData.results[0].geometry.location
@@ -15863,6 +15883,7 @@ app.post('/api/invoices', async (req, res) => {
       if (updateError) {
         console.error('Error updating job invoice status:', updateError);
       } else {
+        // ignored
       }
     }
       
@@ -15957,7 +15978,7 @@ app.put('/api/invoices/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update invoice error:', error);
     console.error('Request body:', req.body);
-    console.error('Invoice ID:', id);
+    console.error('Invoice ID:', req.params.id);
     res.status(500).json({ error: 'Failed to update invoice' });
   }
 });
@@ -15997,7 +16018,7 @@ app.get('/api/analytics/overview', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [userId];
+      const params = [userId];
       
       if (startDate && endDate) {
         dateFilter = 'AND j.scheduled_date BETWEEN ? AND ?';
@@ -16062,7 +16083,7 @@ app.get('/api/analytics/revenue', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [userId];
+      const params = [userId];
       
       if (startDate && endDate) {
         dateFilter = 'AND i.created_at BETWEEN ? AND ?';
@@ -16104,7 +16125,7 @@ app.get('/api/analytics/team-performance', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [userId];
+      const params = [userId];
       
       if (startDate && endDate) {
         dateFilter = 'AND j.scheduled_date BETWEEN ? AND ?';
@@ -16152,7 +16173,7 @@ app.get('/api/analytics/customer-insights', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [userId];
+      const params = [userId];
       
       if (startDate && endDate) {
         dateFilter = 'AND j.scheduled_date BETWEEN ? AND ?';
@@ -16766,7 +16787,7 @@ app.get('/api/analytics/service-performance', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [userId];
+      const params = [userId];
       
       if (startDate && endDate) {
         dateFilter = 'AND j.scheduled_date BETWEEN ? AND ?';
@@ -16808,7 +16829,7 @@ app.get('/api/territories/:id/analytics', async (req, res) => {
     
     try {
       let dateFilter = '';
-      let params = [id];
+      const params = [id];
       
       if (startDate && endDate) {
         dateFilter = 'AND j.scheduled_date BETWEEN ? AND ?';
@@ -17489,7 +17510,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     
     // Use userId from query if provided, otherwise use token userId
     // But verify they match if both are provided
-    let userId = queryUserId || tokenUserId;
+    const userId = queryUserId || tokenUserId;
     
     if (!userId) {
       return res.status(400).json({ error: 'userId is required' });
@@ -17697,7 +17718,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     }
     
     // Process team members to add job statistics
-    let processedTeamMembers = (teamMembers || []).map(member => {
+    const processedTeamMembers = (teamMembers || []).map(member => {
       const jobs = jobsByMember[member.id] || [];
       const totalJobs = jobs.length;
       const completedJobs = jobs.filter(job => job.status === 'completed').length;
@@ -18554,9 +18575,9 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
                 const hoursMatch = dayHours.hours.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
                 if (hoursMatch) {
                   let startHour = parseInt(hoursMatch[1]);
-                  let startMin = hoursMatch[2];
+                  const startMin = hoursMatch[2];
                   let endHour = parseInt(hoursMatch[4]);
-                  let endMin = hoursMatch[5];
+                  const endMin = hoursMatch[5];
                   
                   // Convert to 24-hour format if AM/PM is present
                   if (hoursMatch[3]) {
@@ -19004,7 +19025,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     // Get scheduled jobs for the date range from Supabase
     // Jobs are linked to team members through job_team_assignments table
     // Query through job_team_assignments to get jobs assigned to this team member
-    let assignmentsQuery = supabase
+    const assignmentsQuery = supabase
       .from('job_team_assignments')
       .select(`
         jobs!inner(
@@ -19033,7 +19054,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     
     // Also check for jobs with direct team_member_id (backward compatibility)
     // Some jobs might still have team_member_id directly in the jobs table
-    let directJobsQuery = supabase
+    const directJobsQuery = supabase
       .from('jobs')
       .select('scheduled_date, scheduled_time, duration, id, status, service_name')
       .eq('team_member_id', id)
@@ -19175,8 +19196,8 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     };
     
     // Process availability by date if date range is provided
-    let dailyAvailability = {};
-    let dailyRemainingAvailability = {};
+    const dailyAvailability = {};
+    const dailyRemainingAvailability = {};
     
     // Always process availability if we have a date range, even if availability is null/empty
     // This ensures we return empty availability data rather than nothing
@@ -19636,7 +19657,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     // Fetch ALL job_team_assignments for members in this user's team
     const teamMemberIds = (teamMembers || []).map(m => m.id);
-    let assignmentJobsByMember = {};
+    const assignmentJobsByMember = {};
     if (teamMemberIds.length > 0) {
       // Batch in chunks of 100 to avoid Supabase .in() limits
       for (let i = 0; i < teamMemberIds.length; i += 100) {
@@ -19706,7 +19727,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     // Fetch ALL customer names at once
     const allCustomerIds = [...new Set(Object.values(allJobsById).map(j => j.customer_id).filter(Boolean))];
-    let globalCustomerMap = {};
+    const globalCustomerMap = {};
     if (allCustomerIds.length > 0) {
       for (let i = 0; i < allCustomerIds.length; i += 100) {
         const chunk = allCustomerIds.slice(i, i + 100);
@@ -20123,7 +20144,7 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
     const { startDate, endDate, groupBy = 'day' } = req.query;
 
     // Calculate date range
-    let dateFilter = {};
+    const dateFilter = {};
     if (startDate) {
       dateFilter.gte = startDate;
     }
@@ -20164,7 +20185,7 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
     }
 
     // Also get jobs from job_team_assignments
-    let assignmentsQuery = supabase
+    const assignmentsQuery = supabase
       .from('job_team_assignments')
       .select(`
         team_member_id,
@@ -21109,7 +21130,7 @@ app.post('/api/team-members/register', async (req, res) => {
     // Provide specific error messages based on the error type
     let errorMessage = 'Registration failed';
     let errorType = 'server_error';
-    let details = error.message;
+    const details = error.message;
     
     if (error.message.includes('timeout')) {
       errorMessage = 'Request timed out. Please try again.';
@@ -21606,7 +21627,7 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
       const todayJobs = jobs.filter(job => {
         if (!job.scheduled_date) return false;
         // Handle both ISO format (2025-08-20T09:00:00) and space format (2025-08-20 09:00:00)
-        let jobDateString = '';
+        let jobDateString;
         if (job.scheduled_date.includes('T')) {
           jobDateString = job.scheduled_date.split('T')[0];
         } else if (job.scheduled_date.includes(' ')) {
@@ -21726,6 +21747,7 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
         console.warn('⚠️ Failed to create notification:', notificationError);
         // Continue without notification
       } else {
+        // ignored
       }
     } catch (notificationError) {
       console.warn('⚠️ Notification creation failed:', notificationError);
@@ -22553,7 +22575,7 @@ app.post('/api/public/bookings', async (req, res) => {
     
     try {
       // Create or find customer
-      let [existingCustomer] = await connection.query(`
+      const [existingCustomer] = await connection.query(`
         SELECT id FROM customers WHERE email = ? AND user_id = ?
       `, [customerData.email, userId]);
       
@@ -24280,30 +24302,34 @@ app.get('/api/health/database', async (req, res) => {
         const [teamMembersResult] = await connection.query('SELECT COUNT(*) as count FROM team_members LIMIT 1');
         teamMembersTable = true;
       } catch (error) {
+        // ignored
      }
-      
+
       // Test jobs table
       let jobsTable = false;
       try {
         const [jobsResult] = await connection.query('SELECT COUNT(*) as count FROM jobs LIMIT 1');
         jobsTable = true;
       } catch (error) {
+        // ignored
       }
-      
+
       // Test customers table
       let customersTable = false;
       try {
         const [customersResult] = await connection.query('SELECT COUNT(*) as count FROM customers LIMIT 1');
         customersTable = true;
       } catch (error) {
+        // ignored
       }
-      
+
       // Test services table
       let servicesTable = false;
       try {
         const [servicesResult] = await connection.query('SELECT COUNT(*) as count FROM services LIMIT 1');
         servicesTable = true;
       } catch (error) {
+        // ignored
       }
       
       res.json({
@@ -24534,7 +24560,7 @@ app.get('/api/team-members/:id/performance', async (req, res) => {
           console.error('Error querying jobs for team member:', queryError);
           // Use default values if query fails
         }
-      } else { }
+      } else { /* ignored */ }
       
       const performance = performanceMetrics[0] || {
         jobs_completed: 0,
@@ -24674,8 +24700,9 @@ app.post('/api/migrate/team-member-settings', async (req, res) => {
           ) WHERE settings IS NULL
         `);
       } else {
+        // ignored
       }
-      
+
       // Show table structure
       const [columns] = await connection.query('DESCRIBE team_members');
     
@@ -24722,15 +24749,17 @@ app.post('/api/migrate/jobs-team-member', async (req, res) => {
             ON DELETE SET NULL
           `);
         } catch (fkError) {
+          // ignored
         }
-        
+
         // Add index for better performance
         try {
           await connection.query('CREATE INDEX idx_jobs_team_member_id ON jobs(team_member_id)');
-        
         } catch (indexError) {
+          // ignored
         }
       } else {
+        // ignored
       }
       
       // Show table structure
@@ -24780,6 +24809,7 @@ app.post('/api/migrate/team-member-skills', async (req, res) => {
           ) WHERE skills IS NULL
         `);
       } else {
+        // ignored
       }
       
       // Show table structure
@@ -24826,8 +24856,9 @@ app.post('/api/migrate/team-member-territories', async (req, res) => {
           UPDATE team_members SET territories = JSON_ARRAY(1) WHERE id = 3
         `);
       } else {
+        // ignored
       }
-      
+
       // Show table structure
       const [columns] = await connection.query('DESCRIBE team_members');
       
@@ -28761,7 +28792,7 @@ app.post('/api/address/validate', async (req, res) => {
       // If Google API fails, fall back to geocoding
       try {
         const geocodeResponse = await axios.get(
-          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`
+          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(req.body.address)}&key=${process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ'}`
         );
         
         if (geocodeResponse.data.status === 'OK' && geocodeResponse.data.results && geocodeResponse.data.results.length > 0) {
@@ -29066,21 +29097,22 @@ app.get('/api/twilio/connect/callback', async (req, res) => {
     }
     
     // Exchange authorization code for access token
-    const tokenResponse = await fetch('https://connect.twilio.com/oauth/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
+    const tokenResponse = await axios.post('https://connect.twilio.com/oauth/token',
+      new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: process.env.TWILIO_CONNECT_ACCOUNT_SID,
         client_secret: process.env.TWILIO_CONNECT_AUTH_TOKEN,
         code: code,
         redirect_uri: process.env.FRONTEND_URL + '/settings/sms-settings?connected=true'
-      })
-    });
-    
-    const tokenData = await tokenResponse.json();
+      }).toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        }
+      }
+    );
+
+    const tokenData = tokenResponse.data;
     
     if (!tokenData.access_token) {
       throw new Error('Failed to get access token');
@@ -29962,7 +29994,6 @@ app.delete('/api/twilio/disconnect', authenticateToken, async (req, res) => {
         twilio_account_sid: null,
         twilio_auth_token: null,
         twilio_notification_phone: null,
-        twilio_notification_phone: null,
         twilio_notification_types: null,
         updated_at: new Date().toISOString()
       })
@@ -30366,7 +30397,7 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
       console.log('✅ Parsed date successfully:', startDateTime.toISOString());
     } catch (error) {
       console.error('❌ Error parsing date:', error);
-      throw new Error(`Failed to parse job date/time: ${error.message}`);
+      throw new Error(`Failed to parse job date/time: ${error.message}`, { cause: error });
     }
     
     const endDateTime = new Date(startDateTime.getTime() + duration * 60000);
@@ -30500,10 +30531,10 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
               }
             } catch (refreshError) {
               console.error('❌ Failed to refresh token:', refreshError.message);
-              throw new Error('Access token expired and refresh failed. Please reconnect your Google account.');
+              throw new Error('Access token expired and refresh failed. Please reconnect your Google account.', { cause: refreshError });
             }
           } else {
-            throw new Error('Access token is invalid and no refresh token available. Please reconnect your Google account in Settings → Calendar Syncing.');
+            throw new Error('Access token is invalid and no refresh token available. Please reconnect your Google account in Settings → Calendar Syncing.', { cause: error });
           }
         }
         
@@ -31196,7 +31227,7 @@ console.log('✅ Google Import endpoints setup complete');
 // Correct implementation following RentCast API documentation
 app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   try {
-    let { address, city, state, zipCode, street } = req.body;
+    const { address, city, state, zipCode, street } = req.body;
 
     // Auto-extract city from address if not provided (fallback for Zillow-style full addresses)
     // Example: "445 Albee Square W, Brooklyn, NY 11201, USA" -> city = "Brooklyn"
@@ -31373,7 +31404,11 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
 });
+// Export app for testing
+module.exports = app;
+
 // Start server
+if (require.main === module) {
 app.listen(PORT, async () => {
   console.log(`Serviceflow API server running on port ${PORT}`);
   console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
@@ -31388,6 +31423,7 @@ app.listen(PORT, async () => {
     console.log('⚠️ Server will continue without database initialization');
   }
 });
+} // end if (require.main === module)
 
 // Fix database schema endpoint (Supabase handles schema automatically)
 app.post('/api/fix-schema', async (req, res) => {
