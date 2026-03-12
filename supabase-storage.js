@@ -28,7 +28,7 @@ const BUCKETS = {
 // Ensure all buckets exist
 const ensureBuckets = async () => {
   try {
-    for (const [bucketName, bucketId] of Object.entries(BUCKETS)) {
+    for (const [_bucketName, bucketId] of Object.entries(BUCKETS)) {
       const { data: buckets, error } = await supabase.storage.listBuckets();
       
       if (error) {
@@ -77,7 +77,7 @@ const uploadToStorage = async (file, bucketName, folder = '') => {
     const fileBuffer = fs.readFileSync(file.path);
     
     // Upload to Supabase Storage
-    const { data, error } = await supabase.storage
+    const { error } = await supabase.storage
       .from(bucketName)
       .upload(filename, fileBuffer, {
         contentType: file.mimetype,

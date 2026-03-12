@@ -4,6 +4,9 @@
         "commonjs": true,
         "es2021": true
     },
+    "globals": {
+        "Intl": "readonly"
+    },
     "extends": "eslint:recommended",
     "parserOptions": {
         "ecmaVersion": "latest"

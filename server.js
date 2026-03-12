@@ -1,8 +1,8 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { supabase, db } = require('./supabase');
-const { BUCKETS, ensureBuckets, uploadToStorage, deleteFromStorage, getFileUrl } = require('./supabase-storage');
+const { supabase } = require('./supabase');
+const { BUCKETS, ensureBuckets, uploadToStorage } = require('./supabase-storage');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -24,13 +24,10 @@ const pool = {
 };
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cron = require('node-cron');
-const https = require('https');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const twilio = require('twilio');
-const passport = require('passport');
-const GoogleStrategy = require('passport-google-oauth20').Strategy;
 require('dotenv').config();
 
 // Email configuration - SendGrid only
@@ -100,16 +97,7 @@ async function testSendGridConfig() {
     console.log('📧 API Key present: Yes (hardcoded)');
     console.log('📧 API Key length:', SENDGRID_API_KEY?.length || 0);
     console.log('📧 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
-    
-    // Test with a simple API call to verify the key
-    const testMsg = {
-      to: 'test@example.com',
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-      subject: 'Test',
-      text: 'Test message'
-    };
-    
-    console.log('📧 SendGrid test message prepared');
+
     console.log('📧 SendGrid configuration appears valid');
     return true;
   } catch (error) {
@@ -924,11 +912,11 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Test Supabase connection
 async function testSupabaseConnection() {
   try {
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('users')
       .select('count')
       .limit(1);
-    
+
     if (error) {
       console.error('Supabase connection test failed:', error);
       return false;
@@ -1117,7 +1105,7 @@ app.post('/api/auth/signup', async (req, res) => {
     }
     
     // Create account owner as a team member with role "account owner"
-    const { data: accountOwnerTeamMember, error: teamMemberError } = await supabase
+    const { error: teamMemberError } = await supabase
       .from('team_members')
       .insert({
         user_id: newUser.id,
@@ -1948,7 +1936,7 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
       hasRefreshToken: !!updateData.google_refresh_token
     });
     
-    const { data: updatedUser, error: updateError } = await supabase
+    const { error: updateError } = await supabase
       .from('users')
       .update(updateData)
       .eq('id', req.user.userId)
@@ -1965,7 +1953,7 @@ app.post('/api/auth/connect-google', authenticateToken, async (req, res) => {
       // If error is about missing columns, try updating without token columns
       if (updateError.code === '42703' || updateError.message?.includes('does not exist')) {
         console.log('🔗 Token columns don\'t exist, updating only google_id');
-        const { data: retryUser, error: retryError } = await supabase
+        const { error: retryError } = await supabase
           .from('users')
           .update({ google_id: googleId })
           .eq('id', req.user.userId)
@@ -3399,7 +3387,6 @@ app.get('/api/recurring-bookings', authenticateToken, async (req, res) => {
       
       const customer = job.customers || {};
       const service = job.services || {};
-      const teamMember = job.team_members || {};
       
       // Calculate next job date based on recurring frequency
       let nextJobDate = null;
@@ -3472,13 +3459,12 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
       status, 
       dateFrom, 
       dateTo, 
-      customerId, 
+      customerId,
       teamMemberId,
       territoryId,
       invoiceStatus,
       paymentStatus,
-      priority,
-      includeAnswers = false
+      priority
     } = req.query;
 
     // Build query with filters
@@ -4560,7 +4546,6 @@ async function checkWorkerAvailabilityForOffer(worker, job) {
 // Get available jobs for workers (jobs with offer_to_providers = true)
 app.get('/api/jobs/available-for-workers', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId;
     const teamMemberId = req.user.teamMemberId;
     const userRole = req.user.role;
 
@@ -4609,7 +4594,7 @@ app.get('/api/jobs/available-for-workers', authenticateToken, async (req, res) =
     }
 
     // Get existing claims by this worker
-    const { data: existingClaims, error: claimsError } = await supabase
+    const { data: existingClaims } = await supabase
       .from('job_offers')
       .select('job_id, status')
       .eq('team_member_id', teamMemberId)
@@ -4654,7 +4639,6 @@ app.get('/api/jobs/available-for-workers', authenticateToken, async (req, res) =
 // Claim a job (worker claims an available job)
 app.post('/api/jobs/:id/claim', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.userId;
     const teamMemberId = req.user.teamMemberId;
     const userRole = req.user.role;
     const { id } = req.params;
@@ -5033,17 +5017,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       offerToProviders = false,
       internalNotes,
       serviceAddress,
-      contactInfo,
       serviceName,
       invoiceStatus = 'draft',
       paymentStatus = 'pending',
       priority = 'normal',
-      estimatedDuration,
       skills,
       specialInstructions,
       customerNotes,
       tags,
-      attachments,
       recurringFrequency = '',
       recurringEndDate,
       autoInvoice = true,
@@ -5053,7 +5034,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       qualityCheck = true,
       serviceModifiers,
       serviceIntakeQuestions: serviceIntakeQuestionsInput,
-      intakeQuestionIdMapping,
       forceBook = false
     } = req.body;
 
@@ -5129,7 +5109,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           const quantities = selectedModifierData?.quantities || {};
          
           Object.entries(quantities).forEach(([optionId, quantity]) => {
-            const option = modifier.options?.find(o => o.id == optionId);
+            const option = modifier.options?.find(o => String(o.id) === String(optionId));
             if (option && quantity > 0) {
               const optionPrice = parseFloat(option.price) || 0;
               const optionDuration = parseFloat(option.duration) || 0;
@@ -5148,7 +5128,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           const selections = selectedModifierData?.selections || [];
         
           selections.forEach(optionId => {
-            const option = modifier.options?.find(o => o.id == optionId);
+            const option = modifier.options?.find(o => String(o.id) === String(optionId));
             if (option) {
               const optionPrice = parseFloat(option.price) || 0;
               const optionDuration = parseFloat(option.duration) || 0;
@@ -5167,7 +5147,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           const selection = selectedModifierData?.selection;
          
           if (selection) {
-            const option = modifier.options?.find(o => o.id == selection);
+            const option = modifier.options?.find(o => String(o.id) === String(selection));
             if (option) {
               const optionPrice = parseFloat(option.price) || 0;
               const optionDuration = parseFloat(option.duration) || 0;
@@ -5189,7 +5169,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           // Try old format where selectedModifierData is directly an array or object
           if (Array.isArray(selectedModifierData)) {
             selectedModifierData.forEach(optionId => {
-              const option = modifier.options?.find(o => o.id == optionId);
+              const option = modifier.options?.find(o => String(o.id) === String(optionId));
               if (option) {
                 const optionPrice = parseFloat(option.price) || 0;
                 const optionDuration = parseFloat(option.duration) || 0;
@@ -5206,7 +5186,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           } else if (typeof selectedModifierData === 'object' && !selectedModifierData.quantities && !selectedModifierData.selections && !selectedModifierData.selection) {
             // Try old format where it's {optionId: quantity}
             Object.entries(selectedModifierData).forEach(([optionId, quantity]) => {
-              const option = modifier.options?.find(o => o.id == optionId);
+              const option = modifier.options?.find(o => String(o.id) === String(optionId));
               if (option && quantity > 0) {
                 const optionPrice = parseFloat(option.price) || 0;
                 const optionDuration = parseFloat(option.duration) || 0;
@@ -5249,9 +5229,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       if (!hasSelectedModifiers) {
         // ignored
      } else {
-       serviceModifiers.forEach(modifier => {
-          const hasMatch = req.body.selectedModifiers[modifier.id];
-        });
+       // Modifiers present but no matches found
       }
     }
 
@@ -5292,7 +5270,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       
       if (serviceIntakeQuestions && Array.isArray(serviceIntakeQuestions)) {
        
-        processedIntakeQuestions = serviceIntakeQuestions.map((question, index) => {
+        processedIntakeQuestions = serviceIntakeQuestions.map((question, _index) => {
           // The frontend sends answers using the normalized question IDs (1, 2, 3)
           // So we should use the question.id directly, not the originalQuestionIds
           const answer = intakeAnswers[question.id];
@@ -5314,10 +5292,6 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       
       // Handle empty recurring end date
       const recurringEndDateValue = recurringEndDate && recurringEndDate !== '' ? recurringEndDate : null;
-
-      // Handle multiple services - store in existing fields for now
-      const serviceIds = req.body.serviceIds || [];
-      const serviceNames = req.body.serviceName ? req.body.serviceName.split(', ') : [];
 
       // Create the job
       const jobData = {
@@ -5973,7 +5947,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     let changedByType = 'account_owner';
     
     // First check if it's an account owner
-    const { data: userData, error: userError } = await supabase
+    const { data: userData } = await supabase
       .from('users')
       .select('first_name, last_name, business_name')
       .eq('id', userId)
@@ -5998,8 +5972,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     
     // Check if this status already exists in history for this job
     let existingStatusEntry = null;
-    let checkHistoryError = null;
-    
+
     try {
       const { data, error } = await supabase
         .from('job_status_history')
@@ -6008,11 +5981,10 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
         .eq('status', status)
         .limit(1)
         .maybeSingle(); // Use maybeSingle() instead of single() to avoid error when no rows
-      
-      if (error && error.code !== 'PGRST116' && error.code !== '42P01') { 
+
+      if (error && error.code !== 'PGRST116' && error.code !== '42P01') {
         // PGRST116 = no rows returned, 42P01 = table doesn't exist
         console.error('Error checking status history:', error);
-        checkHistoryError = error;
       } else if (data) {
         existingStatusEntry = data;
       }
@@ -10803,7 +10775,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           if (isUpdate) {
             // UPDATE existing job
             // Remove user_id from update data (shouldn't change) - define outside callback for logging
-            const { user_id, ...updateData } = jobData;
+            const { user_id: _user_id, ...updateData } = jobData;
             
             // Debug: Log what we're about to update
             console.log(`Row ${i + 1}: 🔄 Updating job ID ${job.existingJobId} with fields:`, {
@@ -10832,7 +10804,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
             
             // Fetch the job BEFORE update to compare values
-            const { data: jobBeforeUpdate, error: fetchError } = await supabase
+            const { data: jobBeforeUpdate, error: _fetchError } = await supabase
               .from('jobs')
               .select('id, scheduled_date, scheduled_time, status, invoice_status')
               .eq('id', job.existingJobId)
@@ -11310,7 +11282,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           }
 
           // Insert new customer
-          const { data: newCustomer, error: insertError } = await supabase
+          const { error: insertError } = await supabase
             .from('customers')
             .insert(mappedCustomer)
             .select()
@@ -11538,7 +11510,8 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           }
           const customerPhone = job.phone || job.Phone || job['Phone'] || job['Phone Number'] || job.phone_number;
           const customerApt = job.apt || job.Apt || job['Apt'] || job['Apt. No.'] || job['Apt. No'] || job.apartment;
-          const customerCompany = job.companyName || job['Company name'] || job['Company Name'] || job.company_name;
+          // customerCompany extracted for potential future use
+          // const customerCompany = job.companyName || job['Company name'] || job['Company Name'] || job.company_name;
           
           // Address recognition: Parse combined address strings or use separate fields
           // Booking Koala may export addresses as combined strings like "123 Main St, Jacksonville, FL 32254, USA"
@@ -12525,10 +12498,10 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
           // Check if we already detected a duplicate by external ID earlier
           if (existingJobIdForUpdate) {
             // UPDATE existing job with new data (schedule, status, etc. may have changed)
-            const { user_id, ...updateData } = mappedJob;
+            const { user_id: _user_id, ...updateData } = mappedJob;
             console.log(`Row ${i + 1}: 🔄 Updating existing job ${existingJobIdForUpdate} with new data (schedule/time/status may have changed)`);
 
-            const { data: updatedJob, error: updateError } = await supabase
+            const { error: updateError } = await supabase
               .from('jobs')
               .update(updateData)
               .eq('id', existingJobIdForUpdate)
@@ -12589,7 +12562,7 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
 
             if (existing) {
               if (settings.updateExisting) {
-                const { user_id, ...updateData } = mappedJob;
+                const { user_id: _user_id2, ...updateData } = mappedJob;
                 const { error: updateError } = await supabase
                   .from('jobs')
                   .update(updateData)
@@ -14245,12 +14218,12 @@ app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (
       }
 
       case 'invoice.payment_succeeded': {
-        const invoice = event.data.object;
+        // const _invoice = event.data.object;
         break;
       }
 
       case 'invoice.payment_failed': {
-        const failedInvoice = event.data.object;
+        // const _failedInvoice = event.data.object;
         break;
       }
 
@@ -14583,12 +14556,12 @@ app.post('/api/user/payment-processor/setup', authenticateToken, async (req, res
 
 app.post('/api/user/billing/setup-intent', async (req, res) => {
   try {
-    const { userId, email, name } = req.body;
-    
+    const { userId, email } = req.body;
+
     if (!userId || !email) {
       return res.status(400).json({ error: 'User ID and email are required' });
     }
-    
+
     // For now, return a mock setup intent
     // In a real implementation, you'd create this with Stripe
     const mockSetupIntent = {
@@ -15098,7 +15071,7 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
         timeslot_templates: timeslotTemplatesJson
       };
       
-      const { error: insertError, data: insertDataResult } = await supabase
+      const { error: insertError } = await supabase
         .from('user_availability')
         .insert(insertData)
         .select();
@@ -15799,10 +15772,10 @@ app.get('/api/invoices/:id', async (req, res) => {
 
 app.post('/api/invoices', async (req, res) => {
   try {
-    const { 
-      userId, customerId, jobId, estimateId, invoiceNumber, 
-      subtotal, taxAmount, discountAmount, totalAmount, 
-      status = 'sent', dueDate, notes 
+    const {
+      userId, customerId, jobId, estimateId,
+      taxAmount, totalAmount,
+      status = 'sent', dueDate
     } = req.body;
     
     if (!userId || !customerId || !totalAmount) {
@@ -16233,7 +16206,6 @@ app.get('/api/analytics/lost-customers', authenticateToken, async (req, res) => 
     const inactiveDaysThreshold = parseInt(inactiveDays) || 90;
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - inactiveDaysThreshold);
-    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
 
     // Get all customers
     const { data: allCustomers, error: customersError } = await supabase
@@ -16628,7 +16600,7 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
     }
 
     // Get all pipelines for this user
-    const { data: pipelines, error: pipelinesError } = await supabase
+    const { data: pipelines } = await supabase
       .from('lead_pipelines')
       .select('id')
       .eq('user_id', userId);
@@ -16644,7 +16616,7 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
       stagesQuery = stagesQuery.in('pipeline_id', pipelineIds);
     }
 
-    const { data: stages, error: stagesError } = await stagesQuery;
+    const { data: stages } = await stagesQuery;
 
     const stageMap = {};
     (stages || []).forEach(stage => {
@@ -17523,12 +17495,12 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     }
     
     // First, get the account owner from users table
-    const { data: accountOwner, error: ownerError } = await supabase
+    const { data: accountOwner } = await supabase
       .from('users')
       .select('id, email, first_name, last_name, phone, business_name, profile_picture')
       .eq('id', userId)
       .maybeSingle();
-    
+
     // Build Supabase query for team members (without jobs initially)
     let query = supabase
       .from('team_members')
@@ -17597,7 +17569,7 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     if (accountOwner && (!accountOwnerInTeam || !accountOwnerInFilteredResults)) {
       // Get jobs assigned to the account owner (using user_id)
       // This is for the account owner who may not be in team_members table
-      const { data: ownerJobs, error: jobsError } = await supabase
+      const { data: ownerJobs } = await supabase
         .from('jobs')
         .select('id, status, invoice_amount')
         .eq('user_id', userId)
@@ -18419,7 +18391,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     const lastNameValue = lastName || last_name;
     
     // Check if team member exists by ID
-    const { data: existingMember, error: checkError } = await supabase
+    const { data: existingMember } = await supabase
       .from('team_members')
       .select('id, user_id, role')
       .eq('id', id)
@@ -18612,7 +18584,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
             });
             
             // Update or create user_availability record
-            const { data: existingUserAvail, error: checkAvailError } = await supabase
+            const { data: existingUserAvail } = await supabase
               .from('user_availability')
               .select('id')
               .eq('user_id', userId)
@@ -18718,7 +18690,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
         dataToSave.email = accountOwner.email;
       }
       
-      const { data: newMember, error: createError } = await supabase
+      const { error: createError } = await supabase
           .from('team_members')
         .insert(dataToSave)
         .select()
@@ -20210,7 +20182,7 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
       // Filter will be applied after fetching
     }
 
-    const { data: assignments, error: assignmentsError } = await assignmentsQuery;
+    const { data: assignments } = await assignmentsQuery;
 
     // Combine jobs from both sources
     const jobsByMember = {};
@@ -20386,10 +20358,9 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
   try {
     const { id } = req.params;
     const { availability } = req.body;
-    const userId = req.user.userId;
     const userRole = req.user.role;
     const teamMemberId = req.user.teamMemberId;
-    
+
     // Check if team member exists
     const { data: teamMember, error: memberError } = await supabase
       .from('team_members')
@@ -20877,8 +20848,7 @@ app.post('/api/team-members/register', async (req, res) => {
       hourlyRate,
       territories,
       availability,
-      permissions,
-      isServiceProvider = false
+      permissions
     } = req.body;
     
     // Validate required fields with specific messages
@@ -22416,7 +22386,7 @@ app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res
 
 app.post('/api/payments/confirm-payment', authenticateToken, async (req, res) => {
   try {
-    const { paymentIntentId, invoiceId, customerId } = req.body;
+    const { paymentIntentId, invoiceId } = req.body;
     
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
     
@@ -22510,7 +22480,7 @@ app.post('/api/payments/create-subscription', authenticateToken, async (req, res
 // Tax calculation endpoint
 app.post('/api/tax/calculate', authenticateToken, async (req, res) => {
   try {
-    const { subtotal, state, city, zipCode } = req.body;
+    const { subtotal, state } = req.body;
     
     // Simple tax calculation (you can integrate with tax APIs like TaxJar)
     const taxRates = {
@@ -24238,7 +24208,6 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
 app.get('/api/test-team-assignment/:jobId', authenticateToken, async (req, res) => {
   try {
     const { jobId } = req.params;
-    const userId = req.user.userId;
     const connection = await pool.getConnection();
     
     try {
@@ -24294,12 +24263,12 @@ app.get('/api/health/database', async (req, res) => {
     
     try {
       // Test basic connection
-      const [result] = await connection.query('SELECT 1 as test');
-     
+      await connection.query('SELECT 1 as test');
+
       // Test team_members table
       let teamMembersTable = false;
       try {
-        const [teamMembersResult] = await connection.query('SELECT COUNT(*) as count FROM team_members LIMIT 1');
+        await connection.query('SELECT COUNT(*) as count FROM team_members LIMIT 1');
         teamMembersTable = true;
       } catch (error) {
         // ignored
@@ -24308,7 +24277,7 @@ app.get('/api/health/database', async (req, res) => {
       // Test jobs table
       let jobsTable = false;
       try {
-        const [jobsResult] = await connection.query('SELECT COUNT(*) as count FROM jobs LIMIT 1');
+        const [_jobsResult] = await connection.query('SELECT COUNT(*) as count FROM jobs LIMIT 1');
         jobsTable = true;
       } catch (error) {
         // ignored
@@ -24317,7 +24286,7 @@ app.get('/api/health/database', async (req, res) => {
       // Test customers table
       let customersTable = false;
       try {
-        const [customersResult] = await connection.query('SELECT COUNT(*) as count FROM customers LIMIT 1');
+        const [_customersResult] = await connection.query('SELECT COUNT(*) as count FROM customers LIMIT 1');
         customersTable = true;
       } catch (error) {
         // ignored
@@ -24326,7 +24295,7 @@ app.get('/api/health/database', async (req, res) => {
       // Test services table
       let servicesTable = false;
       try {
-        const [servicesResult] = await connection.query('SELECT COUNT(*) as count FROM services LIMIT 1');
+        const [_servicesResult] = await connection.query('SELECT COUNT(*) as count FROM services LIMIT 1');
         servicesTable = true;
       } catch (error) {
         // ignored
@@ -24918,7 +24887,7 @@ app.get('/api/debug/database', async (req, res) => {
     
     try {
       // Test basic connection
-      const [result] = await connection.query('SELECT 1 as test');
+      const [_result] = await connection.query('SELECT 1 as test');
       // Test all tables
       const tables = ['jobs', 'team_members', 'customers', 'services', 'users'];
       const tableStatus = {};
@@ -26782,7 +26751,7 @@ app.post('/api/transactions/record-payment', authenticateToken, async (req, res)
     // If columns don't exist yet, retry without them
     if (transactionError && transactionError.message && transactionError.message.includes('column')) {
       console.warn('⚠️ tip_amount/notes/discount columns may not exist in transactions table, retrying without them');
-      const { tip_amount, notes: _notes, discount: _discount, ...fallbackData } = transactionData;
+      const { tip_amount: _tip_amount, notes: _notes, discount: _discount, ...fallbackData } = transactionData;
       ({ data: transaction, error: transactionError } = await supabase
         .from('transactions')
         .insert(fallbackData)
@@ -26980,10 +26949,6 @@ const deleteTransactionHandler = async (req, res) => {
     const newTotalPaid = hasRemainingPayments
       ? remainingTx.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0)
       : 0;
-    const newTotalTips = hasRemainingPayments
-      ? remainingTx.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0)
-      : 0;
-
     const jobTotal = parseFloat(job.total ?? job.total_amount ?? job.price) || 0;
     const jobTip = parseFloat(job.tip_amount) || 0;
     const expectedTotal = jobTotal + jobTip;
@@ -27211,7 +27176,7 @@ function generateReceiptHtml(invoice, paymentIntentId, amount) {
 // Receipt Management API endpoints
 app.post('/api/generate-receipt-pdf', async (req, res) => {
   try {
-    const { invoiceId, paymentIntentId, transactionId, amount } = req.body;
+    const { invoiceId, paymentIntentId, transactionId: _transactionId, amount } = req.body;
     
     console.log('📄 Generating receipt PDF for invoice:', invoiceId);
     
@@ -27535,7 +27500,7 @@ app.post('/api/send-receipt-email', async (req, res) => {
     }
     
     // Get user's business info
-    const { data: userData, error: userError } = await supabase
+    const { data: userData, error: _userError } = await supabase
       .from('users')
       .select('business_name, email')
       .eq('id', invoice.user_id)
@@ -28062,9 +28027,8 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
       amount, 
       serviceName, 
       serviceDate, 
-      address, 
-      paymentLink, 
-      includePaymentLink 
+      address,
+      includePaymentLink
     } = req.body;
 
     if (!jobId || !customerEmail || !customerName || !amount) {
@@ -28539,7 +28503,7 @@ const initializeDatabase = async () => {
   try {
     
     // Test Supabase connection
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('users')
       .select('id')
       .limit(1);
@@ -28621,7 +28585,7 @@ app.put('/api/customers/:customerId/notifications', async (req, res) => {
     });
     
     // First, try to get existing preferences
-    const { data: existingPrefs, error: fetchError } = await supabase
+    const { data: _existingPrefs, error: fetchError } = await supabase
       .from('customer_notification_preferences')
       .select('id, email_notifications, sms_notifications')
       .eq('customer_id', customerId)
@@ -28913,8 +28877,8 @@ app.post('/api/address/geocode', async (req, res) => {
 
 app.get('/api/customers/:customerId/notifications/history', async (req, res) => {
   try {
-    const { customerId } = req.params;
-    
+    const { customerId: _customerId } = req.params;
+
     // Get notification history for customer (placeholder implementation)
     // In a real implementation, you would have a notifications table
     res.json({
@@ -28989,16 +28953,16 @@ app.post('/api/migrate/add-color-column', async (req, res) => {
 // CORS is handled by the main cors middleware
 
 // Error handling middleware
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   console.error(err.stack);
-  
+
   // CORS headers are handled by the main cors middleware
-  
+
   res.status(500).json({ error: 'Something went wrong!' });
 });
 
 // Global error handler
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   console.error('Global error handler caught:', err);
   console.error('Error stack:', err.stack);
   console.error('Request URL:', req.url);
@@ -29367,7 +29331,7 @@ app.delete('/api/stripe/connect/disconnect', authenticateToken, async (req, res)
     const userId = req.user.userId;
     
     // Get user's Stripe Connect account ID
-    const { data: userData, error: userError } = await supabase
+    const { data: userData, error: _userError } = await supabase
       .from('users')
       .select('stripe_connect_account_id')
       .eq('id', userId)
@@ -29623,7 +29587,7 @@ app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
 
 app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
   try {
-    const { invoiceId, customerEmail } = req.body;
+    const { invoiceId } = req.body;
     const userId = req.user.userId;
 
     // Get user's Stripe credentials
@@ -30446,9 +30410,6 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
       },
     };
 
-    let eventId;
-    let eventLink;
-
     // Helper function to sync event with retry logic
     const syncEvent = async (retryCount = 0) => {
       const maxRetries = 2;
@@ -30573,9 +30534,7 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
       }
     };
     
-    const result = await syncEvent();
-    eventId = result.eventId;
-    eventLink = result.eventLink;
+    const { eventId, eventLink } = await syncEvent();
     console.log('✅ Calendar event synced successfully:', eventId);
 
     // Update job with calendar event ID and link
@@ -30608,7 +30567,7 @@ async function syncJobToCalendar(jobId, userId, jobData, customerData, req = nul
 // Google Calendar endpoints
 app.post('/api/calendar/sync-job', authenticateToken, async (req, res) => {
   try {
-    const { jobId, customerName, serviceName, scheduledDate, scheduledTime, duration, address } = req.body;
+    const { jobId, customerName, serviceName, scheduledDate, scheduledTime } = req.body;
     
     if (!jobId || !customerName || !serviceName || !scheduledDate || !scheduledTime) {
       return res.status(400).json({ error: 'Missing required job details' });
@@ -30949,7 +30908,6 @@ app.post('/api/sheets/export-customers', authenticateToken, async (req, res) => 
 
     // Create new spreadsheet
     const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-    const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     let spreadsheet;
     try {
@@ -31431,12 +31389,12 @@ app.post('/api/fix-schema', async (req, res) => {
     console.log('🔧 Checking Supabase schema...');
     
     // Test connection to verify schema is working
-    const { data: jobsTest, error: jobsError } = await supabase
+    const { data: _jobsTest, error: jobsError } = await supabase
       .from('jobs')
       .select('id')
       .limit(1);
-    
-    const { data: servicesTest, error: servicesError } = await supabase
+
+    const { data: _servicesTest, error: servicesError } = await supabase
       .from('services')
       .select('id')
       .limit(1);

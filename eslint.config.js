@@ -22,6 +22,7 @@ module.exports = [
         Buffer: 'readonly',
         URL: 'readonly',
         URLSearchParams: 'readonly',
+        Intl: 'readonly',
         // Jest globals
         describe: 'readonly',
         test: 'readonly',

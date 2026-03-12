@@ -37,7 +37,6 @@ app.get('/api/google/sheets/list', authenticateToken, async (req, res) => {
     });
 
     // Get user's spreadsheets
-    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // List spreadsheets
@@ -337,7 +336,7 @@ app.post('/api/google/sheets/import', authenticateToken, async (req, res) => {
 
   // Import customers to database
   async function importCustomers(data, settings) {
-  const { updateExisting = false, skipDuplicates = true } = settings;
+  const { updateExisting: _updateExisting = false, skipDuplicates = true } = settings;
   let imported = 0;
   let skipped = 0;
   const errors = [];
@@ -385,7 +384,7 @@ app.post('/api/google/sheets/import', authenticateToken, async (req, res) => {
 
   // Import jobs to database
   async function importJobs(data, settings) {
-  const { updateExisting = false, skipDuplicates = true } = settings;
+  const { updateExisting: _updateExisting = false, skipDuplicates = true } = settings;
   let imported = 0;
   let skipped = 0;
   const errors = [];
