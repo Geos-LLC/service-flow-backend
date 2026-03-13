@@ -11052,6 +11052,105 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           
           // Duplicate detection is handled by _id checking above
         }
+
+        // After successful import/update, create status history entries from Bubble.io timestamps
+        // This enables tooltips on the progress bar showing original en-route/arrived/completed times
+        if (newJob && !insertError && (job.dateTimeEnroute || job.dateTimeArrived || job.dateTimeCompleted)) {
+          try {
+            const statusHistoryEntries = [];
+
+            // Get team member name for "changed_by" field
+            let changedByName = 'Staff';
+            if (primaryTeamMemberId) {
+              const teamMember = allTeamMembers.find(m => m.id === primaryTeamMemberId);
+              if (teamMember) {
+                changedByName = `${teamMember.first_name || ''} ${teamMember.last_name || ''}`.trim() || 'Staff';
+              }
+            }
+
+            // Helper to parse Bubble.io date format: "2024-11-23, 9:00 am"
+            const parseBubbleDate = (dateStr) => {
+              if (!dateStr || !dateStr.trim()) return null;
+              try {
+                // Replace the comma between date and time parts
+                const cleaned = dateStr.trim().replace(/,\s*/, ' ');
+                const parsed = new Date(cleaned);
+                return isNaN(parsed.getTime()) ? null : parsed.toISOString();
+              } catch (e) {
+                return null;
+              }
+            };
+
+            // Scheduled/pending entry (use scheduled_date or created_at)
+            statusHistoryEntries.push({
+              job_id: newJob.id,
+              status: 'pending',
+              previous_status: null,
+              changed_by: changedByName,
+              changed_by_type: 'import',
+              changed_at: newJob.created_at || new Date().toISOString()
+            });
+
+            // En Route (confirmed)
+            const enrouteDate = parseBubbleDate(job.dateTimeEnroute);
+            if (enrouteDate) {
+              statusHistoryEntries.push({
+                job_id: newJob.id,
+                status: 'confirmed',
+                previous_status: 'pending',
+                changed_by: changedByName,
+                changed_by_type: 'import',
+                changed_at: enrouteDate
+              });
+            }
+
+            // Arrived/Started (in-progress)
+            const arrivedDate = parseBubbleDate(job.dateTimeArrived);
+            if (arrivedDate) {
+              statusHistoryEntries.push({
+                job_id: newJob.id,
+                status: 'in-progress',
+                previous_status: enrouteDate ? 'confirmed' : 'pending',
+                changed_by: changedByName,
+                changed_by_type: 'import',
+                changed_at: arrivedDate
+              });
+            }
+
+            // Completed
+            const completedDate = parseBubbleDate(job.dateTimeCompleted);
+            if (completedDate) {
+              statusHistoryEntries.push({
+                job_id: newJob.id,
+                status: 'completed',
+                previous_status: arrivedDate ? 'in-progress' : (enrouteDate ? 'confirmed' : 'pending'),
+                changed_by: changedByName,
+                changed_by_type: 'import',
+                changed_at: completedDate
+              });
+            }
+
+            if (statusHistoryEntries.length > 1) { // More than just the pending entry
+              // Delete existing status history for this job (in case of re-import update)
+              if (isUpdate) {
+                await supabase.from('job_status_history').delete().eq('job_id', newJob.id);
+              }
+
+              // Insert all entries
+              const { error: historyError } = await supabase
+                .from('job_status_history')
+                .insert(statusHistoryEntries);
+
+              if (historyError) {
+                console.error(`Row ${i + 1}: Error inserting status history from Bubble.io timestamps:`, historyError);
+              } else {
+                console.log(`Row ${i + 1}: ✅ Created ${statusHistoryEntries.length} status history entries from Bubble.io timestamps`);
+              }
+            }
+          } catch (historyError) {
+            console.error(`Row ${i + 1}: Error processing Bubble.io timestamps for status history:`, historyError);
+          }
+        }
       } catch (error) {
         results.errors.push(`Row ${i + 1}: ${error.message}`);
         results.skipped++;
