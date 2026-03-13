@@ -31806,12 +31806,18 @@ app.get('/api/ledger/balance/:teamMemberId', authenticateToken, async (req, res)
 app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
+    const { startDate, endDate } = req.query;
 
-    // Fetch all ledger entries for this business
-    const { data: entries, error } = await supabase
+    // Fetch ledger entries with optional date filter
+    let entryQuery = supabase
       .from('cleaner_ledger')
-      .select('team_member_id, type, amount, payout_batch_id')
+      .select('team_member_id, type, amount, payout_batch_id, job_id')
       .eq('user_id', userId);
+
+    if (startDate) entryQuery = entryQuery.gte('effective_date', startDate);
+    if (endDate) entryQuery = entryQuery.lte('effective_date', endDate);
+
+    const { data: entries, error } = await entryQuery;
 
     if (error) {
       return res.status(500).json({ error: 'Failed to fetch ledger data' });
@@ -31837,7 +31843,9 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
         unpaid_tips: 0,
         unpaid_incentives: 0,
         unpaid_cash_offsets: 0,
-        unpaid_adjustments: 0
+        unpaid_adjustments: 0,
+        job_count: 0,
+        _jobIds: new Set()
       };
     }
 
@@ -31846,6 +31854,11 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       if (!memberMap[mid]) continue;
       const amount = parseFloat(entry.amount) || 0;
       memberMap[mid].current_balance += amount;
+
+      // Count unique jobs
+      if (entry.job_id && entry.type === 'earning') {
+        memberMap[mid]._jobIds.add(entry.job_id);
+      }
 
       if (!entry.payout_batch_id) {
         switch (entry.type) {
@@ -31860,6 +31873,8 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
 
     // Round and return
     const balances = Object.values(memberMap).map(m => {
+      m.job_count = m._jobIds.size;
+      delete m._jobIds;
       for (const key of ['current_balance', 'unpaid_earnings', 'unpaid_tips', 'unpaid_incentives', 'unpaid_cash_offsets', 'unpaid_adjustments']) {
         m[key] = parseFloat(m[key].toFixed(2));
       }
