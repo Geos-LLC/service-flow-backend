@@ -31610,26 +31610,21 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   for (const member of teamMembers) {
     // Calculate earning based on pay type
-    let earningAmount = 0;
     const hourlyRate = parseFloat(member.hourly_rate) || 0;
     const commissionPct = parseFloat(member.commission_percentage) || 0;
 
+    let earningAmount;
     if (hourlyRate > 0 && commissionPct > 0) {
-      // Hybrid: both hourly + commission
       const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
       const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
       earningAmount = hourlyPay + commissionPay;
     } else if (commissionPct > 0) {
-      // Commission only
       earningAmount = (jobRevenue / memberCount) * (commissionPct / 100);
     } else if (hourlyRate > 0) {
-      // Hourly only
       earningAmount = (hoursWorked / memberCount) * hourlyRate;
     } else {
-      // No pay config - use equal split of service_price as fallback
       earningAmount = (parseFloat(job.service_price) || jobRevenue) / memberCount;
     }
-
     earningAmount = parseFloat(earningAmount.toFixed(2));
 
     if (earningAmount > 0) {
