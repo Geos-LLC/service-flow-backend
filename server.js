@@ -31477,13 +31477,6 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
   }
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-// Export app for testing
-module.exports = app;
-
 // Start server
 if (require.main === module) {
 app.listen(PORT, async () => {
@@ -32428,6 +32421,13 @@ app.patch('/api/team-members/:id/payout-preferences', authenticateToken, async (
 // ============================================================
 // END CLEANER LEDGER SYSTEM
 // ============================================================
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+// Export app for testing
+module.exports = app;
 
 // Google Geocoding API proxy endpoint for address validation fallback
 
