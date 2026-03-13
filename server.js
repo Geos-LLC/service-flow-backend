@@ -19854,6 +19854,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       }
     }
 
+    // When "All Time" (no date range), derive a date range from jobs for scheduled-hours calculation
+    let scheduledHoursStartDate = startDate;
+    let scheduledHoursEndDate = endDate;
+    if (!startDate || !endDate) {
+      let earliest = null;
+      (allDirectJobs || []).forEach(job => {
+        if (job.scheduled_date && (!earliest || job.scheduled_date < earliest)) {
+          earliest = job.scheduled_date;
+        }
+      });
+      if (!scheduledHoursStartDate && earliest) scheduledHoursStartDate = earliest;
+      if (!scheduledHoursEndDate) {
+        const today = new Date();
+        scheduledHoursEndDate = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+      }
+    }
+
     // Also compute totalBusinessRevenue from the fetched jobs (no extra query needed)
     // Revenue = price - taxes (base price before tax)
     totalBusinessRevenue = 0;
@@ -19957,7 +19974,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         const isManagerOrOwner = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
         // Calculate scheduled working hours from availability settings
-        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
+        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, scheduledHoursStartDate, scheduledHoursEndDate);
         const scheduledHourlySalary = scheduledHours * hourlyRate;
 
         // For managers/schedulers: hourly salary uses scheduled working hours
