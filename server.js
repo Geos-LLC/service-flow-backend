@@ -31626,23 +31626,30 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const ledgerEntries = [];
 
   for (const member of teamMembers) {
-    // Calculate earning based on pay type
     const hourlyRate = parseFloat(member.hourly_rate) || 0;
     const commissionPct = parseFloat(member.commission_percentage) || 0;
+    const memberRole = (member.role || '').toLowerCase();
+    const isManager = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
     let earningAmount;
-    if (hourlyRate > 0 && commissionPct > 0) {
+    if (isManager) {
+      // Managers: per-job entry is commission only (scheduled salary handled separately)
+      if (commissionPct > 0) {
+        earningAmount = parseFloat((jobRevenue * (commissionPct / 100)).toFixed(2));
+      } else {
+        earningAmount = 0;
+      }
+    } else if (hourlyRate > 0 && commissionPct > 0) {
       const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
       const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
-      earningAmount = hourlyPay + commissionPay;
+      earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
     } else if (commissionPct > 0) {
-      earningAmount = (jobRevenue / memberCount) * (commissionPct / 100);
+      earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
     } else if (hourlyRate > 0) {
-      earningAmount = (hoursWorked / memberCount) * hourlyRate;
+      earningAmount = parseFloat(((hoursWorked / memberCount) * hourlyRate).toFixed(2));
     } else {
-      earningAmount = (parseFloat(job.service_price) || jobRevenue) / memberCount;
+      earningAmount = parseFloat(((parseFloat(job.service_price) || jobRevenue) / memberCount).toFixed(2));
     }
-    earningAmount = parseFloat(earningAmount.toFixed(2));
 
     if (earningAmount > 0) {
       ledgerEntries.push({
@@ -31652,8 +31659,8 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
         type: 'earning',
         amount: earningAmount,
         effective_date: effectiveDate,
-        note: `Earning for job #${jobId}`,
-        metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+        note: isManager ? `Commission for job #${jobId}` : `Earning for job #${jobId}`,
+        metadata: { hours: isManager ? 0 : hoursWorked / memberCount, hourly_rate: isManager ? 0 : hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount, is_manager: isManager },
         created_by: userId
       });
     }
@@ -32345,12 +32352,24 @@ app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
 app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { startDate, endDate, dryRun = false } = req.body;
+    const { startDate, endDate, dryRun = false, resetExisting = false } = req.body;
+
+    // If resetExisting, delete all ledger entries (except payouts) and re-create
+    if (resetExisting && !dryRun) {
+      const { error: deleteError } = await supabase
+        .from('cleaner_ledger')
+        .delete()
+        .eq('user_id', userId)
+        .is('payout_batch_id', null)
+        .in('type', ['earning', 'tip', 'incentive', 'cash_collected']);
+      if (deleteError) console.error('Reset delete error:', deleteError);
+      else console.log(`[Backfill] Cleared existing non-payout ledger entries for user ${userId}`);
+    }
 
     // Fetch all non-cancelled jobs (matching payroll logic, not just 'completed')
     let query = supabase
       .from('jobs')
-      .select('id, status')
+      .select('id, status, scheduled_date')
       .eq('user_id', userId);
 
     if (startDate) query = query.gte('scheduled_date', startDate);
@@ -32386,11 +32405,27 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     const jobsToProcess = jobIds.filter(id => !existingJobIds.has(id));
 
     if (dryRun) {
+      // Count managers that would get salary entries
+      let managerCount = 0;
+      try {
+        const { data: managers } = await supabase
+          .from('team_members')
+          .select('id, role, hourly_rate, availability')
+          .eq('user_id', userId)
+          .eq('status', 'active');
+        const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+        managerCount = (managers || []).filter(m => {
+          const role = (m.role || '').toLowerCase();
+          return managerRoles.includes(role) && parseFloat(m.hourly_rate) > 0 && m.availability;
+        }).length;
+      } catch (e) { /* ignore */ }
+
       return res.json({
         message: 'Dry run complete',
         total_jobs: jobIds.length,
         already_have_entries: existingJobIds.size,
-        would_process: jobsToProcess.length
+        would_process: jobsToProcess.length,
+        managers_with_salary: managerCount
       });
     }
 
@@ -32407,12 +32442,162 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       }
     }
 
+    // ── Manager daily salary backfill ──
+    // Managers earn scheduled-hours salary independent of jobs
+    let managerSalaryEntries = 0;
+    try {
+      // Determine date range from jobs or params
+      let rangeStart = startDate;
+      let rangeEnd = endDate;
+      if (!rangeStart || !rangeEnd) {
+        let earliest = null, latest = null;
+        validJobs.forEach(j => {
+          if (j.scheduled_date) {
+            const d = j.scheduled_date.split(' ')[0].split('T')[0];
+            if (!earliest || d < earliest) earliest = d;
+            if (!latest || d > latest) latest = d;
+          }
+        });
+        if (!rangeStart) rangeStart = earliest;
+        if (!rangeEnd) rangeEnd = latest;
+      }
+
+      if (rangeStart && rangeEnd) {
+        // Get managers with hourly rate
+        const { data: managers } = await supabase
+          .from('team_members')
+          .select('id, first_name, last_name, hourly_rate, availability, role')
+          .eq('user_id', userId)
+          .eq('status', 'active');
+
+        const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+        const activeManagers = (managers || []).filter(m => {
+          const role = (m.role || '').toLowerCase();
+          return managerRoles.includes(role) && parseFloat(m.hourly_rate) > 0 && m.availability;
+        });
+
+        for (const mgr of activeManagers) {
+          const hourlyRate = parseFloat(mgr.hourly_rate);
+          const avail = typeof mgr.availability === 'string' ? JSON.parse(mgr.availability) : mgr.availability;
+          const workingHours = avail.workingHours || avail;
+          const customAvailability = avail.customAvailability || [];
+          const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+          const toMinutes = (timeStr) => {
+            if (!timeStr) return 0;
+            const parts = timeStr.split(':');
+            return parseInt(parts[0]) * 60 + parseInt(parts[1] || 0);
+          };
+
+          // Check which dates already have salary entries for this manager
+          const { data: existingSalaryEntries } = await supabase
+            .from('cleaner_ledger')
+            .select('effective_date')
+            .eq('user_id', userId)
+            .eq('team_member_id', mgr.id)
+            .eq('type', 'earning')
+            .is('job_id', null)
+            .gte('effective_date', rangeStart)
+            .lte('effective_date', rangeEnd);
+
+          const existingSalaryDates = new Set((existingSalaryEntries || []).map(e => e.effective_date));
+
+          const start = new Date(rangeStart + 'T00:00:00');
+          const end = new Date(rangeEnd + 'T00:00:00');
+          const salaryEntries = [];
+
+          for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+            const dateStr = d.getFullYear() + '-' +
+              String(d.getMonth() + 1).padStart(2, '0') + '-' +
+              String(d.getDate()).padStart(2, '0');
+
+            if (existingSalaryDates.has(dateStr)) continue;
+
+            const dayName = dayNames[d.getDay()];
+            let dayHours = 0;
+
+            // Check custom availability override
+            const override = customAvailability.find(item => item.date === dateStr);
+            if (override) {
+              if (override.available === false) continue;
+              if (override.hours && Array.isArray(override.hours) && override.hours.length > 0) {
+                override.hours.forEach(h => {
+                  const hStart = toMinutes(h.start || h.startTime || '09:00');
+                  const hEnd = toMinutes(h.end || h.endTime || '17:00');
+                  if (hEnd > hStart) dayHours += (hEnd - hStart) / 60;
+                });
+              } else {
+                // available=true, fall through to regular schedule
+                const dayHrs = workingHours[dayName];
+                if (dayHrs && dayHrs.enabled !== false && dayHrs.available !== false) {
+                  if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+                    dayHrs.timeSlots.forEach(ts => {
+                      const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
+                      const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
+                      if (tsEnd > tsStart) dayHours += (tsEnd - tsStart) / 60;
+                    });
+                  } else if (dayHrs.start && dayHrs.end) {
+                    const dStart = toMinutes(dayHrs.start);
+                    const dEnd = toMinutes(dayHrs.end);
+                    if (dEnd > dStart) dayHours += (dEnd - dStart) / 60;
+                  }
+                }
+              }
+            } else {
+              const dayHrs = workingHours[dayName];
+              if (!dayHrs || dayHrs.enabled === false || dayHrs.available === false) continue;
+              if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+                dayHrs.timeSlots.forEach(ts => {
+                  const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
+                  const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
+                  if (tsEnd > tsStart) dayHours += (tsEnd - tsStart) / 60;
+                });
+              } else if (dayHrs.start && dayHrs.end) {
+                const dStart = toMinutes(dayHrs.start);
+                const dEnd = toMinutes(dayHrs.end);
+                if (dEnd > dStart) dayHours += (dEnd - dStart) / 60;
+              }
+            }
+
+            if (dayHours > 0) {
+              const dailySalary = parseFloat((dayHours * hourlyRate).toFixed(2));
+              salaryEntries.push({
+                user_id: userId,
+                team_member_id: mgr.id,
+                job_id: null,
+                type: 'earning',
+                amount: dailySalary,
+                effective_date: dateStr,
+                note: `Scheduled salary: ${dayHours.toFixed(1)}h × $${hourlyRate}/hr`,
+                metadata: { scheduled_hours: dayHours, hourly_rate: hourlyRate, is_manager_salary: true },
+                created_by: userId
+              });
+            }
+          }
+
+          // Insert in batches of 100
+          for (let i = 0; i < salaryEntries.length; i += 100) {
+            const batch = salaryEntries.slice(i, i + 100);
+            const { error: insertError } = await supabase.from('cleaner_ledger').insert(batch);
+            if (insertError) {
+              console.error(`Manager salary insert error for ${mgr.id}:`, insertError);
+            } else {
+              managerSalaryEntries += batch.length;
+            }
+          }
+        }
+      }
+    } catch (mgrErr) {
+      console.error('Manager salary backfill error:', mgrErr);
+    }
+
     res.json({
       message: 'Backfill complete',
       total_jobs: jobIds.length,
       already_had_entries: existingJobIds.size,
       processed,
-      errors
+      errors,
+      manager_salary_entries: managerSalaryEntries
     });
   } catch (error) {
     console.error('Backfill error:', error);
