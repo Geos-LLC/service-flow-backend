@@ -6319,6 +6319,16 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
+    // === LEDGER INTEGRATION: Create ledger entries when job is completed ===
+    if (status === 'completed' && previousStatus !== 'completed') {
+      try {
+        await createLedgerEntriesForCompletedJob(id, userId);
+      } catch (ledgerError) {
+        console.error('⚠️ Error creating ledger entries (non-blocking):', ledgerError);
+        // Don't fail the status update if ledger creation fails
+      }
+    }
+
     res.json({
       message: 'Job status updated successfully',
       status: status
@@ -31528,6 +31538,896 @@ app.post('/api/fix-schema', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ============================================================
+// CLEANER LEDGER SYSTEM
+// ============================================================
+
+// Helper: Create ledger entries for a completed job
+async function createLedgerEntriesForCompletedJob(jobId, userId) {
+  // Fetch job details
+  const { data: job, error: jobError } = await supabase
+    .from('jobs')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, tip_amount, incentive_amount, payment_method, hours_worked, duration, estimated_duration, scheduled_date, discount, additional_fees, taxes')
+    .eq('id', jobId)
+    .single();
+
+  if (jobError || !job) {
+    console.error('Ledger: Could not fetch job', jobId, jobError);
+    return;
+  }
+
+  // Check if ledger entries already exist for this job (idempotency)
+  const { data: existingEntries } = await supabase
+    .from('cleaner_ledger')
+    .select('id')
+    .eq('job_id', jobId)
+    .eq('type', 'earning')
+    .limit(1);
+
+  if (existingEntries && existingEntries.length > 0) {
+    console.log(`Ledger: Entries already exist for job ${jobId}, skipping`);
+    return;
+  }
+
+  // Fetch all team member assignments for this job
+  const { data: assignments } = await supabase
+    .from('job_team_assignments')
+    .select('team_member_id, is_primary, incentive_amount')
+    .eq('job_id', jobId);
+
+  // Build list of team members assigned to this job
+  let teamMemberIds = [];
+  if (assignments && assignments.length > 0) {
+    teamMemberIds = assignments.map(a => a.team_member_id);
+  } else if (job.team_member_id) {
+    teamMemberIds = [job.team_member_id];
+  }
+
+  if (teamMemberIds.length === 0) {
+    console.log(`Ledger: No team members assigned to job ${jobId}, skipping`);
+    return;
+  }
+
+  // Fetch team member pay configuration
+  const { data: teamMembers } = await supabase
+    .from('team_members')
+    .select('id, first_name, last_name, hourly_rate, commission_percentage, role')
+    .in('id', teamMemberIds);
+
+  if (!teamMembers || teamMembers.length === 0) return;
+
+  const memberCount = teamMembers.length;
+  const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0] : new Date().toISOString().split('T')[0];
+
+  // Calculate job revenue (same logic as payroll endpoint)
+  const jobRevenue = parseFloat(job.total_amount) || parseFloat(job.total) || parseFloat(job.price) || parseFloat(job.service_price) || 0;
+
+  // Calculate hours worked
+  let hoursWorked = 0;
+  if (job.hours_worked) {
+    hoursWorked = parseFloat(job.hours_worked);
+  } else if (job.duration) {
+    hoursWorked = parseFloat(job.duration) / 60;
+  } else if (job.estimated_duration) {
+    hoursWorked = parseFloat(job.estimated_duration) / 60;
+  }
+
+  const ledgerEntries = [];
+
+  for (const member of teamMembers) {
+    // Calculate earning based on pay type
+    let earningAmount = 0;
+    const hourlyRate = parseFloat(member.hourly_rate) || 0;
+    const commissionPct = parseFloat(member.commission_percentage) || 0;
+
+    if (hourlyRate > 0 && commissionPct > 0) {
+      // Hybrid: both hourly + commission
+      const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
+      const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
+      earningAmount = hourlyPay + commissionPay;
+    } else if (commissionPct > 0) {
+      // Commission only
+      earningAmount = (jobRevenue / memberCount) * (commissionPct / 100);
+    } else if (hourlyRate > 0) {
+      // Hourly only
+      earningAmount = (hoursWorked / memberCount) * hourlyRate;
+    } else {
+      // No pay config - use equal split of service_price as fallback
+      earningAmount = (parseFloat(job.service_price) || jobRevenue) / memberCount;
+    }
+
+    earningAmount = parseFloat(earningAmount.toFixed(2));
+
+    if (earningAmount > 0) {
+      ledgerEntries.push({
+        user_id: userId,
+        team_member_id: member.id,
+        job_id: jobId,
+        type: 'earning',
+        amount: earningAmount,
+        effective_date: effectiveDate,
+        note: `Earning for job #${jobId}`,
+        metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+        created_by: userId
+      });
+    }
+
+    // Tips (split equally)
+    const tipAmount = parseFloat(job.tip_amount) || 0;
+    if (tipAmount > 0) {
+      const memberTip = parseFloat((tipAmount / memberCount).toFixed(2));
+      if (memberTip > 0) {
+        ledgerEntries.push({
+          user_id: userId,
+          team_member_id: member.id,
+          job_id: jobId,
+          type: 'tip',
+          amount: memberTip,
+          effective_date: effectiveDate,
+          note: `Tip for job #${jobId}`,
+          created_by: userId
+        });
+      }
+    }
+
+    // Incentives (check assignment-level first, then job-level split)
+    const assignmentRecord = assignments?.find(a => a.team_member_id === member.id);
+    let incentiveAmount = 0;
+    if (assignmentRecord && parseFloat(assignmentRecord.incentive_amount) > 0) {
+      incentiveAmount = parseFloat(assignmentRecord.incentive_amount);
+    } else {
+      const jobIncentive = parseFloat(job.incentive_amount) || 0;
+      if (jobIncentive > 0) {
+        incentiveAmount = parseFloat((jobIncentive / memberCount).toFixed(2));
+      }
+    }
+    if (incentiveAmount > 0) {
+      ledgerEntries.push({
+        user_id: userId,
+        team_member_id: member.id,
+        job_id: jobId,
+        type: 'incentive',
+        amount: incentiveAmount,
+        effective_date: effectiveDate,
+        note: `Incentive for job #${jobId}`,
+        created_by: userId
+      });
+    }
+
+    // Cash collected by cleaner (negative entry - reduces company payout)
+    const paymentMethod = (job.payment_method || '').toLowerCase();
+    if (paymentMethod.includes('cash')) {
+      // If paid by cash, the cleaner collected the job total from the customer
+      const cashCollected = parseFloat(job.total_amount) || parseFloat(job.total) || parseFloat(job.price) || 0;
+      if (cashCollected > 0) {
+        const memberCashShare = parseFloat((cashCollected / memberCount).toFixed(2));
+        ledgerEntries.push({
+          user_id: userId,
+          team_member_id: member.id,
+          job_id: jobId,
+          type: 'cash_collected',
+          amount: -memberCashShare,
+          effective_date: effectiveDate,
+          note: `Cash collected from customer for job #${jobId}`,
+          metadata: { total_cash: cashCollected, payment_method: job.payment_method },
+          created_by: userId
+        });
+      }
+    }
+  }
+
+  // Batch insert all ledger entries
+  if (ledgerEntries.length > 0) {
+    const { error: insertError } = await supabase
+      .from('cleaner_ledger')
+      .insert(ledgerEntries);
+
+    if (insertError) {
+      console.error('Ledger: Error inserting entries for job', jobId, insertError);
+    } else {
+      console.log(`Ledger: Created ${ledgerEntries.length} entries for job ${jobId}`);
+    }
+  }
+}
+
+// === LEDGER API ENDPOINTS ===
+
+// GET /api/ledger/balance/:teamMemberId - Get cleaner financial summary
+app.get('/api/ledger/balance/:teamMemberId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId } = req.params;
+
+    // Fetch all ledger entries for this cleaner (no payout batch filter - sum ALL)
+    const { data: entries, error } = await supabase
+      .from('cleaner_ledger')
+      .select('type, amount, payout_batch_id')
+      .eq('user_id', userId)
+      .eq('team_member_id', teamMemberId);
+
+    if (error) {
+      console.error('Ledger balance error:', error);
+      return res.status(500).json({ error: 'Failed to fetch ledger balance' });
+    }
+
+    const summary = {
+      current_balance: 0,
+      unpaid_earnings: 0,
+      unpaid_tips: 0,
+      unpaid_incentives: 0,
+      unpaid_cash_offsets: 0,
+      unpaid_adjustments: 0,
+      total_paid_out: 0
+    };
+
+    for (const entry of (entries || [])) {
+      const amount = parseFloat(entry.amount) || 0;
+      summary.current_balance += amount;
+
+      if (!entry.payout_batch_id) {
+        // Unpaid entries
+        switch (entry.type) {
+          case 'earning': summary.unpaid_earnings += amount; break;
+          case 'tip': summary.unpaid_tips += amount; break;
+          case 'incentive': summary.unpaid_incentives += amount; break;
+          case 'cash_collected': summary.unpaid_cash_offsets += amount; break;
+          case 'adjustment': summary.unpaid_adjustments += amount; break;
+        }
+      }
+      if (entry.type === 'payout') {
+        summary.total_paid_out += Math.abs(amount);
+      }
+    }
+
+    // Round all values
+    for (const key of Object.keys(summary)) {
+      summary[key] = parseFloat(summary[key].toFixed(2));
+    }
+
+    // Get last payout date
+    const { data: lastPayout } = await supabase
+      .from('cleaner_payout_batch')
+      .select('paid_at')
+      .eq('user_id', userId)
+      .eq('team_member_id', teamMemberId)
+      .eq('status', 'paid')
+      .order('paid_at', { ascending: false })
+      .limit(1);
+
+    summary.last_payout_date = lastPayout?.[0]?.paid_at || null;
+
+    // Get payout schedule
+    const { data: memberData } = await supabase
+      .from('team_members')
+      .select('payout_schedule_type, payout_day_of_week, payout_interval_days')
+      .eq('id', teamMemberId)
+      .single();
+
+    summary.payout_schedule = memberData?.payout_schedule_type || 'manual';
+    summary.payout_day_of_week = memberData?.payout_day_of_week || null;
+
+    res.json(summary);
+  } catch (error) {
+    console.error('Ledger balance error:', error);
+    res.status(500).json({ error: 'Failed to calculate balance' });
+  }
+});
+
+// GET /api/ledger/balances - Get all cleaners' balances summary
+app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Fetch all ledger entries for this business
+    const { data: entries, error } = await supabase
+      .from('cleaner_ledger')
+      .select('team_member_id, type, amount, payout_batch_id')
+      .eq('user_id', userId);
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to fetch ledger data' });
+    }
+
+    // Fetch team members
+    const { data: teamMembers } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, role, payout_schedule_type')
+      .eq('user_id', userId)
+      .eq('status', 'active');
+
+    // Build per-member summaries
+    const memberMap = {};
+    for (const tm of (teamMembers || [])) {
+      memberMap[tm.id] = {
+        team_member_id: tm.id,
+        name: `${tm.first_name || ''} ${tm.last_name || ''}`.trim(),
+        role: tm.role,
+        payout_schedule: tm.payout_schedule_type || 'manual',
+        current_balance: 0,
+        unpaid_earnings: 0,
+        unpaid_tips: 0,
+        unpaid_incentives: 0,
+        unpaid_cash_offsets: 0,
+        unpaid_adjustments: 0
+      };
+    }
+
+    for (const entry of (entries || [])) {
+      const mid = entry.team_member_id;
+      if (!memberMap[mid]) continue;
+      const amount = parseFloat(entry.amount) || 0;
+      memberMap[mid].current_balance += amount;
+
+      if (!entry.payout_batch_id) {
+        switch (entry.type) {
+          case 'earning': memberMap[mid].unpaid_earnings += amount; break;
+          case 'tip': memberMap[mid].unpaid_tips += amount; break;
+          case 'incentive': memberMap[mid].unpaid_incentives += amount; break;
+          case 'cash_collected': memberMap[mid].unpaid_cash_offsets += amount; break;
+          case 'adjustment': memberMap[mid].unpaid_adjustments += amount; break;
+        }
+      }
+    }
+
+    // Round and return
+    const balances = Object.values(memberMap).map(m => {
+      for (const key of ['current_balance', 'unpaid_earnings', 'unpaid_tips', 'unpaid_incentives', 'unpaid_cash_offsets', 'unpaid_adjustments']) {
+        m[key] = parseFloat(m[key].toFixed(2));
+      }
+      return m;
+    });
+
+    res.json(balances);
+  } catch (error) {
+    console.error('Ledger balances error:', error);
+    res.status(500).json({ error: 'Failed to fetch balances' });
+  }
+});
+
+// GET /api/ledger/entries - List ledger entries with filters
+app.get('/api/ledger/entries', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, startDate, endDate, type, payoutStatus, jobId, page = 1, limit = 50 } = req.query;
+
+    let query = supabase
+      .from('cleaner_ledger')
+      .select('*, team_members!inner(first_name, last_name)', { count: 'exact' })
+      .eq('user_id', userId)
+      .order('effective_date', { ascending: false })
+      .order('created_at', { ascending: false });
+
+    if (teamMemberId) query = query.eq('team_member_id', teamMemberId);
+    if (startDate) query = query.gte('effective_date', startDate);
+    if (endDate) query = query.lte('effective_date', endDate);
+    if (type) query = query.eq('type', type);
+    if (jobId) query = query.eq('job_id', jobId);
+
+    if (payoutStatus === 'unpaid') {
+      query = query.is('payout_batch_id', null);
+    } else if (payoutStatus === 'paid') {
+      query = query.not('payout_batch_id', 'is', null);
+    }
+
+    // Pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query = query.range(offset, offset + parseInt(limit) - 1);
+
+    const { data: entries, error, count } = await query;
+
+    if (error) {
+      console.error('Ledger entries error:', error);
+      return res.status(500).json({ error: 'Failed to fetch ledger entries' });
+    }
+
+    res.json({
+      entries: entries || [],
+      total: count || 0,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      totalPages: Math.ceil((count || 0) / parseInt(limit))
+    });
+  } catch (error) {
+    console.error('Ledger entries error:', error);
+    res.status(500).json({ error: 'Failed to fetch ledger entries' });
+  }
+});
+
+// POST /api/ledger/adjustment - Create manual adjustment
+app.post('/api/ledger/adjustment', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, jobId, amount, note } = req.body;
+
+    if (!teamMemberId || amount === undefined || amount === null) {
+      return res.status(400).json({ error: 'teamMemberId and amount are required' });
+    }
+    if (!note || !note.trim()) {
+      return res.status(400).json({ error: 'A note/reason is required for adjustments' });
+    }
+
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount === 0) {
+      return res.status(400).json({ error: 'Amount must be a non-zero number' });
+    }
+
+    const effectiveDate = new Date().toISOString().split('T')[0];
+
+    const { data: entry, error } = await supabase
+      .from('cleaner_ledger')
+      .insert({
+        user_id: userId,
+        team_member_id: parseInt(teamMemberId),
+        job_id: jobId ? parseInt(jobId) : null,
+        type: 'adjustment',
+        amount: parsedAmount,
+        effective_date: effectiveDate,
+        note: note.trim(),
+        metadata: { manual: true },
+        created_by: userId
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Adjustment creation error:', error);
+      return res.status(500).json({ error: 'Failed to create adjustment' });
+    }
+
+    res.json(entry);
+  } catch (error) {
+    console.error('Adjustment error:', error);
+    res.status(500).json({ error: 'Failed to create adjustment' });
+  }
+});
+
+// POST /api/ledger/cash-collected - Record cash collected by cleaner
+app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, jobId, amount, note } = req.body;
+
+    if (!teamMemberId || !amount) {
+      return res.status(400).json({ error: 'teamMemberId and amount are required' });
+    }
+
+    const parsedAmount = Math.abs(parseFloat(amount));
+    if (isNaN(parsedAmount) || parsedAmount === 0) {
+      return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+
+    const effectiveDate = new Date().toISOString().split('T')[0];
+
+    const { data: entry, error } = await supabase
+      .from('cleaner_ledger')
+      .insert({
+        user_id: userId,
+        team_member_id: parseInt(teamMemberId),
+        job_id: jobId ? parseInt(jobId) : null,
+        type: 'cash_collected',
+        amount: -parsedAmount, // Negative: cleaner already has this money
+        effective_date: effectiveDate,
+        note: note || 'Cash collected from customer',
+        metadata: { manual: true },
+        created_by: userId
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Cash collected error:', error);
+      return res.status(500).json({ error: 'Failed to record cash collection' });
+    }
+
+    res.json(entry);
+  } catch (error) {
+    console.error('Cash collected error:', error);
+    res.status(500).json({ error: 'Failed to record cash collection' });
+  }
+});
+
+// === PAYOUT BATCH ENDPOINTS ===
+
+// POST /api/ledger/payout-batch - Create payout batch for a cleaner
+app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, periodStart, periodEnd, note } = req.body;
+
+    if (!teamMemberId || !periodStart || !periodEnd) {
+      return res.status(400).json({ error: 'teamMemberId, periodStart, and periodEnd are required' });
+    }
+
+    // Fetch unpaid ledger entries in the period
+    const { data: unpaidEntries, error: fetchError } = await supabase
+      .from('cleaner_ledger')
+      .select('id, amount, type')
+      .eq('user_id', userId)
+      .eq('team_member_id', teamMemberId)
+      .is('payout_batch_id', null)
+      .gte('effective_date', periodStart)
+      .lte('effective_date', periodEnd)
+      .neq('type', 'payout'); // Don't include previous payout entries
+
+    if (fetchError) {
+      console.error('Payout batch fetch error:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch unpaid entries' });
+    }
+
+    if (!unpaidEntries || unpaidEntries.length === 0) {
+      return res.status(400).json({ error: 'No unpaid entries found for this period' });
+    }
+
+    // Calculate total
+    const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+    const roundedTotal = parseFloat(totalAmount.toFixed(2));
+
+    // Create payout batch
+    const { data: batch, error: batchError } = await supabase
+      .from('cleaner_payout_batch')
+      .insert({
+        user_id: userId,
+        team_member_id: parseInt(teamMemberId),
+        period_start: periodStart,
+        period_end: periodEnd,
+        status: 'pending',
+        total_amount: roundedTotal,
+        note: note || null,
+        created_by: userId
+      })
+      .select()
+      .single();
+
+    if (batchError) {
+      console.error('Payout batch creation error:', batchError);
+      return res.status(500).json({ error: 'Failed to create payout batch' });
+    }
+
+    // Attach ledger entries to this batch
+    const entryIds = unpaidEntries.map(e => e.id);
+    const { error: attachError } = await supabase
+      .from('cleaner_ledger')
+      .update({ payout_batch_id: batch.id })
+      .in('id', entryIds);
+
+    if (attachError) {
+      console.error('Payout batch attach error:', attachError);
+      // Rollback: delete the batch
+      await supabase.from('cleaner_payout_batch').delete().eq('id', batch.id);
+      return res.status(500).json({ error: 'Failed to attach entries to batch' });
+    }
+
+    res.json({
+      ...batch,
+      entry_count: entryIds.length,
+      entries_summary: {
+        earnings: unpaidEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
+        tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
+        incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
+        cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
+        adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
+      }
+    });
+  } catch (error) {
+    console.error('Payout batch error:', error);
+    res.status(500).json({ error: 'Failed to create payout batch' });
+  }
+});
+
+// PATCH /api/ledger/payout-batch/:id/pay - Mark payout batch as paid
+app.patch('/api/ledger/payout-batch/:id/pay', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { note } = req.body;
+
+    // Fetch the batch
+    const { data: batch, error: fetchError } = await supabase
+      .from('cleaner_payout_batch')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchError || !batch) {
+      return res.status(404).json({ error: 'Payout batch not found' });
+    }
+
+    if (batch.status === 'paid') {
+      return res.status(400).json({ error: 'Batch is already paid' });
+    }
+    if (batch.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot pay a cancelled batch' });
+    }
+
+    const paidAt = new Date().toISOString();
+
+    // Create payout ledger entry (negative amount - settling the balance)
+    const { error: payoutEntryError } = await supabase
+      .from('cleaner_ledger')
+      .insert({
+        user_id: userId,
+        team_member_id: batch.team_member_id,
+        job_id: null,
+        type: 'payout',
+        amount: -Math.abs(batch.total_amount), // Negative: money paid out
+        effective_date: paidAt.split('T')[0],
+        note: note || `Payout batch #${batch.id} settled`,
+        metadata: { payout_batch_id: batch.id },
+        payout_batch_id: batch.id,
+        created_by: userId
+      });
+
+    if (payoutEntryError) {
+      console.error('Payout entry error:', payoutEntryError);
+      return res.status(500).json({ error: 'Failed to create payout entry' });
+    }
+
+    // Mark batch as paid
+    const { data: updatedBatch, error: updateError } = await supabase
+      .from('cleaner_payout_batch')
+      .update({
+        status: 'paid',
+        paid_at: paidAt,
+        note: note || batch.note
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Payout batch update error:', updateError);
+      return res.status(500).json({ error: 'Failed to mark batch as paid' });
+    }
+
+    res.json(updatedBatch);
+  } catch (error) {
+    console.error('Payout batch pay error:', error);
+    res.status(500).json({ error: 'Failed to mark batch as paid' });
+  }
+});
+
+// PATCH /api/ledger/payout-batch/:id/cancel - Cancel payout batch
+app.patch('/api/ledger/payout-batch/:id/cancel', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: batch, error: fetchError } = await supabase
+      .from('cleaner_payout_batch')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchError || !batch) {
+      return res.status(404).json({ error: 'Payout batch not found' });
+    }
+
+    if (batch.status === 'paid') {
+      return res.status(400).json({ error: 'Cannot cancel a paid batch' });
+    }
+
+    // Detach ledger entries from this batch
+    const { error: detachError } = await supabase
+      .from('cleaner_ledger')
+      .update({ payout_batch_id: null })
+      .eq('payout_batch_id', parseInt(id))
+      .neq('type', 'payout'); // Don't detach the payout entry itself
+
+    if (detachError) {
+      console.error('Detach error:', detachError);
+    }
+
+    // Delete any payout-type ledger entries for this batch
+    await supabase
+      .from('cleaner_ledger')
+      .delete()
+      .eq('payout_batch_id', parseInt(id))
+      .eq('type', 'payout');
+
+    // Mark batch as cancelled
+    const { data: updatedBatch, error: updateError } = await supabase
+      .from('cleaner_payout_batch')
+      .update({ status: 'cancelled' })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({ error: 'Failed to cancel batch' });
+    }
+
+    res.json(updatedBatch);
+  } catch (error) {
+    console.error('Payout batch cancel error:', error);
+    res.status(500).json({ error: 'Failed to cancel batch' });
+  }
+});
+
+// GET /api/ledger/payout-batches - List payout batches
+app.get('/api/ledger/payout-batches', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, status, page = 1, limit = 20 } = req.query;
+
+    let query = supabase
+      .from('cleaner_payout_batch')
+      .select('*, team_members!inner(first_name, last_name)', { count: 'exact' })
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (teamMemberId) query = query.eq('team_member_id', teamMemberId);
+    if (status) query = query.eq('status', status);
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    query = query.range(offset, offset + parseInt(limit) - 1);
+
+    const { data: batches, error, count } = await query;
+
+    if (error) {
+      console.error('Payout batches list error:', error);
+      return res.status(500).json({ error: 'Failed to fetch payout batches' });
+    }
+
+    res.json({
+      batches: batches || [],
+      total: count || 0,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    });
+  } catch (error) {
+    console.error('Payout batches error:', error);
+    res.status(500).json({ error: 'Failed to fetch payout batches' });
+  }
+});
+
+// GET /api/ledger/payout-batch/:id - Get payout batch detail with entries
+app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: batch, error: batchError } = await supabase
+      .from('cleaner_payout_batch')
+      .select('*, team_members!inner(first_name, last_name)')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (batchError || !batch) {
+      return res.status(404).json({ error: 'Payout batch not found' });
+    }
+
+    // Fetch entries in this batch
+    const { data: entries, error: entriesError } = await supabase
+      .from('cleaner_ledger')
+      .select('*')
+      .eq('payout_batch_id', id)
+      .order('effective_date', { ascending: true });
+
+    if (entriesError) {
+      console.error('Payout batch entries error:', entriesError);
+    }
+
+    res.json({
+      ...batch,
+      entries: entries || []
+    });
+  } catch (error) {
+    console.error('Payout batch detail error:', error);
+    res.status(500).json({ error: 'Failed to fetch payout batch' });
+  }
+});
+
+// POST /api/ledger/backfill - Backfill ledger entries for existing completed jobs
+app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { startDate, endDate, dryRun = false } = req.body;
+
+    // Fetch completed jobs that don't have ledger entries yet
+    let query = supabase
+      .from('jobs')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('status', 'completed');
+
+    if (startDate) query = query.gte('scheduled_date', startDate);
+    if (endDate) query = query.lte('scheduled_date', endDate);
+
+    const { data: jobs, error: jobsError } = await query;
+
+    if (jobsError) {
+      return res.status(500).json({ error: 'Failed to fetch jobs' });
+    }
+
+    // Check which jobs already have ledger entries
+    const jobIds = (jobs || []).map(j => j.id);
+    if (jobIds.length === 0) {
+      return res.json({ message: 'No completed jobs found', processed: 0, skipped: 0 });
+    }
+
+    const { data: existingLedgerJobs } = await supabase
+      .from('cleaner_ledger')
+      .select('job_id')
+      .eq('user_id', userId)
+      .eq('type', 'earning')
+      .in('job_id', jobIds);
+
+    const existingJobIds = new Set((existingLedgerJobs || []).map(e => e.job_id));
+    const jobsToProcess = jobIds.filter(id => !existingJobIds.has(id));
+
+    if (dryRun) {
+      return res.json({
+        message: 'Dry run complete',
+        total_completed_jobs: jobIds.length,
+        already_have_entries: existingJobIds.size,
+        would_process: jobsToProcess.length
+      });
+    }
+
+    let processed = 0;
+    let errors = 0;
+
+    for (const jobId of jobsToProcess) {
+      try {
+        await createLedgerEntriesForCompletedJob(jobId, userId);
+        processed++;
+      } catch (err) {
+        console.error(`Backfill error for job ${jobId}:`, err);
+        errors++;
+      }
+    }
+
+    res.json({
+      message: 'Backfill complete',
+      total_completed_jobs: jobIds.length,
+      already_had_entries: existingJobIds.size,
+      processed,
+      errors
+    });
+  } catch (error) {
+    console.error('Backfill error:', error);
+    res.status(500).json({ error: 'Failed to backfill ledger' });
+  }
+});
+
+// PATCH /api/team-members/:id/payout-preferences - Update payout preferences
+app.patch('/api/team-members/:id/payout-preferences', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { payoutScheduleType, payoutDayOfWeek, payoutIntervalDays } = req.body;
+
+    const updateData = {};
+    if (payoutScheduleType) updateData.payout_schedule_type = payoutScheduleType;
+    if (payoutDayOfWeek !== undefined) updateData.payout_day_of_week = payoutDayOfWeek;
+    if (payoutIntervalDays !== undefined) updateData.payout_interval_days = payoutIntervalDays;
+
+    const { data, error } = await supabase
+      .from('team_members')
+      .update(updateData)
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select('id, payout_schedule_type, payout_day_of_week, payout_interval_days')
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to update payout preferences' });
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Payout preferences error:', error);
+    res.status(500).json({ error: 'Failed to update payout preferences' });
+  }
+});
+
+// ============================================================
+// END CLEANER LEDGER SYSTEM
+// ============================================================
 
 // Google Geocoding API proxy endpoint for address validation fallback
 
