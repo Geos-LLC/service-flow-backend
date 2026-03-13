@@ -32347,12 +32347,11 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate, dryRun = false } = req.body;
 
-    // Fetch completed jobs that don't have ledger entries yet
+    // Fetch all non-cancelled jobs (matching payroll logic, not just 'completed')
     let query = supabase
       .from('jobs')
-      .select('id')
-      .eq('user_id', userId)
-      .eq('status', 'completed');
+      .select('id, status')
+      .eq('user_id', userId);
 
     if (startDate) query = query.gte('scheduled_date', startDate);
     if (endDate) query = query.lte('scheduled_date', endDate);
@@ -32363,26 +32362,33 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch jobs' });
     }
 
-    // Check which jobs already have ledger entries
-    const jobIds = (jobs || []).map(j => j.id);
+    // Exclude cancelled jobs (same filter as payroll endpoint)
+    const cancelledStatuses = ['cancelled', 'canceled', 'cancel'];
+    const validJobs = (jobs || []).filter(j => !cancelledStatuses.includes((j.status || '').toLowerCase()));
+    const jobIds = validJobs.map(j => j.id);
     if (jobIds.length === 0) {
-      return res.json({ message: 'No completed jobs found', processed: 0, skipped: 0 });
+      return res.json({ message: 'No jobs found to process', processed: 0, skipped: 0 });
     }
 
-    const { data: existingLedgerJobs } = await supabase
-      .from('cleaner_ledger')
-      .select('job_id')
-      .eq('user_id', userId)
-      .eq('type', 'earning')
-      .in('job_id', jobIds);
+    // Check which jobs already have ledger entries (batch in chunks to avoid Supabase .in() URL limit)
+    const existingJobIds = new Set();
+    for (let i = 0; i < jobIds.length; i += 200) {
+      const chunk = jobIds.slice(i, i + 200);
+      const { data: existingLedgerJobs } = await supabase
+        .from('cleaner_ledger')
+        .select('job_id')
+        .eq('user_id', userId)
+        .eq('type', 'earning')
+        .in('job_id', chunk);
+      (existingLedgerJobs || []).forEach(e => existingJobIds.add(e.job_id));
+    }
 
-    const existingJobIds = new Set((existingLedgerJobs || []).map(e => e.job_id));
     const jobsToProcess = jobIds.filter(id => !existingJobIds.has(id));
 
     if (dryRun) {
       return res.json({
         message: 'Dry run complete',
-        total_completed_jobs: jobIds.length,
+        total_jobs: jobIds.length,
         already_have_entries: existingJobIds.size,
         would_process: jobsToProcess.length
       });
@@ -32403,7 +32409,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
 
     res.json({
       message: 'Backfill complete',
-      total_completed_jobs: jobIds.length,
+      total_jobs: jobIds.length,
       already_had_entries: existingJobIds.size,
       processed,
       errors
