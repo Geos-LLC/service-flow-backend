@@ -21,9 +21,11 @@
     ],
     "author": "serviceflow Development Team",
     "license": "MIT",
+    "optionalDependencies": {
+        "@geos/loghub-client": "file:../../geos-loghub-client"
+    },
     "dependencies": {
         "@ffmpeg-installer/ffmpeg": "^1.1.0",
-        "@geos/loghub-client": "file:../../geos-loghub-client",
         "@sendgrid/mail": "^8.1.5",
         "@supabase/supabase-js": "^2.56.0",
         "axios": "^1.11.0",

@@ -1,4 +1,9 @@
-const { loghubLog } = require('@geos/loghub-client');
+let loghubLog;
+try {
+  loghubLog = require('@geos/loghub-client').loghubLog;
+} catch {
+  loghubLog = () => {};
+}
 
 const SERVICE = 'service-flow-backend';
 const APP = 'service-flow';
