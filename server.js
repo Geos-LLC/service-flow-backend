@@ -19887,9 +19887,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     Object.values(allJobsById).forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
-      const taxes = parseFloat(job.taxes) || 0;
-      const rev = Math.max(0, grossPrice - taxes);
+      // Revenue = Subtotal (service_price) on the job card
+      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
       totalBusinessRevenue += rev;
       if (rev > 0) {
         revenueJobsList.push({
@@ -31621,10 +31620,8 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const memberCount = teamMembers.length;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0] : new Date().toISOString().split('T')[0];
 
-  // Calculate job revenue (matching payroll endpoint: grossPrice - taxes)
-  const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || 0;
-  const taxes = parseFloat(job.taxes) || 0;
-  const jobRevenue = Math.max(0, grossPrice - taxes);
+  // Revenue = Subtotal (service_price) on the job card
+  const jobRevenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || 0;
 
   // Calculate hours worked
   let hoursWorked = 0;
@@ -32525,9 +32522,9 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     revenueData.forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (cancelledStatuses2.includes(s)) return;
-      const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || 0;
-      const taxes = parseFloat(job.taxes) || 0;
-      totalBusinessRevenue += Math.max(0, grossPrice - taxes);
+      // Revenue = Subtotal (service_price) on the job card
+      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || 0;
+      totalBusinessRevenue += rev;
     });
 
     // ── Manager daily salary + commission backfill ──
