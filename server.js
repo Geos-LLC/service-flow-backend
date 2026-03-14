@@ -31569,7 +31569,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   // Fetch job details
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, tip_amount, incentive_amount, payment_method, hours_worked, duration, estimated_duration, scheduled_date, discount, additional_fees, taxes')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, payment_method, hours_worked, duration, estimated_duration, scheduled_date, discount, additional_fees, taxes')
     .eq('id', jobId)
     .single();
 
@@ -31621,8 +31621,8 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const memberCount = teamMembers.length;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0] : new Date().toISOString().split('T')[0];
 
-  // Revenue = Subtotal (service_price) on the job card
-  const jobRevenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || 0;
+  // Revenue = Subtotal (service_price) on the job card (same fallback order as payroll)
+  const jobRevenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
 
   // Calculate hours worked
   let hoursWorked = 0;
@@ -31645,7 +31645,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     // Managers: skip per-job EARNINGS (salary + commission handled in backfill)
     // but still get tips/incentives below
     if (!isManager) {
-    let earningAmount;
+    let earningAmount = 0;
     if (hourlyRate > 0 && commissionPct > 0) {
       const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
       const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
@@ -31654,9 +31654,9 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
     } else if (hourlyRate > 0) {
       earningAmount = parseFloat(((hoursWorked / memberCount) * hourlyRate).toFixed(2));
-    } else {
-      earningAmount = parseFloat(((parseFloat(job.service_price) || jobRevenue) / memberCount).toFixed(2));
     }
+    // No fallback: if worker has no hourly rate and no commission, earning = $0
+    // (matches payroll calculation which gives hourlySalary=0 + commission=0)
 
     if (earningAmount > 0) {
       ledgerEntries.push({
@@ -31896,8 +31896,8 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       const amount = parseFloat(entry.amount) || 0;
       memberMap[mid].current_balance += amount;
 
-      // Count unique jobs
-      if (entry.job_id && entry.type === 'earning') {
+      // Count unique jobs (from any entry type, not just earning)
+      if (entry.job_id) {
         memberMap[mid]._jobIds.add(entry.job_id);
       }
 
@@ -32367,144 +32367,6 @@ app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
 
 const formatCurrency2 = (n) => `$${parseFloat(n).toFixed(2)}`;
 
-// POST /api/jobs/migrate-csv-fields - Migrate service_price from sub_total_number and tip_amount from tip_number
-// This fixes historical imports where sub_total_number was never stored
-app.post('/api/jobs/migrate-csv-fields', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { csvData, dryRun = false } = req.body;
-    // csvData should be an array of { _id, sub_total_number, tip_number } objects
-
-    if (!csvData || !Array.isArray(csvData) || csvData.length === 0) {
-      return res.status(400).json({ error: 'csvData array is required' });
-    }
-
-    console.log(`📦 Migration: Processing ${csvData.length} CSV rows, dryRun=${dryRun}`);
-
-    // Build a map of _id -> { subTotal, tip }
-    const csvMap = new Map();
-    for (const row of csvData) {
-      const id = String(row._id || '').trim();
-      if (id) {
-        csvMap.set(id, {
-          subTotal: parseFloat(row.sub_total_number) || 0,
-          tip: parseFloat(row.tip_number) || 0
-        });
-      }
-    }
-    console.log(`📦 Migration: Built CSV map with ${csvMap.size} entries`);
-
-    // Fetch all jobs for this user with pagination
-    let allJobs = [];
-    let offset = 0;
-    const chunkSize = 1000;
-    while (true) {
-      const { data: chunk, error } = await supabase
-        .from('jobs')
-        .select('id, contact_info, service_price, tip_amount')
-        .eq('user_id', userId)
-        .range(offset, offset + chunkSize - 1);
-      if (error) {
-        console.error('Migration job fetch error:', error);
-        return res.status(500).json({ error: 'Failed to fetch jobs' });
-      }
-      if (!chunk || chunk.length === 0) break;
-      allJobs = allJobs.concat(chunk);
-      if (chunk.length < chunkSize) break;
-      offset += chunkSize;
-    }
-    console.log(`📦 Migration: Fetched ${allJobs.length} jobs from database`);
-
-    let matched = 0;
-    let updated = 0;
-    let skipped = 0;
-    let servicePriceChanges = 0;
-    let tipChanges = 0;
-    const changes = [];
-
-    for (const job of allJobs) {
-      // Extract _id from contact_info
-      let contactInfo = job.contact_info;
-      if (typeof contactInfo === 'string') {
-        try { contactInfo = JSON.parse(contactInfo); } catch (e) { contactInfo = {}; }
-      }
-      const jobExternalId = contactInfo?._id || contactInfo?.external_id || '';
-      if (!jobExternalId || !csvMap.has(jobExternalId)) {
-        skipped++;
-        continue;
-      }
-
-      matched++;
-      const csvRow = csvMap.get(jobExternalId);
-      const currentServicePrice = parseFloat(job.service_price) || 0;
-      const currentTip = parseFloat(job.tip_amount) || 0;
-      const newServicePrice = csvRow.subTotal;
-      const newTip = csvRow.tip;
-
-      // Only update if values differ
-      const servicePriceDiff = Math.abs(currentServicePrice - newServicePrice) > 0.001;
-      const tipDiff = Math.abs(currentTip - newTip) > 0.001;
-
-      if (!servicePriceDiff && !tipDiff) {
-        continue; // No changes needed
-      }
-
-      const updateObj = {};
-      if (servicePriceDiff && newServicePrice > 0) {
-        updateObj.service_price = newServicePrice;
-        servicePriceChanges++;
-      }
-      if (tipDiff && newTip > 0) {
-        updateObj.tip_amount = newTip;
-        tipChanges++;
-      }
-
-      if (Object.keys(updateObj).length === 0) continue;
-
-      changes.push({
-        jobId: job.id,
-        externalId: jobExternalId,
-        oldServicePrice: currentServicePrice,
-        newServicePrice: servicePriceDiff ? newServicePrice : currentServicePrice,
-        oldTip: currentTip,
-        newTip: tipDiff ? newTip : currentTip
-      });
-
-      if (!dryRun) {
-        const { error: updateError } = await supabase
-          .from('jobs')
-          .update(updateObj)
-          .eq('id', job.id);
-
-        if (updateError) {
-          console.error(`Migration update error for job ${job.id}:`, updateError);
-        } else {
-          updated++;
-        }
-      } else {
-        updated++;
-      }
-    }
-
-    console.log(`📦 Migration complete: ${matched} matched, ${updated} updated, ${skipped} skipped, ${servicePriceChanges} service_price changes, ${tipChanges} tip changes`);
-
-    res.json({
-      totalJobs: allJobs.length,
-      csvRows: csvData.length,
-      matched,
-      updated,
-      skipped,
-      servicePriceChanges,
-      tipChanges,
-      dryRun,
-      changes: changes.slice(0, 50) // Show first 50 changes for review
-    });
-  } catch (error) {
-    console.error('Migration error:', error);
-    res.status(500).json({ error: 'Migration failed: ' + error.message });
-  }
-});
-
 // In-memory backfill progress tracker
 const backfillProgress = {};
 const backfillCancel = {};
@@ -32653,7 +32515,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       const chunk = revenueJobIds.slice(i, i + 200);
       const { data: revJobs } = await supabase
         .from('jobs')
-        .select('id, price, total, service_price, total_amount, taxes, status')
+        .select('id, price, total, service_price, total_amount, invoice_amount, taxes, status')
         .in('id', chunk);
       revenueData = revenueData.concat(revJobs || []);
     }
@@ -32661,8 +32523,8 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     revenueData.forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (cancelledStatuses2.includes(s)) return;
-      // Revenue = Subtotal (service_price) on the job card
-      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || 0;
+      // Revenue = Subtotal (service_price) on the job card (same fallback as payroll)
+      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
       totalBusinessRevenue += rev;
     });
 
