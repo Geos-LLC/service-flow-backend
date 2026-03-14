@@ -31777,6 +31777,22 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     // No cash_collected entries (Payroll doesn't have this concept)
   }
 
+  // If no entries were generated for any member, create a $0 earning entry for the first active
+  // member so the job is tracked in the ledger (keeps job count in sync with Payroll)
+  if (ledgerEntries.length === 0 && teamMembers.length > 0) {
+    ledgerEntries.push({
+      user_id: userId,
+      team_member_id: teamMembers[0].id,
+      job_id: jobId,
+      type: 'earning',
+      amount: 0,
+      effective_date: effectiveDate,
+      note: `Earning for job #${jobId}`,
+      metadata: { hours: 0, hourly_rate: 0, commission_pct: 0, revenue: 0, member_count: memberCount },
+      created_by: userId
+    });
+  }
+
   // Batch insert all ledger entries
   if (ledgerEntries.length > 0) {
     const { error: insertError } = await supabase
