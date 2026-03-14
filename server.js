@@ -32376,20 +32376,29 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       else console.log(`[Backfill] Cleared existing non-payout ledger entries for user ${userId}`);
     }
 
-    // Fetch all non-cancelled jobs (matching payroll logic, not just 'completed')
-    let query = supabase
-      .from('jobs')
-      .select('id, status, scheduled_date')
-      .eq('user_id', userId);
+    // Fetch ALL jobs with pagination (Supabase default limit is 1000)
+    let allJobs = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      let query = supabase
+        .from('jobs')
+        .select('id, status, scheduled_date')
+        .eq('user_id', userId)
+        .range(from, from + pageSize - 1);
 
-    if (startDate) query = query.gte('scheduled_date', startDate);
-    if (endDate) query = query.lte('scheduled_date', endDate);
+      if (startDate) query = query.gte('scheduled_date', startDate);
+      if (endDate) query = query.lte('scheduled_date', endDate);
 
-    const { data: jobs, error: jobsError } = await query;
-
-    if (jobsError) {
-      return res.status(500).json({ error: 'Failed to fetch jobs' });
+      const { data: page, error: pageError } = await query;
+      if (pageError) {
+        return res.status(500).json({ error: 'Failed to fetch jobs' });
+      }
+      allJobs = allJobs.concat(page || []);
+      if (!page || page.length < pageSize) break;
+      from += pageSize;
     }
+    const jobs = allJobs;
 
     // Exclude cancelled jobs (same filter as payroll endpoint)
     const cancelledStatuses = ['cancelled', 'canceled', 'cancel'];
