@@ -58,6 +58,11 @@ if (SENDGRID_API_KEY) {
 }
 console.log('✅ SendGrid from email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
 
+// Single source of truth for job price: servicePrice - discount + additionalFees + taxes
+function calculateJobTotal({ servicePrice = 0, discount = 0, additionalFees = 0, taxes = 0 } = {}) {
+  return (parseFloat(servicePrice) || 0) - (parseFloat(discount) || 0) + (parseFloat(additionalFees) || 0) + (parseFloat(taxes) || 0);
+}
+
 // Helper function to get today's date in local timezone
 const getTodayString = () => {
   const today = new Date();
@@ -4903,10 +4908,9 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
 
         // Calculate overpayment (amount paid beyond total due)
         const svcPrice = parseFloat(job.service_price) || 0;
-        const jobDiscount = parseFloat(job.discount) || 0;
-        const jobFees = parseFloat(job.additional_fees) || 0;
-        const jobTaxes = parseFloat(job.taxes) || 0;
-        const totalDue = svcPrice > 0 ? (svcPrice - jobDiscount + jobFees + jobTaxes) : (parseFloat(job.total) || 0);
+        const totalDue = svcPrice > 0
+          ? calculateJobTotal({ servicePrice: svcPrice, discount: job.discount, additionalFees: job.additional_fees, taxes: job.taxes })
+          : (parseFloat(job.total) || 0);
         let totalPaid = parseFloat(job.total_paid_amount) || 0;
 
         // Fallback: compute total_paid from completed transactions when jobs column is 0/missing
@@ -6843,14 +6847,13 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
         }
         
         // Calculate new total
-        const servicePrice = parseFloat(updateDataToSend.service_price) || 0;
-        const additionalFees = parseFloat(updateDataToSend.additional_fees || currentJob.additional_fees || 0);
-        const taxes = parseFloat(updateDataToSend.taxes || currentJob.taxes || 0);
-        const discount = parseFloat(updateDataToSend.discount || currentJob.discount || 0);
-        
-        // Calculate subtotal first, then apply discount
-        const subtotal = servicePrice + modifierPrice + additionalFees + taxes;
-        const newTotal = subtotal - discount;
+        const servicePrice = (parseFloat(updateDataToSend.service_price) || 0) + modifierPrice;
+        const newTotal = calculateJobTotal({
+          servicePrice,
+          discount: updateDataToSend.discount || currentJob.discount,
+          additionalFees: updateDataToSend.additional_fees || currentJob.additional_fees,
+          taxes: updateDataToSend.taxes || currentJob.taxes
+        });
         
         // Add calculated total to update data
         updateDataToSend.total = newTotal;
@@ -20079,10 +20082,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
             // Calculate overpayment
             const svcPrice = parseFloat(job.service_price) || 0;
-            const disc = parseFloat(job.discount) || 0;
-            const fees = parseFloat(job.additional_fees) || 0;
-            const taxes = parseFloat(job.taxes) || 0;
-            const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
+            const totalDue = svcPrice > 0
+              ? calculateJobTotal({ servicePrice: svcPrice, discount: job.discount, additionalFees: job.additional_fees, taxes: job.taxes })
+              : (parseFloat(job.total) || 0);
             const totalPaid = parseFloat(job.total_paid_amount) || 0;
             const overpayment = Math.max(0, totalPaid - totalDue);
             const overpaymentShare = overpayment / mc;
@@ -31673,10 +31675,9 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   // Overpayment calculation for tips (same as Payroll)
   const svcPrice = parseFloat(job.service_price) || 0;
-  const disc = parseFloat(job.discount) || 0;
-  const fees = parseFloat(job.additional_fees) || 0;
-  const taxes = parseFloat(job.taxes) || 0;
-  const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
+  const totalDue = svcPrice > 0
+    ? calculateJobTotal({ servicePrice: svcPrice, discount: job.discount, additionalFees: job.additional_fees, taxes: job.taxes })
+    : (parseFloat(job.total) || 0);
   // Fetch total_paid_amount separately (column may not exist in main select — same approach as Payroll)
   let totalPaid = 0;
   try {
