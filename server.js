@@ -31642,15 +31642,11 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     const memberRole = (member.role || '').toLowerCase();
     const isManager = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
+    // Managers: skip per-job earnings entirely (salary + commission handled in backfill)
+    if (isManager) continue;
+
     let earningAmount;
-    if (isManager) {
-      // Managers: per-job entry is commission only (scheduled salary handled separately)
-      if (commissionPct > 0) {
-        earningAmount = parseFloat((jobRevenue * (commissionPct / 100)).toFixed(2));
-      } else {
-        earningAmount = 0;
-      }
-    } else if (hourlyRate > 0 && commissionPct > 0) {
+    if (hourlyRate > 0 && commissionPct > 0) {
       const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
       const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
       earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
@@ -32368,6 +32364,8 @@ app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
   }
 });
 
+const formatCurrency2 = (n) => `$${parseFloat(n).toFixed(2)}`;
+
 // In-memory backfill progress tracker
 const backfillProgress = {};
 const backfillCancel = {};
@@ -32503,7 +32501,33 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'jobs', errors };
     }
 
-    // ── Manager daily salary backfill ──
+    // ── Calculate total business revenue for manager commission ──
+    let totalBusinessRevenue = 0;
+    for (const job of validJobs) {
+      if (!job.scheduled_date) continue;
+      // Need full job data for revenue calc - fetch in batches
+    }
+    // Fetch job prices for revenue calculation
+    const revenueJobIds = validJobs.map(j => j.id);
+    let revenueData = [];
+    for (let i = 0; i < revenueJobIds.length; i += 200) {
+      const chunk = revenueJobIds.slice(i, i + 200);
+      const { data: revJobs } = await supabase
+        .from('jobs')
+        .select('id, price, total, service_price, total_amount, taxes, status')
+        .in('id', chunk);
+      revenueData = revenueData.concat(revJobs || []);
+    }
+    const cancelledStatuses2 = ['cancelled', 'canceled', 'cancel'];
+    revenueData.forEach(job => {
+      const s = (job.status || '').toLowerCase();
+      if (cancelledStatuses2.includes(s)) return;
+      const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || 0;
+      const taxes = parseFloat(job.taxes) || 0;
+      totalBusinessRevenue += Math.max(0, grossPrice - taxes);
+    });
+
+    // ── Manager daily salary + commission backfill ──
     backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'manager_salary', errors };
     let managerSalaryEntries = 0;
     try {
@@ -32524,21 +32548,58 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       }
 
       if (rangeStart && rangeEnd) {
-        // Get managers with hourly rate
+        // Get managers with hourly rate or commission
         const { data: managers } = await supabase
           .from('team_members')
-          .select('id, first_name, last_name, hourly_rate, availability, role')
+          .select('id, first_name, last_name, hourly_rate, commission_percentage, availability, role')
           .eq('user_id', userId)
           .eq('status', 'active');
 
         const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
         const activeManagers = (managers || []).filter(m => {
           const role = (m.role || '').toLowerCase();
-          return managerRoles.includes(role) && parseFloat(m.hourly_rate) > 0 && m.availability;
+          return managerRoles.includes(role) && (parseFloat(m.hourly_rate) > 0 || parseFloat(m.commission_percentage) > 0);
         });
 
         for (const mgr of activeManagers) {
-          const hourlyRate = parseFloat(mgr.hourly_rate);
+          const hourlyRate = parseFloat(mgr.hourly_rate) || 0;
+          const commissionPct = parseFloat(mgr.commission_percentage) || 0;
+
+          // ── Manager commission: single entry for total business revenue ──
+          if (commissionPct > 0 && totalBusinessRevenue > 0) {
+            // Check if commission entry already exists for this manager in this range
+            let commQuery = supabase
+              .from('cleaner_ledger')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('team_member_id', mgr.id)
+              .eq('type', 'earning')
+              .is('job_id', null)
+              .like('note', 'Commission on total revenue%')
+              .limit(1);
+            if (rangeStart) commQuery = commQuery.gte('effective_date', rangeStart);
+            if (rangeEnd) commQuery = commQuery.lte('effective_date', rangeEnd);
+            const { data: existingComm } = await commQuery;
+
+            if (!existingComm || existingComm.length === 0) {
+              const commAmount = parseFloat((totalBusinessRevenue * (commissionPct / 100)).toFixed(2));
+              const { error: commInsertErr } = await supabase.from('cleaner_ledger').insert({
+                user_id: userId,
+                team_member_id: mgr.id,
+                job_id: null,
+                type: 'earning',
+                amount: commAmount,
+                effective_date: rangeEnd || rangeStart,
+                note: `Commission on total revenue: ${formatCurrency2(totalBusinessRevenue)} × ${commissionPct}%`,
+                metadata: { commission_pct: commissionPct, total_revenue: totalBusinessRevenue, is_manager_commission: true },
+                created_by: userId
+              });
+              if (!commInsertErr) managerSalaryEntries++;
+            }
+          }
+
+          // ── Manager daily salary from scheduled hours ──
+          if (!hourlyRate || !mgr.availability) continue;
           const avail = typeof mgr.availability === 'string' ? JSON.parse(mgr.availability) : mgr.availability;
           const workingHours = avail.workingHours || avail;
           const customAvailability = avail.customAvailability || [];
