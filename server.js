@@ -19884,7 +19884,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           earliest = job.scheduled_date;
         }
       });
-      if (!scheduledHoursStartDate && earliest) scheduledHoursStartDate = earliest;
+      // Strip time portion from scheduled_date (e.g. "2024-01-15 10:00:00" → "2024-01-15")
+      // Without this, calculateScheduledHoursFromAvailability creates invalid Date("2024-01-15 10:00:00T00:00:00")
+      if (!scheduledHoursStartDate && earliest) scheduledHoursStartDate = String(earliest).split('T')[0].split(' ')[0];
       if (!scheduledHoursEndDate) {
         const today = new Date();
         scheduledHoursEndDate = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
