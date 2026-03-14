@@ -31644,9 +31644,9 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     const memberRole = (member.role || '').toLowerCase();
     const isManager = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
-    // Managers: skip per-job earnings entirely (salary + commission handled in backfill)
-    if (isManager) continue;
-
+    // Managers: skip per-job EARNINGS (salary + commission handled in backfill)
+    // but still get tips/incentives below
+    if (!isManager) {
     let earningAmount;
     if (hourlyRate > 0 && commissionPct > 0) {
       const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
@@ -31668,11 +31668,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
         type: 'earning',
         amount: earningAmount,
         effective_date: effectiveDate,
-        note: isManager ? `Commission for job #${jobId}` : `Earning for job #${jobId}`,
-        metadata: { hours: isManager ? 0 : hoursWorked / memberCount, hourly_rate: isManager ? 0 : hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount, is_manager: isManager },
+        note: `Earning for job #${jobId}`,
+        metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
         created_by: userId
       });
     }
+    } // end if (!isManager)
 
     // Tips (split equally)
     const tipAmount = parseFloat(job.tip_amount) || 0;
@@ -32533,7 +32534,8 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'manager_salary', errors };
     let managerSalaryEntries = 0;
     try {
-      // Determine date range from jobs or params
+      // Determine date range from jobs or params (cap at today, not future jobs)
+      const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
       let rangeStart = startDate;
       let rangeEnd = endDate;
       if (!rangeStart || !rangeEnd) {
@@ -32546,7 +32548,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           }
         });
         if (!rangeStart) rangeStart = earliest;
-        if (!rangeEnd) rangeEnd = latest;
+        if (!rangeEnd) rangeEnd = latest && latest < todayStr ? latest : todayStr;
       }
 
       if (rangeStart && rangeEnd) {
