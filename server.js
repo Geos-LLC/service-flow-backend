@@ -19756,24 +19756,34 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       }
     });
 
-    // Fetch ALL job_team_assignments for members in this user's team
+    // Fetch ALL job_team_assignments for members in this user's team (with pagination)
     const teamMemberIds = (teamMembers || []).map(m => m.id);
     const assignmentJobsByMember = {};
     if (teamMemberIds.length > 0) {
       // Batch in chunks of 100 to avoid Supabase .in() limits
       for (let i = 0; i < teamMemberIds.length; i += 100) {
         const chunk = teamMemberIds.slice(i, i + 100);
-        const { data: assignData, error: assignErr } = await supabase
-          .from('job_team_assignments')
-          .select('team_member_id, job_id')
-          .in('team_member_id', chunk);
-        if (assignErr) {
-          console.error('[Payroll] Error fetching assignments batch:', assignErr);
-        } else if (assignData) {
-          assignData.forEach(a => {
-            if (!assignmentJobsByMember[a.team_member_id]) assignmentJobsByMember[a.team_member_id] = new Set();
-            assignmentJobsByMember[a.team_member_id].add(a.job_id);
-          });
+        // Paginate: Supabase default limit is 1000 rows
+        let assignFrom = 0;
+        const assignPageSize = 1000;
+        while (true) {
+          const { data: assignData, error: assignErr } = await supabase
+            .from('job_team_assignments')
+            .select('team_member_id, job_id')
+            .in('team_member_id', chunk)
+            .range(assignFrom, assignFrom + assignPageSize - 1);
+          if (assignErr) {
+            console.error('[Payroll] Error fetching assignments batch:', assignErr);
+            break;
+          }
+          if (assignData) {
+            assignData.forEach(a => {
+              if (!assignmentJobsByMember[a.team_member_id]) assignmentJobsByMember[a.team_member_id] = new Set();
+              assignmentJobsByMember[a.team_member_id].add(a.job_id);
+            });
+          }
+          if (!assignData || assignData.length < assignPageSize) break;
+          assignFrom += assignPageSize;
         }
       }
     }
