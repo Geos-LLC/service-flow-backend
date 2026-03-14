@@ -20150,6 +20150,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             role: member.role || 'Service Provider'
           },
           jobCount: (jobs || []).length,
+          jobIds: (jobs || []).map(j => j.id),
           totalHours: parseFloat(totalHours.toFixed(2)),
           scheduledHours: parseFloat(scheduledHours.toFixed(2)),
           scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
@@ -20228,7 +20229,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
-    const grandTotalJobCount = sortedTeamMembers.reduce((sum, item) => sum + (item?.jobCount || 0), 0);
+    // Count UNIQUE jobs across all team members (not sum of per-member counts which double-counts shared jobs)
+    const allUniqueJobIds = new Set();
+    sortedTeamMembers.forEach(item => {
+      (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id));
+    });
+    const grandTotalJobCount = allUniqueJobIds.size;
 
     res.json({
       period: {
@@ -20236,7 +20242,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         endDate: endDate || null
       },
       totalBusinessRevenue: parseFloat(totalBusinessRevenue.toFixed(2)),
-      teamMembers: sortedTeamMembers,
+      teamMembers: sortedTeamMembers.map(({ jobIds, ...rest }) => rest),
       summary: {
         totalTeamMembers: sortedTeamMembers.length,
         totalHours: parseFloat(grandTotalHours.toFixed(2)),
@@ -31912,6 +31918,12 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       }
     }
 
+    // Count unique jobs globally (not per-member sum which double-counts shared jobs)
+    const globalUniqueJobIds = new Set();
+    Object.values(memberMap).forEach(m => {
+      m._jobIds.forEach(id => globalUniqueJobIds.add(id));
+    });
+
     // Round and return
     const balances = Object.values(memberMap).map(m => {
       m.job_count = m._jobIds.size;
@@ -31922,7 +31934,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       return m;
     });
 
-    res.json(balances);
+    res.json({ balances, totalUniqueJobs: globalUniqueJobIds.size });
   } catch (error) {
     console.error('Ledger balances error:', error);
     res.status(500).json({ error: 'Failed to fetch balances' });
