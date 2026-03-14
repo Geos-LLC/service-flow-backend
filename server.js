@@ -31617,7 +31617,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Fetch team member pay configuration — ONLY ACTIVE members (matches Payroll)
+  // Fetch team member pay configuration — ONLY ACTIVE members get entries (matches Payroll)
   const { data: teamMembers } = await supabase
     .from('team_members')
     .select('id, first_name, last_name, hourly_rate, commission_percentage, role')
@@ -31626,7 +31626,13 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   if (!teamMembers || teamMembers.length === 0) return;
 
-  const memberCount = teamMembers.length;
+  // Member count for splitting: match Payroll's memberCountByJobMap logic exactly.
+  // Payroll counts: active members from job_team_assignments UNION job.team_member_id (any status).
+  // So we start with active members from assignments, then add job.team_member_id if set.
+  const memberIdsForCount = new Set();
+  teamMembers.forEach(m => memberIdsForCount.add(m.id));
+  if (job.team_member_id) memberIdsForCount.add(job.team_member_id);
+  const memberCount = memberIdsForCount.size;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
   // Revenue = Subtotal (service_price) on the job card (same fallback order as Payroll)
