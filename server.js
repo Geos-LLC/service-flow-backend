@@ -31619,8 +31619,10 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const memberCount = teamMembers.length;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0] : new Date().toISOString().split('T')[0];
 
-  // Calculate job revenue (same logic as payroll endpoint)
-  const jobRevenue = parseFloat(job.total_amount) || parseFloat(job.total) || parseFloat(job.price) || parseFloat(job.service_price) || 0;
+  // Calculate job revenue (matching payroll endpoint: grossPrice - taxes)
+  const grossPrice = parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.service_price) || parseFloat(job.total_amount) || 0;
+  const taxes = parseFloat(job.taxes) || 0;
+  const jobRevenue = Math.max(0, grossPrice - taxes);
 
   // Calculate hours worked
   let hoursWorked = 0;
