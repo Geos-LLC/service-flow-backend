@@ -32348,6 +32348,16 @@ app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// In-memory backfill progress tracker
+const backfillProgress = {};
+
+// GET /api/ledger/backfill/progress - Poll backfill progress
+app.get('/api/ledger/backfill/progress', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  const progress = backfillProgress[userId] || { status: 'idle' };
+  res.json(progress);
+});
+
 // POST /api/ledger/backfill - Backfill ledger entries for existing completed jobs
 app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
   try {
@@ -32431,6 +32441,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
 
     let processed = 0;
     let errors = 0;
+    const totalToProcess = jobsToProcess.length;
+
+    // Initialize progress tracker
+    backfillProgress[userId] = { status: 'processing', processed: 0, total: totalToProcess, phase: 'jobs', errors: 0 };
 
     for (const jobId of jobsToProcess) {
       try {
@@ -32440,10 +32454,11 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
         console.error(`Backfill error for job ${jobId}:`, err);
         errors++;
       }
+      backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'jobs', errors };
     }
 
     // ── Manager daily salary backfill ──
-    // Managers earn scheduled-hours salary independent of jobs
+    backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'manager_salary', errors };
     let managerSalaryEntries = 0;
     try {
       // Determine date range from jobs or params
@@ -32591,6 +32606,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       console.error('Manager salary backfill error:', mgrErr);
     }
 
+    backfillProgress[userId] = { status: 'complete', processed, total: totalToProcess, phase: 'done', errors, manager_salary_entries: managerSalaryEntries };
+    // Clean up progress after 5 minutes
+    setTimeout(() => { delete backfillProgress[userId]; }, 300000);
+
     res.json({
       message: 'Backfill complete',
       total_jobs: jobIds.length,
@@ -32601,6 +32620,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Backfill error:', error);
+    backfillProgress[req.user?.userId] = { status: 'error', error: error.message };
     res.status(500).json({ error: 'Failed to backfill ledger' });
   }
 });
