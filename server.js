@@ -32134,6 +32134,51 @@ app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/ledger/cash-to-company - Record cash delivered to company (no salary impact)
+app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { teamMemberId, jobId, amount, note } = req.body;
+
+    if (!teamMemberId || !amount) {
+      return res.status(400).json({ error: 'teamMemberId and amount are required' });
+    }
+
+    const parsedAmount = Math.abs(parseFloat(amount));
+    if (isNaN(parsedAmount) || parsedAmount === 0) {
+      return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+
+    const effectiveDate = new Date().toISOString().split('T')[0];
+
+    const { data: entry, error } = await supabase
+      .from('cleaner_ledger')
+      .insert({
+        user_id: userId,
+        team_member_id: parseInt(teamMemberId),
+        job_id: jobId ? parseInt(jobId) : null,
+        type: 'cash_to_company',
+        amount: 0, // No salary impact — just a record
+        effective_date: effectiveDate,
+        note: note || `Cash delivered to company: $${parsedAmount.toFixed(2)}`,
+        metadata: { manual: true, cash_amount: parsedAmount },
+        created_by: userId
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Cash to company error:', error);
+      return res.status(500).json({ error: 'Failed to record cash to company' });
+    }
+
+    res.json(entry);
+  } catch (error) {
+    console.error('Cash to company error:', error);
+    res.status(500).json({ error: 'Failed to record cash to company' });
+  }
+});
+
 // === PAYOUT BATCH ENDPOINTS ===
 
 // POST /api/ledger/payout-batch - Create payout batch for a cleaner
