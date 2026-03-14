@@ -20228,6 +20228,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
+    const grandTotalJobCount = sortedTeamMembers.reduce((sum, item) => sum + (item?.jobCount || 0), 0);
 
     res.json({
       period: {
@@ -20245,7 +20246,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
         totalTips: parseFloat(grandTotalTips.toFixed(2)),
         totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
-        totalSalary: parseFloat(grandTotal.toFixed(2))
+        totalSalary: parseFloat(grandTotal.toFixed(2)),
+        totalJobCount: grandTotalJobCount
       }
     });
   } catch (error) {
