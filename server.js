@@ -32350,6 +32350,7 @@ app.get('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
 
 // In-memory backfill progress tracker
 const backfillProgress = {};
+const backfillCancel = {};
 
 // GET /api/ledger/backfill/progress - Poll backfill progress
 app.get('/api/ledger/backfill/progress', authenticateToken, (req, res) => {
@@ -32358,11 +32359,23 @@ app.get('/api/ledger/backfill/progress', authenticateToken, (req, res) => {
   res.json(progress);
 });
 
+// POST /api/ledger/backfill/cancel - Cancel a running backfill
+app.post('/api/ledger/backfill/cancel', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  backfillCancel[userId] = true;
+  res.json({ message: 'Cancel requested' });
+});
+
 // POST /api/ledger/backfill - Backfill ledger entries for existing completed jobs
 app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { startDate, endDate, dryRun = false, resetExisting = false } = req.body;
+
+    // Cancel any previously running backfill for this user
+    backfillCancel[userId] = true;
+    await new Promise(r => setTimeout(r, 100)); // Brief pause to let previous loop see the flag
+    backfillCancel[userId] = false;
 
     // If resetExisting, delete all ledger entries (except payouts) and re-create
     if (resetExisting && !dryRun) {
@@ -32456,6 +32469,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     backfillProgress[userId] = { status: 'processing', processed: 0, total: totalToProcess, phase: 'jobs', errors: 0 };
 
     for (const jobId of jobsToProcess) {
+      if (backfillCancel[userId]) {
+        backfillProgress[userId] = { status: 'cancelled', processed, total: totalToProcess, phase: 'jobs', errors };
+        return res.json({ message: 'Backfill cancelled', processed, errors, cancelled: true });
+      }
       try {
         await createLedgerEntriesForCompletedJob(jobId, userId);
         processed++;
