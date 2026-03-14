@@ -32353,6 +32353,129 @@ app.patch('/api/ledger/payout-batch/:id/cancel', authenticateToken, async (req, 
   }
 });
 
+// POST /api/ledger/bulk-mark-paid - Bulk mark all unpaid entries as paid up to a cutoff date
+app.post('/api/ledger/bulk-mark-paid', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { cutoffDate, note } = req.body;
+
+    if (!cutoffDate) {
+      return res.status(400).json({ error: 'cutoffDate is required (YYYY-MM-DD)' });
+    }
+
+    // Fetch all unpaid ledger entries up to cutoff date (paginated)
+    let allEntries = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data: entries, error } = await supabase
+        .from('cleaner_ledger')
+        .select('id, team_member_id, amount, type')
+        .eq('user_id', userId)
+        .is('payout_batch_id', null)
+        .neq('type', 'payout')
+        .lte('effective_date', cutoffDate)
+        .range(from, from + pageSize - 1);
+
+      if (error) {
+        console.error('Bulk mark paid fetch error:', error);
+        return res.status(500).json({ error: 'Failed to fetch unpaid entries' });
+      }
+      if (!entries || entries.length === 0) break;
+      allEntries = allEntries.concat(entries);
+      if (entries.length < pageSize) break;
+      from += pageSize;
+    }
+
+    if (allEntries.length === 0) {
+      return res.json({ message: 'No unpaid entries found before cutoff date', batches_created: 0 });
+    }
+
+    // Group by team_member_id
+    const byMember = {};
+    for (const entry of allEntries) {
+      const mid = entry.team_member_id;
+      if (!byMember[mid]) byMember[mid] = [];
+      byMember[mid].push(entry);
+    }
+
+    const paidAt = new Date().toISOString();
+    const results = [];
+
+    for (const [teamMemberId, entries] of Object.entries(byMember)) {
+      const totalAmount = entries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+      const roundedTotal = parseFloat(totalAmount.toFixed(2));
+
+      // Create payout batch
+      const { data: batch, error: batchError } = await supabase
+        .from('cleaner_payout_batch')
+        .insert({
+          user_id: userId,
+          team_member_id: parseInt(teamMemberId),
+          period_start: '2020-01-01',
+          period_end: cutoffDate,
+          status: 'paid',
+          total_amount: roundedTotal,
+          paid_at: paidAt,
+          note: note || `Bulk mark paid up to ${cutoffDate}`,
+          created_by: userId
+        })
+        .select()
+        .single();
+
+      if (batchError) {
+        console.error(`Bulk payout batch error for member ${teamMemberId}:`, batchError);
+        results.push({ team_member_id: parseInt(teamMemberId), error: batchError.message });
+        continue;
+      }
+
+      // Attach entries to batch
+      const entryIds = entries.map(e => e.id);
+      // Update in chunks of 500 to avoid query size limits
+      for (let i = 0; i < entryIds.length; i += 500) {
+        const chunk = entryIds.slice(i, i + 500);
+        await supabase
+          .from('cleaner_ledger')
+          .update({ payout_batch_id: batch.id })
+          .in('id', chunk);
+      }
+
+      // Create payout ledger entry (negative amount)
+      await supabase
+        .from('cleaner_ledger')
+        .insert({
+          user_id: userId,
+          team_member_id: parseInt(teamMemberId),
+          job_id: null,
+          type: 'payout',
+          amount: -Math.abs(roundedTotal),
+          effective_date: paidAt.split('T')[0],
+          note: note || `Bulk payout up to ${cutoffDate}`,
+          metadata: { payout_batch_id: batch.id },
+          payout_batch_id: batch.id,
+          created_by: userId
+        });
+
+      results.push({
+        team_member_id: parseInt(teamMemberId),
+        batch_id: batch.id,
+        entries_count: entries.length,
+        total_amount: roundedTotal
+      });
+    }
+
+    res.json({
+      batches_created: results.filter(r => !r.error).length,
+      total_entries_marked: allEntries.length,
+      cutoff_date: cutoffDate,
+      results
+    });
+  } catch (error) {
+    console.error('Bulk mark paid error:', error);
+    res.status(500).json({ error: 'Failed to bulk mark as paid' });
+  }
+});
+
 // GET /api/ledger/payout-batches - List payout batches
 app.get('/api/ledger/payout-batches', authenticateToken, async (req, res) => {
   try {
