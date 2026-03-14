@@ -19898,8 +19898,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           customerName: globalCustomerMap[job.customer_id] || '',
           status: job.status,
           revenue: parseFloat(rev.toFixed(2)),
-          taxes: parseFloat(taxes.toFixed(2)),
-          grossPrice: parseFloat(grossPrice.toFixed(2))
+          taxes: parseFloat((parseFloat(job.taxes) || 0).toFixed(2)),
+          grossPrice: parseFloat(rev.toFixed(2))
         });
       }
     });
