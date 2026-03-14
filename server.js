@@ -19724,16 +19724,25 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       endDateNextDay = nd.getFullYear() + '-' + String(nd.getMonth() + 1).padStart(2, '0') + '-' + String(nd.getDate()).padStart(2, '0');
     }
 
-    // Fetch all jobs for this business owner in the date range
-    let allDirectJobsQuery = supabase
-      .from('jobs')
-      .select(jobFields)
-      .eq('user_id', userId);
-    if (startDate) allDirectJobsQuery = allDirectJobsQuery.gte('scheduled_date', startDate);
-    if (endDateNextDay) allDirectJobsQuery = allDirectJobsQuery.lt('scheduled_date', endDateNextDay);
+    // Fetch ALL jobs with pagination (Supabase default limit is 1000)
+    let allDirectJobs = [];
+    let jobFrom = 0;
+    const jobPageSize = 1000;
+    while (true) {
+      let allDirectJobsQuery = supabase
+        .from('jobs')
+        .select(jobFields)
+        .eq('user_id', userId)
+        .range(jobFrom, jobFrom + jobPageSize - 1);
+      if (startDate) allDirectJobsQuery = allDirectJobsQuery.gte('scheduled_date', startDate);
+      if (endDateNextDay) allDirectJobsQuery = allDirectJobsQuery.lt('scheduled_date', endDateNextDay);
 
-    const { data: allDirectJobs, error: allDirectJobsError } = await allDirectJobsQuery;
-    if (allDirectJobsError) console.error('[Payroll] Error fetching all jobs:', allDirectJobsError);
+      const { data: jobPage, error: allDirectJobsError } = await allDirectJobsQuery;
+      if (allDirectJobsError) { console.error('[Payroll] Error fetching jobs:', allDirectJobsError); break; }
+      allDirectJobs = allDirectJobs.concat(jobPage || []);
+      if (!jobPage || jobPage.length < jobPageSize) break;
+      jobFrom += jobPageSize;
+    }
 
     // Build map: team_member_id -> jobs (from direct assignment)
     const directJobsByMember = {};
@@ -31832,20 +31841,29 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
 
-    // Fetch ledger entries with optional date filter
-    let entryQuery = supabase
-      .from('cleaner_ledger')
-      .select('team_member_id, type, amount, payout_batch_id, job_id')
-      .eq('user_id', userId);
+    // Fetch ALL ledger entries with pagination (Supabase default limit is 1000)
+    let allEntries = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      let entryQuery = supabase
+        .from('cleaner_ledger')
+        .select('team_member_id, type, amount, payout_batch_id, job_id')
+        .eq('user_id', userId)
+        .range(from, from + pageSize - 1);
 
-    if (startDate) entryQuery = entryQuery.gte('effective_date', startDate);
-    if (endDate) entryQuery = entryQuery.lte('effective_date', endDate);
+      if (startDate) entryQuery = entryQuery.gte('effective_date', startDate);
+      if (endDate) entryQuery = entryQuery.lte('effective_date', endDate);
 
-    const { data: entries, error } = await entryQuery;
-
-    if (error) {
-      return res.status(500).json({ error: 'Failed to fetch ledger data' });
+      const { data: page, error } = await entryQuery;
+      if (error) {
+        return res.status(500).json({ error: 'Failed to fetch ledger data' });
+      }
+      allEntries = allEntries.concat(page || []);
+      if (!page || page.length < pageSize) break;
+      from += pageSize;
     }
+    const entries = allEntries;
 
     // Fetch team members
     const { data: teamMembers } = await supabase
