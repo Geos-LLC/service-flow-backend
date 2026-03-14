@@ -31576,7 +31576,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   // Fetch job details (includes start_time/end_time for hours calc, total_paid_amount for overpayment/tip calc)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, taxes, total_paid_amount')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, taxes')
     .eq('id', jobId)
     .single();
 
@@ -31659,7 +31659,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const fees = parseFloat(job.additional_fees) || 0;
   const taxes = parseFloat(job.taxes) || 0;
   const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
-  let totalPaid = parseFloat(job.total_paid_amount) || 0;
+  // Fetch total_paid_amount separately (column may not exist in main select — same approach as Payroll)
+  let totalPaid = 0;
+  try {
+    const { data: paidData } = await supabase.from('jobs').select('total_paid_amount').eq('id', jobId).single();
+    totalPaid = parseFloat(paidData?.total_paid_amount) || 0;
+  } catch (e) { /* column may not exist */ }
 
   // Fallback: compute from transactions if total_paid_amount missing
   if (totalPaid <= 0) {
