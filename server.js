@@ -31571,11 +31571,12 @@ app.post('/api/fix-schema', async (req, res) => {
 // ============================================================
 
 // Helper: Create ledger entries for a completed job
+// *** Mirrors Payroll endpoint logic exactly (Payroll = single source of truth) ***
 async function createLedgerEntriesForCompletedJob(jobId, userId) {
-  // Fetch job details
+  // Fetch job details (includes start_time/end_time for hours calc, total_paid_amount for overpayment/tip calc)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, payment_method, hours_worked, duration, estimated_duration, scheduled_date, discount, additional_fees, taxes')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, taxes, total_paid_amount')
     .eq('id', jobId)
     .single();
 
@@ -31585,11 +31586,11 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   }
 
   // Check if ledger entries already exist for this job (idempotency)
+  // Check any entry type (not just 'earning') to handle manager-only jobs with only tip/incentive entries
   const { data: existingEntries } = await supabase
     .from('cleaner_ledger')
     .select('id')
     .eq('job_id', jobId)
-    .eq('type', 'earning')
     .limit(1);
 
   if (existingEntries && existingEntries.length > 0) {
@@ -31600,7 +31601,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   // Fetch all team member assignments for this job
   const { data: assignments } = await supabase
     .from('job_team_assignments')
-    .select('team_member_id, is_primary, incentive_amount')
+    .select('team_member_id, is_primary')
     .eq('job_id', jobId);
 
   // Build list of team members assigned to this job
@@ -31616,28 +31617,60 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Fetch team member pay configuration
+  // Fetch team member pay configuration — ONLY ACTIVE members (matches Payroll)
   const { data: teamMembers } = await supabase
     .from('team_members')
     .select('id, first_name, last_name, hourly_rate, commission_percentage, role')
-    .in('id', teamMemberIds);
+    .in('id', teamMemberIds)
+    .eq('status', 'active');
 
   if (!teamMembers || teamMembers.length === 0) return;
 
   const memberCount = teamMembers.length;
-  const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0] : new Date().toISOString().split('T')[0];
+  const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-  // Revenue = Subtotal (service_price) on the job card (same fallback order as payroll)
+  // Revenue = Subtotal (service_price) on the job card (same fallback order as Payroll)
   const jobRevenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
 
-  // Calculate hours worked
+  // Calculate hours worked — same priority as Payroll:
+  // Priority 1: hours_worked
+  // Priority 2: start_time/end_time calculation
+  // Priority 3: duration/estimated_duration (minutes → hours)
   let hoursWorked = 0;
-  if (job.hours_worked) {
+  if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
     hoursWorked = parseFloat(job.hours_worked);
-  } else if (job.duration) {
-    hoursWorked = parseFloat(job.duration) / 60;
-  } else if (job.estimated_duration) {
-    hoursWorked = parseFloat(job.estimated_duration) / 60;
+  } else if (job.start_time && job.end_time) {
+    const start = new Date(job.start_time);
+    const end = new Date(job.end_time);
+    const diffMs = end - start;
+    if (diffMs > 0) {
+      hoursWorked = diffMs / (1000 * 60 * 60);
+    }
+  } else {
+    const durationMinutes = job.duration || job.estimated_duration || 0;
+    if (durationMinutes > 0) {
+      hoursWorked = durationMinutes / 60;
+    }
+  }
+
+  // Overpayment calculation for tips (same as Payroll)
+  const svcPrice = parseFloat(job.service_price) || 0;
+  const disc = parseFloat(job.discount) || 0;
+  const fees = parseFloat(job.additional_fees) || 0;
+  const taxes = parseFloat(job.taxes) || 0;
+  const totalDue = svcPrice > 0 ? (svcPrice - disc + fees + taxes) : (parseFloat(job.total) || 0);
+  let totalPaid = parseFloat(job.total_paid_amount) || 0;
+
+  // Fallback: compute from transactions if total_paid_amount missing
+  if (totalPaid <= 0) {
+    const { data: txData } = await supabase
+      .from('transactions')
+      .select('amount')
+      .eq('job_id', jobId)
+      .eq('status', 'completed');
+    if (txData) {
+      totalPaid = txData.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
+    }
   }
 
   const ledgerEntries = [];
@@ -31648,99 +31681,77 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     const memberRole = (member.role || '').toLowerCase();
     const isManager = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
-    // Managers: skip per-job EARNINGS (salary + commission handled in backfill)
+    // Managers: skip per-job EARNINGS (salary + commission handled in backfill manager section)
     // but still get tips/incentives below
     if (!isManager) {
-    let earningAmount = 0;
-    if (hourlyRate > 0 && commissionPct > 0) {
-      const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
-      const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
-      earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
-    } else if (commissionPct > 0) {
-      earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
-    } else if (hourlyRate > 0) {
-      earningAmount = parseFloat(((hoursWorked / memberCount) * hourlyRate).toFixed(2));
-    }
-    // No fallback: if worker has no hourly rate and no commission, earning = $0
-    // (matches payroll calculation which gives hourlySalary=0 + commission=0)
+      let earningAmount = 0;
+      if (hourlyRate > 0 && commissionPct > 0) {
+        // Hybrid: hourly + commission (same as Payroll)
+        const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
+        const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
+        earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
+      } else if (commissionPct > 0) {
+        earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
+      } else if (hourlyRate > 0) {
+        earningAmount = parseFloat(((hoursWorked / memberCount) * hourlyRate).toFixed(2));
+      }
+      // No fallback: if worker has no hourly rate and no commission, earning = $0
+      // (matches Payroll which gives hourlySalary=0 + commission=0)
 
-    if (earningAmount > 0) {
-      ledgerEntries.push({
-        user_id: userId,
-        team_member_id: member.id,
-        job_id: jobId,
-        type: 'earning',
-        amount: earningAmount,
-        effective_date: effectiveDate,
-        note: `Earning for job #${jobId}`,
-        metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
-        created_by: userId
-      });
-    }
+      if (earningAmount > 0) {
+        ledgerEntries.push({
+          user_id: userId,
+          team_member_id: member.id,
+          job_id: jobId,
+          type: 'earning',
+          amount: earningAmount,
+          effective_date: effectiveDate,
+          note: `Earning for job #${jobId}`,
+          metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+          created_by: userId
+        });
+      }
     } // end if (!isManager)
 
-    // Tips (split equally)
-    const tipAmount = parseFloat(job.tip_amount) || 0;
-    if (tipAmount > 0) {
-      const memberTip = parseFloat((tipAmount / memberCount).toFixed(2));
-      if (memberTip > 0) {
-        ledgerEntries.push({
-          user_id: userId,
-          team_member_id: member.id,
-          job_id: jobId,
-          type: 'tip',
-          amount: memberTip,
-          effective_date: effectiveDate,
-          note: `Tip for job #${jobId}`,
-          created_by: userId
-        });
-      }
-    }
+    // Tips: use the HIGHER of tip_amount split vs overpayment split (same as Payroll)
+    const jobTip = parseFloat(job.tip_amount) || 0;
+    const tipShare = jobTip / Math.max(1, memberCount);
+    const overpayment = Math.max(0, totalPaid - totalDue);
+    const overpaymentShare = overpayment / memberCount;
+    const memberTip = Math.max(tipShare, overpaymentShare);
 
-    // Incentives (check assignment-level first, then job-level split)
-    const assignmentRecord = assignments?.find(a => a.team_member_id === member.id);
-    let incentiveAmount = 0;
-    if (assignmentRecord && parseFloat(assignmentRecord.incentive_amount) > 0) {
-      incentiveAmount = parseFloat(assignmentRecord.incentive_amount);
-    } else {
-      const jobIncentive = parseFloat(job.incentive_amount) || 0;
-      if (jobIncentive > 0) {
-        incentiveAmount = parseFloat((jobIncentive / memberCount).toFixed(2));
-      }
-    }
-    if (incentiveAmount > 0) {
+    if (memberTip > 0) {
       ledgerEntries.push({
         user_id: userId,
         team_member_id: member.id,
         job_id: jobId,
-        type: 'incentive',
-        amount: incentiveAmount,
+        type: 'tip',
+        amount: parseFloat(memberTip.toFixed(2)),
         effective_date: effectiveDate,
-        note: `Incentive for job #${jobId}`,
+        note: `Tip for job #${jobId}`,
         created_by: userId
       });
     }
 
-    // Cash collected by cleaner (negative entry - reduces company payout)
-    const paymentMethod = (job.payment_method || '').toLowerCase();
-    if (paymentMethod.includes('cash')) {
-      // If paid by cash, the cleaner collected the job total from the customer
-      const cashCollected = parseFloat(job.total_amount) || parseFloat(job.total) || parseFloat(job.price) || 0;
-      if (cashCollected > 0) {
-        const memberCashShare = parseFloat((cashCollected / memberCount).toFixed(2));
+    // Incentives: job-level split only (same as Payroll — no assignment-level check)
+    const jobIncentive = parseFloat(job.incentive_amount) || 0;
+    if (jobIncentive > 0) {
+      const memberIncentive = parseFloat((jobIncentive / Math.max(1, memberCount)).toFixed(2));
+      if (memberIncentive > 0) {
         ledgerEntries.push({
           user_id: userId,
           team_member_id: member.id,
           job_id: jobId,
-          type: 'cash_collected',
-          amount: -memberCashShare,
+          type: 'incentive',
+          amount: memberIncentive,
           effective_date: effectiveDate,
-          note: `Cash collected from customer for job #${jobId}`,
-          metadata: { total_cash: cashCollected, payment_method: job.payment_method },
+          note: `Incentive for job #${jobId}`,
           created_by: userId
         });
       }
     }
+
+    // No cash_collected entries (Payroll doesn't have this concept)
   }
 
   // Batch insert all ledger entries
@@ -32460,7 +32471,6 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
         .from('cleaner_ledger')
         .select('job_id')
         .eq('user_id', userId)
-        .eq('type', 'earning')
         .in('job_id', chunk);
       (existingLedgerJobs || []).forEach(e => existingJobIds.add(e.job_id));
     }
@@ -32540,7 +32550,8 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       totalBusinessRevenue += rev;
     });
 
-    // ── Manager daily salary + commission backfill ──
+    // ── Manager salary + commission backfill ──
+    // Uses calculateScheduledHoursFromAvailability (same function as Payroll) for exact match
     backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'manager_salary', errors };
     let managerSalaryEntries = 0;
     try {
@@ -32579,7 +32590,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           const hourlyRate = parseFloat(mgr.hourly_rate) || 0;
           const commissionPct = parseFloat(mgr.commission_percentage) || 0;
 
-          // ── Manager commission: single entry for total business revenue ──
+          // ── Manager commission: single entry for total business revenue (same as Payroll) ──
           if (commissionPct > 0 && totalBusinessRevenue > 0) {
             // Check if commission entry already exists for this manager in this range
             let commQuery = supabase
@@ -32612,113 +32623,40 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
             }
           }
 
-          // ── Manager daily salary from scheduled hours ──
-          if (!hourlyRate || !mgr.availability) continue;
-          const avail = typeof mgr.availability === 'string' ? JSON.parse(mgr.availability) : mgr.availability;
-          const workingHours = avail.workingHours || avail;
-          const customAvailability = avail.customAvailability || [];
-          const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+          // ── Manager scheduled salary: single entry using calculateScheduledHoursFromAvailability ──
+          // This is the SAME function Payroll uses, ensuring identical results
+          if (hourlyRate > 0 && mgr.availability) {
+            // Check if a salary entry already exists for this manager in this range
+            let salaryQuery = supabase
+              .from('cleaner_ledger')
+              .select('id')
+              .eq('user_id', userId)
+              .eq('team_member_id', mgr.id)
+              .eq('type', 'earning')
+              .is('job_id', null)
+              .like('note', 'Scheduled salary:%')
+              .limit(1);
+            if (rangeStart) salaryQuery = salaryQuery.gte('effective_date', rangeStart);
+            if (rangeEnd) salaryQuery = salaryQuery.lte('effective_date', rangeEnd);
+            const { data: existingSalary } = await salaryQuery;
 
-          const toMinutes = (timeStr) => {
-            if (!timeStr) return 0;
-            const parts = timeStr.split(':');
-            return parseInt(parts[0]) * 60 + parseInt(parts[1] || 0);
-          };
-
-          // Check which dates already have salary entries for this manager
-          const { data: existingSalaryEntries } = await supabase
-            .from('cleaner_ledger')
-            .select('effective_date')
-            .eq('user_id', userId)
-            .eq('team_member_id', mgr.id)
-            .eq('type', 'earning')
-            .is('job_id', null)
-            .gte('effective_date', rangeStart)
-            .lte('effective_date', rangeEnd);
-
-          const existingSalaryDates = new Set((existingSalaryEntries || []).map(e => e.effective_date));
-
-          const start = new Date(rangeStart + 'T00:00:00');
-          const end = new Date(rangeEnd + 'T00:00:00');
-          const salaryEntries = [];
-
-          for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-            const dateStr = d.getFullYear() + '-' +
-              String(d.getMonth() + 1).padStart(2, '0') + '-' +
-              String(d.getDate()).padStart(2, '0');
-
-            if (existingSalaryDates.has(dateStr)) continue;
-
-            const dayName = dayNames[d.getDay()];
-            let dayHours = 0;
-
-            // Check custom availability override
-            const override = customAvailability.find(item => item.date === dateStr);
-            if (override) {
-              if (override.available === false) continue;
-              if (override.hours && Array.isArray(override.hours) && override.hours.length > 0) {
-                override.hours.forEach(h => {
-                  const hStart = toMinutes(h.start || h.startTime || '09:00');
-                  const hEnd = toMinutes(h.end || h.endTime || '17:00');
-                  if (hEnd > hStart) dayHours += (hEnd - hStart) / 60;
+            if (!existingSalary || existingSalary.length === 0) {
+              const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, rangeStart, rangeEnd);
+              if (scheduledHours > 0) {
+                const salaryAmount = parseFloat((scheduledHours * hourlyRate).toFixed(2));
+                const { error: salInsertErr } = await supabase.from('cleaner_ledger').insert({
+                  user_id: userId,
+                  team_member_id: mgr.id,
+                  job_id: null,
+                  type: 'earning',
+                  amount: salaryAmount,
+                  effective_date: rangeEnd || rangeStart,
+                  note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr`,
+                  metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
+                  created_by: userId
                 });
-              } else {
-                // available=true, fall through to regular schedule
-                const dayHrs = workingHours[dayName];
-                if (dayHrs && dayHrs.enabled !== false && dayHrs.available !== false) {
-                  if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
-                    dayHrs.timeSlots.forEach(ts => {
-                      const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
-                      const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
-                      if (tsEnd > tsStart) dayHours += (tsEnd - tsStart) / 60;
-                    });
-                  } else if (dayHrs.start && dayHrs.end) {
-                    const dStart = toMinutes(dayHrs.start);
-                    const dEnd = toMinutes(dayHrs.end);
-                    if (dEnd > dStart) dayHours += (dEnd - dStart) / 60;
-                  }
-                }
+                if (!salInsertErr) managerSalaryEntries++;
               }
-            } else {
-              const dayHrs = workingHours[dayName];
-              if (!dayHrs || dayHrs.enabled === false || dayHrs.available === false) continue;
-              if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
-                dayHrs.timeSlots.forEach(ts => {
-                  const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
-                  const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
-                  if (tsEnd > tsStart) dayHours += (tsEnd - tsStart) / 60;
-                });
-              } else if (dayHrs.start && dayHrs.end) {
-                const dStart = toMinutes(dayHrs.start);
-                const dEnd = toMinutes(dayHrs.end);
-                if (dEnd > dStart) dayHours += (dEnd - dStart) / 60;
-              }
-            }
-
-            if (dayHours > 0) {
-              const dailySalary = parseFloat((dayHours * hourlyRate).toFixed(2));
-              salaryEntries.push({
-                user_id: userId,
-                team_member_id: mgr.id,
-                job_id: null,
-                type: 'earning',
-                amount: dailySalary,
-                effective_date: dateStr,
-                note: `Scheduled salary: ${dayHours.toFixed(1)}h × $${hourlyRate}/hr`,
-                metadata: { scheduled_hours: dayHours, hourly_rate: hourlyRate, is_manager_salary: true },
-                created_by: userId
-              });
-            }
-          }
-
-          // Insert in batches of 100
-          for (let i = 0; i < salaryEntries.length; i += 100) {
-            const batch = salaryEntries.slice(i, i + 100);
-            const { error: insertError } = await supabase.from('cleaner_ledger').insert(batch);
-            if (insertError) {
-              console.error(`Manager salary insert error for ${mgr.id}:`, insertError);
-            } else {
-              managerSalaryEntries += batch.length;
             }
           }
         }
