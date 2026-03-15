@@ -20467,6 +20467,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           },
           jobCount: (jobs || []).length,
           jobIds: (jobs || []).map(j => j.id),
+          totalJobRevenue: parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
           totalHours: parseFloat(totalHours.toFixed(2)),
           scheduledHours: parseFloat(scheduledHours.toFixed(2)),
           scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
@@ -20547,6 +20548,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
+    const grandTotalJobRevenue = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalJobRevenue || 0), 0);
     // Count UNIQUE jobs across all team members (not sum of per-member counts which double-counts shared jobs)
     const allUniqueJobIds = new Set();
     sortedTeamMembers.forEach(item => {
@@ -20571,7 +20573,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalTips: parseFloat(grandTotalTips.toFixed(2)),
         totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2)),
-        totalJobCount: grandTotalJobCount
+        totalJobCount: grandTotalJobCount,
+        totalJobRevenue: parseFloat(grandTotalJobRevenue.toFixed(2))
       }
     });
   } catch (error) {
