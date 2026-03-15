@@ -2977,7 +2977,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
     }
     
     // Add sorting
-    const allowedSortFields = ['scheduled_date', 'created_at'];
+    const allowedSortFields = ['scheduled_date', 'created_at', 'total_amount'];
     const allowedSortOrders = ['ASC', 'DESC'];
     
     if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
