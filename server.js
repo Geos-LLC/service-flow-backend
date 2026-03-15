@@ -20304,18 +20304,31 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
         console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%, role = ${member.role}, isManagerOrOwner = ${isManagerOrOwner}`);
 
+        // For managers: filter business revenue by their salary_start_date
+        let managerBusinessRevenue = totalBusinessRevenue;
+        let managerRevenueJobsList = revenueJobsList;
+        if (isManagerOrOwner && memberSalaryStartRaw) {
+          managerRevenueJobsList = revenueJobsList.filter(rj => {
+            if (!rj.scheduledDate) return true;
+            const rjDate = String(rj.scheduledDate).split('T')[0].split(' ')[0];
+            return rjDate >= memberSalaryStartRaw;
+          });
+          managerBusinessRevenue = managerRevenueJobsList.reduce((sum, rj) => sum + (rj.revenue || 0), 0);
+          console.log(`[Payroll] Member ${member.id} (${memberRole}): Filtered business revenue by salary_start_date ${memberSalaryStartRaw}: $${managerBusinessRevenue.toFixed(2)} (${managerRevenueJobsList.length} jobs)`);
+        }
+
         if (isManagerOrOwner && memberPayRates.length > 0) {
           // Manager with rate history: use latest commission rate for total business revenue
           // (commission on total revenue doesn't split by period — it's a flat % of total)
           if (commissionPercentage > 0) {
-            commissionRevenueBase = totalBusinessRevenue;
-            commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
-            console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from total business revenue $${totalBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
+            commissionRevenueBase = managerBusinessRevenue;
+            commissionSalary = managerBusinessRevenue * (commissionPercentage / 100);
+            console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from business revenue $${managerBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
           }
         } else if (commissionPercentage > 0 && isManagerOrOwner) {
-          commissionRevenueBase = totalBusinessRevenue;
-          commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
-          console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from total business revenue $${totalBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
+          commissionRevenueBase = managerBusinessRevenue;
+          commissionSalary = managerBusinessRevenue * (commissionPercentage / 100);
+          console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from business revenue $${managerBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
         } else if (commissionPercentage > 0 || memberPayRates.length > 0) {
           // Service providers: commission per job using effective rate on job date
           (jobs || []).forEach(job => {
@@ -20474,7 +20487,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
                 ? 'commission'
                 : 'none',
           jobs: jobDetails,
-          revenueJobs: isManagerOrOwner ? revenueJobsList : undefined
+          revenueJobs: isManagerOrOwner ? managerRevenueJobsList : undefined
         };
         } catch (memberError) {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
