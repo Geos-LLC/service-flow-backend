@@ -19718,7 +19718,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       .from('team_members')
       .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role, salary_start_date, created_at')
       .eq('user_id', userId)
-      .eq('status', 'active'); // Only show active team members
+      .in('status', ['active', 'inactive']); // Include both active and inactive members for complete payroll records
 
     if (membersError) {
       console.error('Error fetching team members:', membersError);
@@ -19948,9 +19948,22 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         // From job_team_assignments
         (assignmentJobsByMember[member.id] || new Set()).forEach(id => memberJobIds.add(id));
 
+        // Filter out cancelled jobs AND jobs before member's salary_start_date
+        const memberSalaryStartRaw = member.salary_start_date
+          ? String(member.salary_start_date).split('T')[0].split(' ')[0]
+          : null;
+
         const jobs = [...memberJobIds]
           .map(id => allJobsById[id])
-          .filter(j => j && !isCancelled(j));
+          .filter(j => {
+            if (!j || isCancelled(j)) return false;
+            // Exclude jobs before member's salary start date
+            if (memberSalaryStartRaw && j.scheduled_date) {
+              const jobDate = String(j.scheduled_date).split('T')[0].split(' ')[0];
+              if (jobDate < memberSalaryStartRaw) return false;
+            }
+            return true;
+          });
 
         const customerMap = globalCustomerMap;
         const memberCountByJob = memberCountByJobMap;
@@ -20177,7 +20190,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             name: `${member.first_name} ${member.last_name}`,
             hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
             commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null,
-            role: member.role || 'Service Provider'
+            role: member.role || 'Service Provider',
+            status: member.status || 'active'
           },
           jobCount: (jobs || []).length,
           jobIds: (jobs || []).map(j => j.id),
