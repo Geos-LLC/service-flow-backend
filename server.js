@@ -18506,7 +18506,9 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       last_name,
       is_service_provider,
       hourly_rate, // Support snake_case from frontend
-      commission_percentage // Support snake_case from frontend
+      commission_percentage, // Support snake_case from frontend
+      salaryStartDate,
+      salary_start_date
     } = req.body;
     
     // Normalize field names (support both camelCase and snake_case)
@@ -18643,7 +18645,13 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
     if (commissionPercentageValue !== undefined) {
       dataToSave.commission_percentage = commissionPercentageValue;
     }
-    
+
+    // Normalize salary start date (support both camelCase and snake_case)
+    const salaryStartDateValue = salaryStartDate !== undefined ? salaryStartDate : salary_start_date;
+    if (salaryStartDateValue !== undefined) {
+      dataToSave.salary_start_date = salaryStartDateValue;
+    }
+
     if (availability !== undefined) {
       dataToSave.availability = typeof availability === 'string' ? availability : JSON.stringify(availability);
       
@@ -19708,7 +19716,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Get all team members (including those without hourly rates or commission)
     const { data: teamMembers, error: membersError } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role')
+      .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role, salary_start_date, created_at')
       .eq('user_id', userId)
       .eq('status', 'active'); // Only show active team members
 
@@ -19998,7 +20006,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         const isManagerOrOwner = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
         // Calculate scheduled working hours from availability settings
-        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, scheduledHoursStartDate, scheduledHoursEndDate);
+        // Use member's salary_start_date if available, otherwise fall back to shared scheduledHoursStartDate
+        const memberSalaryStart = member.salary_start_date
+          ? String(member.salary_start_date).split('T')[0].split(' ')[0]
+          : scheduledHoursStartDate;
+        // If date range is specified, use the later of (salary_start_date, startDate) as the effective start
+        const effectiveStartDate = startDate && memberSalaryStart && memberSalaryStart > startDate
+          ? memberSalaryStart
+          : (startDate || memberSalaryStart);
+        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
         const scheduledHourlySalary = scheduledHours * hourlyRate;
 
         // For managers/schedulers: hourly salary uses scheduled working hours
@@ -20189,7 +20205,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         };
         } catch (memberError) {
           console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
-          const errScheduledHours = calculateScheduledHoursFromAvailability(member.availability, startDate, endDate);
+          const errMemberStart = member.salary_start_date ? String(member.salary_start_date).split('T')[0].split(' ')[0] : startDate;
+          const errEffectiveStart = startDate && errMemberStart && errMemberStart > startDate ? errMemberStart : (startDate || errMemberStart);
+          const errScheduledHours = calculateScheduledHoursFromAvailability(member.availability, errEffectiveStart, endDate);
           const errHourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
           const errRole = (member.role || '').toLowerCase();
           const errIsManagerOrOwner = errRole === 'account owner' || errRole === 'owner' || errRole === 'manager' || errRole === 'admin' || errRole === 'scheduler';
@@ -32784,7 +32802,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
         // Get managers with hourly rate or commission
         const { data: managers } = await supabase
           .from('team_members')
-          .select('id, first_name, last_name, hourly_rate, commission_percentage, availability, role')
+          .select('id, first_name, last_name, hourly_rate, commission_percentage, availability, role, salary_start_date')
           .eq('user_id', userId)
           .eq('status', 'active');
 
@@ -32797,6 +32815,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
         for (const mgr of activeManagers) {
           const hourlyRate = parseFloat(mgr.hourly_rate) || 0;
           const commissionPct = parseFloat(mgr.commission_percentage) || 0;
+
+          // Use member's salary_start_date as effective start (same logic as Payroll)
+          const mgrSalaryStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
+          const mgrEffectiveStart = mgrSalaryStart && (!rangeStart || mgrSalaryStart > rangeStart) ? mgrSalaryStart : rangeStart;
 
           // ── Manager commission: single entry for total business revenue (same as Payroll) ──
           if (commissionPct > 0 && totalBusinessRevenue > 0) {
@@ -32844,12 +32866,12 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
               .is('job_id', null)
               .like('note', 'Scheduled salary:%')
               .limit(1);
-            if (rangeStart) salaryQuery = salaryQuery.gte('effective_date', rangeStart);
+            if (mgrEffectiveStart) salaryQuery = salaryQuery.gte('effective_date', mgrEffectiveStart);
             if (rangeEnd) salaryQuery = salaryQuery.lte('effective_date', rangeEnd);
             const { data: existingSalary } = await salaryQuery;
 
             if (!existingSalary || existingSalary.length === 0) {
-              const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, rangeStart, rangeEnd);
+              const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, mgrEffectiveStart, rangeEnd);
               if (scheduledHours > 0) {
                 const salaryAmount = parseFloat((scheduledHours * hourlyRate).toFixed(2));
                 const { error: salInsertErr } = await supabase.from('cleaner_ledger').insert({
