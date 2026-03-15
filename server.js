@@ -19642,6 +19642,211 @@ app.get('/api/team-members/:id/salary', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Pay Rate History endpoints ──
+
+// Get all pay rates for a team member
+app.get('/api/team-members/:id/pay-rates', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    const { data, error } = await supabase
+      .from('team_member_pay_rates')
+      .select('*')
+      .eq('team_member_id', id)
+      .eq('user_id', userId)
+      .order('effective_from', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching pay rates:', error);
+      return res.status(500).json({ error: 'Failed to fetch pay rates' });
+    }
+
+    res.json({ payRates: data || [] });
+  } catch (error) {
+    console.error('Get pay rates error:', error);
+    res.status(500).json({ error: 'Failed to fetch pay rates' });
+  }
+});
+
+// Add a new pay rate
+app.post('/api/team-members/:id/pay-rates', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { hourlyRate, commissionPercentage, effectiveFrom, note } = req.body;
+
+    if (!effectiveFrom) {
+      return res.status(400).json({ error: 'effectiveFrom date is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('team_member_pay_rates')
+      .insert({
+        user_id: userId,
+        team_member_id: parseInt(id),
+        hourly_rate: hourlyRate || null,
+        commission_percentage: commissionPercentage || null,
+        effective_from: effectiveFrom,
+        note: note || null
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creating pay rate:', error);
+      return res.status(500).json({ error: 'Failed to create pay rate' });
+    }
+
+    // Also update the current rate on team_members to the latest effective rate
+    const { data: latestRate } = await supabase
+      .from('team_member_pay_rates')
+      .select('hourly_rate, commission_percentage, effective_from')
+      .eq('team_member_id', id)
+      .eq('user_id', userId)
+      .order('effective_from', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (latestRate) {
+      await supabase
+        .from('team_members')
+        .update({
+          hourly_rate: latestRate.hourly_rate,
+          commission_percentage: latestRate.commission_percentage
+        })
+        .eq('id', id);
+    }
+
+    res.json({ payRate: data });
+  } catch (error) {
+    console.error('Create pay rate error:', error);
+    res.status(500).json({ error: 'Failed to create pay rate' });
+  }
+});
+
+// Update a pay rate
+app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, async (req, res) => {
+  try {
+    const { memberId, rateId } = req.params;
+    const userId = req.user.userId;
+    const { hourlyRate, commissionPercentage, effectiveFrom, note } = req.body;
+
+    const updateData = {};
+    if (hourlyRate !== undefined) updateData.hourly_rate = hourlyRate || null;
+    if (commissionPercentage !== undefined) updateData.commission_percentage = commissionPercentage || null;
+    if (effectiveFrom !== undefined) updateData.effective_from = effectiveFrom;
+    if (note !== undefined) updateData.note = note;
+    updateData.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('team_member_pay_rates')
+      .update(updateData)
+      .eq('id', rateId)
+      .eq('user_id', userId)
+      .eq('team_member_id', memberId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating pay rate:', error);
+      return res.status(500).json({ error: 'Failed to update pay rate' });
+    }
+
+    // Sync current rate on team_members to latest effective rate
+    const { data: latestRate } = await supabase
+      .from('team_member_pay_rates')
+      .select('hourly_rate, commission_percentage')
+      .eq('team_member_id', memberId)
+      .eq('user_id', userId)
+      .order('effective_from', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (latestRate) {
+      await supabase
+        .from('team_members')
+        .update({
+          hourly_rate: latestRate.hourly_rate,
+          commission_percentage: latestRate.commission_percentage
+        })
+        .eq('id', memberId);
+    }
+
+    res.json({ payRate: data });
+  } catch (error) {
+    console.error('Update pay rate error:', error);
+    res.status(500).json({ error: 'Failed to update pay rate' });
+  }
+});
+
+// Delete a pay rate
+app.delete('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, async (req, res) => {
+  try {
+    const { memberId, rateId } = req.params;
+    const userId = req.user.userId;
+
+    const { error } = await supabase
+      .from('team_member_pay_rates')
+      .delete()
+      .eq('id', rateId)
+      .eq('user_id', userId)
+      .eq('team_member_id', memberId);
+
+    if (error) {
+      console.error('Error deleting pay rate:', error);
+      return res.status(500).json({ error: 'Failed to delete pay rate' });
+    }
+
+    // Sync current rate on team_members to latest remaining rate
+    const { data: latestRate } = await supabase
+      .from('team_member_pay_rates')
+      .select('hourly_rate, commission_percentage')
+      .eq('team_member_id', memberId)
+      .eq('user_id', userId)
+      .order('effective_from', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (latestRate) {
+      await supabase
+        .from('team_members')
+        .update({
+          hourly_rate: latestRate.hourly_rate,
+          commission_percentage: latestRate.commission_percentage
+        })
+        .eq('id', memberId);
+    } else {
+      // No rates left — clear the fields
+      await supabase
+        .from('team_members')
+        .update({ hourly_rate: null, commission_percentage: null })
+        .eq('id', memberId);
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete pay rate error:', error);
+    res.status(500).json({ error: 'Failed to delete pay rate' });
+  }
+});
+
+// Helper: get effective pay rate for a team member on a specific date
+function getEffectivePayRate(payRates, date) {
+  // payRates should be sorted by effective_from DESC
+  const dateStr = typeof date === 'string' ? date.split('T')[0].split(' ')[0] : date;
+  for (const rate of payRates) {
+    const rateFrom = String(rate.effective_from).split('T')[0].split(' ')[0];
+    if (rateFrom <= dateStr) {
+      return {
+        hourlyRate: rate.hourly_rate ? parseFloat(rate.hourly_rate) : 0,
+        commissionPercentage: rate.commission_percentage ? parseFloat(rate.commission_percentage) : 0
+      };
+    }
+  }
+  return { hourlyRate: 0, commissionPercentage: 0 };
+}
+
 // Helper: calculate scheduled working hours from team member availability for a date range
 function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, endDateStr) {
   if (!availabilityRaw || !startDateStr || !endDateStr) return 0;
@@ -19723,6 +19928,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     if (membersError) {
       console.error('Error fetching team members:', membersError);
       return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    // Batch-fetch all pay rate history for all team members
+    const allTeamMemberIds = (teamMembers || []).map(m => m.id);
+    const payRatesByMember = {};
+    if (allTeamMemberIds.length > 0) {
+      const { data: allPayRates } = await supabase
+        .from('team_member_pay_rates')
+        .select('team_member_id, hourly_rate, commission_percentage, effective_from')
+        .eq('user_id', userId)
+        .in('team_member_id', allTeamMemberIds)
+        .order('effective_from', { ascending: false });
+
+      (allPayRates || []).forEach(rate => {
+        if (!payRatesByMember[rate.team_member_id]) payRatesByMember[rate.team_member_id] = [];
+        payRatesByMember[rate.team_member_id].push(rate);
+      });
     }
 
     let totalBusinessRevenue = 0;
@@ -19970,114 +20192,150 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
         console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
 
+        // Get pay rate history for this member (sorted DESC by effective_from)
+        const memberPayRates = payRatesByMember[member.id] || [];
+        // Current rate = latest effective rate or fallback to member record
+        const currentRate = memberPayRates.length > 0
+          ? { hourlyRate: parseFloat(memberPayRates[0].hourly_rate) || 0, commissionPercentage: parseFloat(memberPayRates[0].commission_percentage) || 0 }
+          : { hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : 0, commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : 0 };
+        const hourlyRate = currentRate.hourlyRate;
+        const commissionPercentage = currentRate.commissionPercentage;
+
         // Calculate hourly-based salary
         let totalHours = 0;
         let hourlySalary = 0;
-        const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
-        
-        console.log(`[Payroll] Member ${member.id}: Hourly rate = ${hourlyRate}`);
-        
-        // Calculate hours for ALL jobs (not just those with time tracking)
+
+        console.log(`[Payroll] Member ${member.id}: Current hourly rate = ${hourlyRate}, pay rate history entries = ${memberPayRates.length}`);
+
+        // Calculate hours for ALL jobs using per-job effective rate
         // Priority: hours_worked > (start_time/end_time calculation) > duration/estimated_duration
         (jobs || []).forEach(job => {
           let hours = 0;
-          
-          // Priority 1: Use hours_worked if available and > 0
+
           if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
             hours = parseFloat(job.hours_worked);
-            console.log(`[Payroll] Job ${job.id}: Using hours_worked = ${hours.toFixed(2)} hours`);
-          }
-          // Priority 2: Calculate from start_time and end_time if available
-          else if (job.start_time && job.end_time) {
+          } else if (job.start_time && job.end_time) {
             const start = new Date(job.start_time);
             const end = new Date(job.end_time);
             const diffMs = end - start;
-            if (diffMs > 0) {
-              hours = diffMs / (1000 * 60 * 60); // Convert milliseconds to hours
-              console.log(`[Payroll] Job ${job.id}: Calculated from start_time/end_time = ${hours.toFixed(2)} hours`);
-            }
-          }
-          // Priority 3: Fallback to duration or estimated_duration (convert minutes to hours)
-          else {
+            if (diffMs > 0) hours = diffMs / (1000 * 60 * 60);
+          } else {
             const durationMinutes = job.duration || job.estimated_duration || 0;
-            if (durationMinutes > 0) {
-              hours = durationMinutes / 60; // Convert minutes to hours
-              console.log(`[Payroll] Job ${job.id}: Using duration fallback = ${durationMinutes} minutes (${hours.toFixed(2)} hours)`);
-            } else {
-              console.log(`[Payroll] Job ${job.id}: No time data available (no hours_worked, start_time/end_time, or duration)`);
-            }
+            if (durationMinutes > 0) hours = durationMinutes / 60;
           }
-          
+
           if (hours > 0) {
             const mc = memberCountByJob[job.id] || 1;
             totalHours += hours / mc;
+
+            // Per-job hourly salary using effective rate on job date
+            if (memberPayRates.length > 0) {
+              const jobDate = job.scheduled_date ? String(job.scheduled_date).split('T')[0].split(' ')[0] : '';
+              const effectiveRate = getEffectivePayRate(memberPayRates, jobDate);
+              if (effectiveRate.hourlyRate > 0) {
+                hourlySalary += (hours / mc) * effectiveRate.hourlyRate;
+              }
+            }
           }
         });
-        
+
         // Determine role type
         const memberRole = (member.role || '').toLowerCase();
         const isManagerOrOwner = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
         // Calculate scheduled working hours from availability settings
-        // Use member's salary_start_date if available, otherwise fall back to shared scheduledHoursStartDate
         const memberSalaryStart = member.salary_start_date
           ? String(member.salary_start_date).split('T')[0].split(' ')[0]
           : scheduledHoursStartDate;
-        // If date range is specified, use the later of (salary_start_date, startDate) as the effective start
         const effectiveStartDate = startDate && memberSalaryStart && memberSalaryStart > startDate
           ? memberSalaryStart
           : (startDate || memberSalaryStart);
         const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
-        const scheduledHourlySalary = scheduledHours * hourlyRate;
+        let scheduledHourlySalary = scheduledHours * hourlyRate;
 
         // For managers/schedulers: hourly salary uses scheduled working hours
-        // For cleaners/workers: hourly salary uses actual job hours
-        if (isManagerOrOwner && hourlyRate > 0) {
+        // With pay rate history, split scheduled hours by rate change periods
+        if (isManagerOrOwner && memberPayRates.length > 0) {
+          // Split scheduled hours by rate change periods for accurate salary
+          const rateChangeDates = memberPayRates.map(r => String(r.effective_from).split('T')[0].split(' ')[0]).sort();
+          // Build period boundaries within the pay period
+          const periodStart = effectiveStartDate;
+          const periodEnd = scheduledHoursEndDate;
+          if (periodStart && periodEnd) {
+            let mgrHourlySalary = 0;
+            let mgrScheduledSalary = 0;
+            // Collect boundaries: periodStart, each rate change within range, periodEnd
+            const boundaries = [periodStart];
+            rateChangeDates.forEach(d => { if (d > periodStart && d <= periodEnd) boundaries.push(d); });
+            boundaries.push(periodEnd);
+            // Remove duplicates and sort
+            const uniqueBoundaries = [...new Set(boundaries)].sort();
+            for (let b = 0; b < uniqueBoundaries.length - 1; b++) {
+              const segStart = uniqueBoundaries[b];
+              // For the last segment, use the actual end date; for others, use day before next boundary
+              const segEnd = uniqueBoundaries[b + 1];
+              const segEndForCalc = b < uniqueBoundaries.length - 2
+                ? (() => { const d = new Date(segEnd + 'T00:00:00'); d.setDate(d.getDate() - 1); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); })()
+                : segEnd;
+              const segHours = calculateScheduledHoursFromAvailability(member.availability, segStart, segEndForCalc);
+              const segRate = getEffectivePayRate(memberPayRates, segStart);
+              mgrHourlySalary += segHours * segRate.hourlyRate;
+              mgrScheduledSalary += segHours * segRate.hourlyRate;
+            }
+            hourlySalary = mgrHourlySalary;
+            scheduledHourlySalary = mgrScheduledSalary;
+          } else if (hourlyRate > 0) {
+            hourlySalary = scheduledHours * hourlyRate;
+          }
+        } else if (isManagerOrOwner && hourlyRate > 0) {
           hourlySalary = scheduledHours * hourlyRate;
           console.log(`[Payroll] Member ${member.id} (${memberRole}): Using SCHEDULED hours for hourly salary: ${scheduledHours.toFixed(2)}h × $${hourlyRate} = $${hourlySalary.toFixed(2)}`);
-        } else {
+        } else if (memberPayRates.length === 0) {
+          // No pay rate history, use flat rate from member record
           hourlySalary = totalHours * hourlyRate;
         }
+        // else: hourlySalary already calculated per-job above
 
         console.log(`[Payroll] Member ${member.id}: Job hours = ${totalHours.toFixed(2)}, Scheduled hours = ${scheduledHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}, Scheduled salary = ${scheduledHourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
         let commissionSalary = 0;
         let commissionRevenueBase = 0;
-        const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
 
         console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%, role = ${member.role}, isManagerOrOwner = ${isManagerOrOwner}`);
 
-        if (commissionPercentage > 0 && isManagerOrOwner) {
-          // Managers/owners: commission is based on TOTAL business revenue for the period
+        if (isManagerOrOwner && memberPayRates.length > 0) {
+          // Manager with rate history: use latest commission rate for total business revenue
+          // (commission on total revenue doesn't split by period — it's a flat % of total)
+          if (commissionPercentage > 0) {
+            commissionRevenueBase = totalBusinessRevenue;
+            commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
+            console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from total business revenue $${totalBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
+          }
+        } else if (commissionPercentage > 0 && isManagerOrOwner) {
           commissionRevenueBase = totalBusinessRevenue;
           commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
           console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from total business revenue $${totalBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
-        } else if (commissionPercentage > 0) {
-          // Service providers: commission is based on their assigned jobs' revenue
-          const jobsWithRevenue = (jobs || []).filter(job => {
-            const revenue = parseFloat(job.service_price) ||
-                           parseFloat(job.price) ||
-                           parseFloat(job.total) ||
-                           parseFloat(job.total_amount) ||
-                           parseFloat(job.invoice_amount) || 0;
-            return revenue > 0;
-          });
-
-          console.log(`[Payroll] Member ${member.id}: ${jobsWithRevenue.length} jobs with revenue out of ${jobs.length} total jobs`);
-
-          jobsWithRevenue.forEach(job => {
+        } else if (commissionPercentage > 0 || memberPayRates.length > 0) {
+          // Service providers: commission per job using effective rate on job date
+          (jobs || []).forEach(job => {
             const jobTotal = parseFloat(job.service_price) ||
                             parseFloat(job.price) ||
                             parseFloat(job.total) ||
                             parseFloat(job.total_amount) ||
                             parseFloat(job.invoice_amount) || 0;
+            if (jobTotal <= 0) return;
             const mc = memberCountByJob[job.id] || 1;
             const splitRevenue = jobTotal / mc;
-            const commission = splitRevenue * (commissionPercentage / 100);
-            commissionSalary += commission;
-            commissionRevenueBase += splitRevenue;
-            console.log(`[Payroll] Job ${job.id}: service_price=$${jobTotal.toFixed(2)} / ${mc} members = $${splitRevenue.toFixed(2)} × ${commissionPercentage}% = $${commission.toFixed(2)} commission`);
+            // Use per-job effective commission rate
+            const jobDate = job.scheduled_date ? String(job.scheduled_date).split('T')[0].split(' ')[0] : '';
+            const effectiveRate = memberPayRates.length > 0 ? getEffectivePayRate(memberPayRates, jobDate) : { commissionPercentage };
+            const jobCommPct = effectiveRate.commissionPercentage || 0;
+            if (jobCommPct > 0) {
+              const commission = splitRevenue * (jobCommPct / 100);
+              commissionSalary += commission;
+              commissionRevenueBase += splitRevenue;
+            }
           });
         }
 
@@ -20188,10 +20446,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           teamMember: {
             id: member.id,
             name: `${member.first_name} ${member.last_name}`,
-            hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
-            commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null,
+            hourlyRate: hourlyRate || null,
+            commissionPercentage: commissionPercentage || null,
             role: member.role || 'Service Provider',
-            status: member.status || 'active'
+            status: member.status || 'active',
+            hasPayRateHistory: memberPayRates.length > 1
           },
           jobCount: (jobs || []).length,
           jobIds: (jobs || []).map(j => j.id),
@@ -31663,12 +31922,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Fetch team member pay configuration — ONLY ACTIVE members get entries (matches Payroll)
+  // Fetch team member pay configuration — ACTIVE and INACTIVE members get entries (matches Payroll)
   const { data: teamMembers } = await supabase
     .from('team_members')
-    .select('id, first_name, last_name, hourly_rate, commission_percentage, role')
+    .select('id, first_name, last_name, hourly_rate, commission_percentage, role, salary_start_date')
     .in('id', teamMemberIds)
-    .eq('status', 'active');
+    .in('status', ['active', 'inactive']);
 
   if (!teamMembers || teamMembers.length === 0) return;
 
@@ -31731,9 +31990,28 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   const ledgerEntries = [];
 
+  // Fetch pay rate history for all assigned members
+  const { data: jobPayRates } = await supabase
+    .from('team_member_pay_rates')
+    .select('team_member_id, hourly_rate, commission_percentage, effective_from')
+    .in('team_member_id', teamMemberIds)
+    .eq('user_id', userId)
+    .order('effective_from', { ascending: false });
+
+  const jobPayRatesByMember = {};
+  (jobPayRates || []).forEach(rate => {
+    if (!jobPayRatesByMember[rate.team_member_id]) jobPayRatesByMember[rate.team_member_id] = [];
+    jobPayRatesByMember[rate.team_member_id].push(rate);
+  });
+
   for (const member of teamMembers) {
-    const hourlyRate = parseFloat(member.hourly_rate) || 0;
-    const commissionPct = parseFloat(member.commission_percentage) || 0;
+    // Use pay rate history if available, otherwise fall back to member record
+    const memberRates = jobPayRatesByMember[member.id] || [];
+    const effectiveRate = memberRates.length > 0
+      ? getEffectivePayRate(memberRates, effectiveDate)
+      : { hourlyRate: parseFloat(member.hourly_rate) || 0, commissionPercentage: parseFloat(member.commission_percentage) || 0 };
+    const hourlyRate = effectiveRate.hourlyRate;
+    const commissionPct = effectiveRate.commissionPercentage;
     const memberRole = (member.role || '').toLowerCase();
     const isManager = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
 
@@ -32813,22 +33091,47 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       }
 
       if (rangeStart && rangeEnd) {
-        // Get managers with hourly rate or commission
+        // Get managers with hourly rate or commission (include inactive for complete records)
         const { data: managers } = await supabase
           .from('team_members')
           .select('id, first_name, last_name, hourly_rate, commission_percentage, availability, role, salary_start_date')
           .eq('user_id', userId)
-          .eq('status', 'active');
+          .in('status', ['active', 'inactive']);
 
         const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+
+        // Fetch pay rate history for all managers
+        const managerIds = (managers || []).filter(m => managerRoles.includes((m.role || '').toLowerCase())).map(m => m.id);
+        let mgrPayRatesByMember = {};
+        if (managerIds.length > 0) {
+          const { data: mgrPayRates } = await supabase
+            .from('team_member_pay_rates')
+            .select('team_member_id, hourly_rate, commission_percentage, effective_from')
+            .in('team_member_id', managerIds)
+            .eq('user_id', userId)
+            .order('effective_from', { ascending: false });
+          (mgrPayRates || []).forEach(rate => {
+            if (!mgrPayRatesByMember[rate.team_member_id]) mgrPayRatesByMember[rate.team_member_id] = [];
+            mgrPayRatesByMember[rate.team_member_id].push(rate);
+          });
+        }
+
         const activeManagers = (managers || []).filter(m => {
           const role = (m.role || '').toLowerCase();
-          return managerRoles.includes(role) && (parseFloat(m.hourly_rate) > 0 || parseFloat(m.commission_percentage) > 0);
+          if (!managerRoles.includes(role)) return false;
+          // Check if they have pay rates in history OR on member record
+          const rates = mgrPayRatesByMember[m.id] || [];
+          return rates.length > 0 || parseFloat(m.hourly_rate) > 0 || parseFloat(m.commission_percentage) > 0;
         });
 
         for (const mgr of activeManagers) {
-          const hourlyRate = parseFloat(mgr.hourly_rate) || 0;
-          const commissionPct = parseFloat(mgr.commission_percentage) || 0;
+          // Use pay rate history if available
+          const mgrRates = mgrPayRatesByMember[mgr.id] || [];
+          const mgrCurrentRate = mgrRates.length > 0
+            ? { hourlyRate: parseFloat(mgrRates[0].hourly_rate) || 0, commissionPercentage: parseFloat(mgrRates[0].commission_percentage) || 0 }
+            : { hourlyRate: parseFloat(mgr.hourly_rate) || 0, commissionPercentage: parseFloat(mgr.commission_percentage) || 0 };
+          const hourlyRate = mgrCurrentRate.hourlyRate;
+          const commissionPct = mgrCurrentRate.commissionPercentage;
 
           // Use member's salary_start_date as effective start (same logic as Payroll)
           const mgrSalaryStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
