@@ -14387,10 +14387,12 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
         defaultMemo: '',
         invoiceFooter: '',
         paymentProcessor: null,
-        paymentProcessorConnected: false
+        paymentProcessorConnected: false,
+        tipCalculationMode: 'automatic',
+        paymentTypeFees: {}
       });
     }
-    
+
     const setting = settings[0];
     res.json({
       onlineBookingTips: setting.online_booking_tips === true,
@@ -14402,7 +14404,9 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
       defaultMemo: setting.default_memo || '',
       invoiceFooter: setting.invoice_footer || '',
       paymentProcessor: setting.payment_processor,
-      paymentProcessorConnected: setting.payment_processor_connected === true
+      paymentProcessorConnected: setting.payment_processor_connected === true,
+      tipCalculationMode: setting.tip_calculation_mode || 'automatic',
+      paymentTypeFees: setting.payment_type_fees || {}
     });
   } catch (error) {
     console.error('Get payment settings error:', error);
@@ -14423,7 +14427,9 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       defaultMemo,
       invoiceFooter,
       paymentProcessor,
-      paymentProcessorConnected
+      paymentProcessorConnected,
+      tipCalculationMode,
+      paymentTypeFees
     } = req.body;
 
     // Check if settings exist
@@ -14452,7 +14458,9 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
           default_memo: defaultMemo,
           invoice_footer: invoiceFooter,
           payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected
+          payment_processor_connected: paymentProcessorConnected,
+          tip_calculation_mode: tipCalculationMode || 'automatic',
+          payment_type_fees: paymentTypeFees || {}
         })
         .eq('user_id', userId);
 
@@ -14475,7 +14483,9 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
           default_memo: defaultMemo,
           invoice_footer: invoiceFooter,
           payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected
+          payment_processor_connected: paymentProcessorConnected,
+          tip_calculation_mode: tipCalculationMode || 'automatic',
+          payment_type_fees: paymentTypeFees || {}
         });
 
       if (insertError) {
