@@ -28618,27 +28618,19 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
 app.get('/api/user/notification-settings', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    const connection = await pool.getConnection();
-    
-    try {
-      const [settings] = await connection.query(`
-        SELECT 
-          notification_type,
-          email_enabled,
-          sms_enabled,
-          push_enabled,
-          created_at,
-          updated_at
-        FROM user_notification_settings 
-        WHERE user_id = ?
-        ORDER BY notification_type
-      `, [userId]);
 
-      res.json(settings);
-    } finally {
-      connection.release();
+    const { data: settings, error } = await supabase
+      .from('user_notification_settings')
+      .select('notification_type, email_enabled, sms_enabled, push_enabled, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('notification_type');
+
+    if (error) {
+      console.error('Error fetching notification settings:', error);
+      return res.status(500).json({ error: 'Failed to fetch notification settings' });
     }
+
+    res.json(settings || []);
   } catch (error) {
     console.error('Error fetching notification settings:', error);
     res.status(500).json({ error: 'Failed to fetch notification settings' });
@@ -28648,45 +28640,47 @@ app.get('/api/user/notification-settings', authenticateToken, async (req, res) =
 app.put('/api/user/notification-settings', async (req, res) => {
   try {
     const { userId, notificationType, emailEnabled, smsEnabled, pushEnabled } = req.body;
-    
+
     if (!userId || !notificationType) {
       return res.status(400).json({ error: 'User ID and notification type are required' });
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if setting exists
-      const [existing] = await connection.query(`
-        SELECT id FROM user_notification_settings 
-        WHERE user_id = ? AND notification_type = ?
-      `, [userId, notificationType]);
+    // Check if setting exists
+    const { data: existing } = await supabase
+      .from('user_notification_settings')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('notification_type', notificationType)
+      .maybeSingle();
 
-      if (existing.length > 0) {
-        // Update existing setting
-        await connection.query(`
-          UPDATE user_notification_settings 
-          SET 
-            email_enabled = ?,
-            sms_enabled = ?,
-            push_enabled = ?,
-            updated_at = NOW()
-          WHERE user_id = ? AND notification_type = ?
-        `, [emailEnabled ? 1 : 0, smsEnabled ? 1 : 0, pushEnabled ? 1 : 0, userId, notificationType]);
-      } else {
-        // Create new setting
-        await connection.query(`
-          INSERT INTO user_notification_settings (user_id, notification_type, email_enabled, sms_enabled, push_enabled)
-          VALUES (?, ?, ?, ?, ?)
-        `, [userId, notificationType, emailEnabled ? 1 : 0, smsEnabled ? 1 : 0, pushEnabled ? 1 : 0]);
-      }
+    if (existing) {
+      const { error } = await supabase
+        .from('user_notification_settings')
+        .update({
+          email_enabled: !!emailEnabled,
+          sms_enabled: !!smsEnabled,
+          push_enabled: !!pushEnabled,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .eq('notification_type', notificationType);
 
-      res.json({ 
-        message: 'Notification setting updated successfully'
-      });
-    } finally {
-      connection.release();
+      if (error) throw error;
+    } else {
+      const { error } = await supabase
+        .from('user_notification_settings')
+        .insert({
+          user_id: userId,
+          notification_type: notificationType,
+          email_enabled: !!emailEnabled,
+          sms_enabled: !!smsEnabled,
+          push_enabled: !!pushEnabled
+        });
+
+      if (error) throw error;
     }
+
+    res.json({ message: 'Notification setting updated successfully' });
   } catch (error) {
     console.error('Error updating notification setting:', error);
     res.status(500).json({ error: 'Failed to update notification setting' });
