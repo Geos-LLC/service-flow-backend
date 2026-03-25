@@ -20665,7 +20665,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           },
           jobCount: (jobs || []).length,
           jobIds: (jobs || []).map(j => j.id),
-          totalJobRevenue: parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
+          totalJobRevenue: isManagerOrOwner && commissionRevenueBase > 0
+            ? parseFloat(commissionRevenueBase.toFixed(2))
+            : parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
           totalHours: parseFloat(totalHours.toFixed(2)),
           scheduledHours: parseFloat(scheduledHours.toFixed(2)),
           scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
