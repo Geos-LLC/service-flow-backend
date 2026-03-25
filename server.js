@@ -20753,7 +20753,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
-    const grandTotalJobRevenue = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalJobRevenue || 0), 0);
+    // Use totalBusinessRevenue for the summary (avoids double-counting manager commission base)
+    const grandTotalJobRevenue = totalBusinessRevenue;
     // Count UNIQUE jobs across all team members (not sum of per-member counts which double-counts shared jobs)
     const allUniqueJobIds = new Set();
     sortedTeamMembers.forEach(item => {
