@@ -479,6 +479,133 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
+// Cron job for auto-payout batch creation
+cron.schedule('0 7 * * *', async () => {
+  logger.info('Running auto-payout batch creation...');
+  try {
+    // Fetch all active team members with auto-payout schedules, grouped by user_id
+    const { data: members, error: membersError } = await supabase
+      .from('team_members')
+      .select('id, user_id, first_name, last_name, payout_schedule_type, payout_day_of_week, payout_interval_days')
+      .neq('payout_schedule_type', 'manual')
+      .not('payout_schedule_type', 'is', null);
+
+    if (membersError) {
+      logger.error('Auto-payout: failed to fetch team members', { error: membersError });
+      return;
+    }
+
+    if (!members || members.length === 0) {
+      logger.info('Auto-payout: no team members with auto-payout schedules found');
+      return;
+    }
+
+    logger.info(`Auto-payout: found ${members.length} team members with auto-payout schedules`);
+
+    const today = new Date();
+    const currentDayOfWeek = today.getUTCDay(); // 0=Sunday, 1=Monday, etc.
+    const yesterday = new Date(today);
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+    const periodEndStr = yesterday.toISOString().split('T')[0];
+
+    let batchesCreated = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const member of members) {
+      try {
+        const scheduleType = member.payout_schedule_type;
+        let isPayoutDay = false;
+
+        if (scheduleType === 'daily') {
+          isPayoutDay = true;
+        } else if (scheduleType === 'weekly') {
+          isPayoutDay = currentDayOfWeek === (member.payout_day_of_week || 0);
+        } else if (scheduleType === 'biweekly') {
+          // Check day of week first
+          if (currentDayOfWeek === (member.payout_day_of_week || 0)) {
+            // Check if >= 14 days since last payout batch
+            const { data: lastBatch } = await supabase
+              .from('cleaner_payout_batch')
+              .select('period_end, created_at')
+              .eq('team_member_id', member.id)
+              .eq('user_id', member.user_id)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .single();
+
+            if (!lastBatch) {
+              isPayoutDay = true; // No prior batch, go ahead
+            } else {
+              const lastBatchDate = new Date(lastBatch.created_at);
+              const daysSinceLast = Math.floor((today - lastBatchDate) / (1000 * 60 * 60 * 24));
+              isPayoutDay = daysSinceLast >= 14;
+            }
+          }
+        }
+
+        if (!isPayoutDay) {
+          continue;
+        }
+
+        // Determine period start: last payout batch end date, or 30 days ago
+        const { data: lastBatch } = await supabase
+          .from('cleaner_payout_batch')
+          .select('period_end')
+          .eq('team_member_id', member.id)
+          .eq('user_id', member.user_id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        let periodStartStr;
+        if (lastBatch && lastBatch.period_end) {
+          // Start from the day after the last batch ended
+          const lastEnd = new Date(lastBatch.period_end);
+          lastEnd.setUTCDate(lastEnd.getUTCDate() + 1);
+          periodStartStr = lastEnd.toISOString().split('T')[0];
+        } else {
+          // No prior batch, use 30 days ago
+          const thirtyDaysAgo = new Date(today);
+          thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+          periodStartStr = thirtyDaysAgo.toISOString().split('T')[0];
+        }
+
+        // Skip if period start is after period end
+        if (periodStartStr > periodEndStr) {
+          logger.info(`Auto-payout: skipping member ${member.id} (${member.first_name} ${member.last_name}) - period start ${periodStartStr} is after period end ${periodEndStr}`);
+          skipped++;
+          continue;
+        }
+
+        const result = await createPayoutBatchForMember(
+          member.user_id,
+          member.id,
+          periodStartStr,
+          periodEndStr,
+          `Auto-payout (${scheduleType})`,
+          'auto'
+        );
+
+        if (result.skipped) {
+          logger.info(`Auto-payout: skipped member ${member.id} (${member.first_name} ${member.last_name}) - ${result.reason}`);
+          skipped++;
+        } else {
+          logger.info(`Auto-payout: created batch ${result.batch.id} for member ${member.id} (${member.first_name} ${member.last_name}), total: $${result.batch.total_amount}, entries: ${result.entry_count}`);
+          batchesCreated++;
+        }
+      } catch (memberError) {
+        logger.error(`Auto-payout: error processing member ${member.id} (${member.first_name} ${member.last_name})`, { error: memberError.message });
+        errors++;
+      }
+    }
+
+    logger.info(`Auto-payout completed: ${batchesCreated} batches created, ${skipped} skipped, ${errors} errors`);
+  } catch (error) {
+    logger.error('Auto-payout cron error', { error: error.message });
+  }
+});
+
 // SendEmail function using SendGrid
 async function sendEmail({ to, subject, html, text }) {
   console.log('📧 Sending email via SendGrid...');
@@ -14617,6 +14744,61 @@ app.delete('/api/user/payment-methods/:id', authenticateToken, async (req, res) 
   } catch (error) {
     console.error('Delete payment method error:', error);
     res.status(500).json({ error: 'Failed to delete payment method' });
+  }
+});
+
+// Payout settings endpoints
+app.get('/api/user/payout-settings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: settings } = await supabase
+      .from('user_payment_settings')
+      .select('payout_frequency, pay_period_start_day, biweekly_anchor_date, payout_method, auto_payout_enabled')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    res.json(settings || {
+      payout_frequency: 'manual',
+      pay_period_start_day: 1,
+      biweekly_anchor_date: null,
+      payout_method: 'bank_transfer',
+      auto_payout_enabled: false
+    });
+  } catch (error) {
+    console.error('Error fetching payout settings:', error);
+    res.status(500).json({ error: 'Failed to fetch payout settings' });
+  }
+});
+
+app.put('/api/user/payout-settings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { payoutFrequency, payPeriodStartDay, biweeklyAnchorDate, payoutMethod, autoPayoutEnabled } = req.body;
+
+    const updateData = {
+      payout_frequency: payoutFrequency || 'manual',
+      pay_period_start_day: payPeriodStartDay ?? 1,
+      biweekly_anchor_date: biweeklyAnchorDate || null,
+      payout_method: payoutMethod || 'bank_transfer',
+      auto_payout_enabled: !!autoPayoutEnabled
+    };
+
+    const { data: existing } = await supabase
+      .from('user_payment_settings')
+      .select('id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (existing) {
+      await supabase.from('user_payment_settings').update(updateData).eq('user_id', userId);
+    } else {
+      await supabase.from('user_payment_settings').insert({ user_id: userId, ...updateData });
+    }
+
+    res.json({ message: 'Payout settings saved successfully' });
+  } catch (error) {
+    console.error('Error saving payout settings:', error);
+    res.status(500).json({ error: 'Failed to save payout settings' });
   }
 });
 
@@ -32511,6 +32693,79 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
 
 // === PAYOUT BATCH ENDPOINTS ===
 
+// Shared function to create a payout batch for a team member
+async function createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, source = 'manual') {
+  // Fetch unpaid ledger entries in the period
+  const { data: unpaidEntries, error: fetchError } = await supabase
+    .from('cleaner_ledger')
+    .select('id, amount, type')
+    .eq('user_id', userId)
+    .eq('team_member_id', teamMemberId)
+    .is('payout_batch_id', null)
+    .gte('effective_date', periodStart)
+    .lte('effective_date', periodEnd)
+    .neq('type', 'payout'); // Don't include previous payout entries
+
+  if (fetchError) {
+    throw new Error(`Failed to fetch unpaid entries: ${fetchError.message}`);
+  }
+
+  if (!unpaidEntries || unpaidEntries.length === 0) {
+    return { skipped: true, reason: 'No unpaid entries found for this period' };
+  }
+
+  // Calculate total
+  const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+  const roundedTotal = parseFloat(totalAmount.toFixed(2));
+
+  // Create payout batch
+  const { data: batch, error: batchError } = await supabase
+    .from('cleaner_payout_batch')
+    .insert({
+      user_id: userId,
+      team_member_id: parseInt(teamMemberId),
+      period_start: periodStart,
+      period_end: periodEnd,
+      status: 'pending',
+      total_amount: roundedTotal,
+      note: note || null,
+      created_by: userId,
+      source: source
+    })
+    .select()
+    .single();
+
+  if (batchError) {
+    throw new Error(`Failed to create payout batch: ${batchError.message}`);
+  }
+
+  // Attach ledger entries to this batch
+  const entryIds = unpaidEntries.map(e => e.id);
+  const { error: attachError } = await supabase
+    .from('cleaner_ledger')
+    .update({ payout_batch_id: batch.id })
+    .in('id', entryIds);
+
+  if (attachError) {
+    // Rollback: delete the batch
+    await supabase.from('cleaner_payout_batch').delete().eq('id', batch.id);
+    throw new Error(`Failed to attach entries to batch: ${attachError.message}`);
+  }
+
+  return {
+    skipped: false,
+    batch,
+    entry_count: entryIds.length,
+    entries_summary: {
+      earnings: unpaidEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
+      tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
+      incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
+      cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
+      adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
+    }
+  };
+}
+
 // POST /api/ledger/payout-batch - Create payout batch for a cleaner
 app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
   try {
@@ -32521,75 +32776,16 @@ app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'teamMemberId, periodStart, and periodEnd are required' });
     }
 
-    // Fetch unpaid ledger entries in the period
-    const { data: unpaidEntries, error: fetchError } = await supabase
-      .from('cleaner_ledger')
-      .select('id, amount, type')
-      .eq('user_id', userId)
-      .eq('team_member_id', teamMemberId)
-      .is('payout_batch_id', null)
-      .gte('effective_date', periodStart)
-      .lte('effective_date', periodEnd)
-      .neq('type', 'payout'); // Don't include previous payout entries
+    const result = await createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, 'manual');
 
-    if (fetchError) {
-      console.error('Payout batch fetch error:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch unpaid entries' });
-    }
-
-    if (!unpaidEntries || unpaidEntries.length === 0) {
-      return res.status(400).json({ error: 'No unpaid entries found for this period' });
-    }
-
-    // Calculate total
-    const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
-    const roundedTotal = parseFloat(totalAmount.toFixed(2));
-
-    // Create payout batch
-    const { data: batch, error: batchError } = await supabase
-      .from('cleaner_payout_batch')
-      .insert({
-        user_id: userId,
-        team_member_id: parseInt(teamMemberId),
-        period_start: periodStart,
-        period_end: periodEnd,
-        status: 'pending',
-        total_amount: roundedTotal,
-        note: note || null,
-        created_by: userId
-      })
-      .select()
-      .single();
-
-    if (batchError) {
-      console.error('Payout batch creation error:', batchError);
-      return res.status(500).json({ error: 'Failed to create payout batch' });
-    }
-
-    // Attach ledger entries to this batch
-    const entryIds = unpaidEntries.map(e => e.id);
-    const { error: attachError } = await supabase
-      .from('cleaner_ledger')
-      .update({ payout_batch_id: batch.id })
-      .in('id', entryIds);
-
-    if (attachError) {
-      console.error('Payout batch attach error:', attachError);
-      // Rollback: delete the batch
-      await supabase.from('cleaner_payout_batch').delete().eq('id', batch.id);
-      return res.status(500).json({ error: 'Failed to attach entries to batch' });
+    if (result.skipped) {
+      return res.status(400).json({ error: result.reason });
     }
 
     res.json({
-      ...batch,
-      entry_count: entryIds.length,
-      entries_summary: {
-        earnings: unpaidEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
-        tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
-        incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
-        cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
-        adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
-      }
+      ...result.batch,
+      entry_count: result.entry_count,
+      entries_summary: result.entries_summary
     });
   } catch (error) {
     console.error('Payout batch error:', error);
