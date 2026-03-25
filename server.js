@@ -20325,6 +20325,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     Object.values(allJobsById).forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      // Enforce date filter (some jobs may have been added via assignments without strict date filtering)
+      if (startDate || endDate) {
+        const raw = job.scheduled_date ? String(job.scheduled_date) : '';
+        const jobDateStr = raw.split('T')[0].split(' ')[0];
+        if (startDate && jobDateStr < startDate) return;
+        if (endDate && jobDateStr > endDate) return;
+      }
       // Revenue = Subtotal (service_price) on the job card
       const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
       totalBusinessRevenue += rev;
