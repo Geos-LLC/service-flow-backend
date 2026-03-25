@@ -20488,6 +20488,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
         // else: hourlySalary already calculated per-job above
 
+        // For managers/owners: use scheduled hours as their "worked" hours
+        // since their salary is based on availability schedule, not job clock-in/out
+        if (isManagerOrOwner && scheduledHours > 0) {
+          totalHours = scheduledHours;
+        }
+
         console.log(`[Payroll] Member ${member.id}: Job hours = ${totalHours.toFixed(2)}, Scheduled hours = ${scheduledHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}, Scheduled salary = ${scheduledHourlySalary.toFixed(2)}`);
 
         // Calculate commission-based salary
