@@ -178,7 +178,9 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // Sync Engine
   // ══════════════════════════════════════
-  // Find existing record by zenbooker_id first, then by natural key (name, email, etc.)
+  const stripPhone = (p) => (p || '').replace(/\D/g, '').slice(-10) // last 10 digits
+
+  // Find existing record by zenbooker_id first, then by natural key (name, email, phone)
   async function findOrLink(table, userId, zbId, naturalMatch) {
     // 1. Already linked by zenbooker_id
     const { data: linked } = await supabase.from(table).select('id').eq('user_id', userId).eq('zenbooker_id', zbId).maybeSingle()
@@ -186,19 +188,34 @@ module.exports = (supabase, logger) => {
 
     // 2. Try natural key match (existing record without zenbooker_id)
     if (naturalMatch) {
+      // Phone matching: strip to last 10 digits and search
+      if (naturalMatch.phone) {
+        const digits = stripPhone(naturalMatch.phone)
+        if (digits.length >= 7) {
+          const { data: allUnlinked } = await supabase.from(table).select('id, phone').eq('user_id', userId).is('zenbooker_id', null).not('phone', 'is', null)
+          const phoneMatch = (allUnlinked || []).find(r => stripPhone(r.phone) === digits)
+          if (phoneMatch) {
+            await supabase.from(table).update({ zenbooker_id: zbId }).eq('id', phoneMatch.id)
+            return { id: phoneMatch.id, wasLinked: false, newlyLinked: true }
+          }
+        }
+        // If phone didn't match, don't fall through to other fields
+        return null
+      }
+
+      // Non-phone matching (name, email)
       let q = supabase.from(table).select('id').eq('user_id', userId).is('zenbooker_id', null)
       Object.entries(naturalMatch).forEach(([k, v]) => {
         if (v) q = q.ilike(k, v)
       })
       const { data: matched } = await q.limit(1).maybeSingle()
       if (matched) {
-        // Link existing record
         await supabase.from(table).update({ zenbooker_id: zbId }).eq('id', matched.id)
         return { id: matched.id, wasLinked: false, newlyLinked: true }
       }
     }
 
-    return null // Not found — needs insert
+    return null
   }
 
   async function syncTerritories(userId, apiKey) {
@@ -263,8 +280,8 @@ module.exports = (supabase, logger) => {
     let created = 0, updated = 0, linked = 0
     for (const zb of zbCustomers) {
       const mapped = mapCustomer(zb, userId)
-      // Match by email first, then by phone
-      const naturalMatch = zb.email ? { email: zb.email } : (zb.phone ? { phone: zb.phone } : null)
+      // Match by phone first (primary identifier), then by email
+      const naturalMatch = zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null)
       const found = await findOrLink('customers', userId, zb.id, naturalMatch)
       if (found) {
         await supabase.from('customers').update(mapped).eq('id', found.id)
