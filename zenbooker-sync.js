@@ -232,95 +232,71 @@ module.exports = (supabase, logger) => {
 
   async function syncTerritories(userId, apiKey) {
     const zbTerritories = await zbFetchAll(apiKey, '/territories')
-    let created = 0, updated = 0, linked = 0, errors = 0
+    let created = 0, skipped = 0, errors = 0
     for (const zb of zbTerritories) {
       try {
+        // Skip if already exists
+        const { data: existing } = await supabase.from('territories').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+        if (existing) { skipped++; continue }
         const mapped = mapTerritory(zb, userId)
-        logger.log(`[Zenbooker] Territory: inserting ${zb.name}, mapped: ${JSON.stringify(mapped)}`)
-        const found = await findOrLink('territories', userId, zb.id, { name: zb.name })
-        if (found) {
-          const { error } = await supabase.from('territories').update(mapped).eq('id', found.id)
-          if (error) { logger.error(`[Zenbooker] Territory update error: ${JSON.stringify(error)}`); errors++ }
-          else if (found.newlyLinked) linked++; else updated++
-        } else {
-          const { data, error } = await supabase.from('territories').insert(mapped).select('id')
-          if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
-          else { logger.log(`[Zenbooker] Territory created: ${data?.[0]?.id}`); created++ }
-        }
+        const { error } = await supabase.from('territories').insert(mapped)
+        if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
+        else created++
       } catch (err) {
-        logger.error(`[Zenbooker] Territory CRASH ${zb.name}: ${err.message}`)
-        errors++
+        logger.error(`[Zenbooker] Territory CRASH ${zb.name}: ${err.message}`); errors++
       }
     }
-    return { total: zbTerritories.length, created, updated, linked, errors }
+    return { total: zbTerritories.length, created, skipped, errors }
   }
 
   async function syncServices(userId, apiKey) {
     const zbServices = await zbFetchAll(apiKey, '/services')
-    let created = 0, updated = 0, linked = 0, errors = 0
+    let created = 0, skipped = 0, errors = 0
     for (const zb of zbServices) {
-      const mapped = mapService(zb, userId)
       const zbId = zb.service_id || zb.id
-      const found = await findOrLink('services', userId, zbId, { name: zb.name })
-      if (found) {
-        // Don't overwrite price if already set on existing service
-        const { price, ...safeUpdate } = mapped
-        const { error } = await supabase.from('services').update(safeUpdate).eq('id', found.id)
-        if (error) { logger.error(`[Zenbooker] Service update error: ${JSON.stringify(error)}`); errors++ }
-        else if (found.newlyLinked) linked++; else updated++
-      } else {
-        const { error } = await supabase.from('services').insert(mapped)
-        if (error) { logger.error(`[Zenbooker] Service insert error: ${JSON.stringify(error)}`); errors++ }
-        else created++
-      }
+      const { data: existing } = await supabase.from('services').select('id').eq('user_id', userId).eq('zenbooker_id', zbId).maybeSingle()
+      if (existing) { skipped++; continue }
+      const mapped = mapService(zb, userId)
+      const { error } = await supabase.from('services').insert(mapped)
+      if (error) { logger.error(`[Zenbooker] Service insert error: ${JSON.stringify(error)}`); errors++ }
+      else created++
     }
-    return { total: zbServices.length, created, updated, linked, errors }
+    return { total: zbServices.length, created, skipped, errors }
   }
 
   async function syncTeamMembers(userId, apiKey) {
     const zbTeam = await zbFetchAll(apiKey, '/team_members')
-    let created = 0, updated = 0, linked = 0, errors = 0
+    let created = 0, skipped = 0, errors = 0
     for (const zb of zbTeam) {
+      const { data: existing } = await supabase.from('team_members').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      if (existing) { skipped++; continue }
       const mapped = mapTeamMember(zb, userId)
-      const naturalMatch = zb.email ? { email: zb.email } : { first_name: mapped.first_name }
-      const found = await findOrLink('team_members', userId, zb.id, naturalMatch)
-      if (found) {
-        const { error } = await supabase.from('team_members').update(mapped).eq('id', found.id)
-        if (error) { logger.error(`[Zenbooker] Team update error: ${JSON.stringify(error)}`); errors++ }
-        else if (found.newlyLinked) linked++; else updated++
-      } else {
-        const { error } = await supabase.from('team_members').insert(mapped)
-        if (error) { logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
-        else created++
-      }
+      const { error } = await supabase.from('team_members').insert(mapped)
+      if (error) { logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
+      else created++
     }
-    return { total: zbTeam.length, created, updated, linked, errors }
+    return { total: zbTeam.length, created, skipped, errors }
   }
 
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
-    let created = 0, updated = 0, linked = 0, errors = 0
+    let created = 0, skipped = 0, errors = 0
     const total = zbCustomers.length
     let processed = 0
     for (const zb of zbCustomers) {
       processed++
-      if (processed % 50 === 0) {
-        syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${linked} linked, ${errors} errors` }
+      // Skip if already exists by zenbooker_id
+      const { data: existing } = await supabase.from('customers').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      if (existing) { skipped++; continue }
+      if (processed % 20 === 0) {
+        syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${skipped} skipped` }
       }
       const mapped = mapCustomer(zb, userId)
-      const naturalMatch = zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null)
-      const found = await findOrLink('customers', userId, zb.id, naturalMatch)
-      if (found) {
-        const { error } = await supabase.from('customers').update(mapped).eq('id', found.id)
-        if (error) { logger.error(`[Zenbooker] Customer update error: ${JSON.stringify(error)}`); errors++ }
-        else if (found.newlyLinked) linked++; else updated++
-      } else {
-        const { error } = await supabase.from('customers').insert(mapped)
-        if (error) { logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
-        else created++
-      }
+      const { error } = await supabase.from('customers').insert(mapped)
+      if (error) { logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
+      else created++
     }
-    return { total: zbCustomers.length, created, updated, linked, errors }
+    return { total: zbCustomers.length, created, skipped, errors }
   }
 
   async function syncJobs(userId, apiKey, params = {}, maxJobs = 0) {
@@ -344,52 +320,26 @@ module.exports = (supabase, logger) => {
     } else {
       zbJobs = await zbFetchAll(apiKey, '/jobs', params)
     }
-    let created = 0, updated = 0, linked = 0
+    let created = 0, skipped = 0, errors = 0
     const jobTotal = zbJobs.length
     let jobProcessed = 0
     for (const zb of zbJobs) {
       jobProcessed++
       if (jobProcessed % 20 === 0 || jobProcessed === 1) {
         const pct = Math.round(60 + (jobProcessed / jobTotal) * 35)
-        syncProgress[userId] = { ...syncProgress[userId], phase: `Jobs (${jobProcessed}/${jobTotal})`, progress: pct, detail: `${created} new, ${updated} updated, ${linked} linked` }
+        syncProgress[userId] = { ...syncProgress[userId], phase: `Jobs (${jobProcessed}/${jobTotal})`, progress: pct, detail: `${created} new, ${skipped} skipped` }
       }
+
+      // Skip if already exists
+      const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      if (existing) { skipped++; continue }
+
       const mapped = mapJob(zb, userId, lookups)
-
-      // 1. Already linked by zenbooker_id
-      const { data: byZbId } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (byZbId) {
-        const { error } = await supabase.from('jobs').update(mapped).eq('id', byZbId.id)
-        if (error) logger.error(`[Zenbooker] Job update error ${zb.id}: ${JSON.stringify(error)}`)
-        else updated++
-        continue
-      }
-
-      // 2. Try matching existing unlinked job by date + customer + service
-      if (mapped.scheduled_date && mapped.customer_id) {
-        const dateStr = String(mapped.scheduled_date).split('T')[0].split(' ')[0]
-        const { data: matchedJob } = await supabase.from('jobs')
-          .select('id')
-          .eq('user_id', userId)
-          .is('zenbooker_id', null)
-          .eq('customer_id', mapped.customer_id)
-          .gte('scheduled_date', dateStr)
-          .lt('scheduled_date', dateStr + ' 23:59:59')
-          .limit(1)
-          .maybeSingle()
-        if (matchedJob) {
-          const { error } = await supabase.from('jobs').update({ ...mapped, zenbooker_id: zb.id }).eq('id', matchedJob.id)
-          if (error) logger.error(`[Zenbooker] Job link error ${zb.id}: ${JSON.stringify(error)}`)
-          else linked++
-          continue
-        }
-      }
-
-      // 3. Create new
       const { error } = await supabase.from('jobs').insert(mapped)
-      if (error) logger.error(`[Zenbooker] Job insert error ${zb.id}: ${JSON.stringify(error)}`)
+      if (error) { logger.error(`[Zenbooker] Job insert error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
       else created++
     }
-    return { total: zbJobs.length, created, updated, linked }
+    return { total: zbJobs.length, created, skipped, errors }
   }
 
   async function runFullSync(userId, apiKey) {
