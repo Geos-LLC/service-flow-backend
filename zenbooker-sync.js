@@ -95,7 +95,7 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       first_name: nameParts[0] || '',
       last_name: nameParts.slice(1).join(' ') || '',
-      email: zb.email || null,
+      email: zb.email || '',
       phone: zb.phone || null,
       zenbooker_id: zb.id,
     }
