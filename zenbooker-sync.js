@@ -232,19 +232,21 @@ module.exports = (supabase, logger) => {
 
   async function syncTerritories(userId, apiKey) {
     const zbTerritories = await zbFetchAll(apiKey, '/territories')
-    let created = 0, updated = 0, linked = 0
+    let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbTerritories) {
       const mapped = mapTerritory(zb, userId)
       const found = await findOrLink('territories', userId, zb.id, { name: zb.name })
       if (found) {
-        await supabase.from('territories').update(mapped).eq('id', found.id)
-        if (found.newlyLinked) linked++; else updated++
+        const { error } = await supabase.from('territories').update(mapped).eq('id', found.id)
+        if (error) { logger.error(`[Zenbooker] Territory update error: ${JSON.stringify(error)}`); errors++ }
+        else if (found.newlyLinked) linked++; else updated++
       } else {
-        await supabase.from('territories').insert(mapped)
-        created++
+        const { error } = await supabase.from('territories').insert(mapped)
+        if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
+        else created++
       }
     }
-    return { total: zbTerritories.length, created, updated, linked }
+    return { total: zbTerritories.length, created, updated, linked, errors }
   }
 
   async function syncServices(userId, apiKey) {
@@ -271,42 +273,42 @@ module.exports = (supabase, logger) => {
 
   async function syncTeamMembers(userId, apiKey) {
     const zbTeam = await zbFetchAll(apiKey, '/team_members')
-    let created = 0, updated = 0, linked = 0
+    let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbTeam) {
       const mapped = mapTeamMember(zb, userId)
-      // Match by email first, then by name
       const naturalMatch = zb.email ? { email: zb.email } : { first_name: mapped.first_name }
       const found = await findOrLink('team_members', userId, zb.id, naturalMatch)
       if (found) {
-        // Don't overwrite hourly_rate, commission_percentage, role, status
-        const { role, status, ...safeUpdate } = mapped
-        await supabase.from('team_members').update(safeUpdate).eq('id', found.id)
-        if (found.newlyLinked) linked++; else updated++
+        const { error } = await supabase.from('team_members').update(mapped).eq('id', found.id)
+        if (error) { logger.error(`[Zenbooker] Team update error: ${JSON.stringify(error)}`); errors++ }
+        else if (found.newlyLinked) linked++; else updated++
       } else {
-        await supabase.from('team_members').insert(mapped)
-        created++
+        const { error } = await supabase.from('team_members').insert(mapped)
+        if (error) { logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
+        else created++
       }
     }
-    return { total: zbTeam.length, created, updated, linked }
+    return { total: zbTeam.length, created, updated, linked, errors }
   }
 
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
-    let created = 0, updated = 0, linked = 0
+    let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbCustomers) {
       const mapped = mapCustomer(zb, userId)
-      // Match by phone first (primary identifier), then by email
       const naturalMatch = zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null)
       const found = await findOrLink('customers', userId, zb.id, naturalMatch)
       if (found) {
-        await supabase.from('customers').update(mapped).eq('id', found.id)
-        if (found.newlyLinked) linked++; else updated++
+        const { error } = await supabase.from('customers').update(mapped).eq('id', found.id)
+        if (error) { logger.error(`[Zenbooker] Customer update error: ${JSON.stringify(error)}`); errors++ }
+        else if (found.newlyLinked) linked++; else updated++
       } else {
-        await supabase.from('customers').insert(mapped)
-        created++
+        const { error } = await supabase.from('customers').insert(mapped)
+        if (error) { logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
+        else created++
       }
     }
-    return { total: zbCustomers.length, created, updated, linked }
+    return { total: zbCustomers.length, created, updated, linked, errors }
   }
 
   async function syncJobs(userId, apiKey, params = {}, maxJobs = 0) {
