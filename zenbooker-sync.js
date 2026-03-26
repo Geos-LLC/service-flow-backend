@@ -82,9 +82,9 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       name: zb.name || 'Unnamed Service',
       description: zb.description || '',
-      base_price: parseFloat(zb.price) || 0,
-      duration: zb.duration || 0,
-      zenbooker_id: zb.id,
+      base_price: parseFloat(zb.base_price) || 0,
+      duration: zb.base_duration || 0,
+      zenbooker_id: zb.service_id || zb.id,
       status: 'active',
     }
   }
@@ -254,7 +254,8 @@ module.exports = (supabase, logger) => {
     let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbServices) {
       const mapped = mapService(zb, userId)
-      const found = await findOrLink('services', userId, zb.id, { name: zb.name })
+      const zbId = zb.service_id || zb.id
+      const found = await findOrLink('services', userId, zbId, { name: zb.name })
       if (found) {
         const { base_price, ...safeUpdate } = mapped
         const { error } = await supabase.from('services').update(safeUpdate).eq('id', found.id)
@@ -392,10 +393,10 @@ module.exports = (supabase, logger) => {
       }
       results.territories = { total: zbTerritories.length, linked: zbTerritories.length }
 
-      // Link services by name
+      // Link services by name (Zenbooker uses service_id not id)
       const zbServices = await zbFetchAll(apiKey, '/services')
       for (const zb of zbServices) {
-        await findOrLink('services', userId, zb.id, { name: zb.name })
+        await findOrLink('services', userId, zb.service_id || zb.id, { name: zb.name })
       }
       results.services = { total: zbServices.length, linked: zbServices.length }
 
