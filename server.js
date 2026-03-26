@@ -65,8 +65,10 @@ function calculateJobTotal({ servicePrice = 0, discount = 0, additionalFees = 0,
 
 // Helper function to get today's date in local timezone
 const getTodayString = () => {
-  const today = new Date();
-  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  // Use Eastern time (most users are US-based) to avoid UTC midnight issues
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const get = (t) => (parts.find(p => p.type === t) || {}).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
 };
 
 // Google OAuth Configuration
