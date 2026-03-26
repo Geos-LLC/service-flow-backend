@@ -234,16 +234,22 @@ module.exports = (supabase, logger) => {
     const zbTerritories = await zbFetchAll(apiKey, '/territories')
     let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbTerritories) {
-      const mapped = mapTerritory(zb, userId)
-      const found = await findOrLink('territories', userId, zb.id, { name: zb.name })
-      if (found) {
-        const { error } = await supabase.from('territories').update(mapped).eq('id', found.id)
-        if (error) { logger.error(`[Zenbooker] Territory update error: ${JSON.stringify(error)}`); errors++ }
-        else if (found.newlyLinked) linked++; else updated++
-      } else {
-        const { error } = await supabase.from('territories').insert(mapped)
-        if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
-        else created++
+      try {
+        const mapped = mapTerritory(zb, userId)
+        logger.log(`[Zenbooker] Territory: inserting ${zb.name}, mapped: ${JSON.stringify(mapped)}`)
+        const found = await findOrLink('territories', userId, zb.id, { name: zb.name })
+        if (found) {
+          const { error } = await supabase.from('territories').update(mapped).eq('id', found.id)
+          if (error) { logger.error(`[Zenbooker] Territory update error: ${JSON.stringify(error)}`); errors++ }
+          else if (found.newlyLinked) linked++; else updated++
+        } else {
+          const { data, error } = await supabase.from('territories').insert(mapped).select('id')
+          if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
+          else { logger.log(`[Zenbooker] Territory created: ${data?.[0]?.id}`); created++ }
+        }
+      } catch (err) {
+        logger.error(`[Zenbooker] Territory CRASH ${zb.name}: ${err.message}`)
+        errors++
       }
     }
     return { total: zbTerritories.length, created, updated, linked, errors }
