@@ -639,6 +639,55 @@ module.exports = (supabase, logger) => {
             logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
           }
 
+          if (entity === 'reconcile') {
+            // Fetch ALL jobs from Zenbooker and update status/invoice for existing SF jobs
+            syncProgress[userId] = { status: 'running', phase: 'Fetching jobs...', progress: 10 }
+            const zbJobs = await zbFetchAll(apiKey, '/jobs')
+            logger.log(`[Zenbooker] Reconcile: ${zbJobs.length} jobs from Zenbooker`)
+
+            let updated = 0, skipped = 0, errors = 0
+            const total = zbJobs.length
+            for (let i = 0; i < zbJobs.length; i++) {
+              const zb = zbJobs[i]
+              if (i % 50 === 0) {
+                const pct = Math.round(10 + (i / total) * 85)
+                syncProgress[userId] = { status: 'running', phase: `Reconciling (${i}/${total})`, progress: pct, detail: `${updated} updated, ${skipped} unchanged` }
+              }
+
+              const { data: sfJob } = await supabase.from('jobs').select('id, status, invoice_status').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+              if (!sfJob) { skipped++; continue }
+
+              const zbStatus = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
+              const inv = zb.invoice || {}
+              const zbInvoiceStatus = inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft')
+              const zbPaymentStatus = inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null)
+
+              // Only update if something changed
+              if (sfJob.status === zbStatus && sfJob.invoice_status === zbInvoiceStatus) {
+                skipped++
+                continue
+              }
+
+              const update = {
+                status: zbStatus,
+                invoice_status: zbInvoiceStatus,
+                scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
+                price: parseFloat(inv.subtotal) || undefined,
+                service_price: parseFloat(inv.subtotal) || undefined,
+                total: parseFloat(inv.total) || undefined,
+                total_amount: parseFloat(inv.total) || undefined,
+              }
+              if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+
+              const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
+              if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
+              else { updated++ }
+            }
+
+            results.reconcile = { total, updated, skipped, errors }
+            logger.log(`[Zenbooker] Reconcile done: ${JSON.stringify(results.reconcile)}`)
+          }
+
           await supabase.from('users').update({ zenbooker_last_sync: new Date().toISOString() }).eq('id', userId)
           syncProgress[userId] = { status: 'complete', progress: 100, results }
           setTimeout(() => { delete syncProgress[userId] }, 300000)
