@@ -300,7 +300,13 @@ module.exports = (supabase, logger) => {
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
     let created = 0, updated = 0, linked = 0, errors = 0
+    const total = zbCustomers.length
+    let processed = 0
     for (const zb of zbCustomers) {
+      processed++
+      if (processed % 50 === 0) {
+        syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${linked} linked, ${errors} errors` }
+      }
       const mapped = mapCustomer(zb, userId)
       const naturalMatch = zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null)
       const found = await findOrLink('customers', userId, zb.id, naturalMatch)
@@ -339,7 +345,14 @@ module.exports = (supabase, logger) => {
       zbJobs = await zbFetchAll(apiKey, '/jobs', params)
     }
     let created = 0, updated = 0, linked = 0
+    const jobTotal = zbJobs.length
+    let jobProcessed = 0
     for (const zb of zbJobs) {
+      jobProcessed++
+      if (jobProcessed % 20 === 0 || jobProcessed === 1) {
+        const pct = Math.round(60 + (jobProcessed / jobTotal) * 35)
+        syncProgress[userId] = { ...syncProgress[userId], phase: `Jobs (${jobProcessed}/${jobTotal})`, progress: pct, detail: `${created} new, ${updated} updated, ${linked} linked` }
+      }
       const mapped = mapJob(zb, userId, lookups)
 
       // 1. Already linked by zenbooker_id
@@ -625,14 +638,20 @@ module.exports = (supabase, logger) => {
           if (!entity || entity === 'jobs') {
             // Ensure entities exist before syncing jobs (needed for FK lookups)
             if (entity === 'jobs') {
-              // Check if entities are already synced
               const { count: tCount } = await supabase.from('territories').select('id', { count: 'exact', head: true }).eq('user_id', userId).not('zenbooker_id', 'is', null)
               if (!tCount || tCount === 0) {
-                syncProgress[userId] = { status: 'running', phase: 'Syncing entities first...', progress: 10 }
+                syncProgress[userId] = { status: 'running', phase: 'Territories', progress: 5, results }
                 results.territories = await syncTerritories(userId, apiKey)
+
+                syncProgress[userId] = { status: 'running', phase: 'Services', progress: 10, results }
                 results.services = await syncServices(userId, apiKey)
+
+                syncProgress[userId] = { status: 'running', phase: 'Team Members', progress: 20, results }
                 results.teamMembers = await syncTeamMembers(userId, apiKey)
+
+                syncProgress[userId] = { status: 'running', phase: `Customers (0/${results.teamMembers?.total || 0} team done)`, progress: 30, results }
                 results.customers = await syncCustomers(userId, apiKey)
+
                 logger.log(`[Zenbooker] Auto-synced entities: T=${results.territories?.total} S=${results.services?.total} TM=${results.teamMembers?.total} C=${results.customers?.total}`)
               }
             }
