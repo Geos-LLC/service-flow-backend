@@ -118,13 +118,16 @@ module.exports = (supabase, logger) => {
     }
   }
 
-  // Use Zenbooker statuses directly (added to job_status enum)
+  // Use Zenbooker statuses directly (all added to job_status enum)
   const STATUS_MAP = {
     'scheduled': 'scheduled',
+    'rescheduled': 'rescheduled',
     'en-route': 'en-route',
     'en_route': 'en-route',
     'enroute': 'en-route',
     'started': 'started',
+    'in-progress': 'started',
+    'late': 'late',
     'complete': 'complete',
     'completed': 'complete',
   }
