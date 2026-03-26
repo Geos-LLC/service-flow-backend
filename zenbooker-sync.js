@@ -551,10 +551,11 @@ module.exports = (supabase, logger) => {
         return res.status(409).json({ error: 'Sync already in progress' })
       }
 
-      const { entity, maxItems, since } = req.body || {}
-      // entity: 'jobs', 'customers', 'services', 'team', 'territories', 'link_all', or null (full)
+      const { entity, maxItems, since, includeCancelled } = req.body || {}
+      // entity: 'jobs', 'customers', 'services', 'team', 'territories', 'link_all', 'reconcile', or null (full)
       // maxItems: number limit
       // since: ISO date string for filtering jobs by start_date_min
+      // includeCancelled: boolean - include cancelled jobs (default: false)
 
       syncProgress[userId] = { status: 'running', phase: 'starting', progress: 0 }
 
@@ -610,6 +611,7 @@ module.exports = (supabase, logger) => {
             }
             syncProgress[userId] = { status: 'running', phase: 'Jobs', progress: 60, results }
             const jobParams = { sort_order: 'descending' }
+            if (!includeCancelled) jobParams.canceled = 'false'
             if (since) jobParams.start_date_min = since
             results.jobs = await syncJobs(userId, apiKey, jobParams, maxItems || 0)
             logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
