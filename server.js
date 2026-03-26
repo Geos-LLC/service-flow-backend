@@ -33383,57 +33383,103 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
             if (rangeEnd) commQuery = commQuery.lte('effective_date', rangeEnd);
             const { data: existingComm } = await commQuery;
 
-            if (!existingComm || existingComm.length === 0) {
-              const commAmount = parseFloat((totalBusinessRevenue * (commissionPct / 100)).toFixed(2));
-              const { error: commInsertErr } = await supabase.from('cleaner_ledger').insert({
-                user_id: userId,
-                team_member_id: mgr.id,
-                job_id: null,
-                type: 'earning',
-                amount: commAmount,
-                effective_date: rangeEnd || rangeStart,
-                note: `Commission on total revenue: ${formatCurrency2(totalBusinessRevenue)} × ${commissionPct}%`,
-                metadata: { commission_pct: commissionPct, total_revenue: totalBusinessRevenue, is_manager_commission: true },
-                created_by: userId
-              });
-              if (!commInsertErr) managerSalaryEntries++;
+            // Create per-week commission entries based on that week's revenue
+            const commWeekStart = new Date(mgrEffectiveStart + 'T00:00:00');
+            const commRangeEnd = new Date((rangeEnd || mgrEffectiveStart) + 'T00:00:00');
+            while (commWeekStart <= commRangeEnd) {
+              const commWeekEnd = new Date(commWeekStart);
+              commWeekEnd.setDate(commWeekEnd.getDate() + 6);
+              if (commWeekEnd > commRangeEnd) commWeekEnd.setTime(commRangeEnd.getTime());
+              const cwStartStr = commWeekStart.getFullYear() + '-' + String(commWeekStart.getMonth()+1).padStart(2,'0') + '-' + String(commWeekStart.getDate()).padStart(2,'0');
+              const cwEndStr = commWeekEnd.getFullYear() + '-' + String(commWeekEnd.getMonth()+1).padStart(2,'0') + '-' + String(commWeekEnd.getDate()).padStart(2,'0');
+
+              // Check if commission entry already exists for this week
+              const { data: existingWeekComm } = await supabase
+                .from('cleaner_ledger')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('team_member_id', mgr.id)
+                .eq('type', 'earning')
+                .is('job_id', null)
+                .eq('effective_date', cwEndStr)
+                .like('note', 'Commission on revenue%')
+                .limit(1);
+
+              if (!existingWeekComm || existingWeekComm.length === 0) {
+                // Calculate revenue for this week only
+                // Build revenue by matching validJobs (has scheduled_date) with revenueData (has prices)
+                const revenueMap = {};
+                revenueData.forEach(r => { revenueMap[r.id] = parseFloat(r.service_price) || parseFloat(r.price) || parseFloat(r.total) || parseFloat(r.total_amount) || 0; });
+                const weekRevenue = validJobs
+                  .filter(j => {
+                    const jd = String(j.scheduled_date || '').split('T')[0].split(' ')[0];
+                    return jd >= cwStartStr && jd <= cwEndStr;
+                  })
+                  .reduce((sum, j) => sum + (revenueMap[j.id] || 0), 0);
+
+                if (weekRevenue > 0) {
+                  const commAmount = parseFloat((weekRevenue * (commissionPct / 100)).toFixed(2));
+                  const { error: commInsertErr } = await supabase.from('cleaner_ledger').insert({
+                    user_id: userId,
+                    team_member_id: mgr.id,
+                    job_id: null,
+                    type: 'earning',
+                    amount: commAmount,
+                    effective_date: cwEndStr,
+                    note: `Commission on revenue: ${formatCurrency2(weekRevenue)} × ${commissionPct}% (${cwStartStr} to ${cwEndStr})`,
+                    metadata: { commission_pct: commissionPct, week_revenue: weekRevenue, is_manager_commission: true, period_start: cwStartStr, period_end: cwEndStr },
+                    created_by: userId
+                  });
+                  if (!commInsertErr) managerSalaryEntries++;
+                }
+              }
+              commWeekStart.setDate(commWeekStart.getDate() + 7);
             }
           }
 
-          // ── Manager scheduled salary: single entry using calculateScheduledHoursFromAvailability ──
-          // This is the SAME function Payroll uses, ensuring identical results
+          // ── Manager scheduled salary: per-week entries using calculateScheduledHoursFromAvailability ──
           if (hourlyRate > 0 && mgr.availability) {
-            // Check if a salary entry already exists for this manager in this range
-            let salaryQuery = supabase
-              .from('cleaner_ledger')
-              .select('id')
-              .eq('user_id', userId)
-              .eq('team_member_id', mgr.id)
-              .eq('type', 'earning')
-              .is('job_id', null)
-              .like('note', 'Scheduled salary:%')
-              .limit(1);
-            if (mgrEffectiveStart) salaryQuery = salaryQuery.gte('effective_date', mgrEffectiveStart);
-            if (rangeEnd) salaryQuery = salaryQuery.lte('effective_date', rangeEnd);
-            const { data: existingSalary } = await salaryQuery;
+            // Split the date range into weekly chunks and create an entry per week
+            const weekStart = new Date(mgrEffectiveStart + 'T00:00:00');
+            const rangeEndDate = new Date((rangeEnd || mgrEffectiveStart) + 'T00:00:00');
+            while (weekStart <= rangeEndDate) {
+              const weekEnd = new Date(weekStart);
+              weekEnd.setDate(weekEnd.getDate() + 6);
+              if (weekEnd > rangeEndDate) weekEnd.setTime(rangeEndDate.getTime());
+              const wStartStr = weekStart.getFullYear() + '-' + String(weekStart.getMonth()+1).padStart(2,'0') + '-' + String(weekStart.getDate()).padStart(2,'0');
+              const wEndStr = weekEnd.getFullYear() + '-' + String(weekEnd.getMonth()+1).padStart(2,'0') + '-' + String(weekEnd.getDate()).padStart(2,'0');
 
-            if (!existingSalary || existingSalary.length === 0) {
-              const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, mgrEffectiveStart, rangeEnd);
-              if (scheduledHours > 0) {
-                const salaryAmount = parseFloat((scheduledHours * hourlyRate).toFixed(2));
-                const { error: salInsertErr } = await supabase.from('cleaner_ledger').insert({
-                  user_id: userId,
-                  team_member_id: mgr.id,
-                  job_id: null,
-                  type: 'earning',
-                  amount: salaryAmount,
-                  effective_date: rangeEnd || rangeStart,
-                  note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr`,
-                  metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
-                  created_by: userId
-                });
-                if (!salInsertErr) managerSalaryEntries++;
+              // Check if entry already exists for this week
+              const { data: existingSalary } = await supabase
+                .from('cleaner_ledger')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('team_member_id', mgr.id)
+                .eq('type', 'earning')
+                .is('job_id', null)
+                .eq('effective_date', wEndStr)
+                .like('note', 'Scheduled salary:%')
+                .limit(1);
+
+              if (!existingSalary || existingSalary.length === 0) {
+                const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, wStartStr, wEndStr);
+                if (scheduledHours > 0) {
+                  const salaryAmount = parseFloat((scheduledHours * hourlyRate).toFixed(2));
+                  const { error: salInsertErr } = await supabase.from('cleaner_ledger').insert({
+                    user_id: userId,
+                    team_member_id: mgr.id,
+                    job_id: null,
+                    type: 'earning',
+                    amount: salaryAmount,
+                    effective_date: wEndStr,
+                    note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr (${wStartStr} to ${wEndStr})`,
+                    metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true, period_start: wStartStr, period_end: wEndStr },
+                    created_by: userId
+                  });
+                  if (!salInsertErr) managerSalaryEntries++;
+                }
               }
+              weekStart.setDate(weekStart.getDate() + 7);
             }
           }
         }
