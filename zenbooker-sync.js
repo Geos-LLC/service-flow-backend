@@ -364,7 +364,8 @@ module.exports = (supabase, logger) => {
 
   async function runFullSync(userId, apiKey) {
     const results = {}
-    syncProgress[userId] = { status: 'running', phase: 'territories', progress: 0 }
+    syncProgress[userId] = { status: 'running', phase: 'starting', progress: 0 }
+    logger.log(`[Zenbooker] Starting full sync for user ${userId}`)
 
     try {
       syncProgress[userId] = { status: 'running', phase: 'territories', progress: 10 }
@@ -562,6 +563,9 @@ module.exports = (supabase, logger) => {
       if (syncProgress[userId]?.status === 'running') {
         return res.status(409).json({ error: 'Sync already in progress' })
       }
+
+      // Set progress immediately so polling picks it up
+      syncProgress[userId] = { status: 'running', phase: 'starting', progress: 0 }
 
       // Run in background
       runFullSync(userId, user.zenbooker_api_key).catch(err => {
