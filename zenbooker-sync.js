@@ -178,74 +178,103 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // Sync Engine
   // ══════════════════════════════════════
+  // Find existing record by zenbooker_id first, then by natural key (name, email, etc.)
+  async function findOrLink(table, userId, zbId, naturalMatch) {
+    // 1. Already linked by zenbooker_id
+    const { data: linked } = await supabase.from(table).select('id').eq('user_id', userId).eq('zenbooker_id', zbId).maybeSingle()
+    if (linked) return { id: linked.id, wasLinked: true }
+
+    // 2. Try natural key match (existing record without zenbooker_id)
+    if (naturalMatch) {
+      let q = supabase.from(table).select('id').eq('user_id', userId).is('zenbooker_id', null)
+      Object.entries(naturalMatch).forEach(([k, v]) => {
+        if (v) q = q.ilike(k, v)
+      })
+      const { data: matched } = await q.limit(1).maybeSingle()
+      if (matched) {
+        // Link existing record
+        await supabase.from(table).update({ zenbooker_id: zbId }).eq('id', matched.id)
+        return { id: matched.id, wasLinked: false, newlyLinked: true }
+      }
+    }
+
+    return null // Not found — needs insert
+  }
+
   async function syncTerritories(userId, apiKey) {
     const zbTerritories = await zbFetchAll(apiKey, '/territories')
-    let created = 0, updated = 0
+    let created = 0, updated = 0, linked = 0
     for (const zb of zbTerritories) {
       const mapped = mapTerritory(zb, userId)
-      const { data: existing } = await supabase.from('territories').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) {
-        await supabase.from('territories').update(mapped).eq('id', existing.id)
-        updated++
+      const found = await findOrLink('territories', userId, zb.id, { name: zb.name })
+      if (found) {
+        await supabase.from('territories').update(mapped).eq('id', found.id)
+        if (found.newlyLinked) linked++; else updated++
       } else {
         await supabase.from('territories').insert(mapped)
         created++
       }
     }
-    return { total: zbTerritories.length, created, updated }
+    return { total: zbTerritories.length, created, updated, linked }
   }
 
   async function syncServices(userId, apiKey) {
     const zbServices = await zbFetchAll(apiKey, '/services')
-    let created = 0, updated = 0
+    let created = 0, updated = 0, linked = 0
     for (const zb of zbServices) {
       const mapped = mapService(zb, userId)
-      const { data: existing } = await supabase.from('services').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) {
-        await supabase.from('services').update(mapped).eq('id', existing.id)
-        updated++
+      const found = await findOrLink('services', userId, zb.id, { name: zb.name })
+      if (found) {
+        // Don't overwrite base_price if already set
+        const { base_price, ...safeUpdate } = mapped
+        await supabase.from('services').update(safeUpdate).eq('id', found.id)
+        if (found.newlyLinked) linked++; else updated++
       } else {
         await supabase.from('services').insert(mapped)
         created++
       }
     }
-    return { total: zbServices.length, created, updated }
+    return { total: zbServices.length, created, updated, linked }
   }
 
   async function syncTeamMembers(userId, apiKey) {
     const zbTeam = await zbFetchAll(apiKey, '/team_members')
-    let created = 0, updated = 0
+    let created = 0, updated = 0, linked = 0
     for (const zb of zbTeam) {
       const mapped = mapTeamMember(zb, userId)
-      const { data: existing } = await supabase.from('team_members').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) {
-        // Don't overwrite hourly_rate, commission_percentage, etc.
+      // Match by email first, then by name
+      const naturalMatch = zb.email ? { email: zb.email } : { first_name: mapped.first_name }
+      const found = await findOrLink('team_members', userId, zb.id, naturalMatch)
+      if (found) {
+        // Don't overwrite hourly_rate, commission_percentage, role, status
         const { role, status, ...safeUpdate } = mapped
-        await supabase.from('team_members').update(safeUpdate).eq('id', existing.id)
-        updated++
+        await supabase.from('team_members').update(safeUpdate).eq('id', found.id)
+        if (found.newlyLinked) linked++; else updated++
       } else {
         await supabase.from('team_members').insert(mapped)
         created++
       }
     }
-    return { total: zbTeam.length, created, updated }
+    return { total: zbTeam.length, created, updated, linked }
   }
 
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
-    let created = 0, updated = 0
+    let created = 0, updated = 0, linked = 0
     for (const zb of zbCustomers) {
       const mapped = mapCustomer(zb, userId)
-      const { data: existing } = await supabase.from('customers').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) {
-        await supabase.from('customers').update(mapped).eq('id', existing.id)
-        updated++
+      // Match by email first, then by phone
+      const naturalMatch = zb.email ? { email: zb.email } : (zb.phone ? { phone: zb.phone } : null)
+      const found = await findOrLink('customers', userId, zb.id, naturalMatch)
+      if (found) {
+        await supabase.from('customers').update(mapped).eq('id', found.id)
+        if (found.newlyLinked) linked++; else updated++
       } else {
         await supabase.from('customers').insert(mapped)
         created++
       }
     }
-    return { total: zbCustomers.length, created, updated }
+    return { total: zbCustomers.length, created, updated, linked }
   }
 
   async function syncJobs(userId, apiKey, params = {}) {
@@ -262,19 +291,42 @@ module.exports = (supabase, logger) => {
     const lookups = { customerMap, serviceMap, teamMap, territoryMap }
 
     const zbJobs = await zbFetchAll(apiKey, '/jobs', params)
-    let created = 0, updated = 0
+    let created = 0, updated = 0, linked = 0
     for (const zb of zbJobs) {
       const mapped = mapJob(zb, userId, lookups)
-      const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) {
-        await supabase.from('jobs').update(mapped).eq('id', existing.id)
+
+      // 1. Already linked by zenbooker_id
+      const { data: byZbId } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      if (byZbId) {
+        await supabase.from('jobs').update(mapped).eq('id', byZbId.id)
         updated++
-      } else {
-        await supabase.from('jobs').insert(mapped)
-        created++
+        continue
       }
+
+      // 2. Try matching existing unlinked job by date + customer + service
+      if (mapped.scheduled_date && mapped.customer_id) {
+        const dateStr = String(mapped.scheduled_date).split('T')[0].split(' ')[0]
+        const { data: matchedJob } = await supabase.from('jobs')
+          .select('id')
+          .eq('user_id', userId)
+          .is('zenbooker_id', null)
+          .eq('customer_id', mapped.customer_id)
+          .gte('scheduled_date', dateStr)
+          .lt('scheduled_date', dateStr + ' 23:59:59')
+          .limit(1)
+          .maybeSingle()
+        if (matchedJob) {
+          await supabase.from('jobs').update({ ...mapped, zenbooker_id: zb.id }).eq('id', matchedJob.id)
+          linked++
+          continue
+        }
+      }
+
+      // 3. Create new
+      await supabase.from('jobs').insert(mapped)
+      created++
     }
-    return { total: zbJobs.length, created, updated }
+    return { total: zbJobs.length, created, updated, linked }
   }
 
   async function runFullSync(userId, apiKey) {
