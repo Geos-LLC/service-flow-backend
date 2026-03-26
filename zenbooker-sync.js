@@ -577,7 +577,7 @@ module.exports = (supabase, logger) => {
     }
   })
 
-  // POST /sync — manual full sync
+  // POST /sync — manual sync with options
   router.post('/sync', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
@@ -590,14 +590,87 @@ module.exports = (supabase, logger) => {
         return res.status(409).json({ error: 'Sync already in progress' })
       }
 
-      // Set progress immediately so polling picks it up
+      const { entity, maxItems, since } = req.body || {}
+      // entity: 'jobs', 'customers', 'services', 'team', 'territories', 'link_all', or null (full)
+      // maxItems: number limit
+      // since: ISO date string for filtering jobs by start_date_min
+
       syncProgress[userId] = { status: 'running', phase: 'starting', progress: 0 }
 
-      // Run in background
-      runFullSync(userId, user.zenbooker_api_key).catch(err => {
-        logger.error(`[Zenbooker] Manual sync failed: ${err.message}`)
-      })
+      const apiKey = user.zenbooker_api_key
+      const runSync = async () => {
+        const results = {}
+        try {
+          if (!entity || entity === 'link_all') {
+            // Link entities only (fast)
+            syncProgress[userId] = { status: 'running', phase: 'Linking', progress: 20 }
+            const zbT = await zbFetchAll(apiKey, '/territories')
+            for (const zb of zbT) await findOrLink('territories', userId, zb.id, { name: zb.name })
+            const zbS = await zbFetchAll(apiKey, '/services')
+            for (const zb of zbS) await findOrLink('services', userId, zb.id, { name: zb.name })
+            const zbTm = await zbFetchAll(apiKey, '/team_members')
+            for (const zb of zbTm) {
+              const n = (zb.name || '').split(' ')
+              await findOrLink('team_members', userId, zb.id, zb.email ? { email: zb.email } : { first_name: n[0] || '' })
+            }
+            const zbC = await zbFetchAll(apiKey, '/customers')
+            for (const zb of zbC) {
+              await findOrLink('customers', userId, zb.id, zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null))
+            }
+            results.linked = { territories: zbT.length, services: zbS.length, team: zbTm.length, customers: zbC.length }
+            logger.log(`[Zenbooker] Linked: ${JSON.stringify(results.linked)}`)
+            if (entity === 'link_all') {
+              syncProgress[userId] = { status: 'complete', progress: 100, results }
+              await supabase.from('users').update({ zenbooker_last_sync: new Date().toISOString() }).eq('id', userId)
+              setTimeout(() => { delete syncProgress[userId] }, 300000)
+              return results
+            }
+          }
 
+          if (!entity || entity === 'jobs') {
+            syncProgress[userId] = { status: 'running', phase: 'Jobs', progress: 60, results }
+            const jobParams = { sort_order: 'descending' }
+            if (since) jobParams.start_date_min = since
+            results.jobs = await syncJobs(userId, apiKey, jobParams, maxItems || 0)
+            logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
+          }
+
+          if (entity === 'customers') {
+            syncProgress[userId] = { status: 'running', phase: 'Customers', progress: 30 }
+            results.customers = await syncCustomers(userId, apiKey)
+            logger.log(`[Zenbooker] Customers done: ${JSON.stringify(results.customers)}`)
+          }
+
+          if (entity === 'services') {
+            syncProgress[userId] = { status: 'running', phase: 'Services', progress: 30 }
+            results.services = await syncServices(userId, apiKey)
+            logger.log(`[Zenbooker] Services done: ${JSON.stringify(results.services)}`)
+          }
+
+          if (entity === 'team') {
+            syncProgress[userId] = { status: 'running', phase: 'Team Members', progress: 30 }
+            results.teamMembers = await syncTeamMembers(userId, apiKey)
+            logger.log(`[Zenbooker] Team done: ${JSON.stringify(results.teamMembers)}`)
+          }
+
+          if (entity === 'territories') {
+            syncProgress[userId] = { status: 'running', phase: 'Territories', progress: 30 }
+            results.territories = await syncTerritories(userId, apiKey)
+            logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
+          }
+
+          await supabase.from('users').update({ zenbooker_last_sync: new Date().toISOString() }).eq('id', userId)
+          syncProgress[userId] = { status: 'complete', progress: 100, results }
+          setTimeout(() => { delete syncProgress[userId] }, 300000)
+          return results
+        } catch (err) {
+          logger.error(`[Zenbooker] Sync failed: ${err.message}`)
+          syncProgress[userId] = { status: 'error', error: err.message, results }
+          setTimeout(() => { delete syncProgress[userId] }, 300000)
+        }
+      }
+
+      runSync()
       res.json({ message: 'Sync started' })
     } catch (err) {
       logger.error(`[Zenbooker] Sync trigger error: ${err.message}`)
