@@ -383,48 +383,29 @@ module.exports = (supabase, logger) => {
         syncProgress[userId] = { status: 'running', phase, progress, detail: detail || null, results }
       }
 
-      // Link existing entities by matching zenbooker IDs (no create/update — just set zenbooker_id)
-      updateProgress('Linking entities', 10)
-      logger.log('[Zenbooker] Linking existing entities...')
+      updateProgress('Territories', 5)
+      logger.log('[Zenbooker] Syncing territories...')
+      results.territories = await syncTerritories(userId, apiKey)
+      logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
 
-      // Link territories by name
-      const zbTerritories = await zbFetchAll(apiKey, '/territories')
-      for (const zb of zbTerritories) {
-        await findOrLink('territories', userId, zb.id, { name: zb.name })
-      }
-      results.territories = { total: zbTerritories.length, linked: zbTerritories.length }
+      updateProgress('Services', 15, `Territories: ${results.territories.total}`)
+      logger.log('[Zenbooker] Syncing services...')
+      results.services = await syncServices(userId, apiKey)
+      logger.log(`[Zenbooker] Services done: ${JSON.stringify(results.services)}`)
 
-      // Link services by name (Zenbooker uses service_id not id)
-      const zbServices = await zbFetchAll(apiKey, '/services')
-      for (const zb of zbServices) {
-        await findOrLink('services', userId, zb.service_id || zb.id, { name: zb.name })
-      }
-      results.services = { total: zbServices.length, linked: zbServices.length }
+      updateProgress('Team Members', 25, `Services: ${results.services.total}`)
+      logger.log('[Zenbooker] Syncing team members...')
+      results.teamMembers = await syncTeamMembers(userId, apiKey)
+      logger.log(`[Zenbooker] Team members done: ${JSON.stringify(results.teamMembers)}`)
 
-      // Link team members by email or name
-      updateProgress('Linking team', 20)
-      const zbTeam = await zbFetchAll(apiKey, '/team_members')
-      for (const zb of zbTeam) {
-        const nameParts = (zb.name || '').split(' ')
-        const naturalMatch = zb.email ? { email: zb.email } : { first_name: nameParts[0] || '' }
-        await findOrLink('team_members', userId, zb.id, naturalMatch)
-      }
-      results.teamMembers = { total: zbTeam.length, linked: zbTeam.length }
+      updateProgress('Customers', 40, `Team: ${results.teamMembers.total}`)
+      logger.log('[Zenbooker] Syncing customers...')
+      results.customers = await syncCustomers(userId, apiKey)
+      logger.log(`[Zenbooker] Customers done: ${JSON.stringify(results.customers)}`)
 
-      // Link customers by phone
-      updateProgress('Linking customers', 30)
-      const zbCustomers = await zbFetchAll(apiKey, '/customers')
-      for (const zb of zbCustomers) {
-        const naturalMatch = zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null)
-        await findOrLink('customers', userId, zb.id, naturalMatch)
-      }
-      results.customers = { total: zbCustomers.length, linked: zbCustomers.length }
-      logger.log(`[Zenbooker] Entity linking done: ${zbTerritories.length} territories, ${zbServices.length} services, ${zbTeam.length} team, ${zbCustomers.length} customers`)
-
-      // Sync jobs (create/update/link)
-      updateProgress('Jobs', 50, `Linked ${zbCustomers.length} customers`)
+      updateProgress('Jobs', 60, `Customers: ${results.customers.total}`)
       logger.log('[Zenbooker] Syncing jobs...')
-      results.jobs = await syncJobs(userId, apiKey, { sort_order: 'descending' }, 50)
+      results.jobs = await syncJobs(userId, apiKey)
       logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
 
       // Update last sync timestamp
