@@ -597,23 +597,23 @@ module.exports = (supabase, logger) => {
         const results = {}
         try {
           if (!entity || entity === 'link_all') {
-            // Link entities only (fast)
-            syncProgress[userId] = { status: 'running', phase: 'Linking', progress: 20 }
-            const zbT = await zbFetchAll(apiKey, '/territories')
-            for (const zb of zbT) await findOrLink('territories', userId, zb.id, { name: zb.name })
-            const zbS = await zbFetchAll(apiKey, '/services')
-            for (const zb of zbS) await findOrLink('services', userId, zb.id, { name: zb.name })
-            const zbTm = await zbFetchAll(apiKey, '/team_members')
-            for (const zb of zbTm) {
-              const n = (zb.name || '').split(' ')
-              await findOrLink('team_members', userId, zb.id, zb.email ? { email: zb.email } : { first_name: n[0] || '' })
-            }
-            const zbC = await zbFetchAll(apiKey, '/customers')
-            for (const zb of zbC) {
-              await findOrLink('customers', userId, zb.id, zb.phone ? { phone: zb.phone } : (zb.email ? { email: zb.email } : null))
-            }
-            results.linked = { territories: zbT.length, services: zbS.length, team: zbTm.length, customers: zbC.length }
-            logger.log(`[Zenbooker] Linked: ${JSON.stringify(results.linked)}`)
+            // Full entity sync: create + update + link
+            syncProgress[userId] = { status: 'running', phase: 'Territories', progress: 5 }
+            results.territories = await syncTerritories(userId, apiKey)
+            logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
+
+            syncProgress[userId] = { status: 'running', phase: 'Services', progress: 15 }
+            results.services = await syncServices(userId, apiKey)
+            logger.log(`[Zenbooker] Services done: ${JSON.stringify(results.services)}`)
+
+            syncProgress[userId] = { status: 'running', phase: 'Team Members', progress: 25 }
+            results.teamMembers = await syncTeamMembers(userId, apiKey)
+            logger.log(`[Zenbooker] Team done: ${JSON.stringify(results.teamMembers)}`)
+
+            syncProgress[userId] = { status: 'running', phase: 'Customers', progress: 40 }
+            results.customers = await syncCustomers(userId, apiKey)
+            logger.log(`[Zenbooker] Customers done: ${JSON.stringify(results.customers)}`)
+
             if (entity === 'link_all') {
               syncProgress[userId] = { status: 'complete', progress: 100, results }
               await supabase.from('users').update({ zenbooker_last_sync: new Date().toISOString() }).eq('id', userId)
