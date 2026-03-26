@@ -183,9 +183,7 @@ module.exports = (supabase, logger) => {
       taxes: parseFloat(inv.tax_amount || inv.total_tax_amount) || 0,
       discount: parseFloat(inv.discount_amount) || 0,
       tip_amount: parseFloat(inv.tip || inv.tip_amount) || 0,
-      total_paid_amount: parseFloat(inv.amount_paid) || 0,
       invoice_status: inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft'),
-      payment_status: inv.status === 'paid' ? 'paid' : 'pending',
       is_recurring: zb.recurring === true,
       zenbooker_id: zb.id,
     }
@@ -311,7 +309,7 @@ module.exports = (supabase, logger) => {
     return { total: zbCustomers.length, created, updated, linked }
   }
 
-  async function syncJobs(userId, apiKey, params = {}) {
+  async function syncJobs(userId, apiKey, params = {}, maxJobs = 0) {
     // Build lookup maps: zenbooker_id → internal record
     const { data: customers } = await supabase.from('customers').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
     const { data: services } = await supabase.from('services').select('id, name, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
@@ -324,7 +322,8 @@ module.exports = (supabase, logger) => {
     const territoryMap = {}; (territories || []).forEach(t => { territoryMap[t.zenbooker_id] = t.id })
     const lookups = { customerMap, serviceMap, teamMap, territoryMap }
 
-    const zbJobs = await zbFetchAll(apiKey, '/jobs', params)
+    let zbJobs = await zbFetchAll(apiKey, '/jobs', params)
+    if (maxJobs > 0) zbJobs = zbJobs.slice(0, maxJobs)
     let created = 0, updated = 0, linked = 0
     for (const zb of zbJobs) {
       const mapped = mapJob(zb, userId, lookups)
@@ -417,7 +416,7 @@ module.exports = (supabase, logger) => {
       // Sync jobs (create/update/link)
       updateProgress('Jobs', 50, `Linked ${zbCustomers.length} customers`)
       logger.log('[Zenbooker] Syncing jobs...')
-      results.jobs = await syncJobs(userId, apiKey)
+      results.jobs = await syncJobs(userId, apiKey, { sort_order: 'descending' }, 50)
       logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
 
       // Update last sync timestamp
