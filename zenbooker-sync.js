@@ -623,6 +623,19 @@ module.exports = (supabase, logger) => {
           }
 
           if (!entity || entity === 'jobs') {
+            // Ensure entities exist before syncing jobs (needed for FK lookups)
+            if (entity === 'jobs') {
+              // Check if entities are already synced
+              const { count: tCount } = await supabase.from('territories').select('id', { count: 'exact', head: true }).eq('user_id', userId).not('zenbooker_id', 'is', null)
+              if (!tCount || tCount === 0) {
+                syncProgress[userId] = { status: 'running', phase: 'Syncing entities first...', progress: 10 }
+                results.territories = await syncTerritories(userId, apiKey)
+                results.services = await syncServices(userId, apiKey)
+                results.teamMembers = await syncTeamMembers(userId, apiKey)
+                results.customers = await syncCustomers(userId, apiKey)
+                logger.log(`[Zenbooker] Auto-synced entities: T=${results.territories?.total} S=${results.services?.total} TM=${results.teamMembers?.total} C=${results.customers?.total}`)
+              }
+            }
             syncProgress[userId] = { status: 'running', phase: 'Jobs', progress: 60, results }
             const jobParams = { sort_order: 'descending' }
             if (since) jobParams.start_date_min = since
