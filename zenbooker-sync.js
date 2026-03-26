@@ -121,9 +121,9 @@ module.exports = (supabase, logger) => {
   }
 
   const STATUS_MAP = {
-    'scheduled': 'scheduled',
-    'en-route': 'in_progress',
-    'started': 'in_progress',
+    'scheduled': 'confirmed',
+    'en-route': 'in-progress',
+    'started': 'in-progress',
     'complete': 'completed',
   }
 
@@ -145,7 +145,7 @@ module.exports = (supabase, logger) => {
 
   function mapJob(zb, userId, lookups) {
     const { customerMap, serviceMap, teamMap, territoryMap } = lookups
-    const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'scheduled')
+    const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
     const inv = zb.invoice || {}
     const addr = zb.service_address || {}
     const assignedProvider = zb.assigned_providers?.[0]
