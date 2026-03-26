@@ -253,21 +253,22 @@ module.exports = (supabase, logger) => {
 
   async function syncServices(userId, apiKey) {
     const zbServices = await zbFetchAll(apiKey, '/services')
-    let created = 0, updated = 0, linked = 0
+    let created = 0, updated = 0, linked = 0, errors = 0
     for (const zb of zbServices) {
       const mapped = mapService(zb, userId)
       const found = await findOrLink('services', userId, zb.id, { name: zb.name })
       if (found) {
-        // Don't overwrite base_price if already set
         const { base_price, ...safeUpdate } = mapped
-        await supabase.from('services').update(safeUpdate).eq('id', found.id)
-        if (found.newlyLinked) linked++; else updated++
+        const { error } = await supabase.from('services').update(safeUpdate).eq('id', found.id)
+        if (error) { logger.error(`[Zenbooker] Service update error: ${JSON.stringify(error)}`); errors++ }
+        else if (found.newlyLinked) linked++; else updated++
       } else {
-        await supabase.from('services').insert(mapped)
-        created++
+        const { error } = await supabase.from('services').insert(mapped)
+        if (error) { logger.error(`[Zenbooker] Service insert error: ${JSON.stringify(error)}`); errors++ }
+        else created++
       }
     }
-    return { total: zbServices.length, created, updated, linked }
+    return { total: zbServices.length, created, updated, linked, errors }
   }
 
   async function syncTeamMembers(userId, apiKey) {
@@ -331,8 +332,9 @@ module.exports = (supabase, logger) => {
       // 1. Already linked by zenbooker_id
       const { data: byZbId } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
       if (byZbId) {
-        await supabase.from('jobs').update(mapped).eq('id', byZbId.id)
-        updated++
+        const { error } = await supabase.from('jobs').update(mapped).eq('id', byZbId.id)
+        if (error) logger.error(`[Zenbooker] Job update error ${zb.id}: ${JSON.stringify(error)}`)
+        else updated++
         continue
       }
 
@@ -349,15 +351,17 @@ module.exports = (supabase, logger) => {
           .limit(1)
           .maybeSingle()
         if (matchedJob) {
-          await supabase.from('jobs').update({ ...mapped, zenbooker_id: zb.id }).eq('id', matchedJob.id)
-          linked++
+          const { error } = await supabase.from('jobs').update({ ...mapped, zenbooker_id: zb.id }).eq('id', matchedJob.id)
+          if (error) logger.error(`[Zenbooker] Job link error ${zb.id}: ${JSON.stringify(error)}`)
+          else linked++
           continue
         }
       }
 
       // 3. Create new
-      await supabase.from('jobs').insert(mapped)
-      created++
+      const { error } = await supabase.from('jobs').insert(mapped)
+      if (error) logger.error(`[Zenbooker] Job insert error ${zb.id}: ${JSON.stringify(error)}`)
+      else created++
     }
     return { total: zbJobs.length, created, updated, linked }
   }
