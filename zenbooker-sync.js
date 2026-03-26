@@ -368,27 +368,31 @@ module.exports = (supabase, logger) => {
     logger.log(`[Zenbooker] Starting full sync for user ${userId}`)
 
     try {
-      syncProgress[userId] = { status: 'running', phase: 'territories', progress: 10 }
+      const updateProgress = (phase, progress, detail) => {
+        syncProgress[userId] = { status: 'running', phase, progress, detail: detail || null, results }
+      }
+
+      updateProgress('Territories', 5)
       logger.log('[Zenbooker] Syncing territories...')
       results.territories = await syncTerritories(userId, apiKey)
       logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
 
-      syncProgress[userId] = { status: 'running', phase: 'services', progress: 25 }
+      updateProgress('Services', 15, `Territories: ${results.territories.total}`)
       logger.log('[Zenbooker] Syncing services...')
       results.services = await syncServices(userId, apiKey)
       logger.log(`[Zenbooker] Services done: ${JSON.stringify(results.services)}`)
 
-      syncProgress[userId] = { status: 'running', phase: 'team_members', progress: 40 }
+      updateProgress('Team Members', 25, `Services: ${results.services.total}`)
       logger.log('[Zenbooker] Syncing team members...')
       results.teamMembers = await syncTeamMembers(userId, apiKey)
       logger.log(`[Zenbooker] Team members done: ${JSON.stringify(results.teamMembers)}`)
 
-      syncProgress[userId] = { status: 'running', phase: 'customers', progress: 55 }
+      updateProgress('Customers', 40, `Team: ${results.teamMembers.total}`)
       logger.log('[Zenbooker] Syncing customers...')
       results.customers = await syncCustomers(userId, apiKey)
       logger.log(`[Zenbooker] Customers done: ${JSON.stringify(results.customers)}`)
 
-      syncProgress[userId] = { status: 'running', phase: 'jobs', progress: 70 }
+      updateProgress('Jobs', 60, `Customers: ${results.customers.total}`)
       logger.log('[Zenbooker] Syncing jobs...')
       results.jobs = await syncJobs(userId, apiKey)
       logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
