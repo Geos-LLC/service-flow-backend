@@ -82,10 +82,10 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       name: zb.name || 'Unnamed Service',
       description: zb.description || '',
-      base_price: parseFloat(zb.base_price) || 0,
+      price: parseFloat(zb.base_price) || 0,
       duration: zb.base_duration || 0,
       zenbooker_id: zb.service_id || zb.id,
-      status: 'active',
+      is_active: true,
     }
   }
 
@@ -257,7 +257,8 @@ module.exports = (supabase, logger) => {
       const zbId = zb.service_id || zb.id
       const found = await findOrLink('services', userId, zbId, { name: zb.name })
       if (found) {
-        const { base_price, ...safeUpdate } = mapped
+        // Don't overwrite price if already set on existing service
+        const { price, ...safeUpdate } = mapped
         const { error } = await supabase.from('services').update(safeUpdate).eq('id', found.id)
         if (error) { logger.error(`[Zenbooker] Service update error: ${JSON.stringify(error)}`); errors++ }
         else if (found.newlyLinked) linked++; else updated++
