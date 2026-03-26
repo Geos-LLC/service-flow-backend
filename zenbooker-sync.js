@@ -52,12 +52,17 @@ module.exports = (supabase, logger) => {
   async function zbFetchAll(apiKey, path, params = {}) {
     const all = []
     let cursor = 0
+    let page = 0
     while (true) {
+      page++
+      logger.log(`[Zenbooker] Fetching ${path} page ${page} (cursor=${cursor})`)
       const data = await zbFetch(apiKey, path, { ...params, cursor, limit: 100 })
       if (data.results && data.results.length > 0) all.push(...data.results)
+      logger.log(`[Zenbooker] Got ${data.results?.length || 0} results, has_more=${data.has_more}`)
       if (!data.has_more || !data.next_cursor) break
       cursor = data.next_cursor
     }
+    logger.log(`[Zenbooker] Total ${path}: ${all.length} records`)
     return all
   }
 
@@ -278,19 +283,29 @@ module.exports = (supabase, logger) => {
 
     try {
       syncProgress[userId] = { status: 'running', phase: 'territories', progress: 10 }
+      logger.log('[Zenbooker] Syncing territories...')
       results.territories = await syncTerritories(userId, apiKey)
+      logger.log(`[Zenbooker] Territories done: ${JSON.stringify(results.territories)}`)
 
       syncProgress[userId] = { status: 'running', phase: 'services', progress: 25 }
+      logger.log('[Zenbooker] Syncing services...')
       results.services = await syncServices(userId, apiKey)
+      logger.log(`[Zenbooker] Services done: ${JSON.stringify(results.services)}`)
 
       syncProgress[userId] = { status: 'running', phase: 'team_members', progress: 40 }
+      logger.log('[Zenbooker] Syncing team members...')
       results.teamMembers = await syncTeamMembers(userId, apiKey)
+      logger.log(`[Zenbooker] Team members done: ${JSON.stringify(results.teamMembers)}`)
 
       syncProgress[userId] = { status: 'running', phase: 'customers', progress: 55 }
+      logger.log('[Zenbooker] Syncing customers...')
       results.customers = await syncCustomers(userId, apiKey)
+      logger.log(`[Zenbooker] Customers done: ${JSON.stringify(results.customers)}`)
 
       syncProgress[userId] = { status: 'running', phase: 'jobs', progress: 70 }
+      logger.log('[Zenbooker] Syncing jobs...')
       results.jobs = await syncJobs(userId, apiKey)
+      logger.log(`[Zenbooker] Jobs done: ${JSON.stringify(results.jobs)}`)
 
       // Update last sync timestamp
       await supabase.from('users').update({ zenbooker_last_sync: new Date().toISOString() }).eq('id', userId)
@@ -300,7 +315,9 @@ module.exports = (supabase, logger) => {
 
       return results
     } catch (err) {
-      syncProgress[userId] = { status: 'error', error: err.message }
+      logger.error(`[Zenbooker] Sync failed at phase: ${syncProgress[userId]?.phase || 'unknown'}: ${err.message}`)
+      syncProgress[userId] = { status: 'error', error: err.message, phase: syncProgress[userId]?.phase }
+      setTimeout(() => { delete syncProgress[userId] }, 300000)
       throw err
     }
   }
