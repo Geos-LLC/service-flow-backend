@@ -95,11 +95,9 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       first_name: nameParts[0] || '',
       last_name: nameParts.slice(1).join(' ') || '',
-      email: zb.email || '',
-      phone: zb.phone || '',
+      email: zb.email || null,
+      phone: zb.phone || null,
       zenbooker_id: zb.id,
-      status: 'active',
-      role: 'service_provider',
     }
   }
 
@@ -110,12 +108,12 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       first_name: nameParts[0] || '',
       last_name: nameParts.slice(1).join(' ') || '',
-      email: zb.email || '',
-      phone: zb.phone || '',
-      address: addr.line1 || '',
-      city: addr.city || '',
-      state: addr.state || '',
-      zip_code: addr.postal_code || '',
+      email: zb.email || null,
+      phone: zb.phone || null,
+      address: addr.line1 || null,
+      city: addr.city || null,
+      state: addr.state || null,
+      zip_code: addr.postal_code || null,
       zenbooker_id: zb.id,
     }
   }
