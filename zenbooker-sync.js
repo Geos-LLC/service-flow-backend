@@ -127,6 +127,22 @@ module.exports = (supabase, logger) => {
     'complete': 'completed',
   }
 
+  // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
+  function zbDateToLocal(isoDate, timezone) {
+    if (!isoDate) return null
+    try {
+      const d = new Date(isoDate)
+      // Use Intl to convert to timezone
+      const opts = { timeZone: timezone || 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }
+      const parts = new Intl.DateTimeFormat('en-CA', opts).formatToParts(d)
+      const get = (type) => (parts.find(p => p.type === type) || {}).value || '00'
+      return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`
+    } catch {
+      // Fallback: strip T and Z
+      return isoDate.replace('T', ' ').replace(/\.000Z$/, '').replace('Z', '')
+    }
+  }
+
   function mapJob(zb, userId, lookups) {
     const { customerMap, serviceMap, teamMap, territoryMap } = lookups
     const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'scheduled')
@@ -154,7 +170,7 @@ module.exports = (supabase, logger) => {
       team_member_id: teamMemberId,
       territory_id: territoryId,
       status,
-      scheduled_date: zb.start_date || null,
+      scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
       duration: zb.estimated_duration_seconds ? Math.round(zb.estimated_duration_seconds / 60) : 0,
       service_address_street: addr.line1 || addr.formatted || '',
       service_address_city: addr.city || '',
