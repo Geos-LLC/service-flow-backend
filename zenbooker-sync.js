@@ -322,8 +322,14 @@ module.exports = (supabase, logger) => {
     const territoryMap = {}; (territories || []).forEach(t => { territoryMap[t.zenbooker_id] = t.id })
     const lookups = { customerMap, serviceMap, teamMap, territoryMap }
 
-    let zbJobs = await zbFetchAll(apiKey, '/jobs', params)
-    if (maxJobs > 0) zbJobs = zbJobs.slice(0, maxJobs)
+    let zbJobs
+    if (maxJobs > 0) {
+      // Fetch only what we need (single page)
+      const data = await zbFetch(apiKey, '/jobs', { ...params, limit: Math.min(maxJobs, 100) })
+      zbJobs = (data.results || []).slice(0, maxJobs)
+    } else {
+      zbJobs = await zbFetchAll(apiKey, '/jobs', params)
+    }
     let created = 0, updated = 0, linked = 0
     for (const zb of zbJobs) {
       const mapped = mapJob(zb, userId, lookups)
