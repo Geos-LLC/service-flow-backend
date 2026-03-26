@@ -118,14 +118,15 @@ module.exports = (supabase, logger) => {
     }
   }
 
+  // Use Zenbooker statuses directly (added to job_status enum)
   const STATUS_MAP = {
-    'scheduled': 'confirmed',
-    'en-route': 'in-progress',
-    'en_route': 'in-progress',
-    'enroute': 'in-progress',
-    'started': 'in-progress',
-    'complete': 'completed',
-    'completed': 'completed',
+    'scheduled': 'scheduled',
+    'en-route': 'en-route',
+    'en_route': 'en-route',
+    'enroute': 'en-route',
+    'started': 'started',
+    'complete': 'complete',
+    'completed': 'complete',
   }
 
   // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
