@@ -121,8 +121,11 @@ module.exports = (supabase, logger) => {
   const STATUS_MAP = {
     'scheduled': 'confirmed',
     'en-route': 'in-progress',
+    'en_route': 'in-progress',
+    'enroute': 'in-progress',
     'started': 'in-progress',
     'complete': 'completed',
+    'completed': 'completed',
   }
 
   // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
@@ -705,8 +708,10 @@ module.exports = (supabase, logger) => {
         try {
           if (event.startsWith('job.')) {
             await handleJobEvent(event, data, user.id, user.zenbooker_api_key)
-          } else if (event.startsWith('invoice_payment.')) {
-            await handlePaymentEvent(event, data, user.id)
+          } else if (event.startsWith('invoice_payment.') || event.startsWith('invoice.payment_')) {
+            // Normalize event name: invoice.payment_recorded → invoice_payment.recorded
+            const normalizedEvent = event.replace('invoice.payment_', 'invoice_payment.')
+            await handlePaymentEvent(normalizedEvent, data, user.id)
           } else if (event === 'recurring_booking.created' || event === 'recurring_booking.canceled') {
             // Recurring bookings generate jobs — those come via job.created webhook
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
