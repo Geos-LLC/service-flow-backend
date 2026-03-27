@@ -20122,7 +20122,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       .from('team_members')
       .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role, salary_start_date, created_at')
       .eq('user_id', userId)
-      .in('status', ['active', 'inactive']); // Include both active and inactive members for complete payroll records
+      .eq('status', 'active'); // Only active members — inactive members should not appear on payroll
 
     if (membersError) {
       console.error('Error fetching team members:', membersError);
