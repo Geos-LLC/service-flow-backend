@@ -4731,7 +4731,7 @@ app.get('/api/jobs/available-for-workers', authenticateToken, async (req, res) =
       `)
       .eq('offer_to_providers', true)
       .is('team_member_id', null) // Not assigned yet
-      .in('status', ['pending', 'confirmed'])
+      .in('status', ['pending', 'confirmed', 'scheduled', 'rescheduled'])
       .gte('scheduled_date', today.toISOString())
       .order('scheduled_date', { ascending: true });
 
@@ -6209,7 +6209,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     }
 
     // Send automatic confirmation for certain status changes
-    if (status === 'confirmed' || status === 'completed' || status === 'cancelled') {
+    if (status === 'confirmed' || status === 'scheduled' || status === 'completed' || status === 'cancelled') {
       try {
         // Get job details with customer and service information
         const { data: jobData, error: jobError } = await supabase
@@ -19139,8 +19139,8 @@ app.delete('/api/team-members/:id', async (req, res) => {
       .from('jobs')
       .select('id, status', { count: 'exact' })
       .eq('team_member_id', id)
-      .in('status', ['pending', 'confirmed', 'in-progress']);
-    
+      .in('status', ['pending', 'confirmed', 'scheduled', 'rescheduled', 'in-progress', 'en-route', 'started']);
+
     if (jobsError) {
       console.error('❌ Error checking assigned jobs:', jobsError);
       return res.status(500).json({ 
@@ -19346,7 +19346,7 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
     if (assignments && !assignmentsError) {
       scheduledJobs = assignments
         .map(assignment => assignment.jobs)
-        .filter(job => job && ['pending', 'confirmed', 'in-progress'].includes(job.status));
+        .filter(job => job && ['pending', 'confirmed', 'scheduled', 'rescheduled', 'in-progress', 'en-route', 'started'].includes(job.status));
     } else if (assignmentsError) {
       console.error('Error fetching job assignments:', assignmentsError);
       // Continue to check direct jobs even if assignments fail
@@ -19358,8 +19358,8 @@ app.get('/api/team-members/:id/availability', async (req, res) => {
       .from('jobs')
       .select('scheduled_date, scheduled_time, duration, id, status, service_name')
       .eq('team_member_id', id)
-      .in('status', ['pending', 'confirmed', 'in-progress']);
-    
+      .in('status', ['pending', 'confirmed', 'scheduled', 'rescheduled', 'in-progress', 'en-route', 'started']);
+
     const { data: directJobs, error: directJobsError } = await directJobsQuery;
     
     // Merge both results and remove duplicates by job ID
@@ -22433,7 +22433,7 @@ app.get('/api/team-analytics', async (req, res) => {
           tm.role,
           COUNT(DISTINCT all_jobs.job_id) as total_jobs,
           COUNT(DISTINCT CASE WHEN all_jobs.status = 'completed' THEN all_jobs.job_id END) as completed_jobs,
-          COUNT(DISTINCT CASE WHEN all_jobs.status IN ('pending', 'confirmed', 'in-progress') THEN all_jobs.job_id END) as active_jobs,
+          COUNT(DISTINCT CASE WHEN all_jobs.status IN ('pending', 'confirmed', 'scheduled', 'rescheduled', 'in-progress', 'en-route', 'started') THEN all_jobs.job_id END) as active_jobs,
           AVG(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as avg_job_value,
           SUM(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as total_revenue,
           AVG(CASE WHEN all_jobs.status = 'completed' THEN TIMESTAMPDIFF(MINUTE, all_jobs.scheduled_date, all_jobs.updated_at) END) as avg_completion_time

@@ -118,7 +118,9 @@ module.exports = (supabase, logger) => {
     }
   }
 
-  // Use Zenbooker statuses directly (all added to job_status enum)
+  // Map Zenbooker statuses to internal statuses
+  // IMPORTANT: The codebase relies on 'completed' (not 'complete') in 50+ places
+  // for payroll, ledger, revenue, analytics. Never change 'complete' → anything other than 'completed'.
   const STATUS_MAP = {
     'scheduled': 'scheduled',
     'rescheduled': 'rescheduled',
@@ -128,8 +130,8 @@ module.exports = (supabase, logger) => {
     'started': 'started',
     'in-progress': 'started',
     'late': 'late',
-    'complete': 'complete',
-    'completed': 'complete',
+    'complete': 'completed',
+    'completed': 'completed',
   }
 
   // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
