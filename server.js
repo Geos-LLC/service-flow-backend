@@ -1360,19 +1360,21 @@ app.post('/api/auth/signin', async (req, res) => {
       }
       
       // Check if account owner exists in team_members table and get their role
+      // Order by role to prefer 'account owner' over 'worker' (handles Zenbooker sync duplicates)
       const { data: teamMemberData, error: teamMemberError } = await supabase
         .from('team_members')
         .select('role')
         .eq('user_id', user.id)
-        .eq('email', sanitizedEmail)
-        .limit(1);
-      
+        .eq('email', sanitizedEmail);
+
       if (!teamMemberError && teamMemberData && teamMemberData.length > 0) {
-        // Account owner exists in team_members, use their role (should be 'account owner')
-        const role = teamMemberData[0].role;
+        // Prefer the record with 'account owner' or 'owner' role; fall back to first
+        const ownerRecord = teamMemberData.find(r => r.role === 'account owner' || r.role === 'owner');
+        const role = ownerRecord ? ownerRecord.role : teamMemberData[0].role;
         userRole = role || 'account owner'; // Use the role from team_members table
       } else {
         // If not found in team_members, default to 'account owner'
+        // This is an account owner login (found in users table), so always owner
         userRole = 'account owner';
       }
     } else {
