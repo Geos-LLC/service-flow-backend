@@ -98,6 +98,7 @@ module.exports = (supabase, logger) => {
       email: zb.email || '',
       phone: zb.phone || null,
       zenbooker_id: zb.id,
+      salary_start_date: null, // Explicit null: DB default is CURRENT_DATE which breaks payroll for historical jobs
     }
   }
 
