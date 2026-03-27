@@ -20111,165 +20111,100 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
   return totalHours;
 }
 
-// Get payroll summary for all team members
+// Get payroll summary for all team members — reads from cleaner_ledger (single source of truth)
 app.get('/api/payroll', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
 
-    // Get all team members (including those without hourly rates or commission)
-    const { data: teamMembers, error: membersError } = await supabase
+    // ===== PARALLEL BATCH: Fetch team members, ledger entries, and jobs =====
+    const endDateNextDay = endDate ? (() => {
+      const [ey, em, ed] = endDate.split('-').map(Number);
+      const nd = new Date(ey, em - 1, ed + 1);
+      return nd.getFullYear() + '-' + String(nd.getMonth() + 1).padStart(2, '0') + '-' + String(nd.getDate()).padStart(2, '0');
+    })() : null;
+
+    // 1. Team members
+    const membersPromise = supabase
       .from('team_members')
       .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role, salary_start_date, created_at')
       .eq('user_id', userId)
-      .eq('status', 'active'); // Only active members — inactive members should not appear on payroll
+      .eq('status', 'active');
 
+    // 2. Ledger entries for period (paginated)
+    const fetchLedgerEntries = async () => {
+      let all = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        let q = supabase.from('cleaner_ledger')
+          .select('team_member_id, job_id, type, amount, metadata')
+          .eq('user_id', userId)
+          .range(from, from + pageSize - 1);
+        if (startDate) q = q.gte('effective_date', startDate);
+        if (endDate) q = q.lte('effective_date', endDate);
+        const { data: page, error } = await q;
+        if (error) { console.error('[Payroll] Ledger fetch error:', error); break; }
+        all = all.concat(page || []);
+        if (!page || page.length < pageSize) break;
+        from += pageSize;
+      }
+      return all;
+    };
+
+    // 3. Jobs for business revenue + revenueJobs + job details (paginated)
+    const fetchJobs = async () => {
+      let all = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        let q = supabase.from('jobs')
+          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, status, service_name, customer_id, hours_worked, duration, estimated_duration, start_time, end_time')
+          .eq('user_id', userId)
+          .range(from, from + pageSize - 1);
+        if (startDate) q = q.gte('scheduled_date', startDate);
+        if (endDateNextDay) q = q.lt('scheduled_date', endDateNextDay);
+        const { data: page, error } = await q;
+        if (error) { console.error('[Payroll] Jobs fetch error:', error); break; }
+        all = all.concat(page || []);
+        if (!page || page.length < pageSize) break;
+        from += pageSize;
+      }
+      return all;
+    };
+
+    const [membersResult, ledgerEntries, allJobs] = await Promise.all([
+      membersPromise, fetchLedgerEntries(), fetchJobs()
+    ]);
+
+    const { data: teamMembers, error: membersError } = membersResult;
     if (membersError) {
       console.error('Error fetching team members:', membersError);
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
 
-    // Batch-fetch all pay rate history for all team members
-    const allTeamMemberIds = (teamMembers || []).map(m => m.id);
-    const payRatesByMember = {};
-    if (allTeamMemberIds.length > 0) {
-      const { data: allPayRates } = await supabase
-        .from('team_member_pay_rates')
-        .select('team_member_id, hourly_rate, commission_percentage, effective_from')
-        .eq('user_id', userId)
-        .in('team_member_id', allTeamMemberIds)
-        .order('effective_from', { ascending: false });
-
-      (allPayRates || []).forEach(rate => {
-        if (!payRatesByMember[rate.team_member_id]) payRatesByMember[rate.team_member_id] = [];
-        payRatesByMember[rate.team_member_id].push(rate);
-      });
-    }
-
-    let totalBusinessRevenue = 0;
-
-    // ===== BATCH: Fetch ALL jobs and assignments for this user/period ONCE =====
-    const jobFields = 'id, scheduled_date, start_time, end_time, hours_worked, duration, estimated_duration, total, total_amount, invoice_amount, price, service_price, discount, additional_fees, taxes, status, service_name, tip_amount, incentive_amount, customer_id, team_member_id';
-    let endDateNextDay = null;
-    if (endDate) {
-      const [ey, em, ed] = endDate.split('-').map(Number);
-      const nd = new Date(ey, em - 1, ed + 1);
-      endDateNextDay = nd.getFullYear() + '-' + String(nd.getMonth() + 1).padStart(2, '0') + '-' + String(nd.getDate()).padStart(2, '0');
-    }
-
-    // Fetch ALL jobs with pagination (Supabase default limit is 1000)
-    let allDirectJobs = [];
-    let jobFrom = 0;
-    const jobPageSize = 1000;
-    while (true) {
-      let allDirectJobsQuery = supabase
-        .from('jobs')
-        .select(jobFields)
-        .eq('user_id', userId)
-        .range(jobFrom, jobFrom + jobPageSize - 1);
-      if (startDate) allDirectJobsQuery = allDirectJobsQuery.gte('scheduled_date', startDate);
-      if (endDateNextDay) allDirectJobsQuery = allDirectJobsQuery.lt('scheduled_date', endDateNextDay);
-
-      const { data: jobPage, error: allDirectJobsError } = await allDirectJobsQuery;
-      if (allDirectJobsError) { console.error('[Payroll] Error fetching jobs:', allDirectJobsError); break; }
-      allDirectJobs = allDirectJobs.concat(jobPage || []);
-      if (!jobPage || jobPage.length < jobPageSize) break;
-      jobFrom += jobPageSize;
-    }
-
-    // Build map: team_member_id -> jobs (from direct assignment)
-    const directJobsByMember = {};
+    // ===== Build lookup maps =====
     const allJobsById = {};
-    (allDirectJobs || []).forEach(job => {
+    let totalBusinessRevenue = 0;
+    const revenueJobsList = [];
+    (allJobs || []).forEach(job => {
       allJobsById[job.id] = job;
-      if (job.team_member_id) {
-        if (!directJobsByMember[job.team_member_id]) directJobsByMember[job.team_member_id] = [];
-        directJobsByMember[job.team_member_id].push(job);
+      const s = (job.status || '').toLowerCase();
+      if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      totalBusinessRevenue += rev;
+      if (rev > 0) {
+        revenueJobsList.push({
+          id: job.id, scheduledDate: job.scheduled_date, serviceName: job.service_name || 'Unknown Service',
+          customerName: '', status: job.status, revenue: parseFloat(rev.toFixed(2)),
+          taxes: parseFloat((parseFloat(job.taxes) || 0).toFixed(2)), grossPrice: parseFloat(rev.toFixed(2))
+        });
       }
     });
+    revenueJobsList.sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
-    // Fetch ALL job_team_assignments for members in this user's team (with pagination)
-    const teamMemberIds = (teamMembers || []).map(m => m.id);
-    const assignmentJobsByMember = {};
-    if (teamMemberIds.length > 0) {
-      // Batch in chunks of 100 to avoid Supabase .in() limits
-      for (let i = 0; i < teamMemberIds.length; i += 100) {
-        const chunk = teamMemberIds.slice(i, i + 100);
-        // Paginate: Supabase default limit is 1000 rows
-        let assignFrom = 0;
-        const assignPageSize = 1000;
-        while (true) {
-          const { data: assignData, error: assignErr } = await supabase
-            .from('job_team_assignments')
-            .select('team_member_id, job_id')
-            .in('team_member_id', chunk)
-            .range(assignFrom, assignFrom + assignPageSize - 1);
-          if (assignErr) {
-            console.error('[Payroll] Error fetching assignments batch:', assignErr);
-            break;
-          }
-          if (assignData) {
-            assignData.forEach(a => {
-              if (!assignmentJobsByMember[a.team_member_id]) assignmentJobsByMember[a.team_member_id] = new Set();
-              assignmentJobsByMember[a.team_member_id].add(a.job_id);
-            });
-          }
-          if (!assignData || assignData.length < assignPageSize) break;
-          assignFrom += assignPageSize;
-        }
-      }
-    }
-
-    // Fetch jobs referenced by assignments that weren't in the direct query (edge case: job assigned but team_member_id not set on job)
-    const assignmentJobIds = new Set();
-    Object.values(assignmentJobsByMember).forEach(idSet => idSet.forEach(id => assignmentJobIds.add(id)));
-    const missingJobIds = [...assignmentJobIds].filter(id => !allJobsById[id]);
-    if (missingJobIds.length > 0) {
-      for (let i = 0; i < missingJobIds.length; i += 100) {
-        const chunk = missingJobIds.slice(i, i + 100);
-        const { data: extraJobs } = await supabase
-          .from('jobs')
-          .select(jobFields)
-          .in('id', chunk)
-          .eq('user_id', userId);
-        if (extraJobs) {
-          extraJobs.forEach(job => {
-            // Apply date filter
-            if (startDate || endDate) {
-              const raw = job.scheduled_date ? String(job.scheduled_date) : '';
-              const jobDateStr = raw.split('T')[0].split(' ')[0];
-              if (!jobDateStr) return;
-              if (startDate && jobDateStr < startDate) return;
-              if (endDate && jobDateStr > endDate) return;
-            }
-            allJobsById[job.id] = job;
-          });
-        }
-      }
-    }
-
-    // Build global member count per job (for splitting hours/revenue/commission)
-    const globalMemberCountByJob = {};
-    Object.entries(assignmentJobsByMember).forEach(([memberId, jobIdSet]) => {
-      jobIdSet.forEach(jobId => {
-        if (!globalMemberCountByJob[jobId]) globalMemberCountByJob[jobId] = new Set();
-        globalMemberCountByJob[jobId].add(Number(memberId));
-      });
-    });
-    // Also count direct assignments
-    (allDirectJobs || []).forEach(job => {
-      if (job.team_member_id) {
-        if (!globalMemberCountByJob[job.id]) globalMemberCountByJob[job.id] = new Set();
-        globalMemberCountByJob[job.id].add(job.team_member_id);
-      }
-    });
-    const memberCountByJobMap = {};
-    Object.entries(globalMemberCountByJob).forEach(([jobId, memberSet]) => {
-      memberCountByJobMap[jobId] = memberSet.size;
-    });
-
-    // Fetch ALL customer names at once
-    const allCustomerIds = [...new Set(Object.values(allJobsById).map(j => j.customer_id).filter(Boolean))];
+    // Fetch customer names for jobs
+    const allCustomerIds = [...new Set((allJobs || []).map(j => j.customer_id).filter(Boolean))];
     const globalCustomerMap = {};
     if (allCustomerIds.length > 0) {
       for (let i = 0; i < allCustomerIds.length; i += 100) {
@@ -20278,46 +20213,24 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         if (custs) custs.forEach(c => { globalCustomerMap[c.id] = `${c.first_name || ''} ${c.last_name || ''}`.trim(); });
       }
     }
+    // Backfill customer names into revenueJobsList
+    revenueJobsList.forEach(rj => { rj.customerName = globalCustomerMap[allJobsById[rj.id]?.customer_id] || ''; });
 
-    // Fetch total_paid_amount for ALL jobs at once
-    const allPaymentJobIds = Object.keys(allJobsById).filter(Boolean);
-    if (allPaymentJobIds.length > 0) {
-      for (let i = 0; i < allPaymentJobIds.length; i += 100) {
-        const chunk = allPaymentJobIds.slice(i, i + 100);
-        const { data: paymentData } = await supabase.from('jobs').select('id, total_paid_amount').in('id', chunk);
-        if (paymentData) paymentData.forEach(p => {
-          if (allJobsById[p.id]) allJobsById[p.id].total_paid_amount = parseFloat(p.total_paid_amount) || 0;
-        });
-      }
-      // Fallback: compute from transactions for jobs missing total_paid_amount
-      const jobsMissingPaid = allPaymentJobIds.filter(id => !allJobsById[id]?.total_paid_amount || allJobsById[id].total_paid_amount <= 0);
-      if (jobsMissingPaid.length > 0) {
-        for (let i = 0; i < jobsMissingPaid.length; i += 100) {
-          const chunk = jobsMissingPaid.slice(i, i + 100);
-          const { data: txData } = await supabase.from('transactions').select('job_id, amount').in('job_id', chunk).eq('status', 'completed');
-          if (txData) {
-            const txSums = {};
-            txData.forEach(tx => { txSums[tx.job_id] = (txSums[tx.job_id] || 0) + (parseFloat(tx.amount) || 0); });
-            Object.entries(txSums).forEach(([jobId, total]) => {
-              if (allJobsById[jobId]) allJobsById[jobId].total_paid_amount = total;
-            });
-          }
-        }
-      }
-    }
+    // ===== Group ledger entries by team member =====
+    const entriesByMember = {};
+    (ledgerEntries || []).forEach(e => {
+      if (!entriesByMember[e.team_member_id]) entriesByMember[e.team_member_id] = [];
+      entriesByMember[e.team_member_id].push(e);
+    });
 
-    // When "All Time" (no date range), derive a date range from jobs for scheduled-hours calculation
+    // Scheduled hours date range
     let scheduledHoursStartDate = startDate;
     let scheduledHoursEndDate = endDate;
-    if (!startDate || !endDate) {
+    if (!scheduledHoursStartDate || !scheduledHoursEndDate) {
       let earliest = null;
-      (allDirectJobs || []).forEach(job => {
-        if (job.scheduled_date && (!earliest || job.scheduled_date < earliest)) {
-          earliest = job.scheduled_date;
-        }
+      (allJobs || []).forEach(job => {
+        if (job.scheduled_date && (!earliest || job.scheduled_date < earliest)) earliest = job.scheduled_date;
       });
-      // Strip time portion from scheduled_date (e.g. "2024-01-15 10:00:00" → "2024-01-15")
-      // Without this, calculateScheduledHoursFromAvailability creates invalid Date("2024-01-15 10:00:00T00:00:00")
       if (!scheduledHoursStartDate && earliest) scheduledHoursStartDate = String(earliest).split('T')[0].split(' ')[0];
       if (!scheduledHoursEndDate) {
         const today = new Date();
@@ -20325,426 +20238,159 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       }
     }
 
-    // Also compute totalBusinessRevenue from the fetched jobs (no extra query needed)
-    // Revenue = price - taxes (base price before tax)
-    totalBusinessRevenue = 0;
-    const revenueJobsList = [];
-    Object.values(allJobsById).forEach(job => {
-      const s = (job.status || '').toLowerCase();
-      if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      // Enforce date filter (some jobs may have been added via assignments without strict date filtering)
-      if (startDate || endDate) {
-        const raw = job.scheduled_date ? String(job.scheduled_date) : '';
-        const jobDateStr = raw.split('T')[0].split(' ')[0];
-        if (startDate && jobDateStr < startDate) return;
-        if (endDate && jobDateStr > endDate) return;
-      }
-      // Revenue = Subtotal (service_price) on the job card
-      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
-      totalBusinessRevenue += rev;
-      if (rev > 0) {
-        revenueJobsList.push({
-          id: job.id,
-          scheduledDate: job.scheduled_date,
-          serviceName: job.service_name || 'Unknown Service',
-          customerName: globalCustomerMap[job.customer_id] || '',
-          status: job.status,
-          revenue: parseFloat(rev.toFixed(2)),
-          taxes: parseFloat((parseFloat(job.taxes) || 0).toFixed(2)),
-          grossPrice: parseFloat(rev.toFixed(2))
-        });
-      }
-    });
-    // Sort revenue jobs by date
-    revenueJobsList.sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
-    console.log(`[Payroll] Total business revenue for period: $${totalBusinessRevenue.toFixed(2)}, Revenue jobs: ${revenueJobsList.length}`);
+    // ===== PROCESS: Build payroll from ledger entries =====
+    const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
 
-    // ===== END BATCH =====
+    const payrollData = (teamMembers || []).map(member => {
+      const memberEntries = entriesByMember[member.id] || [];
+      const memberRole = (member.role || '').toLowerCase();
+      const isManagerOrOwner = managerRoles.includes(memberRole);
+      const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
+      const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
 
-    const payrollData = await Promise.all(
-      (teamMembers || []).map(async (member) => {
-        try {
-        // Build this member's job list from pre-fetched data
-        const isCancelled = (job) => {
-          const s = (job?.status || '').toLowerCase();
-          return s === 'cancelled' || s === 'canceled' || s === 'cancel';
-        };
+      // Separate entries by type
+      let hourlySalary = 0;
+      let commissionSalary = 0;
+      let commissionRevenueBase = 0;
+      let totalTips = 0;
+      let totalIncentives = 0;
+      let totalHours = 0;
+      const jobIdSet = new Set();
+      const jobEntriesMap = {}; // job_id -> { earning, tip, incentive }
 
-        const memberJobIds = new Set();
-        // From direct team_member_id on jobs
-        (directJobsByMember[member.id] || []).forEach(j => memberJobIds.add(j.id));
-        // From job_team_assignments
-        (assignmentJobsByMember[member.id] || new Set()).forEach(id => memberJobIds.add(id));
+      for (const entry of memberEntries) {
+        const amount = parseFloat(entry.amount) || 0;
+        const meta = entry.metadata || {};
 
-        // Filter out cancelled jobs AND jobs before member's salary_start_date
-        const memberSalaryStartRaw = member.salary_start_date
-          ? String(member.salary_start_date).split('T')[0].split(' ')[0]
-          : null;
-
-        const jobs = [...memberJobIds]
-          .map(id => allJobsById[id])
-          .filter(j => {
-            if (!j || isCancelled(j)) return false;
-            // Exclude jobs before member's salary start date
-            if (memberSalaryStartRaw && j.scheduled_date) {
-              const jobDate = String(j.scheduled_date).split('T')[0].split(' ')[0];
-              if (jobDate < memberSalaryStartRaw) return false;
-            }
-            return true;
-          });
-
-        const customerMap = globalCustomerMap;
-        const memberCountByJob = memberCountByJobMap;
-
-        console.log(`[Payroll] Member ${member.id} (${member.first_name}): Found ${jobs.length} jobs`);
-
-        // Get pay rate history for this member (sorted DESC by effective_from)
-        const memberPayRates = payRatesByMember[member.id] || [];
-        // Current rate = latest effective rate or fallback to member record
-        const currentRate = memberPayRates.length > 0
-          ? { hourlyRate: parseFloat(memberPayRates[0].hourly_rate) || 0, commissionPercentage: parseFloat(memberPayRates[0].commission_percentage) || 0 }
-          : { hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : 0, commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : 0 };
-        const hourlyRate = currentRate.hourlyRate;
-        const commissionPercentage = currentRate.commissionPercentage;
-
-        // Calculate hourly-based salary
-        let totalHours = 0;
-        let hourlySalary = 0;
-
-        console.log(`[Payroll] Member ${member.id}: Current hourly rate = ${hourlyRate}, pay rate history entries = ${memberPayRates.length}`);
-
-        // Calculate hours for ALL jobs using per-job effective rate
-        // Priority: hours_worked > (start_time/end_time calculation) > duration/estimated_duration
-        (jobs || []).forEach(job => {
-          let hours = 0;
-
-          if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
-            hours = parseFloat(job.hours_worked);
-          } else if (job.start_time && job.end_time) {
-            const start = new Date(job.start_time);
-            const end = new Date(job.end_time);
-            const diffMs = end - start;
-            if (diffMs > 0) hours = diffMs / (1000 * 60 * 60);
+        if (entry.type === 'earning') {
+          if (meta.is_manager_salary) {
+            hourlySalary += amount;
+            totalHours += (meta.scheduled_hours || 0);
+          } else if (meta.is_manager_commission) {
+            commissionSalary += amount;
+            commissionRevenueBase += (meta.day_revenue || meta.week_revenue || 0);
           } else {
-            const durationMinutes = job.duration || job.estimated_duration || 0;
-            if (durationMinutes > 0) hours = durationMinutes / 60;
-          }
+            // Service provider earning — split hourly vs commission from metadata
+            const entryHours = meta.hours || 0;
+            const mc = meta.member_count || 1;
+            const entryHourlyRate = meta.hourly_rate || 0;
+            const entryCommPct = meta.commission_pct || 0;
+            const entryRevenue = (meta.revenue || 0) / mc;
 
-          if (hours > 0) {
-            const mc = memberCountByJob[job.id] || 1;
-            totalHours += hours / mc;
-
-            // Per-job hourly salary using effective rate on job date
-            if (memberPayRates.length > 0) {
-              const jobDate = job.scheduled_date ? String(job.scheduled_date).split('T')[0].split(' ')[0] : '';
-              const effectiveRate = getEffectivePayRate(memberPayRates, jobDate);
-              if (effectiveRate.hourlyRate > 0) {
-                hourlySalary += (hours / mc) * effectiveRate.hourlyRate;
-              }
+            if (entryHourlyRate > 0) {
+              hourlySalary += (entryHours / mc) * entryHourlyRate;
             }
-          }
-        });
-
-        // Determine role type
-        const memberRole = (member.role || '').toLowerCase();
-        const isManagerOrOwner = memberRole === 'account owner' || memberRole === 'owner' || memberRole === 'manager' || memberRole === 'admin' || memberRole === 'scheduler';
-
-        // Calculate scheduled working hours from availability settings
-        const memberSalaryStart = member.salary_start_date
-          ? String(member.salary_start_date).split('T')[0].split(' ')[0]
-          : scheduledHoursStartDate;
-        const effectiveStartDate = startDate && memberSalaryStart && memberSalaryStart > startDate
-          ? memberSalaryStart
-          : (startDate || memberSalaryStart);
-        const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
-        let scheduledHourlySalary = scheduledHours * hourlyRate;
-
-        // For managers/schedulers: hourly salary uses scheduled working hours
-        // With pay rate history, split scheduled hours by rate change periods
-        if (isManagerOrOwner && memberPayRates.length > 0) {
-          // Split scheduled hours by rate change periods for accurate salary
-          const rateChangeDates = memberPayRates.map(r => String(r.effective_from).split('T')[0].split(' ')[0]).sort();
-          // Build period boundaries within the pay period
-          const periodStart = effectiveStartDate;
-          const periodEnd = scheduledHoursEndDate;
-          if (periodStart && periodEnd) {
-            let mgrHourlySalary = 0;
-            let mgrScheduledSalary = 0;
-            // Collect boundaries: periodStart, each rate change within range, periodEnd
-            const boundaries = [periodStart];
-            rateChangeDates.forEach(d => { if (d > periodStart && d <= periodEnd) boundaries.push(d); });
-            boundaries.push(periodEnd);
-            // Remove duplicates and sort
-            const uniqueBoundaries = [...new Set(boundaries)].sort();
-            for (let b = 0; b < uniqueBoundaries.length - 1; b++) {
-              const segStart = uniqueBoundaries[b];
-              // For the last segment, use the actual end date; for others, use day before next boundary
-              const segEnd = uniqueBoundaries[b + 1];
-              const segEndForCalc = b < uniqueBoundaries.length - 2
-                ? (() => { const d = new Date(segEnd + 'T00:00:00'); d.setDate(d.getDate() - 1); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); })()
-                : segEnd;
-              const segHours = calculateScheduledHoursFromAvailability(member.availability, segStart, segEndForCalc);
-              const segRate = getEffectivePayRate(memberPayRates, segStart);
-              mgrHourlySalary += segHours * segRate.hourlyRate;
-              mgrScheduledSalary += segHours * segRate.hourlyRate;
+            if (entryCommPct > 0) {
+              commissionSalary += entryRevenue * (entryCommPct / 100);
+              commissionRevenueBase += entryRevenue;
             }
-            hourlySalary = mgrHourlySalary;
-            scheduledHourlySalary = mgrScheduledSalary;
-          } else if (hourlyRate > 0) {
-            hourlySalary = scheduledHours * hourlyRate;
+            totalHours += entryHours / mc;
           }
-        } else if (isManagerOrOwner && hourlyRate > 0) {
-          hourlySalary = scheduledHours * hourlyRate;
-          console.log(`[Payroll] Member ${member.id} (${memberRole}): Using SCHEDULED hours for hourly salary: ${scheduledHours.toFixed(2)}h × $${hourlyRate} = $${hourlySalary.toFixed(2)}`);
-        } else if (memberPayRates.length === 0) {
-          // No pay rate history, use flat rate from member record
-          hourlySalary = totalHours * hourlyRate;
-        }
-        // else: hourlySalary already calculated per-job above
-
-        // For managers/owners: use scheduled hours as their "worked" hours
-        // since their salary is based on availability schedule, not job clock-in/out
-        if (isManagerOrOwner && scheduledHours > 0) {
-          totalHours = scheduledHours;
+        } else if (entry.type === 'tip') {
+          totalTips += amount;
+        } else if (entry.type === 'incentive') {
+          totalIncentives += amount;
         }
 
-        console.log(`[Payroll] Member ${member.id}: Job hours = ${totalHours.toFixed(2)}, Scheduled hours = ${scheduledHours.toFixed(2)}, Hourly rate = ${hourlyRate}, Hourly salary = ${hourlySalary.toFixed(2)}, Scheduled salary = ${scheduledHourlySalary.toFixed(2)}`);
-
-        // Calculate commission-based salary
-        let commissionSalary = 0;
-        let commissionRevenueBase = 0;
-
-        console.log(`[Payroll] Member ${member.id}: Commission percentage = ${commissionPercentage}%, role = ${member.role}, isManagerOrOwner = ${isManagerOrOwner}`);
-
-        // For managers: filter business revenue by their salary_start_date
-        let managerBusinessRevenue = totalBusinessRevenue;
-        let managerRevenueJobsList = revenueJobsList;
-        if (isManagerOrOwner && memberSalaryStartRaw) {
-          managerRevenueJobsList = revenueJobsList.filter(rj => {
-            if (!rj.scheduledDate) return true;
-            const rjDate = String(rj.scheduledDate).split('T')[0].split(' ')[0];
-            return rjDate >= memberSalaryStartRaw;
-          });
-          managerBusinessRevenue = managerRevenueJobsList.reduce((sum, rj) => sum + (rj.revenue || 0), 0);
-          console.log(`[Payroll] Member ${member.id} (${memberRole}): Filtered business revenue by salary_start_date ${memberSalaryStartRaw}: $${managerBusinessRevenue.toFixed(2)} (${managerRevenueJobsList.length} jobs)`);
+        // Track jobs
+        if (entry.job_id) {
+          jobIdSet.add(entry.job_id);
+          if (!jobEntriesMap[entry.job_id]) jobEntriesMap[entry.job_id] = {};
+          jobEntriesMap[entry.job_id][entry.type] = entry;
         }
+      }
 
-        if (isManagerOrOwner && memberPayRates.length > 0) {
-          // Manager with rate history: use latest commission rate for total business revenue
-          // (commission on total revenue doesn't split by period — it's a flat % of total)
-          if (commissionPercentage > 0) {
-            commissionRevenueBase = managerBusinessRevenue;
-            commissionSalary = managerBusinessRevenue * (commissionPercentage / 100);
-            console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from business revenue $${managerBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
-          }
-        } else if (commissionPercentage > 0 && isManagerOrOwner) {
-          commissionRevenueBase = managerBusinessRevenue;
-          commissionSalary = managerBusinessRevenue * (commissionPercentage / 100);
-          console.log(`[Payroll] Member ${member.id} (${memberRole}): Commission from business revenue $${managerBusinessRevenue.toFixed(2)} × ${commissionPercentage}% = $${commissionSalary.toFixed(2)}`);
-        } else if (commissionPercentage > 0 || memberPayRates.length > 0) {
-          // Service providers: commission per job using effective rate on job date
-          (jobs || []).forEach(job => {
-            const jobTotal = parseFloat(job.service_price) ||
-                            parseFloat(job.price) ||
-                            parseFloat(job.total) ||
-                            parseFloat(job.total_amount) ||
-                            parseFloat(job.invoice_amount) || 0;
-            if (jobTotal <= 0) return;
-            const mc = memberCountByJob[job.id] || 1;
-            const splitRevenue = jobTotal / mc;
-            // Use per-job effective commission rate
-            const jobDate = job.scheduled_date ? String(job.scheduled_date).split('T')[0].split(' ')[0] : '';
-            const effectiveRate = memberPayRates.length > 0 ? getEffectivePayRate(memberPayRates, jobDate) : { commissionPercentage };
-            const jobCommPct = effectiveRate.commissionPercentage || 0;
-            if (jobCommPct > 0) {
-              const commission = splitRevenue * (jobCommPct / 100);
-              commissionSalary += commission;
-              commissionRevenueBase += splitRevenue;
-            }
-          });
-        }
+      // Scheduled hours (display only — managers use this for "Hours" column)
+      const memberSalaryStart = member.salary_start_date
+        ? String(member.salary_start_date).split('T')[0].split(' ')[0]
+        : scheduledHoursStartDate;
+      const effectiveStartDate = startDate && memberSalaryStart && memberSalaryStart > startDate
+        ? memberSalaryStart : (startDate || memberSalaryStart);
+      const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
+      const scheduledHourlySalary = scheduledHours * hourlyRate;
 
-        console.log(`[Payroll] Member ${member.id}: Total commission = $${commissionSalary.toFixed(2)}`);
-        
-        // Final summary for this member
-        console.log(`[Payroll] === Member ${member.id} (${member.first_name}) Summary ===`);
-        console.log(`[Payroll] Total jobs: ${jobs.length}`);
-        console.log(`[Payroll] Commission revenue base: $${commissionRevenueBase.toFixed(2)}`);
-        console.log(`[Payroll] Hourly rate: ${hourlyRate ? `$${hourlyRate}/hr` : 'Not set'}`);
-        console.log(`[Payroll] Commission %: ${commissionPercentage ? `${commissionPercentage}%` : 'Not set'}`);
-        console.log(`[Payroll] Total hours: ${totalHours.toFixed(2)}`);
-        console.log(`[Payroll] Hourly salary: $${hourlySalary.toFixed(2)}`);
-        console.log(`[Payroll] Commission: $${commissionSalary.toFixed(2)}`);
-        console.log(`[Payroll] Total salary: $${(hourlySalary + commissionSalary).toFixed(2)}`);
-        console.log(`[Payroll] ==========================================`);
+      // For managers, show scheduled hours as their "worked" hours
+      if (isManagerOrOwner && scheduledHours > 0) {
+        totalHours = scheduledHours;
+      }
 
-        // Calculate tips and incentives for this team member
-        let totalTips = 0;
-        let totalIncentives = 0;
-        // Track per-job tip/incentive for detail view
-        const tipsByJob = {};
+      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
 
-        const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
-        if (jobIds.length > 0) {
-          // Tips: use the higher of job-level tip or overpayment, split equally among team members
-          for (const job of jobs) {
-            const jobTip = parseFloat(job.tip_amount) || 0;
-            const mc = memberCountByJob[job.id] || 1;
-            const tipShare = jobTip / Math.max(1, mc);
-
-            // Calculate overpayment
-            const svcPrice = parseFloat(job.service_price) || 0;
-            const totalDue = svcPrice > 0
-              ? calculateJobTotal({ servicePrice: svcPrice, discount: job.discount, additionalFees: job.additional_fees, taxes: job.taxes })
-              : (parseFloat(job.total) || 0);
-            const totalPaid = parseFloat(job.total_paid_amount) || 0;
-            const overpayment = Math.max(0, totalPaid - totalDue);
-            const overpaymentShare = overpayment / mc;
-
-            // Use whichever is higher
-            const memberTip = Math.max(tipShare, overpaymentShare);
-            if (memberTip > 0) {
-              totalTips += memberTip;
-              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
-              tipsByJob[job.id].tip = memberTip;
-            }
-          }
-
-          // Incentives: always split job-level incentive_amount equally among team members
-          for (const job of jobs) {
-            const jobIncentive = parseFloat(job.incentive_amount) || 0;
-            if (jobIncentive > 0) {
-              const memberCount = memberCountByJob[job.id] || 1;
-              const memberIncentive = jobIncentive / Math.max(1, memberCount);
-              totalIncentives += memberIncentive;
-              if (!tipsByJob[job.id]) tipsByJob[job.id] = { tip: 0, incentive: 0 };
-              tipsByJob[job.id].incentive = memberIncentive;
-            }
-          }
-        }
-
-        console.log(`[Payroll] Member ${member.id}: Total tips = $${totalTips.toFixed(2)}, Total incentives = $${totalIncentives.toFixed(2)}`);
-
-        // Total salary is sum of hourly + commission + tips + incentives
-        const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
-
-        const jobDetails = (jobs || []).map(job => {
-          // Calculate hours for this job (same logic as above)
-          let hours = 0;
-          if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
-            hours = parseFloat(job.hours_worked);
-          } else if (job.start_time && job.end_time) {
-            const diffMs = new Date(job.end_time) - new Date(job.start_time);
-            if (diffMs > 0) hours = diffMs / (1000 * 60 * 60);
-          } else {
-            const dur = job.duration || job.estimated_duration || 0;
-            if (dur > 0) hours = dur / 60;
-          }
-
-          // Use service_price as revenue for cleaner job details
-          const revenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
-          const mc = memberCountByJob[job.id] || 1;
-          const splitHours = hours / mc;
-          const splitRevenue = revenue / mc;
-          const jobCommission = commissionPercentage > 0 ? splitRevenue * (commissionPercentage / 100) : 0;
-          const jobHourlySalary = hourlyRate > 0 ? splitHours * hourlyRate : 0;
-          const perMember = tipsByJob[job.id] || {};
-
-          return {
-            id: job.id,
-            scheduledDate: job.scheduled_date,
-            serviceName: job.service_name || 'Unknown Service',
-            customerName: customerMap[job.customer_id] || '',
-            status: job.status,
-            memberCount: mc,
-            hours: parseFloat(splitHours.toFixed(2)),
-            revenue: parseFloat(splitRevenue.toFixed(2)),
-            fullRevenue: parseFloat(revenue.toFixed(2)),
-            hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
-            commission: parseFloat(jobCommission.toFixed(2)),
-            tip: parseFloat((perMember.tip || 0).toFixed(2)),
-            incentive: parseFloat((perMember.incentive || 0).toFixed(2))
-          };
-        });
-
+      // Build job details for expandable rows
+      const jobDetails = Object.entries(jobEntriesMap).map(([jobId, entries]) => {
+        const job = allJobsById[jobId];
+        const earning = entries.earning;
+        const meta = earning?.metadata || {};
+        const mc = meta.member_count || 1;
+        const entryHours = (meta.hours || 0) / mc;
+        const entryRevenue = (meta.revenue || 0) / mc;
+        const fullRevenue = meta.revenue || 0;
+        const jobHourlySalary = (meta.hourly_rate || 0) > 0 ? entryHours * meta.hourly_rate : 0;
+        const jobCommission = (meta.commission_pct || 0) > 0 ? entryRevenue * (meta.commission_pct / 100) : 0;
         return {
-          teamMember: {
-            id: member.id,
-            name: `${member.first_name} ${member.last_name}`,
-            hourlyRate: hourlyRate || null,
-            commissionPercentage: commissionPercentage || null,
-            role: member.role || 'Service Provider',
-            status: member.status || 'active',
-            hasPayRateHistory: memberPayRates.length > 1
-          },
-          jobCount: (jobs || []).length,
-          jobIds: (jobs || []).map(j => j.id),
-          totalJobRevenue: parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
-          totalHours: parseFloat(totalHours.toFixed(2)),
-          scheduledHours: parseFloat(scheduledHours.toFixed(2)),
-          scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
-          hourlySalary: parseFloat(hourlySalary.toFixed(2)),
-          commissionSalary: parseFloat(commissionSalary.toFixed(2)),
-          commissionRevenueBase: parseFloat(commissionRevenueBase.toFixed(2)),
-          totalTips: parseFloat(totalTips.toFixed(2)),
-          totalIncentives: parseFloat(totalIncentives.toFixed(2)),
-          totalSalary: parseFloat(totalSalary.toFixed(2)),
-          hasHourlyRate: !!member.hourly_rate,
-          hasCommission: !!member.commission_percentage,
-          isManagerOrOwner,
-          paymentMethod: member.hourly_rate && member.commission_percentage
-            ? 'hybrid'
-            : member.hourly_rate
-              ? 'hourly'
-              : member.commission_percentage
-                ? 'commission'
-                : 'none',
-          jobs: jobDetails,
-          revenueJobs: isManagerOrOwner ? managerRevenueJobsList : undefined
+          id: parseInt(jobId),
+          scheduledDate: job?.scheduled_date,
+          serviceName: job?.service_name || 'Unknown Service',
+          customerName: globalCustomerMap[job?.customer_id] || '',
+          status: job?.status,
+          memberCount: mc,
+          hours: parseFloat(entryHours.toFixed(2)),
+          revenue: parseFloat(entryRevenue.toFixed(2)),
+          fullRevenue: parseFloat(fullRevenue.toFixed(2)),
+          hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
+          commission: parseFloat(jobCommission.toFixed(2)),
+          tip: parseFloat((parseFloat(entries.tip?.amount) || 0).toFixed(2)),
+          incentive: parseFloat((parseFloat(entries.incentive?.amount) || 0).toFixed(2))
         };
-        } catch (memberError) {
-          console.error(`[Payroll] Error processing member ${member.id} (${member.first_name}):`, memberError);
-          const errMemberStart = member.salary_start_date ? String(member.salary_start_date).split('T')[0].split(' ')[0] : startDate;
-          const errEffectiveStart = startDate && errMemberStart && errMemberStart > startDate ? errMemberStart : (startDate || errMemberStart);
-          const errScheduledHours = calculateScheduledHoursFromAvailability(member.availability, errEffectiveStart, endDate);
-          const errHourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
-          const errRole = (member.role || '').toLowerCase();
-          const errIsManagerOrOwner = errRole === 'account owner' || errRole === 'owner' || errRole === 'manager' || errRole === 'admin' || errRole === 'scheduler';
-          return {
-            teamMember: {
-              id: member.id,
-              name: `${member.first_name} ${member.last_name}`,
-              hourlyRate: member.hourly_rate ? parseFloat(member.hourly_rate) : null,
-              commissionPercentage: member.commission_percentage ? parseFloat(member.commission_percentage) : null,
-              role: member.role || 'Service Provider'
-            },
-            jobCount: 0,
-            totalHours: 0,
-            scheduledHours: parseFloat(errScheduledHours.toFixed(2)),
-            scheduledHourlySalary: parseFloat((errScheduledHours * errHourlyRate).toFixed(2)),
-            hourlySalary: 0,
-            commissionSalary: 0,
-            commissionRevenueBase: 0,
-            totalTips: 0,
-            totalIncentives: 0,
-            totalSalary: 0,
-            hasHourlyRate: !!member.hourly_rate,
-            hasCommission: !!member.commission_percentage,
-            isManagerOrOwner: errIsManagerOrOwner,
-            paymentMethod: member.hourly_rate && member.commission_percentage
-              ? 'hybrid'
-              : member.hourly_rate
-                ? 'hourly'
-                : member.commission_percentage
-                  ? 'commission'
-                  : 'none',
-            error: `Failed to calculate payroll for this member: ${memberError.message}`
-          };
-        }
-      })
-    );
+      }).sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
-    // Include team members who have jobs, scheduled working hours, or are managers/owners with commission
+      // Manager revenue jobs
+      const memberSalaryStartRaw = member.salary_start_date
+        ? String(member.salary_start_date).split('T')[0].split(' ')[0] : null;
+      let managerRevenueJobsList = revenueJobsList;
+      if (isManagerOrOwner && memberSalaryStartRaw) {
+        managerRevenueJobsList = revenueJobsList.filter(rj => {
+          if (!rj.scheduledDate) return true;
+          const rjDate = String(rj.scheduledDate).split('T')[0].split(' ')[0];
+          return rjDate >= memberSalaryStartRaw;
+        });
+      }
+
+      return {
+        teamMember: {
+          id: member.id,
+          name: `${member.first_name} ${member.last_name}`,
+          hourlyRate: hourlyRate || null,
+          commissionPercentage: commissionPercentage || null,
+          role: member.role || 'Service Provider',
+          status: member.status || 'active',
+          hasPayRateHistory: false // simplified — UI indicator only
+        },
+        jobCount: jobIdSet.size,
+        jobIds: [...jobIdSet],
+        totalJobRevenue: parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
+        totalHours: parseFloat(totalHours.toFixed(2)),
+        scheduledHours: parseFloat(scheduledHours.toFixed(2)),
+        scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
+        hourlySalary: parseFloat(hourlySalary.toFixed(2)),
+        commissionSalary: parseFloat(commissionSalary.toFixed(2)),
+        commissionRevenueBase: parseFloat(commissionRevenueBase.toFixed(2)),
+        totalTips: parseFloat(totalTips.toFixed(2)),
+        totalIncentives: parseFloat(totalIncentives.toFixed(2)),
+        totalSalary: parseFloat(totalSalary.toFixed(2)),
+        hasHourlyRate: !!member.hourly_rate,
+        hasCommission: !!member.commission_percentage,
+        isManagerOrOwner,
+        paymentMethod: member.hourly_rate && member.commission_percentage
+          ? 'hybrid'
+          : member.hourly_rate ? 'hourly'
+          : member.commission_percentage ? 'commission' : 'none',
+        jobs: jobDetails,
+        revenueJobs: isManagerOrOwner ? managerRevenueJobsList : undefined
+      };
+    });
+
+    // Include team members with activity
     const withActivity = (payrollData || []).filter(item =>
       (item?.jobCount || 0) > 0 ||
       (item?.scheduledHours || 0) > 0 ||
@@ -20760,20 +20406,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
-    // Use totalBusinessRevenue for the summary (avoids double-counting manager commission base)
     const grandTotalJobRevenue = totalBusinessRevenue;
-    // Count UNIQUE jobs across all team members (not sum of per-member counts which double-counts shared jobs)
     const allUniqueJobIds = new Set();
-    sortedTeamMembers.forEach(item => {
-      (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id));
-    });
+    sortedTeamMembers.forEach(item => { (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id)); });
     const grandTotalJobCount = allUniqueJobIds.size;
 
     res.json({
-      period: {
-        startDate: startDate || null,
-        endDate: endDate || null
-      },
+      period: { startDate: startDate || null, endDate: endDate || null },
       totalBusinessRevenue: parseFloat(totalBusinessRevenue.toFixed(2)),
       teamMembers: sortedTeamMembers.map(({ jobIds, ...rest }) => rest),
       summary: {
@@ -20796,6 +20435,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
   }
 });
 
+// REMOVED: Old payroll recalculation code (replaced by ledger-based payroll above)
+// Keeping salary analytics endpoint below
 // Get salary analytics with time-series data
 app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
   try {
