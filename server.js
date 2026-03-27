@@ -20271,20 +20271,22 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             commissionRevenueBase += (meta.day_revenue || meta.week_revenue || 0);
           } else {
             // Service provider earning — split hourly vs commission from metadata
-            const entryHours = meta.hours || 0;
+            // NOTE: meta.hours is already per-member (divided by memberCount in createLedgerEntriesForCompletedJob)
+            // meta.revenue is the FULL job revenue (not split), so we divide by memberCount here
+            const entryHours = meta.hours || 0; // already per-member
             const mc = meta.member_count || 1;
             const entryHourlyRate = meta.hourly_rate || 0;
             const entryCommPct = meta.commission_pct || 0;
-            const entryRevenue = (meta.revenue || 0) / mc;
+            const entryRevenue = (meta.revenue || 0) / mc; // split revenue per-member
 
             if (entryHourlyRate > 0) {
-              hourlySalary += (entryHours / mc) * entryHourlyRate;
+              hourlySalary += entryHours * entryHourlyRate;
             }
             if (entryCommPct > 0) {
               commissionSalary += entryRevenue * (entryCommPct / 100);
               commissionRevenueBase += entryRevenue;
             }
-            totalHours += entryHours / mc;
+            totalHours += entryHours;
           }
         } else if (entry.type === 'tip') {
           totalTips += amount;
@@ -20322,8 +20324,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         const earning = entries.earning;
         const meta = earning?.metadata || {};
         const mc = meta.member_count || 1;
-        const entryHours = (meta.hours || 0) / mc;
-        const entryRevenue = (meta.revenue || 0) / mc;
+        const entryHours = meta.hours || 0; // already per-member
+        const entryRevenue = (meta.revenue || 0) / mc; // full revenue, split here
         const fullRevenue = meta.revenue || 0;
         const jobHourlySalary = (meta.hourly_rate || 0) > 0 ? entryHours * meta.hourly_rate : 0;
         const jobCommission = (meta.commission_pct || 0) > 0 ? entryRevenue * (meta.commission_pct / 100) : 0;
