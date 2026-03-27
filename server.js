@@ -33310,6 +33310,8 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
 
     // ── Manager salary + commission backfill ──
     // Uses calculateScheduledHoursFromAvailability (same function as Payroll) for exact match
+    console.log(`[Backfill] Jobs done (${processed}/${totalToProcess}). Starting manager salary/commission...`);
+    console.log(`[Backfill] Total business revenue: $${totalBusinessRevenue.toFixed(2)}, validJobs: ${validJobs.length}, revenueData: ${revenueData.length}`);
     backfillProgress[userId] = { status: 'processing', processed, total: totalToProcess, phase: 'manager_salary', errors };
     let managerSalaryEntries = 0;
     try {
@@ -33363,6 +33365,9 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           const rates = mgrPayRatesByMember[m.id] || [];
           return rates.length > 0 || parseFloat(m.hourly_rate) > 0 || parseFloat(m.commission_percentage) > 0;
         });
+
+        console.log(`[Backfill] Found ${activeManagers.length} active managers: ${activeManagers.map(m => `${m.first_name}(${m.id})`).join(', ')}`);
+        console.log(`[Backfill] Date range: ${rangeStart} to ${rangeEnd}`);
 
         for (const mgr of activeManagers) {
           // Use pay rate history if available
