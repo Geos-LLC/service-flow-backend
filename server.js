@@ -33257,17 +33257,20 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       });
     }
 
-    let processed = 0;
-    let errors = 0;
     const totalToProcess = jobsToProcess.length;
 
-    // Initialize progress tracker
+    // Send response immediately — processing continues in background
     backfillProgress[userId] = { status: 'processing', processed: 0, total: totalToProcess, phase: 'jobs', errors: 0 };
+    res.json({ message: 'Backfill started', total_jobs: jobIds.length, already_had_entries: existingJobIds.size, would_process: totalToProcess, background: true });
+
+    // ── Background processing ──
+    let processed = 0;
+    let errors = 0;
 
     for (const jobId of jobsToProcess) {
       if (backfillCancel[userId]) {
         backfillProgress[userId] = { status: 'cancelled', processed, total: totalToProcess, phase: 'jobs', errors };
-        return res.json({ message: 'Backfill cancelled', processed, errors, cancelled: true });
+        return;
       }
       try {
         await createLedgerEntriesForCompletedJob(jobId, userId);
@@ -33485,21 +33488,14 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     }
 
     backfillProgress[userId] = { status: 'complete', processed, total: totalToProcess, phase: 'done', errors, manager_salary_entries: managerSalaryEntries };
+    console.log(`[Backfill] Complete for user ${userId}: ${processed} jobs, ${errors} errors, ${managerSalaryEntries} manager entries`);
     // Clean up progress after 5 minutes
     setTimeout(() => { delete backfillProgress[userId]; }, 300000);
-
-    res.json({
-      message: 'Backfill complete',
-      total_jobs: jobIds.length,
-      already_had_entries: existingJobIds.size,
-      processed,
-      errors,
-      manager_salary_entries: managerSalaryEntries
-    });
+    // Response already sent at start — nothing to do here
   } catch (error) {
     console.error('Backfill error:', error);
-    backfillProgress[req.user?.userId] = { status: 'error', error: error.message };
-    res.status(500).json({ error: 'Failed to backfill ledger' });
+    if (req.user?.userId) backfillProgress[req.user.userId] = { status: 'error', error: error.message };
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to backfill ledger' });
   }
 });
 
