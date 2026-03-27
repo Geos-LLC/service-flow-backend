@@ -1053,7 +1053,7 @@ app.use('/api', (req, res, next) => {
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
-try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
 // Test Supabase connection

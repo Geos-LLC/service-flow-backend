@@ -12,7 +12,7 @@ const ZB_BASE = 'https://api.zenbooker.com/v1'
 // In-memory sync progress tracking (per userId)
 const syncProgress = {}
 
-module.exports = (supabase, logger) => {
+module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
   const router = express.Router()
 
   // ══════════════════════════════════════
@@ -670,51 +670,111 @@ module.exports = (supabase, logger) => {
           }
 
           if (entity === 'reconcile') {
-            // Fetch ALL jobs from Zenbooker and update status/invoice for existing SF jobs
-            syncProgress[userId] = { status: 'running', phase: 'Fetching jobs...', progress: 10 }
+            // Fetch ALL jobs from Zenbooker and update status/invoice/team assignments for existing SF jobs
+            syncProgress[userId] = { status: 'running', phase: 'Fetching jobs...', progress: 5 }
             const zbJobs = await zbFetchAll(apiKey, '/jobs')
             logger.log(`[Zenbooker] Reconcile: ${zbJobs.length} jobs from Zenbooker`)
 
-            let updated = 0, skipped = 0, errors = 0
+            // Build team map for assignment lookups
+            const { data: team } = await supabase.from('team_members').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
+            const teamMap = {}; (team || []).forEach(t => { teamMap[t.zenbooker_id] = t.id })
+
+            let updated = 0, skipped = 0, errors = 0, assignmentsFixed = 0
             const total = zbJobs.length
             for (let i = 0; i < zbJobs.length; i++) {
               const zb = zbJobs[i]
               if (i % 50 === 0) {
-                const pct = Math.round(10 + (i / total) * 85)
-                syncProgress[userId] = { status: 'running', phase: `Reconciling (${i}/${total})`, progress: pct, detail: `${updated} updated, ${skipped} unchanged` }
+                const pct = Math.round(5 + (i / total) * 70)
+                syncProgress[userId] = { status: 'running', phase: `Reconciling (${i}/${total})`, progress: pct, detail: `${updated} updated, ${assignmentsFixed} assignments fixed` }
               }
 
-              const { data: sfJob } = await supabase.from('jobs').select('id, status, invoice_status').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+              const { data: sfJob } = await supabase.from('jobs').select('id, status, invoice_status, team_member_id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
               if (!sfJob) { skipped++; continue }
 
+              // ── Update status/invoice ──
               const zbStatus = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
               const inv = zb.invoice || {}
               const zbInvoiceStatus = inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft')
               const zbPaymentStatus = inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null)
 
-              // Only update if something changed
-              if (sfJob.status === zbStatus && sfJob.invoice_status === zbInvoiceStatus) {
-                skipped++
-                continue
+              if (sfJob.status !== zbStatus || sfJob.invoice_status !== zbInvoiceStatus) {
+                const update = {
+                  status: zbStatus,
+                  invoice_status: zbInvoiceStatus,
+                  scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
+                  price: parseFloat(inv.subtotal) || undefined,
+                  service_price: parseFloat(inv.subtotal) || undefined,
+                  total: parseFloat(inv.total) || undefined,
+                  total_amount: parseFloat(inv.total) || undefined,
+                }
+                if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+
+                const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
+                if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
+                else { updated++ }
               }
 
-              const update = {
-                status: zbStatus,
-                invoice_status: zbInvoiceStatus,
-                scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
-                price: parseFloat(inv.subtotal) || undefined,
-                service_price: parseFloat(inv.subtotal) || undefined,
-                total: parseFloat(inv.total) || undefined,
-                total_amount: parseFloat(inv.total) || undefined,
-              }
-              if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+              // ── Sync team assignments ──
+              const providers = zb.assigned_providers || []
+              if (providers.length > 0) {
+                const zbMemberIds = providers.map(p => teamMap[p.id]).filter(Boolean)
+                if (zbMemberIds.length > 0) {
+                  // Update primary team_member_id on job if different
+                  const primaryId = teamMap[providers[0].id]
+                  if (primaryId && sfJob.team_member_id !== primaryId) {
+                    await supabase.from('jobs').update({ team_member_id: primaryId }).eq('id', sfJob.id)
+                  }
 
-              const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
-              if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
-              else { updated++ }
+                  // Sync job_team_assignments if multiple providers
+                  if (zbMemberIds.length > 1) {
+                    const { data: existingAssignments } = await supabase.from('job_team_assignments').select('team_member_id').eq('job_id', sfJob.id)
+                    const existingIds = new Set((existingAssignments || []).map(a => a.team_member_id))
+                    const missing = zbMemberIds.filter(id => !existingIds.has(id))
+                    if (missing.length > 0 || existingIds.size !== zbMemberIds.length) {
+                      // Replace all assignments with the correct set
+                      await supabase.from('job_team_assignments').delete().eq('job_id', sfJob.id)
+                      const assignments = zbMemberIds.map((id, idx) => ({
+                        job_id: sfJob.id, team_member_id: id, is_primary: idx === 0
+                      }))
+                      const { error: assignErr } = await supabase.from('job_team_assignments').insert(assignments)
+                      if (!assignErr) assignmentsFixed++
+                      else logger.error(`[Zenbooker] Assignment fix error job ${sfJob.id}: ${JSON.stringify(assignErr)}`)
+                    }
+                  }
+                }
+              }
             }
 
-            results.reconcile = { total, updated, skipped, errors }
+            // ── Rebuild ledger entries for jobs that got new assignments ──
+            if (assignmentsFixed > 0 && createLedgerEntriesForCompletedJob) {
+              syncProgress[userId] = { status: 'running', phase: 'Rebuilding ledger for updated assignments...', progress: 80 }
+              logger.log(`[Zenbooker] Reconcile: ${assignmentsFixed} jobs got assignment fixes, rebuilding ledger entries`)
+              // Get all jobs that have team assignments
+              const { data: assignedJobs } = await supabase
+                .from('job_team_assignments')
+                .select('job_id')
+                .in('job_id', (await supabase.from('jobs').select('id').eq('user_id', userId)).data?.map(j => j.id) || [])
+              const multiJobIds = [...new Set((assignedJobs || []).map(a => a.job_id))]
+              let ledgerRebuilt = 0
+              for (const jobId of multiJobIds) {
+                // Delete old entries for this job
+                await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive'])
+                // Recreate with correct member count
+                try {
+                  await createLedgerEntriesForCompletedJob(jobId, userId)
+                  ledgerRebuilt++
+                } catch (e) {
+                  logger.error(`[Zenbooker] Ledger rebuild error job ${jobId}: ${e.message}`)
+                }
+                if (ledgerRebuilt % 50 === 0) {
+                  syncProgress[userId] = { ...syncProgress[userId], phase: `Rebuilding ledger (${ledgerRebuilt}/${multiJobIds.length})`, progress: 80 + Math.round((ledgerRebuilt / multiJobIds.length) * 15) }
+                }
+              }
+              results.reconcile.ledgerRebuilt = ledgerRebuilt
+              logger.log(`[Zenbooker] Reconcile: rebuilt ledger for ${ledgerRebuilt} jobs`)
+            }
+
+            results.reconcile = { total, updated, skipped, errors, assignmentsFixed }
             logger.log(`[Zenbooker] Reconcile done: ${JSON.stringify(results.reconcile)}`)
           }
 
