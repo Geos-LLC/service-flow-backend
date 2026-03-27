@@ -276,11 +276,19 @@ module.exports = (supabase, logger) => {
 
   async function syncTeamMembers(userId, apiKey) {
     const zbTeam = await zbFetchAll(apiKey, '/team_members')
+    // Pre-fetch account owner email to avoid creating team members with owner's email
+    const { data: ownerData } = await supabase.from('users').select('email').eq('id', userId).single()
+    const ownerEmail = (ownerData?.email || '').toLowerCase().trim()
     let created = 0, skipped = 0, errors = 0
     for (const zb of zbTeam) {
       const { data: existing } = await supabase.from('team_members').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
       if (existing) { skipped++; continue }
       const mapped = mapTeamMember(zb, userId)
+      // Clear email if it matches the account owner to prevent role conflicts on login
+      if (ownerEmail && (mapped.email || '').toLowerCase().trim() === ownerEmail) {
+        logger.log(`[Zenbooker] Clearing owner email from team member ${zb.name} to avoid role conflict`)
+        mapped.email = ''
+      }
       const { error } = await supabase.from('team_members').insert(mapped)
       if (error) { logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
       else created++
