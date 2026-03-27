@@ -353,9 +353,22 @@ module.exports = (supabase, logger) => {
       if (existing) { skipped++; continue }
 
       const mapped = mapJob(zb, userId, lookups)
-      const { error } = await supabase.from('jobs').insert(mapped)
+      const { data: newJob, error } = await supabase.from('jobs').insert(mapped).select('id').single()
       if (error) { logger.error(`[Zenbooker] Job insert error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
-      else created++
+      else {
+        created++
+        // Create job_team_assignments for ALL assigned providers (not just the first)
+        const providers = zb.assigned_providers || []
+        if (providers.length > 1 && newJob?.id) {
+          const assignments = providers
+            .map(p => ({ job_id: newJob.id, team_member_id: teamMap[p.id], is_primary: p.id === providers[0]?.id }))
+            .filter(a => a.team_member_id)
+          if (assignments.length > 1) {
+            const { error: assignErr } = await supabase.from('job_team_assignments').insert(assignments)
+            if (assignErr) logger.error(`[Zenbooker] Assignment insert error job ${zb.id}: ${JSON.stringify(assignErr)}`)
+          }
+        }
+      }
     }
     return { total: zbJobs.length, created, skipped, errors }
   }
