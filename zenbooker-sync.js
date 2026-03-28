@@ -321,6 +321,62 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     return { total: zbCustomers.length, created, skipped, errors }
   }
 
+  async function syncTransactions(userId, apiKey) {
+    const zbTransactions = await zbFetchAll(apiKey, '/transactions')
+    logger.log(`[Zenbooker] Fetched ${zbTransactions.length} transactions`)
+
+    // Build lookup: ZB invoice_id → SF job (via jobs.zenbooker_id matching the ZB job that owns the invoice)
+    // ZB transactions have invoice_id, ZB invoices belong to jobs
+    // We need to map ZB invoice_id → ZB job_id → SF job_id
+    // Simplest: fetch all SF jobs with zenbooker_id, then for each ZB transaction find the job
+    const { data: sfJobs } = await supabase.from('jobs').select('id, zenbooker_id, customer_id, invoice_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
+    const { data: sfCustomers } = await supabase.from('customers').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
+    const customerMap = {}; (sfCustomers || []).forEach(c => { customerMap[c.zenbooker_id] = c.id })
+
+    // Build invoice → job map from ZB data: each job has invoice.id
+    // We already have the ZB jobs data from the full sync, but here we just need invoice→job mapping
+    // The ZB transaction has invoice_id — we need to find which SF job has that invoice
+    // Since we store zenbooker_id on jobs (which is the ZB job ID, not invoice ID),
+    // we need to fetch ZB jobs to get their invoice IDs
+    const zbJobs = await zbFetchAll(apiKey, '/jobs')
+    const zbInvoiceToJob = {}
+    zbJobs.forEach(j => {
+      if (j.invoice?.id) zbInvoiceToJob[j.invoice.id] = j.id
+    })
+    const sfJobByZbId = {}; (sfJobs || []).forEach(j => { sfJobByZbId[j.zenbooker_id] = j })
+
+    let created = 0, skipped = 0, errors = 0
+    for (const zbt of zbTransactions) {
+      // Skip if already synced
+      const { data: existing } = await supabase.from('transactions').select('id').eq('zenbooker_id', zbt.id).maybeSingle()
+      if (existing) { skipped++; continue }
+
+      // Find the SF job for this transaction
+      const zbJobId = zbInvoiceToJob[zbt.invoice_id]
+      const sfJob = zbJobId ? sfJobByZbId[zbJobId] : null
+      const sfCustomerId = zbt.customer_id ? customerMap[zbt.customer_id] : (sfJob?.customer_id || null)
+
+      const txData = {
+        user_id: userId,
+        job_id: sfJob?.id || null,
+        invoice_id: sfJob?.invoice_id || null,
+        customer_id: sfCustomerId,
+        amount: parseFloat(zbt.amount) || 0,
+        payment_method: zbt.custom_payment_method_name || zbt.payment_method || 'other',
+        payment_intent_id: zbt.stripe_transaction_id || `zb_${zbt.id}`,
+        status: zbt.status === 'succeeded' ? 'completed' : zbt.status,
+        notes: zbt.memo || null,
+        zenbooker_id: zbt.id,
+        created_at: zbt.payment_date || zbt.created
+      }
+
+      const { error } = await supabase.from('transactions').insert(txData)
+      if (error) { logger.error(`[Zenbooker] Transaction insert error ${zbt.id}: ${JSON.stringify(error)}`); errors++ }
+      else created++
+    }
+    return { total: zbTransactions.length, created, skipped, errors }
+  }
+
   async function syncJobs(userId, apiKey, params = {}, maxJobs = 0) {
     // Build lookup maps: zenbooker_id → internal record
     const { data: customers } = await supabase.from('customers').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
@@ -808,7 +864,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               logger.log(`[Zenbooker] Reconcile: rebuilt ledger for ${ledgerRebuilt} jobs`)
             }
 
-            results.reconcile = { total, updated, skipped, errors, assignmentsFixed }
+            // ── Sync transactions (payments) ──
+            syncProgress[userId] = { status: 'running', phase: 'Syncing transactions...', progress: 90 }
+            const txResults = await syncTransactions(userId, apiKey)
+            logger.log(`[Zenbooker] Transactions synced: ${JSON.stringify(txResults)}`)
+
+            results.reconcile = { total, updated, skipped, errors, assignmentsFixed, transactions: txResults }
             logger.log(`[Zenbooker] Reconcile done: ${JSON.stringify(results.reconcile)}`)
           }
 
