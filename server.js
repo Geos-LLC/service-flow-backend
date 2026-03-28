@@ -6463,7 +6463,17 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
         await createLedgerEntriesForCompletedJob(id, userId);
       } catch (ledgerError) {
         console.error('⚠️ Error creating ledger entries (non-blocking):', ledgerError);
-        // Don't fail the status update if ledger creation fails
+      }
+    }
+
+    // === LEDGER CLEANUP: Remove ledger entries when job is cancelled ===
+    if (status === 'cancelled' && previousStatus !== 'cancelled') {
+      try {
+        const { error: delErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', id);
+        if (delErr) console.error('⚠️ Error removing ledger entries for cancelled job:', delErr);
+        else console.log(`[Ledger] Removed entries for cancelled job ${id}`);
+      } catch (ledgerError) {
+        console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
       }
     }
 
@@ -31753,6 +31763,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   if (jobError || !job) {
     console.error('Ledger: Could not fetch job', jobId, jobError);
+    return;
+  }
+
+  // Skip cancelled jobs
+  const jobStatus = (job.status || '').toLowerCase();
+  if (jobStatus === 'cancelled' || jobStatus === 'canceled') {
     return;
   }
 
