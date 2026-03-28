@@ -20201,9 +20201,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       allJobsById[job.id] = job;
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
       const rev = svcP > 0
-        ? calculateJobTotal({ servicePrice: svcP, discount: job.discount, additionalFees: job.additional_fees })
+        ? svcP + (parseFloat(job.additional_fees) || 0)
         : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
       totalBusinessRevenue += rev;
       if (rev > 0) {
@@ -20461,7 +20462,7 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { hoursWorked, tipAmount, incentiveAmount } = req.body;
+    const { hoursWorked, tipAmount, incentiveAmount, totalDue } = req.body;
 
     // Verify job belongs to user
     const { data: job, error: jobErr } = await supabase
@@ -20477,6 +20478,11 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     if (hoursWorked !== undefined) update.hours_worked = parseFloat(hoursWorked) > 0 ? parseFloat(hoursWorked) : null;
     if (tipAmount !== undefined) update.tip_amount = parseFloat(tipAmount) >= 0 ? parseFloat(tipAmount) : 0;
     if (incentiveAmount !== undefined) update.incentive_amount = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
+    if (req.body.servicePrice !== undefined) {
+      const val = parseFloat(req.body.servicePrice) || 0;
+      update.service_price = val;
+      update.price = val;
+    }
 
     if (Object.keys(update).length > 0) {
       const { error: updateErr } = await supabase.from('jobs').update(update).eq('id', id);
@@ -31873,11 +31879,11 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const memberCount = memberIdsForCount.size;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-  // Revenue = service_price - discount + additional_fees (no taxes — taxes are not revenue)
+  // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
   // Falls back to total/total_amount if service_price is missing
   const basePrice = parseFloat(job.service_price) || parseFloat(job.price) || 0;
   const jobRevenue = basePrice > 0
-    ? calculateJobTotal({ servicePrice: basePrice, discount: job.discount, additionalFees: job.additional_fees })
+    ? basePrice + (parseFloat(job.additional_fees) || 0)
     : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
 
   // Calculate hours worked — same priority as Payroll:
@@ -33017,10 +33023,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     revenueData.forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (cancelledStatuses2.includes(s)) return;
-      // Revenue = service_price - discount + additional_fees (no taxes)
+      // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
       const rev = svcP > 0
-        ? calculateJobTotal({ servicePrice: svcP, discount: job.discount, additionalFees: job.additional_fees })
+        ? svcP + (parseFloat(job.additional_fees) || 0)
         : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
       totalBusinessRevenue += rev;
     });
@@ -33120,7 +33126,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
             revenueData.forEach(r => {
               const sp = parseFloat(r.service_price) || parseFloat(r.price) || 0;
               revenueMap[r.id] = sp > 0
-                ? calculateJobTotal({ servicePrice: sp, discount: r.discount, additionalFees: r.additional_fees })
+                ? sp + (parseFloat(r.additional_fees) || 0)
                 : (parseFloat(r.total) || parseFloat(r.total_amount) || 0);
             });
             const commDayStart = new Date(mgrEffectiveStart + 'T00:00:00');
