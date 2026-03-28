@@ -20125,7 +20125,8 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
 app.get('/api/payroll', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, jobFilter } = req.query;
+    const includeScheduled = jobFilter === 'all';
 
     // ===== PARALLEL BATCH: Fetch team members, ledger entries, and jobs =====
     const endDateNextDay = endDate ? (() => {
@@ -20236,6 +20237,48 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       if (!entriesByMember[e.team_member_id]) entriesByMember[e.team_member_id] = [];
       entriesByMember[e.team_member_id].push(e);
     });
+
+    // ===== Include projected entries for scheduled/in-progress jobs when jobFilter=all =====
+    if (includeScheduled) {
+      const cancelStatuses = ['cancelled', 'canceled', 'cancel'];
+      const completedStatuses = ['completed'];
+      // Find jobs that have no ledger entries (not completed yet)
+      const jobsWithLedger = new Set((ledgerEntries || []).map(e => e.job_id).filter(Boolean));
+      const teamMemberMap = {};
+      (teamMembers || []).forEach(m => { teamMemberMap[m.id] = m; });
+
+      for (const job of (allJobs || [])) {
+        const s = (job.status || '').toLowerCase();
+        if (cancelStatuses.includes(s) || completedStatuses.includes(s)) continue;
+        if (jobsWithLedger.has(job.id)) continue;
+        if (!job.team_member_id) continue;
+
+        const member = teamMemberMap[job.team_member_id];
+        if (!member) continue;
+        const memberRole = (member.role || '').toLowerCase();
+        if (['manager', 'scheduler', 'admin', 'account owner', 'owner'].includes(memberRole)) continue;
+
+        const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+        const revenue = svcP + (parseFloat(job.additional_fees) || 0);
+        const hours = parseFloat(job.hours_worked) || (job.duration ? job.duration / 60 : (job.estimated_duration ? job.estimated_duration / 60 : 0));
+        const hr = parseFloat(member.hourly_rate) || 0;
+        const cp = parseFloat(member.commission_percentage) || 0;
+        let amount = 0;
+        if (hr > 0 && cp > 0) amount = (hours * hr) + (revenue * cp / 100);
+        else if (cp > 0) amount = revenue * cp / 100;
+        else if (hr > 0) amount = hours * hr;
+
+        const projected = {
+          team_member_id: member.id,
+          job_id: job.id,
+          type: 'earning',
+          amount: parseFloat(amount.toFixed(2)),
+          metadata: { hours, revenue, hourly_rate: hr, commission_pct: cp, member_count: 1, projected: true }
+        };
+        if (!entriesByMember[member.id]) entriesByMember[member.id] = [];
+        entriesByMember[member.id].push(projected);
+      }
+    }
 
     // Scheduled hours date range
     let scheduledHoursStartDate = startDate;
