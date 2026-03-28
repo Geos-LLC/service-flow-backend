@@ -460,7 +460,18 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       } catch { /* customer sync failed, continue without linking */ }
     }
 
-    const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
+    const { data: existing } = await supabase.from('jobs').select('id, start_time').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
+
+    // Capture real start/end timestamps from status webhooks
+    if (eventType === 'job.started' && existing) {
+      mapped.start_time = new Date().toISOString()
+    }
+    if ((eventType === 'job.completed' || eventType === 'job.complete') && existing) {
+      mapped.end_time = new Date().toISOString()
+      // Preserve start_time if it was already set
+      if (existing.start_time) delete mapped.start_time
+    }
+
     if (existing) {
       await supabase.from('jobs').update(mapped).eq('id', existing.id)
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
