@@ -20169,7 +20169,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const pageSize = 1000;
       while (true) {
         let q = supabase.from('jobs')
-          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, status, service_name, customer_id, hours_worked, duration, estimated_duration, start_time, end_time')
+          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, status, service_name, customer_id, hours_worked, duration, estimated_duration, start_time, end_time')
           .eq('user_id', userId)
           .range(from, from + pageSize - 1);
         if (startDate) q = q.gte('scheduled_date', startDate);
@@ -20350,6 +20350,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           status: job?.status,
           memberCount: mc,
           hours: parseFloat(entryHours.toFixed(2)),
+          // Real time from start_time/end_time (informational)
+          realHours: (job?.start_time && job?.end_time) ? parseFloat(((new Date(job.end_time) - new Date(job.start_time)) / (1000 * 60 * 60) / mc).toFixed(2)) : null,
+          startTime: job?.start_time || null,
+          endTime: job?.end_time || null,
+          estimatedDuration: job?.duration || job?.estimated_duration || null,
+          hoursWorked: job?.hours_worked ? parseFloat(job.hours_worked) : null,
           revenue: parseFloat(entryRevenue.toFixed(2)),
           fullRevenue: parseFloat(fullRevenue.toFixed(2)),
           hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
@@ -20447,6 +20453,49 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get payroll error:', error);
     res.status(500).json({ error: 'Failed to fetch payroll data' });
+  }
+});
+
+// PATCH /api/jobs/:id/hours - Update hours_worked and recalculate ledger entry
+app.patch('/api/jobs/:id/hours', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { hoursWorked } = req.body;
+
+    if (hoursWorked === undefined || hoursWorked === null) {
+      return res.status(400).json({ error: 'hoursWorked is required' });
+    }
+
+    // Verify job belongs to user
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs')
+      .select('id, user_id, status')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    if (jobErr || !job) return res.status(404).json({ error: 'Job not found' });
+
+    // Update hours_worked on the job
+    const parsedHours = parseFloat(hoursWorked);
+    const { error: updateErr } = await supabase
+      .from('jobs')
+      .update({ hours_worked: parsedHours > 0 ? parsedHours : null })
+      .eq('id', id);
+    if (updateErr) return res.status(500).json({ error: 'Failed to update hours' });
+
+    // Recalculate ledger entries for this job
+    await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
+    try {
+      await createLedgerEntriesForCompletedJob(parseInt(id), userId);
+    } catch (e) {
+      console.error('Ledger rebuild after hours edit:', e);
+    }
+
+    res.json({ success: true, hoursWorked: parsedHours > 0 ? parsedHours : null });
+  } catch (error) {
+    console.error('Update hours error:', error);
+    res.status(500).json({ error: 'Failed to update hours' });
   }
 });
 
