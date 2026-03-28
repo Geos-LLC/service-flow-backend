@@ -468,9 +468,34 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     if (existing) {
       await supabase.from('jobs').update(mapped).eq('id', existing.id)
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
+
+      // Create ledger entries when job is completed via Zenbooker webhook
+      if (mapped.status === 'completed' && createLedgerEntriesForCompletedJob) {
+        try {
+          await createLedgerEntriesForCompletedJob(existing.id, userId)
+          logger.log(`[Zenbooker] Ledger entries created for job ${existing.id}`)
+        } catch (ledgerErr) {
+          logger.error(`[Zenbooker] Ledger creation failed for job ${existing.id}: ${ledgerErr.message}`)
+        }
+      }
+
+      // Delete ledger entries when job is cancelled via Zenbooker webhook
+      if (mapped.status === 'cancelled') {
+        await supabase.from('cleaner_ledger').delete().eq('job_id', existing.id)
+        logger.log(`[Zenbooker] Ledger entries removed for cancelled job ${existing.id}`)
+      }
     } else {
-      await supabase.from('jobs').insert(mapped)
+      const { data: newJob } = await supabase.from('jobs').insert(mapped).select('id').single()
       logger.log(`[Zenbooker] Job created: ${data.id} (${eventType})`)
+
+      // Create ledger entries if job is already completed on creation
+      if (mapped.status === 'completed' && newJob?.id && createLedgerEntriesForCompletedJob) {
+        try {
+          await createLedgerEntriesForCompletedJob(newJob.id, userId)
+        } catch (ledgerErr) {
+          logger.error(`[Zenbooker] Ledger creation failed for new job ${newJob.id}: ${ledgerErr.message}`)
+        }
+      }
     }
   }
 
