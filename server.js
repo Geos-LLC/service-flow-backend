@@ -20395,7 +20395,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           memberCount: mc,
           hours: parseFloat(entryHours.toFixed(2)),
           // Real time from start_time/end_time (informational)
-          realHours: (job?.start_time && job?.end_time) ? parseFloat(((new Date(job.end_time) - new Date(job.start_time)) / (1000 * 60 * 60) / mc).toFixed(2)) : null,
+          realHours: (job?.start_time && job?.end_time && (new Date(job.end_time) - new Date(job.start_time)) > 60000) ? parseFloat(((new Date(job.end_time) - new Date(job.start_time)) / (1000 * 60 * 60) / mc).toFixed(2)) : null,
           startTime: job?.start_time || null,
           endTime: job?.end_time || null,
           estimatedDuration: job?.duration || job?.estimated_duration || null,
@@ -31940,10 +31940,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     const start = new Date(job.start_time);
     const end = new Date(job.end_time);
     const diffMs = end - start;
-    if (diffMs > 0) {
+    if (diffMs > 60000) { // At least 1 minute — ignore bad ZB timestamps where start ≈ end
       hoursWorked = diffMs / (1000 * 60 * 60);
     }
-  } else {
+  }
+  // Fallback to estimated duration if no valid real time
+  if (hoursWorked <= 0) {
     const durationMinutes = job.duration || job.estimated_duration || 0;
     if (durationMinutes > 0) {
       hoursWorked = durationMinutes / 60;
