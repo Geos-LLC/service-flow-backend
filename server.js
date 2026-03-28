@@ -20201,13 +20201,16 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       allJobsById[job.id] = job;
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+      const rev = svcP > 0
+        ? calculateJobTotal({ servicePrice: svcP, discount: job.discount, additionalFees: job.additional_fees })
+        : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
       totalBusinessRevenue += rev;
       if (rev > 0) {
         revenueJobsList.push({
           id: job.id, scheduledDate: job.scheduled_date, serviceName: job.service_name || 'Unknown Service',
           customerName: '', status: job.status, revenue: parseFloat(rev.toFixed(2)),
-          taxes: parseFloat((parseFloat(job.taxes) || 0).toFixed(2)), grossPrice: parseFloat(rev.toFixed(2))
+          taxes: parseFloat((parseFloat(job.taxes) || 0).toFixed(2)), grossPrice: parseFloat(svcP.toFixed(2))
         });
       }
     });
@@ -31822,8 +31825,12 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const memberCount = memberIdsForCount.size;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-  // Revenue = Subtotal (service_price) on the job card (same fallback order as Payroll)
-  const jobRevenue = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+  // Revenue = service_price - discount + additional_fees (no taxes — taxes are not revenue)
+  // Falls back to total/total_amount if service_price is missing
+  const basePrice = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+  const jobRevenue = basePrice > 0
+    ? calculateJobTotal({ servicePrice: basePrice, discount: job.discount, additionalFees: job.additional_fees })
+    : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
 
   // Calculate hours worked — same priority as Payroll:
   // Priority 1: hours_worked
@@ -32954,7 +32961,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       const chunk = revenueJobIds.slice(i, i + 200);
       const { data: revJobs } = await supabase
         .from('jobs')
-        .select('id, price, total, service_price, total_amount, invoice_amount, taxes, status')
+        .select('id, price, total, service_price, total_amount, invoice_amount, taxes, discount, additional_fees, status')
         .in('id', chunk);
       revenueData = revenueData.concat(revJobs || []);
     }
@@ -32962,8 +32969,11 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     revenueData.forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (cancelledStatuses2.includes(s)) return;
-      // Revenue = Subtotal (service_price) on the job card (same fallback as payroll)
-      const rev = parseFloat(job.service_price) || parseFloat(job.price) || parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0;
+      // Revenue = service_price - discount + additional_fees (no taxes)
+      const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+      const rev = svcP > 0
+        ? calculateJobTotal({ servicePrice: svcP, discount: job.discount, additionalFees: job.additional_fees })
+        : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
       totalBusinessRevenue += rev;
     });
 
@@ -33059,7 +33069,12 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
 
             // Create per-day commission entries so any date range sums correctly
             const revenueMap = {};
-            revenueData.forEach(r => { revenueMap[r.id] = parseFloat(r.service_price) || parseFloat(r.price) || parseFloat(r.total) || parseFloat(r.total_amount) || 0; });
+            revenueData.forEach(r => {
+              const sp = parseFloat(r.service_price) || parseFloat(r.price) || 0;
+              revenueMap[r.id] = sp > 0
+                ? calculateJobTotal({ servicePrice: sp, discount: r.discount, additionalFees: r.additional_fees })
+                : (parseFloat(r.total) || parseFloat(r.total_amount) || 0);
+            });
             const commDayStart = new Date(mgrEffectiveStart + 'T00:00:00');
             const commRangeEnd = new Date((rangeEnd || mgrEffectiveStart) + 'T00:00:00');
             while (commDayStart <= commRangeEnd) {
