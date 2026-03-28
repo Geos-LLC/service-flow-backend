@@ -170,7 +170,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       if (found) serviceId = found[1].id
     }
 
-    return {
+    const mapped = {
       user_id: userId,
       customer_id: customerId,
       service_id: serviceId,
@@ -195,6 +195,10 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       is_recurring: zb.recurring === true,
       zenbooker_id: zb.id,
     }
+    // Real timestamps from Zenbooker (started_at, completed_at)
+    if (zb.started_at) mapped.start_time = zb.started_at
+    if (zb.completed_at) mapped.end_time = zb.completed_at
+    return mapped
   }
 
   // ══════════════════════════════════════
@@ -460,18 +464,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       } catch { /* customer sync failed, continue without linking */ }
     }
 
-    const { data: existing } = await supabase.from('jobs').select('id, start_time').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
-
-    // Capture real start/end timestamps from status webhooks
-    if (eventType === 'job.started' && existing) {
-      mapped.start_time = new Date().toISOString()
-    }
-    if ((eventType === 'job.completed' || eventType === 'job.complete') && existing) {
-      mapped.end_time = new Date().toISOString()
-      // Preserve start_time if it was already set
-      if (existing.start_time) delete mapped.start_time
-    }
-
+    const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
     if (existing) {
       await supabase.from('jobs').update(mapped).eq('id', existing.id)
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
@@ -708,22 +701,27 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               const zbInvoiceStatus = inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft')
               const zbPaymentStatus = inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null)
 
-              if (sfJob.status !== zbStatus || sfJob.invoice_status !== zbInvoiceStatus) {
-                const update = {
-                  status: zbStatus,
-                  invoice_status: zbInvoiceStatus,
-                  scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
-                  price: parseFloat(inv.subtotal) || undefined,
-                  service_price: parseFloat(inv.subtotal) || undefined,
-                  total: parseFloat(inv.total) || undefined,
-                  total_amount: parseFloat(inv.total) || undefined,
-                }
-                if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+              const update = {}
+              if (sfJob.status !== zbStatus) update.status = zbStatus
+              if (sfJob.invoice_status !== zbInvoiceStatus) update.invoice_status = zbInvoiceStatus
+              if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+              // Always sync timestamps, prices, discounts
+              update.scheduled_date = zbDateToLocal(zb.start_date, zb.timezone)
+              update.price = parseFloat(inv.subtotal) || undefined
+              update.service_price = parseFloat(inv.subtotal) || undefined
+              update.total = parseFloat(inv.total) || undefined
+              update.total_amount = parseFloat(inv.total) || undefined
+              update.discount = parseFloat(inv.discount_amount) || 0
+              update.additional_fees = parseFloat(inv.additional_fees || inv.fees_amount) || 0
+              update.tip_amount = parseFloat(inv.tip || inv.tip_amount) || 0
+              update.taxes = parseFloat(inv.tax_amount || inv.total_tax_amount) || 0
+              // Real start/end times from Zenbooker
+              if (zb.started_at) update.start_time = zb.started_at
+              if (zb.completed_at) update.end_time = zb.completed_at
 
-                const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
-                if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
-                else { updated++ }
-              }
+              const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
+              if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
+              else { updated++ }
 
               // ── Sync team assignments ──
               const providers = zb.assigned_providers || []
