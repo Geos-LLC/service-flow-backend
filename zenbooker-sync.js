@@ -946,6 +946,15 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
             // Normalize event name: invoice.payment_recorded → invoice_payment.recorded
             const normalizedEvent = event.replace('invoice.payment_', 'invoice_payment.')
             await handlePaymentEvent(normalizedEvent, data, user.id)
+          } else if (event.startsWith('invoice.') && !event.startsWith('invoice_payment.')) {
+            // Invoice updated/created — re-fetch the job to update prices
+            const jobZbId = data.job_id || data.job?.id
+            if (jobZbId) {
+              await handleJobEvent('job.updated', { id: jobZbId }, user.id, user.zenbooker_api_key)
+              logger.log(`[Zenbooker] Invoice event ${event} → updated job ${jobZbId}`)
+            } else {
+              logger.log(`[Zenbooker] Invoice event ${event} — no job_id to update`)
+            }
           } else if (event === 'recurring_booking.created' || event === 'recurring_booking.canceled') {
             // Recurring bookings generate jobs — those come via job.created webhook
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
