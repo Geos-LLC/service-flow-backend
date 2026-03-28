@@ -20456,16 +20456,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /api/jobs/:id/hours - Update hours_worked and recalculate ledger entry
-app.patch('/api/jobs/:id/hours', authenticateToken, async (req, res) => {
+// PATCH /api/jobs/:id/payroll - Update hours, tips, incentives and recalculate ledger
+app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { hoursWorked } = req.body;
-
-    if (hoursWorked === undefined || hoursWorked === null) {
-      return res.status(400).json({ error: 'hoursWorked is required' });
-    }
+    const { hoursWorked, tipAmount, incentiveAmount } = req.body;
 
     // Verify job belongs to user
     const { data: job, error: jobErr } = await supabase
@@ -20476,26 +20472,29 @@ app.patch('/api/jobs/:id/hours', authenticateToken, async (req, res) => {
       .single();
     if (jobErr || !job) return res.status(404).json({ error: 'Job not found' });
 
-    // Update hours_worked on the job
-    const parsedHours = parseFloat(hoursWorked);
-    const { error: updateErr } = await supabase
-      .from('jobs')
-      .update({ hours_worked: parsedHours > 0 ? parsedHours : null })
-      .eq('id', id);
-    if (updateErr) return res.status(500).json({ error: 'Failed to update hours' });
+    // Build update object — only set fields that were provided
+    const update = {};
+    if (hoursWorked !== undefined) update.hours_worked = parseFloat(hoursWorked) > 0 ? parseFloat(hoursWorked) : null;
+    if (tipAmount !== undefined) update.tip_amount = parseFloat(tipAmount) >= 0 ? parseFloat(tipAmount) : 0;
+    if (incentiveAmount !== undefined) update.incentive_amount = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
+
+    if (Object.keys(update).length > 0) {
+      const { error: updateErr } = await supabase.from('jobs').update(update).eq('id', id);
+      if (updateErr) return res.status(500).json({ error: 'Failed to update job' });
+    }
 
     // Recalculate ledger entries for this job
     await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
     try {
       await createLedgerEntriesForCompletedJob(parseInt(id), userId);
     } catch (e) {
-      console.error('Ledger rebuild after hours edit:', e);
+      console.error('Ledger rebuild after payroll edit:', e);
     }
 
-    res.json({ success: true, hoursWorked: parsedHours > 0 ? parsedHours : null });
+    res.json({ success: true });
   } catch (error) {
-    console.error('Update hours error:', error);
-    res.status(500).json({ error: 'Failed to update hours' });
+    console.error('Update payroll error:', error);
+    res.status(500).json({ error: 'Failed to update job payroll data' });
   }
 });
 
