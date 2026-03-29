@@ -32000,30 +32000,6 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     }
   }
 
-  // Overpayment calculation for tips (same as Payroll)
-  const svcPrice = parseFloat(job.service_price) || 0;
-  const totalDue = svcPrice > 0
-    ? calculateJobTotal({ servicePrice: svcPrice, discount: job.discount, additionalFees: job.additional_fees, taxes: job.taxes })
-    : (parseFloat(job.total) || 0);
-  // Fetch total_paid_amount separately (column may not exist in main select — same approach as Payroll)
-  let totalPaid = 0;
-  try {
-    const { data: paidData } = await supabase.from('jobs').select('total_paid_amount').eq('id', jobId).single();
-    totalPaid = parseFloat(paidData?.total_paid_amount) || 0;
-  } catch (e) { /* column may not exist */ }
-
-  // Fallback: compute from transactions if total_paid_amount missing
-  if (totalPaid <= 0) {
-    const { data: txData } = await supabase
-      .from('transactions')
-      .select('amount')
-      .eq('job_id', jobId)
-      .eq('status', 'completed');
-    if (txData) {
-      totalPaid = txData.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
-    }
-  }
-
   const ledgerEntries = [];
 
   // Fetch pay rate history for all assigned members
@@ -32083,12 +32059,9 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       }
     } // end if (!isManager)
 
-    // Tips: use the HIGHER of tip_amount split vs overpayment split (same as Payroll)
+    // Tips: ONLY from job.tip_amount (overpayment is processing fee, not a tip)
     const jobTip = parseFloat(job.tip_amount) || 0;
-    const tipShare = jobTip / Math.max(1, memberCount);
-    const overpayment = Math.max(0, totalPaid - totalDue);
-    const overpaymentShare = overpayment / memberCount;
-    const memberTip = Math.max(tipShare, overpaymentShare);
+    const memberTip = jobTip / Math.max(1, memberCount);
 
     if (memberTip > 0) {
       ledgerEntries.push({
