@@ -20242,41 +20242,66 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     if (includeScheduled) {
       const cancelStatuses = ['cancelled', 'canceled', 'cancel'];
       const completedStatuses = ['completed'];
-      // Find jobs that have no ledger entries (not completed yet)
       const jobsWithLedger = new Set((ledgerEntries || []).map(e => e.job_id).filter(Boolean));
       const teamMemberMap = {};
       (teamMembers || []).forEach(m => { teamMemberMap[m.id] = m; });
+      const managerRolesSet = new Set(['manager', 'scheduler', 'admin', 'account owner', 'owner']);
+
+      // Fetch assignments for non-completed jobs in this period
+      const nonCompletedJobIds = (allJobs || []).filter(j => {
+        const s = (j.status || '').toLowerCase();
+        return !cancelStatuses.includes(s) && !completedStatuses.includes(s) && !jobsWithLedger.has(j.id);
+      }).map(j => j.id);
+
+      const assignmentsByJob = {};
+      if (nonCompletedJobIds.length > 0) {
+        for (let i = 0; i < nonCompletedJobIds.length; i += 100) {
+          const chunk = nonCompletedJobIds.slice(i, i + 100);
+          const { data: assigns } = await supabase.from('job_team_assignments').select('job_id, team_member_id').in('job_id', chunk);
+          (assigns || []).forEach(a => {
+            if (!assignmentsByJob[a.job_id]) assignmentsByJob[a.job_id] = [];
+            assignmentsByJob[a.job_id].push(a.team_member_id);
+          });
+        }
+      }
 
       for (const job of (allJobs || [])) {
         const s = (job.status || '').toLowerCase();
         if (cancelStatuses.includes(s) || completedStatuses.includes(s)) continue;
         if (jobsWithLedger.has(job.id)) continue;
-        if (!job.team_member_id) continue;
 
-        const member = teamMemberMap[job.team_member_id];
-        if (!member) continue;
-        const memberRole = (member.role || '').toLowerCase();
-        if (['manager', 'scheduler', 'admin', 'account owner', 'owner'].includes(memberRole)) continue;
+        // Get assigned members: from job_team_assignments or direct team_member_id
+        let memberIds = assignmentsByJob[job.id] || [];
+        if (memberIds.length === 0 && job.team_member_id) memberIds = [job.team_member_id];
+        if (memberIds.length === 0) continue;
 
+        const mc = memberIds.length;
         const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
         const revenue = svcP + (parseFloat(job.additional_fees) || 0);
         const hours = parseFloat(job.hours_worked) || (job.duration ? job.duration / 60 : (job.estimated_duration ? job.estimated_duration / 60 : 0));
-        const hr = parseFloat(member.hourly_rate) || 0;
-        const cp = parseFloat(member.commission_percentage) || 0;
-        let amount = 0;
-        if (hr > 0 && cp > 0) amount = (hours * hr) + (revenue * cp / 100);
-        else if (cp > 0) amount = revenue * cp / 100;
-        else if (hr > 0) amount = hours * hr;
 
-        const projected = {
-          team_member_id: member.id,
-          job_id: job.id,
-          type: 'earning',
-          amount: parseFloat(amount.toFixed(2)),
-          metadata: { hours, revenue, hourly_rate: hr, commission_pct: cp, member_count: 1, projected: true }
-        };
-        if (!entriesByMember[member.id]) entriesByMember[member.id] = [];
-        entriesByMember[member.id].push(projected);
+        for (const memberId of memberIds) {
+          const member = teamMemberMap[memberId];
+          if (!member) continue;
+          if (managerRolesSet.has((member.role || '').toLowerCase())) continue;
+
+          const hr = parseFloat(member.hourly_rate) || 0;
+          const cp = parseFloat(member.commission_percentage) || 0;
+          let amount = 0;
+          if (hr > 0 && cp > 0) amount = ((hours / mc) * hr) + ((revenue / mc) * cp / 100);
+          else if (cp > 0) amount = (revenue / mc) * cp / 100;
+          else if (hr > 0) amount = (hours / mc) * hr;
+
+          const projected = {
+            team_member_id: member.id,
+            job_id: job.id,
+            type: 'earning',
+            amount: parseFloat(amount.toFixed(2)),
+            metadata: { hours: hours / mc, revenue, hourly_rate: hr, commission_pct: cp, member_count: mc, projected: true }
+          };
+          if (!entriesByMember[member.id]) entriesByMember[member.id] = [];
+          entriesByMember[member.id].push(projected);
+        }
       }
     }
 
