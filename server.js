@@ -33171,23 +33171,12 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           const mgrSalaryStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
           const mgrEffectiveStart = mgrSalaryStart && (!rangeStart || mgrSalaryStart > rangeStart) ? mgrSalaryStart : rangeStart;
 
-          // ── Manager commission: single entry for total business revenue (same as Payroll) ──
-          if (commissionPct > 0 && totalBusinessRevenue > 0) {
-            // Check if commission entry already exists for this manager in this range
-            let commQuery = supabase
-              .from('cleaner_ledger')
-              .select('id')
-              .eq('user_id', userId)
-              .eq('team_member_id', mgr.id)
-              .eq('type', 'earning')
-              .is('job_id', null)
-              .like('note', 'Commission on total revenue%')
-              .limit(1);
-            if (rangeStart) commQuery = commQuery.gte('effective_date', rangeStart);
-            if (rangeEnd) commQuery = commQuery.lte('effective_date', rangeEnd);
-            const { data: existingComm } = await commQuery;
+          // Delete existing manager entries for this member (clean slate)
+          await supabase.from('cleaner_ledger').delete()
+            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning');
 
-            // Create per-day commission entries so any date range sums correctly
+          // ── Manager commission: per-day entries based on daily revenue ──
+          if (commissionPct > 0 && totalBusinessRevenue > 0) {
             const revenueMap = {};
             revenueData.forEach(r => {
               const sp = parseFloat(r.service_price) || parseFloat(r.price) || 0;
@@ -33195,89 +33184,62 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
                 ? sp + (parseFloat(r.additional_fees) || 0)
                 : (parseFloat(r.total) || parseFloat(r.total_amount) || 0);
             });
-            const commDayStart = new Date(mgrEffectiveStart + 'T00:00:00');
-            const commRangeEnd = new Date((rangeEnd || mgrEffectiveStart) + 'T00:00:00');
-            while (commDayStart <= commRangeEnd) {
-              const dayStr = commDayStart.getFullYear() + '-' + String(commDayStart.getMonth()+1).padStart(2,'0') + '-' + String(commDayStart.getDate()).padStart(2,'0');
 
-              const dayRevenue = validJobs
-                .filter(j => {
-                  const jd = String(j.scheduled_date || '').split('T')[0].split(' ')[0];
-                  return jd === dayStr;
-                })
-                .reduce((sum, j) => sum + (revenueMap[j.id] || 0), 0);
-
-              if (dayRevenue > 0) {
-                // Check if entry already exists for this day
-                const { data: existingDayComm } = await supabase
-                  .from('cleaner_ledger')
-                  .select('id')
-                  .eq('user_id', userId)
-                  .eq('team_member_id', mgr.id)
-                  .eq('type', 'earning')
-                  .is('job_id', null)
-                  .eq('effective_date', dayStr)
-                  .like('note', 'Commission on revenue%')
-                  .limit(1);
-
-                if (!existingDayComm || existingDayComm.length === 0) {
-                  const commAmount = parseFloat((dayRevenue * (commissionPct / 100)).toFixed(2));
-                  const { error: commInsertErr } = await supabase.from('cleaner_ledger').insert({
-                    user_id: userId,
-                    team_member_id: mgr.id,
-                    job_id: null,
-                    type: 'earning',
-                    amount: commAmount,
-                    effective_date: dayStr,
-                    note: `Commission on revenue: ${formatCurrency2(dayRevenue)} × ${commissionPct}% (${dayStr})`,
-                    metadata: { commission_pct: commissionPct, day_revenue: dayRevenue, is_manager_commission: true },
-                    created_by: userId
-                  });
-                  if (!commInsertErr) managerSalaryEntries++;
-                }
+            // Group revenue by day, then batch insert
+            const commByDay = {};
+            validJobs.forEach(j => {
+              const jd = String(j.scheduled_date || '').split('T')[0].split(' ')[0];
+              if (jd >= mgrEffectiveStart && jd <= rangeEnd) {
+                commByDay[jd] = (commByDay[jd] || 0) + (revenueMap[j.id] || 0);
               }
-              commDayStart.setDate(commDayStart.getDate() + 1);
+            });
+
+            const commEntries = Object.entries(commByDay)
+              .filter(([, rev]) => rev > 0)
+              .map(([dayStr, dayRevenue]) => ({
+                user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
+                amount: parseFloat((dayRevenue * (commissionPct / 100)).toFixed(2)),
+                effective_date: dayStr,
+                note: `Commission on revenue: ${formatCurrency2(dayRevenue)} × ${commissionPct}% (${dayStr})`,
+                metadata: { commission_pct: commissionPct, day_revenue: dayRevenue, is_manager_commission: true },
+                created_by: userId
+              }));
+
+            if (commEntries.length > 0) {
+              for (let c = 0; c < commEntries.length; c += 100) {
+                const { error: commErr } = await supabase.from('cleaner_ledger').insert(commEntries.slice(c, c + 100));
+                if (commErr) console.error('[Backfill] Commission insert error:', commErr);
+              }
+              managerSalaryEntries += commEntries.length;
             }
           }
 
-          // ── Manager scheduled salary: per-day entries using calculateScheduledHoursFromAvailability ──
+          // ── Manager scheduled salary: per-day entries ──
           if (hourlyRate > 0 && mgr.availability) {
+            const salEntries = [];
             const salDayStart = new Date(mgrEffectiveStart + 'T00:00:00');
             const rangeEndDate = new Date((rangeEnd || mgrEffectiveStart) + 'T00:00:00');
             while (salDayStart <= rangeEndDate) {
               const dayStr = salDayStart.getFullYear() + '-' + String(salDayStart.getMonth()+1).padStart(2,'0') + '-' + String(salDayStart.getDate()).padStart(2,'0');
               const scheduledHours = calculateScheduledHoursFromAvailability(mgr.availability, dayStr, dayStr);
-
               if (scheduledHours > 0) {
-                // Check if entry already exists for this day
-                const { data: existingSalary } = await supabase
-                  .from('cleaner_ledger')
-                  .select('id')
-                  .eq('user_id', userId)
-                  .eq('team_member_id', mgr.id)
-                  .eq('type', 'earning')
-                  .is('job_id', null)
-                  .eq('effective_date', dayStr)
-                  .like('note', 'Scheduled salary:%')
-                  .limit(1);
-
-                if (!existingSalary || existingSalary.length === 0) {
-                  const salaryAmount = parseFloat((scheduledHours * hourlyRate).toFixed(2));
-                  const { error: salInsertErr } = await supabase.from('cleaner_ledger').insert({
-                    user_id: userId,
-                    team_member_id: mgr.id,
-                    job_id: null,
-                    type: 'earning',
-                    amount: salaryAmount,
-                    effective_date: dayStr,
-                    note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr (${dayStr})`,
-                    metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
-                    created_by: userId
-                  });
-                  if (!salInsertErr) managerSalaryEntries++;
-                }
+                salEntries.push({
+                  user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
+                  amount: parseFloat((scheduledHours * hourlyRate).toFixed(2)),
+                  effective_date: dayStr,
+                  note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr (${dayStr})`,
+                  metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
+                  created_by: userId
+                });
               }
               salDayStart.setDate(salDayStart.getDate() + 1);
+            }
+            if (salEntries.length > 0) {
+              for (let c = 0; c < salEntries.length; c += 100) {
+                const { error: salErr } = await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
+                if (salErr) console.error('[Backfill] Salary insert error:', salErr);
+              }
+              managerSalaryEntries += salEntries.length;
             }
           }
         }
