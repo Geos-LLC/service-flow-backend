@@ -20170,7 +20170,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const pageSize = 1000;
       while (true) {
         let q = supabase.from('jobs')
-          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, status, service_name, customer_id, hours_worked, duration, estimated_duration, start_time, end_time')
+          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, status, service_name, customer_id, team_member_id, hours_worked, duration, estimated_duration, start_time, end_time')
           .eq('user_id', userId)
           .range(from, from + pageSize - 1);
         if (startDate) q = q.gte('scheduled_date', startDate);
