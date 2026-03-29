@@ -808,7 +808,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               update.additional_fees = parseFloat(inv.additional_fees || inv.fees_amount) || 0
               update.tip_amount = parseFloat(inv.tip || inv.tip_amount) || 0
               update.taxes = parseFloat(inv.tax_amount || inv.total_tax_amount) || 0
-              // Real start/end times from Zenbooker
+              // Duration and real start/end times from Zenbooker
+              if (zb.estimated_duration_seconds) update.duration = Math.round(zb.estimated_duration_seconds / 60)
               if (zb.started_at) update.start_time = zb.started_at
               if (zb.completed_at) update.end_time = zb.completed_at
 
