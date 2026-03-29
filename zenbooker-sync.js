@@ -347,9 +347,15 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
     let created = 0, skipped = 0, errors = 0
     for (const zbt of zbTransactions) {
-      // Skip if already synced
+      // Skip if already synced (by zenbooker_id or by matching job_id + amount)
       const { data: existing } = await supabase.from('transactions').select('id').eq('zenbooker_id', zbt.id).maybeSingle()
       if (existing) { skipped++; continue }
+      const zbJobId2 = zbInvoiceToJob[zbt.invoice_id]
+      const sfJob2 = zbJobId2 ? sfJobByZbId[zbJobId2] : null
+      if (sfJob2?.id) {
+        const { data: dupCheck } = await supabase.from('transactions').select('id').eq('job_id', sfJob2.id).eq('amount', parseFloat(zbt.amount) || 0).limit(1)
+        if (dupCheck && dupCheck.length > 0) { skipped++; continue }
+      }
 
       // Find the SF job for this transaction
       const zbJobId = zbInvoiceToJob[zbt.invoice_id]
