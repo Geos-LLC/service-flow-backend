@@ -31923,9 +31923,9 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Skip cancelled jobs
+  // Only create ledger entries for completed jobs
   const jobStatus = (job.status || '').toLowerCase();
-  if (jobStatus === 'cancelled' || jobStatus === 'canceled') {
+  if (jobStatus !== 'completed') {
     return;
   }
 
