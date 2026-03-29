@@ -20368,7 +20368,14 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               commissionSalary += entryRevenue * (entryCommPct / 100);
               commissionRevenueBase += entryRevenue;
             }
-            totalHours += entryHours;
+            // Use estimated hours from job for display, not real time from ledger
+            if (entry.job_id && allJobsById[entry.job_id]) {
+              const j = allJobsById[entry.job_id];
+              const estMin = j.duration || j.estimated_duration || 0;
+              totalHours += estMin > 0 ? (estMin / 60 / mc) : entryHours;
+            } else {
+              totalHours += entryHours;
+            }
           }
         } else if (entry.type === 'tip') {
           totalTips += amount;
@@ -31954,23 +31961,14 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     ? basePrice + (parseFloat(job.additional_fees) || 0)
     : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
 
-  // Calculate hours worked — same priority as Payroll:
-  // Priority 1: hours_worked
-  // Priority 2: start_time/end_time calculation
-  // Priority 3: duration/estimated_duration (minutes → hours)
+  // Hours for salary: use estimated duration (booked time), not real time
+  // Priority 1: hours_worked (manually overridden)
+  // Priority 2: duration/estimated_duration (booked time in minutes)
+  // Real time (start_time/end_time) is informational only — stored in metadata
   let hoursWorked = 0;
   if (job.hours_worked && parseFloat(job.hours_worked) > 0) {
     hoursWorked = parseFloat(job.hours_worked);
-  } else if (job.start_time && job.end_time) {
-    const start = new Date(job.start_time);
-    const end = new Date(job.end_time);
-    const diffMs = end - start;
-    if (diffMs > 60000) { // At least 1 minute — ignore bad ZB timestamps where start ≈ end
-      hoursWorked = diffMs / (1000 * 60 * 60);
-    }
-  }
-  // Fallback to estimated duration if no valid real time
-  if (hoursWorked <= 0) {
+  } else {
     const durationMinutes = job.duration || job.estimated_duration || 0;
     if (durationMinutes > 0) {
       hoursWorked = durationMinutes / 60;
