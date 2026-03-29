@@ -20540,10 +20540,10 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { hoursWorked, tipAmount, incentiveAmount, totalDue } = req.body;
 
-    // Verify job belongs to user
+    // Verify job belongs to user and fetch old values for audit
     const { data: job, error: jobErr } = await supabase
       .from('jobs')
-      .select('id, user_id, status')
+      .select('id, user_id, status, hours_worked, tip_amount, incentive_amount, service_price, duration')
       .eq('id', id)
       .eq('user_id', userId)
       .single();
@@ -20551,18 +20551,42 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
 
     // Build update object — only set fields that were provided
     const update = {};
-    if (hoursWorked !== undefined) update.hours_worked = parseFloat(hoursWorked) > 0 ? parseFloat(hoursWorked) : null;
-    if (tipAmount !== undefined) update.tip_amount = parseFloat(tipAmount) >= 0 ? parseFloat(tipAmount) : 0;
-    if (incentiveAmount !== undefined) update.incentive_amount = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
+    const edits = []; // track changes for audit
+    if (hoursWorked !== undefined) {
+      const newVal = parseFloat(hoursWorked) > 0 ? parseFloat(hoursWorked) : null;
+      const oldVal = job.hours_worked ? parseFloat(job.hours_worked) : (job.duration ? job.duration / 60 : null);
+      update.hours_worked = newVal;
+      if (String(newVal) !== String(oldVal)) edits.push({ field: 'hours_worked', old_value: String(oldVal ?? ''), new_value: String(newVal ?? '') });
+    }
+    if (tipAmount !== undefined) {
+      const newVal = parseFloat(tipAmount) >= 0 ? parseFloat(tipAmount) : 0;
+      const oldVal = parseFloat(job.tip_amount) || 0;
+      update.tip_amount = newVal;
+      if (newVal !== oldVal) edits.push({ field: 'tip_amount', old_value: String(oldVal), new_value: String(newVal) });
+    }
+    if (incentiveAmount !== undefined) {
+      const newVal = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
+      const oldVal = parseFloat(job.incentive_amount) || 0;
+      update.incentive_amount = newVal;
+      if (newVal !== oldVal) edits.push({ field: 'incentive_amount', old_value: String(oldVal), new_value: String(newVal) });
+    }
     if (req.body.servicePrice !== undefined) {
-      const val = parseFloat(req.body.servicePrice) || 0;
-      update.service_price = val;
-      update.price = val;
+      const newVal = parseFloat(req.body.servicePrice) || 0;
+      const oldVal = parseFloat(job.service_price) || 0;
+      update.service_price = newVal;
+      update.price = newVal;
+      if (newVal !== oldVal) edits.push({ field: 'service_price', old_value: String(oldVal), new_value: String(newVal) });
     }
 
     if (Object.keys(update).length > 0) {
       const { error: updateErr } = await supabase.from('jobs').update(update).eq('id', id);
       if (updateErr) return res.status(500).json({ error: 'Failed to update job' });
+    }
+
+    // Log changes to payroll_edits
+    if (edits.length > 0) {
+      const editRows = edits.map(e => ({ user_id: userId, job_id: parseInt(id), field: e.field, old_value: e.old_value, new_value: e.new_value, edited_by: userId }));
+      await supabase.from('payroll_edits').insert(editRows).catch(err => console.error('Audit log error:', err));
     }
 
     // Recalculate ledger entries for this job
