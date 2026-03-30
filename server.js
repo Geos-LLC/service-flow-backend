@@ -33397,9 +33397,9 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           const mgrSalaryStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
           const mgrEffectiveStart = mgrSalaryStart && (!rangeStart || mgrSalaryStart > rangeStart) ? mgrSalaryStart : rangeStart;
 
-          // Delete existing manager entries for this member (clean slate)
+          // Delete ALL existing manager entries for this member (salary + commission)
           await supabase.from('cleaner_ledger').delete()
-            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
+            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning');
 
           // ── Manager commission: per-day entries based on daily revenue ──
           if (commissionPct > 0 && totalBusinessRevenue > 0) {
