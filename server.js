@@ -19104,7 +19104,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
           // Delete old salary entries
           await supabase.from('cleaner_ledger').delete()
             .eq('user_id', mgrInfo.user_id).eq('team_member_id', parseInt(actualTeamMemberId))
-            .is('job_id', null).eq('type', 'earning');
+            .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
           // Rebuild
           const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
           const mgrStart = mgrInfo.salary_start_date ? String(mgrInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
@@ -20028,7 +20028,7 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
       const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
       if (mgrCheck && managerRoles.includes((mgrCheck.role || '').toLowerCase()) && parseFloat(mgrCheck.hourly_rate) > 0 && mgrCheck.availability) {
         await supabase.from('cleaner_ledger').delete()
-          .eq('user_id', mgrCheck.user_id).eq('team_member_id', parseInt(memberId)).is('job_id', null).eq('type', 'earning');
+          .eq('user_id', mgrCheck.user_id).eq('team_member_id', parseInt(memberId)).is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
         const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
         const mgrStart = mgrCheck.salary_start_date ? String(mgrCheck.salary_start_date).split('T')[0].split(' ')[0] : null;
         const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrCheck.user_id).order('scheduled_date', { ascending: true }).limit(1);
@@ -20990,7 +20990,7 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
         // Delete old salary entries for this manager
         await supabase.from('cleaner_ledger').delete()
           .eq('user_id', teamMember.user_id).eq('team_member_id', parseInt(id))
-          .is('job_id', null).eq('type', 'earning');
+          .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
 
         // Determine date range
         const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
@@ -33334,7 +33334,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
 
           // Delete existing manager entries for this member (clean slate)
           await supabase.from('cleaner_ledger').delete()
-            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning');
+            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
 
           // ── Manager commission: per-day entries based on daily revenue ──
           if (commissionPct > 0 && totalBusinessRevenue > 0) {
