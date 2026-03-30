@@ -537,13 +537,15 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       await supabase.from('jobs').update(mapped).eq('id', existing.id)
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
 
-      // Create ledger entries when job is completed via Zenbooker webhook
+      // Create/rebuild ledger entries when job is completed or edited while completed
       if (mapped.status === 'completed' && createLedgerEntriesForCompletedJob) {
         try {
+          // Delete existing entries first (handles edits to price/tips/etc on completed jobs)
+          await supabase.from('cleaner_ledger').delete().eq('job_id', existing.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
           await createLedgerEntriesForCompletedJob(existing.id, userId)
-          logger.log(`[Zenbooker] Ledger entries created for job ${existing.id}`)
+          logger.log(`[Zenbooker] Ledger entries rebuilt for job ${existing.id} (${eventType})`)
         } catch (ledgerErr) {
-          logger.error(`[Zenbooker] Ledger creation failed for job ${existing.id}: ${ledgerErr.message}`)
+          logger.error(`[Zenbooker] Ledger rebuild failed for job ${existing.id}: ${ledgerErr.message}`)
         }
       }
 
