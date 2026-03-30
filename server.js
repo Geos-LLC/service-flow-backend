@@ -27188,7 +27188,7 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
       .from('transactions')
       .select('*')
       .eq('job_id', jobId)
-      .eq('status', 'completed')
+      .in('status', ['completed', 'voided'])
       .order('created_at', { ascending: false });
     
     if (error) {
@@ -27201,10 +27201,11 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
       console.log('💳 First transaction:', transactions[0]);
     }
     
-    // Calculate totals
-    const totalPaid = transactions?.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0) || 0;
-    const totalTips = transactions?.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0) || 0;
-    const transactionCount = transactions?.length || 0;
+    // Calculate totals (only from completed, not voided)
+    const completedTxs = (transactions || []).filter(tx => tx.status === 'completed');
+    const totalPaid = completedTxs.reduce((sum, tx) => sum + parseFloat(tx.amount || 0), 0);
+    const totalTips = completedTxs.reduce((sum, tx) => sum + parseFloat(tx.tip_amount || 0), 0);
+    const transactionCount = completedTxs.length;
 
     console.log('💳 Payment summary:', { totalPaid, totalTips, transactionCount });
 
