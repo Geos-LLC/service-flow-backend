@@ -20281,6 +20281,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       allJobsById[job.id] = job;
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      // Only count completed jobs in revenue (unless includeScheduled)
+      if (!includeScheduled && s !== 'completed') return;
       // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
       const rev = svcP > 0
@@ -20479,9 +20481,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
       const scheduledHourlySalary = scheduledHours * hourlyRate;
 
-      // For managers, show scheduled hours as their "worked" hours
+      // For managers: use scheduled hours and project salary for the full period
       if (isManagerOrOwner && scheduledHours > 0) {
         totalHours = scheduledHours;
+        // If includeScheduled or current period extends beyond today,
+        // use scheduled hours * rate as hourly salary (instead of ledger entries which only go to today)
+        if (hourlyRate > 0) {
+          hourlySalary = scheduledHours * hourlyRate;
+        }
+      }
+
+      // For managers: if includeScheduled, project commission on total business revenue
+      if (isManagerOrOwner && includeScheduled && commissionPercentage > 0 && totalBusinessRevenue > 0 && commissionSalary === 0) {
+        commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
+        commissionRevenueBase = totalBusinessRevenue;
       }
 
       const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
