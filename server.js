@@ -20067,6 +20067,7 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
 
   const workingHours = avail.workingHours || avail;
   const customAvailability = avail.customAvailability || [];
+  const breakTime = avail.break || null; // { start: "13:00", end: "14:00" }
   const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 
   const toMinutes = (timeStr) => {
@@ -20074,6 +20075,11 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     const parts = timeStr.split(':');
     return parseInt(parts[0]) * 60 + parseInt(parts[1] || 0);
   };
+
+  // Break duration in hours (applied to each working day)
+  const breakHours = breakTime && breakTime.start && breakTime.end
+    ? Math.max(0, (toMinutes(breakTime.end) - toMinutes(breakTime.start)) / 60)
+    : 0;
 
   let totalHours = 0;
   const start = new Date(startDateStr + 'T00:00:00');
@@ -20106,17 +20112,23 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     const isDayEnabled = dayHrs.enabled !== false && dayHrs.available !== false;
     if (!isDayEnabled) continue;
 
+    let dayHoursTotal = 0;
     if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
       dayHrs.timeSlots.forEach(ts => {
         const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
         const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
-        if (tsEnd > tsStart) totalHours += (tsEnd - tsStart) / 60;
+        if (tsEnd > tsStart) dayHoursTotal += (tsEnd - tsStart) / 60;
       });
     } else if (dayHrs.start && dayHrs.end) {
       const dStart = toMinutes(dayHrs.start);
       const dEnd = toMinutes(dayHrs.end);
-      if (dEnd > dStart) totalHours += (dEnd - dStart) / 60;
+      if (dEnd > dStart) dayHoursTotal = (dEnd - dStart) / 60;
     }
+    // Subtract common break (only if using simple from-to, not multiple timeSlots which already account for breaks)
+    if (breakHours > 0 && dayHoursTotal > 0 && !(dayHrs.timeSlots && dayHrs.timeSlots.length > 1)) {
+      dayHoursTotal = Math.max(0, dayHoursTotal - breakHours);
+    }
+    totalHours += dayHoursTotal;
   }
   return totalHours;
 }
