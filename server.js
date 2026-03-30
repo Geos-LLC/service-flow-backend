@@ -27274,6 +27274,57 @@ app.get('/api/transactions/job/:jobId', async (req, res) => {
   }
 });
 
+// Void a transaction
+app.post('/api/transactions/:id/void', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    // Verify transaction belongs to user
+    const { data: tx, error: txErr } = await supabase
+      .from('transactions')
+      .select('id, job_id, amount, status, payment_method')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    if (txErr || !tx) return res.status(404).json({ error: 'Transaction not found' });
+    if (tx.status === 'voided') return res.status(400).json({ error: 'Transaction already voided' });
+
+    // Void the transaction
+    await supabase.from('transactions').update({ status: 'voided' }).eq('id', id);
+
+    // Recalculate job payment status from remaining completed transactions
+    if (tx.job_id) {
+      const { data: remaining } = await supabase.from('transactions')
+        .select('amount').eq('job_id', tx.job_id).eq('status', 'completed');
+      const remainingTotal = (remaining || []).reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
+
+      const { data: job } = await supabase.from('jobs')
+        .select('total, total_amount').eq('id', tx.job_id).single();
+      const jobTotal = parseFloat(job?.total) || parseFloat(job?.total_amount) || 0;
+
+      const paymentStatus = remainingTotal >= jobTotal ? 'paid' : remainingTotal > 0 ? 'partial' : 'pending';
+      const invoiceStatus = paymentStatus === 'paid' ? 'paid' : paymentStatus === 'partial' ? 'invoiced' : 'invoiced';
+      await supabase.from('jobs').update({ payment_status: paymentStatus, invoice_status: invoiceStatus }).eq('id', tx.job_id);
+
+      // Rebuild ledger (cash_collected changes if cash payment voided)
+      await supabase.from('cleaner_ledger').delete().eq('job_id', tx.job_id).in('type', ['earning', 'tip', 'incentive', 'cash_collected']);
+      try { await createLedgerEntriesForCompletedJob(tx.job_id, userId); } catch (e) { console.error('Ledger rebuild after void:', e); }
+    }
+
+    // Log to payroll_edits for audit
+    await supabase.from('payroll_edits').insert({
+      user_id: userId, job_id: tx.job_id, field: 'transaction_voided',
+      old_value: `${tx.payment_method} $${tx.amount}`, new_value: 'voided', edited_by: userId
+    }).catch(() => {});
+
+    res.json({ success: true, message: 'Transaction voided' });
+  } catch (error) {
+    console.error('Void transaction error:', error);
+    res.status(500).json({ error: 'Failed to void transaction' });
+  }
+});
+
 // Record manual payment
 app.post('/api/transactions/record-payment', authenticateToken, async (req, res) => {
   try {

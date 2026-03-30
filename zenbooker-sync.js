@@ -586,6 +586,19 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     } else if (eventType === 'invoice_payment.voided') {
       update.payment_status = 'pending'
       update.invoice_status = 'invoiced'
+      // Void the most recent completed transaction for this job
+      const { data: latestTx } = await supabase.from('transactions')
+        .select('id').eq('job_id', job.id).eq('status', 'completed')
+        .order('created_at', { ascending: false }).limit(1)
+      if (latestTx && latestTx.length > 0) {
+        await supabase.from('transactions').update({ status: 'voided' }).eq('id', latestTx[0].id)
+        logger.log(`[Zenbooker] Transaction ${latestTx[0].id} voided for job ${job.id}`)
+      }
+      // Rebuild ledger (cash_collected may need to be removed)
+      if (createLedgerEntriesForCompletedJob) {
+        await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+        await createLedgerEntriesForCompletedJob(job.id, userId).catch(() => {})
+      }
     }
     if (Object.keys(update).length > 0) {
       await supabase.from('jobs').update(update).eq('id', job.id)
