@@ -20491,8 +20491,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
       }
 
-      // For managers: if includeScheduled, project commission on total business revenue
-      if (isManagerOrOwner && includeScheduled && commissionPercentage > 0 && totalBusinessRevenue > 0 && commissionSalary === 0) {
+      // For managers: if includeScheduled, recalculate commission on full revenue (including scheduled jobs)
+      if (isManagerOrOwner && includeScheduled && commissionPercentage > 0 && totalBusinessRevenue > 0) {
         commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
         commissionRevenueBase = totalBusinessRevenue;
       }
