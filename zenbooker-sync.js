@@ -616,6 +616,27 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
       logger.log(`[Zenbooker] Connected for user ${userId}`)
 
+      // Auto-register webhooks
+      const webhookUrl = `${req.protocol}://${req.get('host')}/api/zenbooker/webhook`
+      const webhookEvents = ['job.created', 'job.canceled', 'job.rescheduled', 'job.en_route', 'job.started', 'job.completed', 'job.service_providers.assigned', 'job.service_order.edited', 'invoice.payment_succeeded', 'invoice.payment_recorded', 'customer.edited']
+      try {
+        // Get existing webhooks
+        const existingRes = await zbFetch(apiKey, '/webhooks', { limit: 50 })
+        const existingEvents = new Set((existingRes.results || existingRes || []).map(w => w.event_type))
+        // Register missing events
+        for (const evt of webhookEvents) {
+          if (existingEvents.has(evt)) continue
+          try {
+            await fetch(`${ZB_BASE}/webhooks`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ event_type: evt, url: webhookUrl, webhook_api_version: '2025-09-01' })
+            })
+            logger.log(`[Zenbooker] Webhook registered: ${evt}`)
+          } catch (wErr) { logger.error(`[Zenbooker] Webhook register failed: ${evt}: ${wErr.message}`) }
+        }
+      } catch (wErr) { logger.error(`[Zenbooker] Webhook setup error: ${wErr.message}`) }
+
       // Start full sync in background
       runFullSync(userId, apiKey).catch(err => {
         logger.error(`[Zenbooker] Initial sync failed for user ${userId}: ${err.message}`)
