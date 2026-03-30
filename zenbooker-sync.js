@@ -1006,6 +1006,22 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
             } else {
               logger.log(`[Zenbooker] Invoice event ${event} — no job_id to update`)
             }
+          } else if (event.startsWith('customer.')) {
+            // Customer created/edited — sync customer data
+            if (data?.id && user.zenbooker_api_key) {
+              try {
+                const zbCustomer = await zbFetch(user.zenbooker_api_key, `/customers/${data.id}`)
+                const mapped = mapCustomer(zbCustomer, user.id)
+                const { data: existing } = await supabase.from('customers').select('id').eq('user_id', user.id).eq('zenbooker_id', data.id).maybeSingle()
+                if (existing) {
+                  await supabase.from('customers').update(mapped).eq('id', existing.id)
+                  logger.log(`[Zenbooker] Customer updated: ${data.id} (${event})`)
+                } else {
+                  await supabase.from('customers').insert(mapped)
+                  logger.log(`[Zenbooker] Customer created: ${data.id} (${event})`)
+                }
+              } catch (custErr) { logger.error(`[Zenbooker] Customer sync error: ${custErr.message}`) }
+            }
           } else if (event === 'recurring_booking.created' || event === 'recurring_booking.canceled') {
             // Recurring bookings generate jobs — those come via job.created webhook
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
