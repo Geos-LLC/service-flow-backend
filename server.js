@@ -20911,7 +20911,63 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
       console.error('Error updating team member availability:', updateError);
       return res.status(500).json({ error: 'Failed to update team member availability' });
     }
-    
+
+    // Recalculate manager/scheduler salary entries if this is a manager with hourly rate
+    const { data: memberInfo } = await supabase.from('team_members')
+      .select('role, hourly_rate, commission_percentage, salary_start_date')
+      .eq('id', id).single();
+    const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+    if (memberInfo && managerRoles.includes((memberInfo.role || '').toLowerCase()) && parseFloat(memberInfo.hourly_rate) > 0) {
+      try {
+        // Delete old salary entries for this manager
+        await supabase.from('cleaner_ledger').delete()
+          .eq('user_id', teamMember.user_id).eq('team_member_id', parseInt(id))
+          .is('job_id', null).eq('type', 'earning');
+
+        // Determine date range
+        const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
+        const mgrStart = memberInfo.salary_start_date ? String(memberInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
+        // Find earliest job date for this user
+        const { data: earliestJob } = await supabase.from('jobs').select('scheduled_date').eq('user_id', teamMember.user_id).order('scheduled_date', { ascending: true }).limit(1);
+        const rangeStart = mgrStart || (earliestJob?.[0]?.scheduled_date ? String(earliestJob[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+
+        const parsedAvail = typeof availability === 'string' ? JSON.parse(availability) : availability;
+        const hourlyRate = parseFloat(memberInfo.hourly_rate);
+
+        // Build salary entries
+        const salEntries = [];
+        const salDayStart = new Date(rangeStart + 'T00:00:00');
+        const rangeEndDate = new Date(todayStr + 'T00:00:00');
+        while (salDayStart <= rangeEndDate) {
+          const dayStr = salDayStart.getFullYear() + '-' + String(salDayStart.getMonth()+1).padStart(2,'0') + '-' + String(salDayStart.getDate()).padStart(2,'0');
+          const scheduledHours = calculateScheduledHoursFromAvailability(parsedAvail, dayStr, dayStr);
+          if (scheduledHours > 0) {
+            salEntries.push({
+              user_id: teamMember.user_id, team_member_id: parseInt(id), job_id: null, type: 'earning',
+              amount: parseFloat((scheduledHours * hourlyRate).toFixed(2)),
+              effective_date: dayStr,
+              note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr (${dayStr})`,
+              metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
+              created_by: teamMember.user_id
+            });
+          }
+          salDayStart.setDate(salDayStart.getDate() + 1);
+        }
+        // Also rebuild commission entries if applicable
+        if (parseFloat(memberInfo.commission_percentage) > 0) {
+          // Commission entries need revenue data — skip here, handled by backfill
+        }
+        if (salEntries.length > 0) {
+          for (let c = 0; c < salEntries.length; c += 100) {
+            await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
+          }
+        }
+        console.log(`[Availability] Rebuilt ${salEntries.length} salary entries for manager ${id}`);
+      } catch (salErr) {
+        console.error('Error rebuilding manager salary after availability change:', salErr);
+      }
+    }
+
     res.json({ message: 'Team member availability updated successfully' });
   } catch (error) {
     console.error('Update team member availability error:', error);
