@@ -20897,12 +20897,13 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
     }
     
     // Update team member availability in Supabase
-    const availabilityJson = typeof availability === 'string' ? availability : JSON.stringify(availability);
-    
+    // Store as object — Supabase handles jsonb serialization. Don't stringify.
+    const availabilityObj = typeof availability === 'string' ? JSON.parse(availability) : availability;
+
     const { error: updateError } = await supabase
       .from('team_members')
-      .update({ 
-        availability: availabilityJson,
+      .update({
+        availability: availabilityObj,
         updated_at: new Date().toISOString()
       })
       .eq('id', id);
