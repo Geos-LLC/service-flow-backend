@@ -20481,20 +20481,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, effectiveStartDate, scheduledHoursEndDate);
       const scheduledHourlySalary = scheduledHours * hourlyRate;
 
-      // For managers: use scheduled hours and project salary for the full period
+      // For managers: show scheduled hours in Hours column
       if (isManagerOrOwner && scheduledHours > 0) {
         totalHours = scheduledHours;
-        // If includeScheduled or current period extends beyond today,
-        // use scheduled hours * rate as hourly salary (instead of ledger entries which only go to today)
-        if (hourlyRate > 0) {
-          hourlySalary = scheduledHours * hourlyRate;
-        }
       }
 
-      // For managers: if includeScheduled, recalculate commission on full revenue (including scheduled jobs)
-      if (isManagerOrOwner && includeScheduled && commissionPercentage > 0 && totalBusinessRevenue > 0) {
-        commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
-        commissionRevenueBase = totalBusinessRevenue;
+      // For managers with includeScheduled: project full period salary and commission
+      if (isManagerOrOwner && includeScheduled) {
+        if (hourlyRate > 0 && scheduledHours > 0) {
+          hourlySalary = scheduledHours * hourlyRate;
+        }
+        if (commissionPercentage > 0 && totalBusinessRevenue > 0) {
+          commissionSalary = totalBusinessRevenue * (commissionPercentage / 100);
+          commissionRevenueBase = totalBusinessRevenue;
+        }
       }
 
       const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
