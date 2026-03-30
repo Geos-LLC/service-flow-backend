@@ -19091,6 +19091,44 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       });
     }
     
+    // Recalculate manager salary if rate or role changed
+    const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+    const memberRole = (dataToSave.role || existingMember?.[0]?.role || '').toLowerCase();
+    const rateChanged = hourlyRateValue !== undefined || commissionPercentageValue !== undefined;
+    if (rateChanged && managerRoles.includes(memberRole)) {
+      try {
+        const { data: mgrInfo } = await supabase.from('team_members')
+          .select('hourly_rate, commission_percentage, availability, salary_start_date, user_id')
+          .eq('id', actualTeamMemberId).single();
+        if (mgrInfo && parseFloat(mgrInfo.hourly_rate) > 0 && mgrInfo.availability) {
+          // Delete old salary entries
+          await supabase.from('cleaner_ledger').delete()
+            .eq('user_id', mgrInfo.user_id).eq('team_member_id', parseInt(actualTeamMemberId))
+            .is('job_id', null).eq('type', 'earning');
+          // Rebuild
+          const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
+          const mgrStart = mgrInfo.salary_start_date ? String(mgrInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
+          const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrInfo.user_id).order('scheduled_date', { ascending: true }).limit(1);
+          const rangeStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+          const parsedAvail = typeof mgrInfo.availability === 'string' ? JSON.parse(mgrInfo.availability) : mgrInfo.availability;
+          const hr = parseFloat(mgrInfo.hourly_rate);
+          const salEntries = [];
+          const d = new Date(rangeStart + 'T00:00:00');
+          const end = new Date(todayStr + 'T00:00:00');
+          while (d <= end) {
+            const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            const sh = calculateScheduledHoursFromAvailability(parsedAvail, ds, ds);
+            if (sh > 0) salEntries.push({ user_id: mgrInfo.user_id, team_member_id: parseInt(actualTeamMemberId), job_id: null, type: 'earning', amount: parseFloat((sh * hr).toFixed(2)), effective_date: ds, note: `Scheduled salary: ${sh.toFixed(1)}h × $${hr}/hr (${ds})`, metadata: { scheduled_hours: sh, hourly_rate: hr, is_manager_salary: true }, created_by: mgrInfo.user_id });
+            d.setDate(d.getDate() + 1);
+          }
+          for (let c = 0; c < salEntries.length; c += 100) {
+            await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
+          }
+          console.log(`[TeamMember] Rebuilt ${salEntries.length} salary entries for manager ${actualTeamMemberId} after rate change`);
+        }
+      } catch (e) { console.error('Manager salary rebuild after rate change:', e); }
+    }
+
     res.json({ message: 'Team member updated successfully' });
     }
   } catch (error) {
@@ -19981,6 +20019,35 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
         })
         .eq('id', memberId);
     }
+
+    // Recalculate manager salary if this is a manager
+    try {
+      const { data: mgrCheck } = await supabase.from('team_members')
+        .select('role, hourly_rate, availability, salary_start_date, user_id')
+        .eq('id', memberId).single();
+      const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+      if (mgrCheck && managerRoles.includes((mgrCheck.role || '').toLowerCase()) && parseFloat(mgrCheck.hourly_rate) > 0 && mgrCheck.availability) {
+        await supabase.from('cleaner_ledger').delete()
+          .eq('user_id', mgrCheck.user_id).eq('team_member_id', parseInt(memberId)).is('job_id', null).eq('type', 'earning');
+        const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
+        const mgrStart = mgrCheck.salary_start_date ? String(mgrCheck.salary_start_date).split('T')[0].split(' ')[0] : null;
+        const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrCheck.user_id).order('scheduled_date', { ascending: true }).limit(1);
+        const rangeStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+        const parsedAvail = typeof mgrCheck.availability === 'string' ? JSON.parse(mgrCheck.availability) : mgrCheck.availability;
+        const hr = parseFloat(mgrCheck.hourly_rate);
+        const salEntries = [];
+        const d = new Date(rangeStart + 'T00:00:00');
+        const end = new Date(todayStr + 'T00:00:00');
+        while (d <= end) {
+          const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+          const sh = calculateScheduledHoursFromAvailability(parsedAvail, ds, ds);
+          if (sh > 0) salEntries.push({ user_id: mgrCheck.user_id, team_member_id: parseInt(memberId), job_id: null, type: 'earning', amount: parseFloat((sh * hr).toFixed(2)), effective_date: ds, note: `Scheduled salary: ${sh.toFixed(1)}h × $${hr}/hr (${ds})`, metadata: { scheduled_hours: sh, hourly_rate: hr, is_manager_salary: true }, created_by: mgrCheck.user_id });
+          d.setDate(d.getDate() + 1);
+        }
+        for (let c = 0; c < salEntries.length; c += 100) await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
+        console.log(`[PayRate] Rebuilt ${salEntries.length} salary entries for manager ${memberId}`);
+      }
+    } catch (e) { console.error('Manager salary rebuild after pay rate change:', e); }
 
     res.json({ payRate: data });
   } catch (error) {
