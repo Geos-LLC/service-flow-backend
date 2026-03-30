@@ -190,7 +190,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       total_amount: parseFloat(inv.total) || 0,
       taxes: parseFloat(inv.tax_amount || inv.total_tax_amount) || 0,
       discount: parseFloat(inv.discount_amount) || 0,
-      tip_amount: parseFloat(inv.tip || inv.tip_amount) || 0,
+      // Only set tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips with 0)
+      ...(parseFloat(inv.tip || inv.tip_amount) > 0 ? { tip_amount: parseFloat(inv.tip || inv.tip_amount) } : {}),
       invoice_status: inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft'),
       is_recurring: zb.recurring === true,
       zenbooker_id: zb.id,
@@ -842,7 +843,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               update.total_amount = parseFloat(inv.total) || undefined
               update.discount = parseFloat(inv.discount_amount) || 0
               update.additional_fees = parseFloat(inv.additional_fees || inv.fees_amount) || 0
-              update.tip_amount = parseFloat(inv.tip || inv.tip_amount) || 0
+              // Only update tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips)
+              if (parseFloat(inv.tip || inv.tip_amount) > 0) update.tip_amount = parseFloat(inv.tip || inv.tip_amount)
               update.taxes = parseFloat(inv.tax_amount || inv.total_tax_amount) || 0
               // Duration and real start/end times from Zenbooker
               if (zb.estimated_duration_seconds) update.duration = Math.round(zb.estimated_duration_seconds / 60)
