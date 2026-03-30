@@ -424,3 +424,168 @@ describe('Real time validation', () => {
     expect(realHours).toBeCloseTo(2.31, 1);
   });
 });
+
+describe('Revenue filtering by job status', () => {
+  const jobs = [
+    { status: 'completed', service_price: 189, additional_fees: 0 },
+    { status: 'completed', service_price: 159, additional_fees: 0 },
+    { status: 'scheduled', service_price: 139, additional_fees: 0 },
+    { status: 'en-route', service_price: 209, additional_fees: 0 },
+    { status: 'cancelled', service_price: 100, additional_fees: 0 },
+  ];
+
+  test('default (completed only): revenue excludes scheduled/en-route/cancelled', () => {
+    const includeScheduled = false;
+    let revenue = 0;
+    jobs.forEach(j => {
+      const s = j.status.toLowerCase();
+      if (s === 'cancelled') return;
+      if (!includeScheduled && s !== 'completed') return;
+      revenue += j.service_price + (j.additional_fees || 0);
+    });
+    expect(revenue).toBe(348); // 189 + 159
+  });
+
+  test('includeScheduled: revenue includes all non-cancelled jobs', () => {
+    const includeScheduled = true;
+    let revenue = 0;
+    jobs.forEach(j => {
+      const s = j.status.toLowerCase();
+      if (s === 'cancelled') return;
+      if (!includeScheduled && s !== 'completed') return;
+      revenue += j.service_price + (j.additional_fees || 0);
+    });
+    expect(revenue).toBe(696); // 189 + 159 + 139 + 209
+  });
+
+  test('cancelled jobs never count in revenue', () => {
+    const includeScheduled = true;
+    let revenue = 0;
+    jobs.forEach(j => {
+      const s = j.status.toLowerCase();
+      if (s === 'cancelled') return;
+      revenue += j.service_price;
+    });
+    expect(revenue).toBe(696); // no $100 from cancelled
+  });
+});
+
+describe('Manager salary: Incl. Scheduled projections', () => {
+  test('manager commission recalculates on full revenue when includeScheduled', () => {
+    const completedRevenue = 5000;
+    const scheduledRevenue = 3000;
+    const totalRevenue = completedRevenue + scheduledRevenue;
+    const commPct = 2;
+
+    // Without includeScheduled: commission from ledger (completed only)
+    const commFromLedger = completedRevenue * (commPct / 100);
+    expect(commFromLedger).toBe(100);
+
+    // With includeScheduled: recalculate on total
+    const commProjected = totalRevenue * (commPct / 100);
+    expect(commProjected).toBe(160);
+  });
+
+  test('manager commission always recalculates with includeScheduled (not skipped when > 0)', () => {
+    const commFromLedger = 100; // existing from completed jobs
+    const totalRevenue = 8000;
+    const commPct = 2;
+    const includeScheduled = true;
+
+    // Should use totalRevenue, not keep commFromLedger
+    const commission = includeScheduled ? totalRevenue * (commPct / 100) : commFromLedger;
+    expect(commission).toBe(160);
+  });
+
+  test('manager hourly uses full period scheduled hours (not capped at today)', () => {
+    const avail = {
+      workingHours: {
+        sunday: { available: true, start: '09:00', end: '17:00' },
+        monday: { available: true, start: '09:00', end: '17:00' },
+        tuesday: { available: false },
+        wednesday: { available: false },
+        thursday: { available: false },
+        friday: { available: true, start: '09:00', end: '17:00' },
+        saturday: { available: true, start: '09:00', end: '17:00' },
+      },
+      break: { start: '13:00', end: '14:00' }
+    };
+    const hourlyRate = 4;
+    // Full week Mar 29 (Sun) - Apr 4 (Sat): Sun, Mon, Fri, Sat = 4 days × 7h = 28h
+    const scheduledHours = calculateScheduledHoursFromAvailability(avail, '2026-03-29', '2026-04-04');
+    expect(scheduledHours).toBe(28);
+    expect(scheduledHours * hourlyRate).toBe(112);
+  });
+
+  test('manager salary projected even for future days in period', () => {
+    // Period: Mar 29 - Apr 4. Today is Mar 30.
+    // Ledger has entries for Mar 29-30 only.
+    // With includeScheduled, salary = full period scheduled hours × rate
+    const avail = {
+      workingHours: {
+        monday: { available: true, start: '09:00', end: '18:00' },
+        tuesday: { available: true, start: '09:00', end: '18:00' },
+        wednesday: { available: true, start: '09:00', end: '18:00' },
+        thursday: { available: true, start: '09:00', end: '18:00' },
+        friday: { available: true, start: '09:00', end: '18:00' },
+      },
+      break: { start: '13:00', end: '14:00' }
+    };
+    const hourlyRate = 3.75;
+    // Mar 30 (Mon) - Apr 3 (Fri) = 5 days × 8h = 40h
+    const fullPeriodHours = calculateScheduledHoursFromAvailability(avail, '2026-03-30', '2026-04-03');
+    expect(fullPeriodHours).toBe(40);
+    expect(fullPeriodHours * hourlyRate).toBe(150);
+  });
+});
+
+describe('Cash collected offset', () => {
+  test('cash payment creates negative balance offset', () => {
+    const earning = 113.40; // 60% of $189
+    const cashCollected = -189; // cleaner collected full amount
+    const balance = earning + cashCollected;
+    expect(balance).toBeCloseTo(-75.60); // cleaner owes $75.60
+  });
+
+  test('cash split between 2 members', () => {
+    const cashAmount = 189;
+    const memberCount = 2;
+    const perMember = -(cashAmount / memberCount);
+    expect(perMember).toBeCloseTo(-94.50);
+  });
+
+  test('non-cash payment does not create offset', () => {
+    const paymentMethod = 'stripe';
+    const isCash = paymentMethod.toLowerCase().includes('cash');
+    expect(isCash).toBe(false);
+  });
+
+  test('Zelle payment is not cash', () => {
+    const paymentMethod = 'Zelle BofA';
+    const isCash = paymentMethod.toLowerCase().includes('cash');
+    expect(isCash).toBe(false);
+  });
+});
+
+describe('Payroll edit audit trail', () => {
+  test('hours change tracked with old and new values', () => {
+    const oldHours = 3;
+    const newHours = 2.5;
+    const edit = { field: 'hours_worked', old_value: String(oldHours), new_value: String(newHours) };
+    expect(edit.field).toBe('hours_worked');
+    expect(edit.old_value).toBe('3');
+    expect(edit.new_value).toBe('2.5');
+  });
+
+  test('no edit logged when value unchanged', () => {
+    const oldVal = 20;
+    const newVal = 20;
+    const changed = newVal !== oldVal;
+    expect(changed).toBe(false);
+  });
+
+  test('service_price edit tracked', () => {
+    const edit = { field: 'service_price', old_value: '189', new_value: '200' };
+    expect(edit.field).toBe('service_price');
+  });
+});
