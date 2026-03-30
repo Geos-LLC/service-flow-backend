@@ -32163,7 +32163,32 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       }
     }
 
-    // No cash_collected entries (Payroll doesn't have this concept)
+  }
+
+  // Cash collected: if job was paid cash, cleaner collected the money — create negative offset
+  const { data: cashTxs } = await supabase.from('transactions')
+    .select('amount, payment_method')
+    .eq('job_id', jobId)
+    .eq('status', 'completed')
+    .ilike('payment_method', '%cash%');
+  if (cashTxs && cashTxs.length > 0) {
+    const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
+    if (totalCash > 0) {
+      // Split cash among assigned members (whoever collected it)
+      for (const member of teamMembers) {
+        const memberShare = parseFloat((totalCash / memberCount).toFixed(2));
+        ledgerEntries.push({
+          user_id: userId,
+          team_member_id: member.id,
+          job_id: jobId,
+          type: 'cash_collected',
+          amount: -memberShare, // negative — offsets balance
+          effective_date: effectiveDate,
+          note: `Cash collected for job #${jobId}`,
+          created_by: userId
+        });
+      }
+    }
   }
 
   // If no entries were generated for any member, create a $0 earning entry for the first active
