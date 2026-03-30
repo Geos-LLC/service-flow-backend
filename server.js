@@ -20586,7 +20586,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       (item?.scheduledHours || 0) > 0 ||
       (item?.isManagerOrOwner && item?.hasCommission)
     );
-    const sortedTeamMembers = withActivity.slice().sort((a, b) => (b?.jobCount || 0) - (a?.jobCount || 0));
+    const sortedTeamMembers = withActivity.slice().sort((a, b) => (a?.teamMember?.name || '').localeCompare(b?.teamMember?.name || ''));
 
     const grandTotal = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalSalary || 0), 0);
     const grandTotalHours = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalHours || 0), 0);
@@ -32530,6 +32530,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       return m;
     });
 
+    balances.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     res.json({ balances, totalUniqueJobs: globalUniqueJobIds.size });
   } catch (error) {
     console.error('Ledger balances error:', error);
