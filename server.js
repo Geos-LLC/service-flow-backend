@@ -32646,6 +32646,65 @@ app.post('/api/ledger/adjustment', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/ledger/adjust-and-rebuild-batch - Create adjustment, delete old batch, recreate with new total, mark paid
+app.post('/api/ledger/adjust-and-rebuild-batch', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { batchId, amount, note } = req.body;
+
+    if (!batchId || amount === undefined || !note?.trim()) {
+      return res.status(400).json({ error: 'batchId, amount, and note are required' });
+    }
+
+    // 1. Get the batch
+    const { data: batch, error: batchErr } = await supabase
+      .from('cleaner_payout_batch')
+      .select('*')
+      .eq('id', batchId)
+      .eq('user_id', userId)
+      .single();
+    if (batchErr || !batch) return res.status(404).json({ error: 'Batch not found' });
+
+    const teamMemberId = batch.team_member_id;
+    const periodStart = batch.period_start;
+    const periodEnd = batch.period_end;
+
+    // 2. Create the adjustment entry
+    const effectiveDate = new Date().toISOString().split('T')[0];
+    const { error: adjErr } = await supabase.from('cleaner_ledger').insert({
+      user_id: userId, team_member_id: teamMemberId, job_id: null,
+      type: 'adjustment', amount: parseFloat(amount),
+      effective_date: effectiveDate, note: note.trim(),
+      metadata: { manual: true }, created_by: userId
+    });
+    if (adjErr) return res.status(500).json({ error: 'Failed to create adjustment' });
+
+    // 3. Detach entries from old batch + delete payout entries + delete batch
+    await supabase.from('cleaner_ledger').update({ payout_batch_id: null })
+      .eq('payout_batch_id', batchId).neq('type', 'payout');
+    await supabase.from('cleaner_ledger').delete()
+      .eq('payout_batch_id', batchId).eq('type', 'payout');
+    await supabase.from('cleaner_payout_batch').delete().eq('id', batchId);
+
+    // 4. Recreate batch with all unpaid entries (including the new adjustment)
+    const result = await createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, batch.note, 'manual');
+
+    if (result.skipped) {
+      return res.json({ success: true, adjustment: parseFloat(amount), new_batch: null, message: 'Adjustment created, no entries left for batch' });
+    }
+
+    // 5. Mark as paid
+    const newBatchId = result.batch.id;
+    const paidAt = new Date().toISOString();
+    await supabase.from('cleaner_payout_batch').update({ status: 'paid', paid_at: paidAt }).eq('id', newBatchId);
+
+    res.json({ success: true, adjustment: parseFloat(amount), new_batch: result.batch, new_total: result.batch.total_amount });
+  } catch (error) {
+    console.error('Adjust and rebuild batch error:', error);
+    res.status(500).json({ error: 'Failed to adjust and rebuild batch' });
+  }
+});
+
 // POST /api/ledger/cash-collected - Record cash collected by cleaner
 app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
   try {
