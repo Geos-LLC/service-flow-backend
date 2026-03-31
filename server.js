@@ -6467,14 +6467,24 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // === LEDGER CLEANUP: Remove ledger entries when job is cancelled or rescheduled ===
-    if ((status === 'cancelled' || status === 'rescheduled') && previousStatus !== status) {
+    // === LEDGER CLEANUP: Remove ledger entries when job leaves completed status ===
+    // Covers: cancel, reschedule, reset to pending, or any status change FROM completed
+    const completedStatuses = ['completed', 'complete'];
+    if (completedStatuses.includes(previousStatus) && !completedStatuses.includes(status)) {
       try {
         const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).select('id');
         if (delErr) console.error(`⚠️ Error removing ledger entries for ${status} job:`, delErr);
-        else console.log(`[Ledger] Removed ${deletedEntries?.length || 0} entries for ${status} job ${id}`);
+        else console.log(`[Ledger] Removed ${deletedEntries?.length || 0} entries for job ${id} (${previousStatus} → ${status})`);
       } catch (ledgerError) {
         console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
+      }
+    }
+    // Also clean up if directly set to cancelled/rescheduled from non-completed status (e.g. pending→cancelled)
+    if ((status === 'cancelled' || status === 'rescheduled') && !completedStatuses.includes(previousStatus)) {
+      try {
+        await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id));
+      } catch (ledgerError) {
+        // Non-blocking — there may be no entries to delete
       }
     }
 
