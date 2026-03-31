@@ -32836,6 +32836,48 @@ app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/ledger/payout-batch/all - Create payout batches for ALL team members at once
+app.post('/api/ledger/payout-batch/all', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { periodStart, periodEnd, note } = req.body;
+
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({ error: 'periodStart and periodEnd are required' });
+    }
+
+    // Get ALL team members (active + inactive)
+    const { data: members, error: membersError } = await supabase
+      .from('team_members')
+      .select('id, first_name, last_name, status')
+      .eq('user_id', userId);
+
+    if (membersError) {
+      return res.status(500).json({ error: 'Failed to fetch team members' });
+    }
+
+    const results = { created: [], skipped: [] };
+
+    for (const tm of (members || [])) {
+      try {
+        const result = await createPayoutBatchForMember(userId, tm.id, periodStart, periodEnd, note, 'manual');
+        if (result.skipped) {
+          results.skipped.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), reason: result.reason });
+        } else {
+          results.created.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), batch_id: result.batch.id, total: result.batch.total_amount });
+        }
+      } catch (err) {
+        results.skipped.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), reason: err.message });
+      }
+    }
+
+    res.json(results);
+  } catch (error) {
+    console.error('Payout batch all error:', error);
+    res.status(500).json({ error: 'Failed to create payout batches' });
+  }
+});
+
 // PATCH /api/ledger/payout-batch/:id/pay - Mark payout batch as paid
 app.patch('/api/ledger/payout-batch/:id/pay', authenticateToken, async (req, res) => {
   try {
