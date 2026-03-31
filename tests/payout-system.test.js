@@ -391,3 +391,158 @@ describe('Pay Period Alignment', () => {
     expect(calculateBalance(entries, 100, '2026-03-29', '2026-04-04')).toBe(300);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// Job Status Change → Ledger Cleanup
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Simulate the backend ledger behavior on status change.
+ * Matches server.js logic: completed → creates entries, leaving completed → deletes entries.
+ */
+function simulateStatusChange(entries, jobId, previousStatus, newStatus, memberId) {
+  const completedStatuses = ['completed', 'complete'];
+
+  // Create ledger entries when job becomes completed
+  if (completedStatuses.includes(newStatus) && !completedStatuses.includes(previousStatus)) {
+    entries.push(
+      makeEntry(entries.length + 1000, memberId, 'earning', 150, '2026-03-25', null),
+      makeEntry(entries.length + 1001, memberId, 'tip', 20, '2026-03-25', null)
+    );
+    // Tag entries with job_id
+    entries.filter(e => e.id >= 1000 && !e.job_id).forEach(e => { e.job_id = jobId; });
+  }
+
+  // Remove ledger entries when job LEAVES completed status
+  if (completedStatuses.includes(previousStatus) && !completedStatuses.includes(newStatus)) {
+    const toRemove = entries.filter(e => e.job_id === jobId);
+    toRemove.forEach(e => {
+      const idx = entries.indexOf(e);
+      if (idx >= 0) entries.splice(idx, 1);
+    });
+  }
+
+  // Also remove for cancel/reschedule from non-completed (safety net)
+  if ((newStatus === 'cancelled' || newStatus === 'rescheduled') && !completedStatuses.includes(previousStatus)) {
+    const toRemove = entries.filter(e => e.job_id === jobId);
+    toRemove.forEach(e => {
+      const idx = entries.indexOf(e);
+      if (idx >= 0) entries.splice(idx, 1);
+    });
+  }
+
+  return { previousStatus, newStatus };
+}
+
+function makeJobEntry(id, memberId, type, amount, date, jobId) {
+  return { id, team_member_id: memberId, type, amount, effective_date: date, payout_batch_id: null, job_id: jobId };
+}
+
+describe('Job Status Change — Ledger Cleanup', () => {
+  test('completing a job creates ledger entries', () => {
+    const entries = [];
+    simulateStatusChange(entries, 501, 'pending', 'completed', 100);
+    expect(entries.length).toBe(2); // earning + tip
+    expect(entries[0].type).toBe('earning');
+    expect(entries[1].type).toBe('tip');
+  });
+
+  test('reset (completed → pending) removes ledger entries', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 150, '2026-03-25', 501),
+      makeJobEntry(2, 100, 'tip', 20, '2026-03-25', 501),
+      makeJobEntry(3, 100, 'earning', 300, '2026-03-26', 502), // different job — untouched
+    ];
+    simulateStatusChange(entries, 501, 'completed', 'pending', 100);
+    expect(entries.length).toBe(1);
+    expect(entries[0].job_id).toBe(502); // only other job remains
+  });
+
+  test('cancel (completed → cancelled) removes ledger entries', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 150, '2026-03-25', 501),
+      makeJobEntry(2, 100, 'tip', 20, '2026-03-25', 501),
+    ];
+    simulateStatusChange(entries, 501, 'completed', 'cancelled', 100);
+    expect(entries.length).toBe(0);
+  });
+
+  test('reschedule (completed → rescheduled) removes ledger entries', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 150, '2026-03-25', 501),
+    ];
+    simulateStatusChange(entries, 501, 'completed', 'rescheduled', 100);
+    expect(entries.length).toBe(0);
+  });
+
+  test('cancel from pending also removes entries (safety net)', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 150, '2026-03-25', 501), // shouldn't exist for pending, but safety
+    ];
+    simulateStatusChange(entries, 501, 'pending', 'cancelled', 100);
+    expect(entries.length).toBe(0);
+  });
+
+  test('non-completed status changes do NOT remove entries', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 300, '2026-03-26', 502),
+    ];
+    // pending → confirmed: no ledger impact
+    simulateStatusChange(entries, 502, 'pending', 'confirmed', 100);
+    expect(entries.length).toBe(1);
+    // confirmed → in-progress: no ledger impact
+    simulateStatusChange(entries, 502, 'confirmed', 'in-progress', 100);
+    expect(entries.length).toBe(1);
+  });
+
+  test('balance drops when completed job is reset', () => {
+    const entries = [
+      makeJobEntry(1, 100, 'earning', 500, '2026-03-22', 501),
+      makeJobEntry(2, 100, 'tip', 50, '2026-03-22', 501),
+      makeJobEntry(3, 100, 'earning', 300, '2026-03-25', 502),
+    ];
+    expect(calculateBalance(entries, 100)).toBe(850);
+
+    // Reset job 501
+    simulateStatusChange(entries, 501, 'completed', 'pending', 100);
+    expect(calculateBalance(entries, 100)).toBe(300); // only job 502 remains
+  });
+
+  test('the full cleaner-marks-complete-but-client-cancelled flow', () => {
+    // 1. Job starts as pending, no ledger entries
+    const entries = [];
+    expect(calculateBalance(entries, 100)).toBe(0);
+
+    // 2. Cleaner marks complete → ledger entries created
+    simulateStatusChange(entries, 501, 'pending', 'completed', 100);
+    expect(entries.length).toBe(2);
+    expect(calculateBalance(entries, 100)).toBe(170); // 150 + 20
+
+    // 3. Owner resets job (completed → pending) → entries removed
+    simulateStatusChange(entries, 501, 'completed', 'pending', 100);
+    expect(entries.length).toBe(0);
+    expect(calculateBalance(entries, 100)).toBe(0);
+
+    // 4. Owner cancels the pending job
+    simulateStatusChange(entries, 501, 'pending', 'cancelled', 100);
+    expect(entries.length).toBe(0);
+    expect(calculateBalance(entries, 100)).toBe(0);
+    // Cleaner was never paid for a job that didn't happen ✓
+  });
+
+  test('re-completing after reset creates fresh entries', () => {
+    const entries = [];
+
+    // Complete → entries created
+    simulateStatusChange(entries, 501, 'pending', 'completed', 100);
+    expect(entries.length).toBe(2);
+
+    // Reset → entries removed
+    simulateStatusChange(entries, 501, 'completed', 'pending', 100);
+    expect(entries.length).toBe(0);
+
+    // Complete again → fresh entries created
+    simulateStatusChange(entries, 501, 'pending', 'completed', 100);
+    expect(entries.length).toBe(2);
+  });
+});
