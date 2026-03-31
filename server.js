@@ -32465,12 +32465,11 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
     }
     const entries = allEntries;
 
-    // Fetch team members
+    // Fetch ALL team members (active + inactive — you still owe inactive members)
     const { data: teamMembers } = await supabase
       .from('team_members')
-      .select('id, first_name, last_name, role, payout_schedule_type')
-      .eq('user_id', userId)
-      .eq('status', 'active');
+      .select('id, first_name, last_name, role, status, payout_schedule_type')
+      .eq('user_id', userId);
 
     // Build per-member summaries
     const memberMap = {};
@@ -32479,6 +32478,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
         team_member_id: tm.id,
         name: `${tm.first_name || ''} ${tm.last_name || ''}`.trim(),
         role: tm.role,
+        status: tm.status || 'active',
         payout_schedule: tm.payout_schedule_type || 'manual',
         current_balance: 0,
         unpaid_earnings: 0,
