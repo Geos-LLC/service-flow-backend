@@ -32967,6 +32967,58 @@ app.patch('/api/ledger/payout-batch/:id/cancel', authenticateToken, async (req, 
   }
 });
 
+// DELETE /api/ledger/payout-batch/:id - Delete a pending batch entirely (detach entries + remove batch row)
+app.delete('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: batch, error: fetchError } = await supabase
+      .from('cleaner_payout_batch')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchError || !batch) {
+      return res.status(404).json({ error: 'Payout batch not found' });
+    }
+
+    if (batch.status === 'paid') {
+      return res.status(400).json({ error: 'Cannot delete a paid batch' });
+    }
+
+    // Detach ledger entries from this batch
+    await supabase
+      .from('cleaner_ledger')
+      .update({ payout_batch_id: null })
+      .eq('payout_batch_id', parseInt(id))
+      .neq('type', 'payout');
+
+    // Delete any payout-type ledger entries for this batch
+    await supabase
+      .from('cleaner_ledger')
+      .delete()
+      .eq('payout_batch_id', parseInt(id))
+      .eq('type', 'payout');
+
+    // Delete the batch row
+    const { error: deleteError } = await supabase
+      .from('cleaner_payout_batch')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) {
+      return res.status(500).json({ error: 'Failed to delete batch' });
+    }
+
+    res.json({ success: true, deleted_batch_id: parseInt(id) });
+  } catch (error) {
+    console.error('Payout batch delete error:', error);
+    res.status(500).json({ error: 'Failed to delete batch' });
+  }
+});
+
 // POST /api/ledger/bulk-mark-paid - Bulk mark all unpaid entries as paid up to a cutoff date
 app.post('/api/ledger/bulk-mark-paid', authenticateToken, async (req, res) => {
   try {
