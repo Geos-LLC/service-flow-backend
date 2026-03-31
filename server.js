@@ -32967,7 +32967,7 @@ app.patch('/api/ledger/payout-batch/:id/cancel', authenticateToken, async (req, 
   }
 });
 
-// DELETE /api/ledger/payout-batch/:id - Delete a pending batch entirely (detach entries + remove batch row)
+// DELETE /api/ledger/payout-batch/:id - Delete a batch (paid or pending): detach entries, remove payout ledger entry, delete batch row
 app.delete('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -32984,11 +32984,7 @@ app.delete('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) =
       return res.status(404).json({ error: 'Payout batch not found' });
     }
 
-    if (batch.status === 'paid') {
-      return res.status(400).json({ error: 'Cannot delete a paid batch' });
-    }
-
-    // Detach ledger entries from this batch
+    // Detach ledger entries from this batch (makes them unpaid again)
     await supabase
       .from('cleaner_ledger')
       .update({ payout_batch_id: null })
@@ -33012,7 +33008,7 @@ app.delete('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) =
       return res.status(500).json({ error: 'Failed to delete batch' });
     }
 
-    res.json({ success: true, deleted_batch_id: parseInt(id) });
+    res.json({ success: true, deleted_batch_id: parseInt(id), was_status: batch.status });
   } catch (error) {
     console.error('Payout batch delete error:', error);
     res.status(500).json({ error: 'Failed to delete batch' });
