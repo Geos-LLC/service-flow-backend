@@ -32495,14 +32495,14 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       const mid = entry.team_member_id;
       if (!memberMap[mid]) continue;
       const amount = parseFloat(entry.amount) || 0;
-      // Balance = sum of UNPAID entries only (not attached to any payout batch)
-      if (!entry.payout_batch_id) {
-        memberMap[mid].current_balance += amount;
-      }
 
-      // Apply date filter for breakdown columns only
       const ed = entry.effective_date ? String(entry.effective_date).split('T')[0] : null;
       const inPeriod = (!startDate || !ed || ed >= startDate) && (!endDate || !ed || ed <= endDate);
+
+      // current_balance = unpaid entries within the selected period
+      if (!entry.payout_batch_id && inPeriod) {
+        memberMap[mid].current_balance += amount;
+      }
 
       if (inPeriod && entry.job_id) {
         memberMap[mid]._jobIds.add(entry.job_id);
