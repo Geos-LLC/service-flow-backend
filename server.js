@@ -32446,21 +32446,16 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { startDate, endDate } = req.query;
 
-    // Fetch ALL ledger entries with pagination (Supabase default limit is 1000)
+    // Fetch ALL ledger entries (no date filter for balance calculation)
     let allEntries = [];
     let from = 0;
     const pageSize = 1000;
     while (true) {
-      let entryQuery = supabase
+      const { data: page, error } = await supabase
         .from('cleaner_ledger')
-        .select('team_member_id, type, amount, payout_batch_id, job_id')
+        .select('team_member_id, type, amount, payout_batch_id, job_id, effective_date')
         .eq('user_id', userId)
         .range(from, from + pageSize - 1);
-
-      if (startDate) entryQuery = entryQuery.gte('effective_date', startDate);
-      if (endDate) entryQuery = entryQuery.lte('effective_date', endDate);
-
-      const { data: page, error } = await entryQuery;
       if (error) {
         return res.status(500).json({ error: 'Failed to fetch ledger data' });
       }
@@ -32500,14 +32495,18 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
       const mid = entry.team_member_id;
       if (!memberMap[mid]) continue;
       const amount = parseFloat(entry.amount) || 0;
+      // Balance = sum of ALL entries (no date filter — true unpaid amount)
       memberMap[mid].current_balance += amount;
 
-      // Count unique jobs (from any entry type, not just earning)
-      if (entry.job_id) {
+      // Apply date filter for breakdown columns only
+      const ed = entry.effective_date ? String(entry.effective_date).split('T')[0] : null;
+      const inPeriod = (!startDate || !ed || ed >= startDate) && (!endDate || !ed || ed <= endDate);
+
+      if (inPeriod && entry.job_id) {
         memberMap[mid]._jobIds.add(entry.job_id);
       }
 
-      if (!entry.payout_batch_id) {
+      if (inPeriod && !entry.payout_batch_id) {
         switch (entry.type) {
           case 'earning': memberMap[mid].unpaid_earnings += amount; break;
           case 'tip': memberMap[mid].unpaid_tips += amount; break;
