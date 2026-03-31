@@ -32667,10 +32667,12 @@ app.post('/api/ledger/adjust-and-rebuild-batch', authenticateToken, async (req, 
 
     const teamMemberId = batch.team_member_id;
     const periodStart = batch.period_start;
-    const periodEnd = batch.period_end;
+    // Extend period to include today so the adjustment is captured
+    const todayStr = new Date().toISOString().split('T')[0];
+    const periodEnd = batch.period_end < todayStr ? todayStr : batch.period_end;
 
     // 2. Create the adjustment entry
-    const effectiveDate = new Date().toISOString().split('T')[0];
+    const effectiveDate = todayStr;
     const { error: adjErr } = await supabase.from('cleaner_ledger').insert({
       user_id: userId, team_member_id: teamMemberId, job_id: null,
       type: 'adjustment', amount: parseFloat(amount),
