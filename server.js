@@ -33748,19 +33748,37 @@ async function autoLinkConversation(userId, conversationId, phone) {
   if (!phone) return;
   const normalized = normalizePhone(phone);
   if (!normalized) return;
+  const last10 = normalized.slice(-10);
+  if (last10.length < 7) return; // too short to match
+
   // Try customers first
-  const { data: customer } = await supabase.from('customers').select('id').eq('user_id', userId).ilike('phone', `%${normalized.slice(-10)}%`).limit(1).maybeSingle();
+  const { data: customer } = await supabase.from('customers')
+    .select('id, first_name, last_name')
+    .eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
   if (customer) {
-    await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', conversationId);
-    return;
+    const name = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
+    await supabase.from('communication_conversations').update({
+      customer_id: customer.id,
+      participant_name: name || undefined  // set name from customer if we have it
+    }).eq('id', conversationId);
+    return { type: 'customer', id: customer.id, name };
   }
-  // Try leads (if table exists)
+
+  // Try leads
   try {
-    const { data: lead } = await supabase.from('leads').select('id').eq('user_id', userId).ilike('phone', `%${normalized.slice(-10)}%`).limit(1).maybeSingle();
+    const { data: lead } = await supabase.from('leads')
+      .select('id, first_name, last_name, name')
+      .eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
     if (lead) {
-      await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', conversationId);
+      const name = lead.name || `${lead.first_name || ''} ${lead.last_name || ''}`.trim();
+      await supabase.from('communication_conversations').update({
+        lead_id: lead.id,
+        participant_name: name || undefined
+      }).eq('id', conversationId);
+      return { type: 'lead', id: lead.id, name };
     }
   } catch (e) { /* leads table may not exist */ }
+  return null;
 }
 
 // ── Phase 2: Connect/Disconnect/Status ──
@@ -34083,24 +34101,27 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           const { data: existing } = await supabase.from('communication_conversations')
             .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
 
+          // Determine best name: Sigcore contactName or metadata
+          const sigcoreName = conv.contactName || conv.metadata?.conversationName || null;
+
           if (existing) {
-            // Update
-            const { data: updated } = await supabase.from('communication_conversations').update({
-              participant_name: conv.contactName || conv.metadata?.conversationName || existing.participant_name,
+            const updates = {
               last_preview: conv.lastMessage || existing.last_preview,
               last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || existing.last_event_at,
               updated_at: new Date().toISOString()
-            }).eq('id', existing.id).select().single();
+            };
+            // Only overwrite name if we have a better one from Sigcore and existing has none
+            if (sigcoreName && !existing.participant_name) updates.participant_name = sigcoreName;
+            const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', existing.id).select().single();
             localConv = updated || existing;
           } else {
-            // Insert
             const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
               user_id: userId,
               sigcore_conversation_id: sigcoreConvId,
               provider: 'openphone',
               channel: 'sms',
               participant_phone: participantPhone,
-              participant_name: conv.contactName || conv.metadata?.conversationName || null,
+              participant_name: sigcoreName,
               last_preview: conv.lastMessage || null,
               last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
               metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
@@ -34111,8 +34132,14 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
           if (!localConv) { commSyncProgress[userId].errors++; continue; }
 
+          // Auto-link to SF customer/lead by phone — also sets name from customer if matched
           if (!localConv.customer_id && !localConv.lead_id) {
-            autoLinkConversation(userId, localConv.id, participantPhone);
+            const linkResult = await autoLinkConversation(userId, localConv.id, participantPhone);
+            if (linkResult?.name && !localConv.participant_name) {
+              // Re-read to get updated name
+              const { data: refreshed } = await supabase.from('communication_conversations').select('*').eq('id', localConv.id).single();
+              if (refreshed) localConv = refreshed;
+            }
           }
 
           // Fetch messages
