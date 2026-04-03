@@ -34044,11 +34044,17 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 const commSyncProgress = {};
 
 // Core sync function (runs in background)
-async function runCommSync(userId, tenantKey, maxConversations = 0) {
+async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreSync = false) {
   commSyncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' };
 
   try {
-    // First count total conversations from Sigcore
+    // Trigger Sigcore OpenPhone sync only for full syncs (not test/limited)
+    if (!skipSigcoreSync) {
+      commSyncProgress[userId].phase = 'sigcore_sync';
+      try { await sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }); } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
+    }
+
+    // Count total conversations from Sigcore
     const countRes = await sigcoreRequest('GET', '/conversations?page=1&limit=1', tenantKey);
     const totalAvailable = countRes.data?.meta?.total || countRes.data?.data?.length || 0;
     const limit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
@@ -34162,7 +34168,8 @@ app.post('/api/communications/sync', authenticateToken, async (req, res) => {
 
     // Start sync in background
     const maxConversations = parseInt(maxConv) || 0;
-    setImmediate(() => runCommSync(userId, settings.sigcore_tenant_api_key, maxConversations));
+    const skipSigcoreSync = maxConversations > 0; // Skip Sigcore full sync for test/limited syncs
+    setImmediate(() => runCommSync(userId, settings.sigcore_tenant_api_key, maxConversations, skipSigcoreSync));
 
     res.json({ started: true, limit: maxConversations || 'all' });
   } catch (error) {
