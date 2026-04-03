@@ -34071,20 +34071,39 @@ async function runCommSync(userId, tenantKey, maxConversations = 0) {
 
         const participantPhone = normalizePhone(conv.participantPhoneNumber);
         try {
-          const { data: localConv, error: convErr } = await supabase.from('communication_conversations').upsert({
-            user_id: userId,
-            sigcore_conversation_id: conv.id || conv.externalId,
-            provider: 'openphone',
-            channel: 'sms',
-            participant_phone: participantPhone,
-            participant_name: conv.contactName || conv.metadata?.conversationName || null,
-            last_preview: conv.lastMessage || null,
-            last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
-            metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'sigcore_conversation_id', ignoreDuplicates: false }).select().single();
+          const sigcoreConvId = conv.id || conv.externalId;
+          // Check if already exists
+          let localConv = null;
+          const { data: existing } = await supabase.from('communication_conversations')
+            .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
 
-          if (convErr) { commSyncProgress[userId].errors++; continue; }
+          if (existing) {
+            // Update
+            const { data: updated } = await supabase.from('communication_conversations').update({
+              participant_name: conv.contactName || conv.metadata?.conversationName || existing.participant_name,
+              last_preview: conv.lastMessage || existing.last_preview,
+              last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || existing.last_event_at,
+              updated_at: new Date().toISOString()
+            }).eq('id', existing.id).select().single();
+            localConv = updated || existing;
+          } else {
+            // Insert
+            const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
+              user_id: userId,
+              sigcore_conversation_id: sigcoreConvId,
+              provider: 'openphone',
+              channel: 'sms',
+              participant_phone: participantPhone,
+              participant_name: conv.contactName || conv.metadata?.conversationName || null,
+              last_preview: conv.lastMessage || null,
+              last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
+              metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
+            }).select().single();
+            if (convErr) { console.error('[Sync] Insert conv error:', convErr.message); commSyncProgress[userId].errors++; continue; }
+            localConv = created;
+          }
+
+          if (!localConv) { commSyncProgress[userId].errors++; continue; }
 
           if (!localConv.customer_id && !localConv.lead_id) {
             autoLinkConversation(userId, localConv.id, participantPhone);
