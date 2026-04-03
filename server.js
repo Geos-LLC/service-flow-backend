@@ -34416,22 +34416,24 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
 // POST /api/admin/test-sigcore — test Sigcore connection with workspace key
 app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
   try {
-    const sigcoreUrl = process.env.SIGCORE_URL;
-    const sigcoreKey = process.env.SIGCORE_WORKSPACE_KEY;
-    if (!sigcoreUrl || !sigcoreKey) return res.json({ connected: false, error: 'Sigcore URL or key not configured' });
+    // Read from DB first, fall back to in-memory
+    const { data: setting } = await supabase.from('communication_settings').select('*').eq('sigcore_tenant_id', 'global_workspace').maybeSingle();
+    const sigcoreUrl = setting?.preferences?.sigcore_url || SIGCORE_URL;
+    const sigcoreKey = setting?.sigcore_tenant_api_key || SIGCORE_WORKSPACE_KEY;
+    if (!sigcoreUrl || !sigcoreKey) return res.json({ connected: false, error: 'Sigcore URL or key not configured. Save them first.' });
 
-    // Test by listing tenants or hitting a health endpoint
+    // Update in-memory
+    SIGCORE_URL = sigcoreUrl;
+    SIGCORE_WORKSPACE_KEY = sigcoreKey;
+
+    // Test by listing tenants
     const testRes = await axios.get(`${sigcoreUrl}/tenants`, { headers: { 'x-api-key': sigcoreKey }, timeout: 10000 });
     const connected = testRes.status === 200;
 
-    // Update stored setting
-    try {
-      await supabase.from('admin_global_settings').upsert({
-        key: 'sigcore',
-        value: { sigcore_url: sigcoreUrl, sigcore_workspace_key: sigcoreKey, connected },
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'key' });
-    } catch (e) { /* ignore */ }
+    // Update connection status in DB
+    if (setting) {
+      await supabase.from('communication_settings').update({ connection_status: connected ? 'connected' : 'error' }).eq('id', setting.id);
+    }
 
     res.json({ connected, tenants: testRes.data?.data?.length || 0 });
   } catch (error) {
