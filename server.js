@@ -34040,89 +34040,121 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 
 // ── Phase 4: Sync/Backfill from Sigcore ──
 
-app.post('/api/communications/sync', authenticateToken, async (req, res) => {
+// In-memory sync progress per user
+const commSyncProgress = {};
+
+// Core sync function (runs in background)
+async function runCommSync(userId, tenantKey, maxConversations = 0) {
+  commSyncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' };
+
   try {
-    const userId = req.user.userId;
-    const settings = await getSigcoreSettings(userId);
-    if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
+    // First count total conversations from Sigcore
+    const countRes = await sigcoreRequest('GET', '/conversations?page=1&limit=1', tenantKey);
+    const totalAvailable = countRes.data?.meta?.total || countRes.data?.data?.length || 0;
+    const limit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
+    commSyncProgress[userId].total = limit;
+    commSyncProgress[userId].phase = 'syncing';
 
-    const tenantKey = settings.sigcore_tenant_api_key;
-
-    // Trigger sync at Sigcore
-    try { await sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }); } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
-
-    // Fetch conversations from Sigcore
     let page = 1;
     let totalSynced = 0;
     let totalMessages = 0;
+    const pageSize = maxConversations > 0 ? Math.min(maxConversations, 50) : 50;
+    const maxPages = maxConversations > 0 ? Math.ceil(maxConversations / pageSize) : 100;
 
-    while (page <= 20) { // Cap at 20 pages
-      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=50`, tenantKey);
+    while (page <= maxPages) {
+      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}`, tenantKey);
       const conversations = convRes.data?.data || [];
       if (conversations.length === 0) break;
 
       for (const conv of conversations) {
+        if (maxConversations > 0 && totalSynced >= maxConversations) break;
+
         const participantPhone = normalizePhone(conv.participantPhoneNumber);
-        // Upsert conversation
-        const { data: localConv, error: convErr } = await supabase.from('communication_conversations').upsert({
-          user_id: userId,
-          sigcore_conversation_id: conv.id || conv.externalId,
-          provider: 'openphone',
-          channel: 'sms',
-          participant_phone: participantPhone,
-          participant_name: conv.contactName || conv.metadata?.conversationName || null,
-          last_preview: conv.lastMessage || null,
-          last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
-          metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'sigcore_conversation_id', ignoreDuplicates: false }).select().single();
-
-        if (convErr) { console.error('[Sync] Conv upsert error:', convErr); continue; }
-
-        // Auto-link
-        if (!localConv.customer_id && !localConv.lead_id) {
-          autoLinkConversation(userId, localConv.id, participantPhone);
-        }
-
-        // Fetch messages for this conversation
         try {
-          const msgRes = await sigcoreRequest('GET', `/conversations/${conv.id}/messages`, tenantKey);
-          const messages = msgRes.data?.data || [];
-          for (const msg of messages) {
-            const sigcoreId = msg.id;
-            // Deduplicate
-            const { data: existing } = await supabase.from('communication_messages').select('id').eq('sigcore_message_id', sigcoreId).maybeSingle();
-            if (existing) continue;
+          const { data: localConv, error: convErr } = await supabase.from('communication_conversations').upsert({
+            user_id: userId,
+            sigcore_conversation_id: conv.id || conv.externalId,
+            provider: 'openphone',
+            channel: 'sms',
+            participant_phone: participantPhone,
+            participant_name: conv.contactName || conv.metadata?.conversationName || null,
+            last_preview: conv.lastMessage || null,
+            last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
+            metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'sigcore_conversation_id', ignoreDuplicates: false }).select().single();
 
-            await supabase.from('communication_messages').insert({
-              conversation_id: localConv.id,
-              sigcore_message_id: sigcoreId,
-              provider_message_id: msg.providerMessageId || null,
-              direction: msg.direction === 'in' ? 'in' : 'out',
-              channel: msg.channel || 'sms',
-              body: msg.body || '',
-              from_number: normalizePhone(msg.fromNumber),
-              to_number: normalizePhone(msg.toNumber),
-              sender_role: msg.direction === 'in' ? 'customer' : 'agent',
-              status: msg.status || 'delivered',
-              metadata: { sigcoreConvId: conv.id },
-              created_at: msg.createdAt || new Date().toISOString()
-            });
-            totalMessages++;
+          if (convErr) { commSyncProgress[userId].errors++; continue; }
+
+          if (!localConv.customer_id && !localConv.lead_id) {
+            autoLinkConversation(userId, localConv.id, participantPhone);
           }
-        } catch (e) { console.warn('[Sync] Messages fetch error for conv:', conv.id, e.message); }
 
-        totalSynced++;
+          // Fetch messages
+          try {
+            const msgRes = await sigcoreRequest('GET', `/conversations/${conv.id}/messages`, tenantKey);
+            const messages = msgRes.data?.data || [];
+            for (const msg of messages) {
+              const sigcoreId = msg.id;
+              const { data: existing } = await supabase.from('communication_messages').select('id').eq('sigcore_message_id', sigcoreId).maybeSingle();
+              if (existing) continue;
+              await supabase.from('communication_messages').insert({
+                conversation_id: localConv.id, sigcore_message_id: sigcoreId,
+                provider_message_id: msg.providerMessageId || null,
+                direction: msg.direction === 'in' ? 'in' : 'out', channel: msg.channel || 'sms',
+                body: msg.body || '', from_number: normalizePhone(msg.fromNumber),
+                to_number: normalizePhone(msg.toNumber),
+                sender_role: msg.direction === 'in' ? 'customer' : 'agent',
+                status: msg.status || 'delivered', metadata: { sigcoreConvId: conv.id },
+                created_at: msg.createdAt || new Date().toISOString()
+              });
+              totalMessages++;
+            }
+          } catch (e) { commSyncProgress[userId].errors++; }
+
+          totalSynced++;
+          commSyncProgress[userId].synced = totalSynced;
+          commSyncProgress[userId].messages = totalMessages;
+        } catch (e) { commSyncProgress[userId].errors++; }
       }
+      if (maxConversations > 0 && totalSynced >= maxConversations) break;
       page++;
     }
 
-    console.log(`[Sync] Synced ${totalSynced} conversations, ${totalMessages} messages for user ${userId}`);
-    res.json({ success: true, conversations: totalSynced, messages: totalMessages });
+    commSyncProgress[userId] = { status: 'complete', total: limit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
+    console.log(`[Sync] Done: ${totalSynced}/${limit} conversations, ${totalMessages} messages for user ${userId}`);
   } catch (error) {
-    console.error('Communications sync error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Sync failed' });
+    console.error('Sync error:', error.response?.data || error.message);
+    commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
   }
+}
+
+// POST /api/communications/sync — start sync (returns immediately, runs in background)
+app.post('/api/communications/sync', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { limit: maxConv } = req.body || {};
+    const settings = await getSigcoreSettings(userId);
+    if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
+
+    if (commSyncProgress[userId]?.status === 'running') {
+      return res.json({ started: false, message: 'Sync already in progress', progress: commSyncProgress[userId] });
+    }
+
+    // Start sync in background
+    const maxConversations = parseInt(maxConv) || 0;
+    setImmediate(() => runCommSync(userId, settings.sigcore_tenant_api_key, maxConversations));
+
+    res.json({ started: true, limit: maxConversations || 'all' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to start sync' });
+  }
+});
+
+// GET /api/communications/sync/progress — poll sync progress
+app.get('/api/communications/sync/progress', authenticateToken, (req, res) => {
+  const progress = commSyncProgress[req.user.userId] || { status: 'idle', total: 0, synced: 0, messages: 0 };
+  res.json(progress);
 });
 
 // ── Phase 5: Conversations API ──
