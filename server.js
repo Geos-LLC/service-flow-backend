@@ -33699,8 +33699,21 @@ app.patch('/api/team-members/:id/payout-preferences', authenticateToken, async (
 // COMMUNICATIONS SYSTEM (Sigcore-backed)
 // ============================================================
 
-const SIGCORE_URL = process.env.SIGCORE_URL || 'https://sigcore-production.up.railway.app/api';
-const SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
+// Sigcore config — loaded from admin_global_settings table, falls back to env vars
+let SIGCORE_URL = process.env.SIGCORE_URL || '';
+let SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
+
+// Load Sigcore config from DB on startup
+(async () => {
+  try {
+    const { data } = await supabase.from('admin_global_settings').select('value').eq('key', 'sigcore').maybeSingle();
+    if (data?.value) {
+      if (data.value.sigcore_url) SIGCORE_URL = data.value.sigcore_url;
+      if (data.value.sigcore_workspace_key) SIGCORE_WORKSPACE_KEY = data.value.sigcore_workspace_key;
+      console.log('[Sigcore] Loaded config from DB:', SIGCORE_URL ? 'URL set' : 'no URL', SIGCORE_WORKSPACE_KEY ? 'key set' : 'no key');
+    }
+  } catch (e) { /* table may not exist yet */ }
+})();
 
 // Helper: make authenticated request to Sigcore
 async function sigcoreRequest(method, path, tenantApiKey, data = null) {
@@ -34358,23 +34371,23 @@ app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/admin/global-settings — save Sigcore connection
+// PUT /api/admin/global-settings — save Sigcore workspace key (URL resolved from Sigcore)
 app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
-    const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
+    const { sigcoreWorkspaceKey } = req.body;
+    if (!sigcoreWorkspaceKey) return res.status(400).json({ error: 'Workspace API key is required' });
 
     // Ensure table exists
-    await supabase.rpc('exec_sql', { sql: "CREATE TABLE IF NOT EXISTS public.admin_global_settings (key text PRIMARY KEY, value jsonb DEFAULT '{}'::jsonb, updated_at timestamptz DEFAULT NOW())" }).catch(() => {});
-    // Fallback: try creating via direct query
     try {
       await supabase.from('admin_global_settings').select('key').limit(1);
     } catch (e) {
-      // Table doesn't exist — create it
-      const axios2 = require('axios');
-      await axios2.post('https://api.supabase.com/v1/projects/ezyhbvskbwmwgwyduqpt/database/query', {
+      await axios.post('https://api.supabase.com/v1/projects/ezyhbvskbwmwgwyduqpt/database/query', {
         query: "CREATE TABLE IF NOT EXISTS public.admin_global_settings (key text PRIMARY KEY, value jsonb DEFAULT '{}'::jsonb, updated_at timestamptz DEFAULT NOW()); NOTIFY pgrst, 'reload schema';"
       }, { headers: { Authorization: 'Bearer sbp_c389bf53aa31e8d1880ee5889c9d88842919af64', 'Content-Type': 'application/json' } }).catch(() => {});
     }
+
+    // The Sigcore URL is always the production instance
+    const sigcoreUrl = 'https://sigcore-production.up.railway.app/api';
 
     await supabase.from('admin_global_settings').upsert({
       key: 'sigcore',
@@ -34382,9 +34395,9 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
       updated_at: new Date().toISOString()
     }, { onConflict: 'key' });
 
-    // Also update in-memory for immediate use
-    if (sigcoreUrl) process.env.SIGCORE_URL = sigcoreUrl;
-    if (sigcoreWorkspaceKey) process.env.SIGCORE_WORKSPACE_KEY = sigcoreWorkspaceKey;
+    // Update in-memory for immediate use
+    SIGCORE_URL = sigcoreUrl;
+    SIGCORE_WORKSPACE_KEY = sigcoreWorkspaceKey;
 
     res.json({ success: true });
   } catch (error) {
