@@ -34314,8 +34314,33 @@ app.patch('/api/communications/conversations/:id', authenticateToken, async (req
 // ADMIN DASHBOARD
 // ============================================================
 
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'info@geos-ai.com';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'aspire5733Z!';
+
+// Admin login — separate from SF user auth
+app.post('/api/admin/login', (req, res) => {
+  const { email, password } = req.body;
+  if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+    const token = jwt.sign({ admin: true, email }, JWT_SECRET, { expiresIn: '24h' });
+    return res.json({ token, email });
+  }
+  res.status(401).json({ error: 'Invalid admin credentials' });
+});
+
+// Admin auth middleware
+function authenticateAdmin(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Admin token required' });
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err || !decoded?.admin) return res.status(403).json({ error: 'Invalid admin token' });
+    req.admin = decoded;
+    next();
+  });
+}
+
 // GET /api/admin/global-settings — Sigcore connection config
-app.get('/api/admin/global-settings', authenticateToken, async (req, res) => {
+app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
     const { data: setting } = await supabase.from('admin_global_settings').select('*').eq('key', 'sigcore').maybeSingle();
     res.json({
@@ -34334,7 +34359,7 @@ app.get('/api/admin/global-settings', authenticateToken, async (req, res) => {
 });
 
 // PUT /api/admin/global-settings — save Sigcore connection
-app.put('/api/admin/global-settings', authenticateToken, async (req, res) => {
+app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
     const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
 
@@ -34369,7 +34394,7 @@ app.put('/api/admin/global-settings', authenticateToken, async (req, res) => {
 });
 
 // POST /api/admin/test-sigcore — test Sigcore connection with workspace key
-app.post('/api/admin/test-sigcore', authenticateToken, async (req, res) => {
+app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
   try {
     const sigcoreUrl = process.env.SIGCORE_URL;
     const sigcoreKey = process.env.SIGCORE_WORKSPACE_KEY;
@@ -34395,7 +34420,7 @@ app.post('/api/admin/test-sigcore', authenticateToken, async (req, res) => {
 });
 
 // GET /api/admin/users — list all users with subscription + comms status
-app.get('/api/admin/users', authenticateToken, async (req, res) => {
+app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
     // Fetch all users
     const { data: allUsers, error } = await supabase.from('users')
