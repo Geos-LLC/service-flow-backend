@@ -34371,10 +34371,10 @@ app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   }
 });
 
-// PUT /api/admin/global-settings — save Sigcore workspace key (URL resolved from Sigcore)
+// PUT /api/admin/global-settings — save Sigcore URL + workspace key
 app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
-    const { sigcoreWorkspaceKey } = req.body;
+    const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
     if (!sigcoreWorkspaceKey) return res.status(400).json({ error: 'Workspace API key is required' });
 
     // Ensure table exists
@@ -34386,17 +34386,16 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
       }, { headers: { Authorization: 'Bearer sbp_c389bf53aa31e8d1880ee5889c9d88842919af64', 'Content-Type': 'application/json' } }).catch(() => {});
     }
 
-    // The Sigcore URL is always the production instance
-    const sigcoreUrl = 'https://sigcore-production.up.railway.app/api';
+    const url = sigcoreUrl || 'https://sigcore-production.up.railway.app/api';
 
     await supabase.from('admin_global_settings').upsert({
       key: 'sigcore',
-      value: { sigcore_url: sigcoreUrl, sigcore_workspace_key: sigcoreWorkspaceKey, connected: false },
+      value: { sigcore_url: url, sigcore_workspace_key: sigcoreWorkspaceKey, connected: false },
       updated_at: new Date().toISOString()
     }, { onConflict: 'key' });
 
     // Update in-memory for immediate use
-    SIGCORE_URL = sigcoreUrl;
+    SIGCORE_URL = url;
     SIGCORE_WORKSPACE_KEY = sigcoreWorkspaceKey;
 
     res.json({ success: true });
