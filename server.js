@@ -34133,7 +34133,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     const userId = req.user.userId;
     const { filter, search, archived } = req.query;
 
-    let query = supabase.from('communication_conversations').select('*, customers(first_name, last_name, phone, email)')
+    let query = supabase.from('communication_conversations').select('*')
       .eq('user_id', userId).order('last_event_at', { ascending: false, nullsFirst: false });
 
     if (archived !== 'true') query = query.eq('is_archived', false);
@@ -34149,7 +34149,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     const conversations = (data || []).map(c => ({
       id: c.id,
       sigcoreConversationId: c.sigcore_conversation_id,
-      displayName: c.participant_name || c.customers?.first_name ? `${c.customers?.first_name || ''} ${c.customers?.last_name || ''}`.trim() : '',
+      displayName: c.participant_name || '',
       fallbackIdentifier: c.participant_phone,
       lastPreview: c.last_preview,
       lastEventAt: c.last_event_at,
@@ -34173,7 +34173,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const { id } = req.params;
 
     const { data: conv, error: convErr } = await supabase.from('communication_conversations')
-      .select('*, customers(id, first_name, last_name, phone, email)')
+      .select('*')
       .eq('id', id).eq('user_id', userId).single();
     if (convErr || !conv) return res.status(404).json({ error: 'Conversation not found' });
 
@@ -34214,12 +34214,16 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
 
     // Build lead data from customer
     let lead = null;
-    if (conv.customers) {
-      lead = {
-        id: conv.customers.id, name: `${conv.customers.first_name || ''} ${conv.customers.last_name || ''}`.trim(),
-        phone: conv.customers.phone, email: conv.customers.email,
-        source: conv.provider, tags: [], status: 'Customer'
-      };
+    // If customer linked, fetch their data
+    if (conv.customer_id) {
+      const { data: customer } = await supabase.from('customers').select('id, first_name, last_name, phone, email').eq('id', conv.customer_id).maybeSingle();
+      if (customer) {
+        lead = {
+          id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
+          phone: customer.phone, email: customer.email,
+          source: conv.provider, tags: [], status: 'Customer'
+        };
+      }
     }
 
     res.json({ events, availableSendChannels, lead, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
