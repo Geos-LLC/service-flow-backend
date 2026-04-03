@@ -34310,6 +34310,131 @@ app.patch('/api/communications/conversations/:id', authenticateToken, async (req
 // END COMMUNICATIONS SYSTEM
 // ============================================================
 
+// ============================================================
+// ADMIN DASHBOARD
+// ============================================================
+
+// GET /api/admin/global-settings — Sigcore connection config
+app.get('/api/admin/global-settings', authenticateToken, async (req, res) => {
+  try {
+    const { data: setting } = await supabase.from('admin_global_settings').select('*').eq('key', 'sigcore').maybeSingle();
+    res.json({
+      sigcoreUrl: setting?.value?.sigcore_url || process.env.SIGCORE_URL || '',
+      sigcoreWorkspaceKey: setting?.value?.sigcore_workspace_key || process.env.SIGCORE_WORKSPACE_KEY || '',
+      sigcoreConnected: setting?.value?.connected || false,
+    });
+  } catch (error) {
+    // Table might not exist yet — return env defaults
+    res.json({
+      sigcoreUrl: process.env.SIGCORE_URL || '',
+      sigcoreWorkspaceKey: process.env.SIGCORE_WORKSPACE_KEY ? '••••••' + process.env.SIGCORE_WORKSPACE_KEY.slice(-8) : '',
+      sigcoreConnected: !!process.env.SIGCORE_WORKSPACE_KEY,
+    });
+  }
+});
+
+// PUT /api/admin/global-settings — save Sigcore connection
+app.put('/api/admin/global-settings', authenticateToken, async (req, res) => {
+  try {
+    const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
+
+    // Ensure table exists
+    await supabase.rpc('exec_sql', { sql: "CREATE TABLE IF NOT EXISTS public.admin_global_settings (key text PRIMARY KEY, value jsonb DEFAULT '{}'::jsonb, updated_at timestamptz DEFAULT NOW())" }).catch(() => {});
+    // Fallback: try creating via direct query
+    try {
+      await supabase.from('admin_global_settings').select('key').limit(1);
+    } catch (e) {
+      // Table doesn't exist — create it
+      const axios2 = require('axios');
+      await axios2.post('https://api.supabase.com/v1/projects/ezyhbvskbwmwgwyduqpt/database/query', {
+        query: "CREATE TABLE IF NOT EXISTS public.admin_global_settings (key text PRIMARY KEY, value jsonb DEFAULT '{}'::jsonb, updated_at timestamptz DEFAULT NOW()); NOTIFY pgrst, 'reload schema';"
+      }, { headers: { Authorization: 'Bearer sbp_c389bf53aa31e8d1880ee5889c9d88842919af64', 'Content-Type': 'application/json' } }).catch(() => {});
+    }
+
+    await supabase.from('admin_global_settings').upsert({
+      key: 'sigcore',
+      value: { sigcore_url: sigcoreUrl, sigcore_workspace_key: sigcoreWorkspaceKey, connected: false },
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'key' });
+
+    // Also update in-memory for immediate use
+    if (sigcoreUrl) process.env.SIGCORE_URL = sigcoreUrl;
+    if (sigcoreWorkspaceKey) process.env.SIGCORE_WORKSPACE_KEY = sigcoreWorkspaceKey;
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin save settings error:', error);
+    res.status(500).json({ error: 'Failed to save settings' });
+  }
+});
+
+// POST /api/admin/test-sigcore — test Sigcore connection with workspace key
+app.post('/api/admin/test-sigcore', authenticateToken, async (req, res) => {
+  try {
+    const sigcoreUrl = process.env.SIGCORE_URL;
+    const sigcoreKey = process.env.SIGCORE_WORKSPACE_KEY;
+    if (!sigcoreUrl || !sigcoreKey) return res.json({ connected: false, error: 'Sigcore URL or key not configured' });
+
+    // Test by listing tenants or hitting a health endpoint
+    const testRes = await axios.get(`${sigcoreUrl}/tenants`, { headers: { 'x-api-key': sigcoreKey }, timeout: 10000 });
+    const connected = testRes.status === 200;
+
+    // Update stored setting
+    try {
+      await supabase.from('admin_global_settings').upsert({
+        key: 'sigcore',
+        value: { sigcore_url: sigcoreUrl, sigcore_workspace_key: sigcoreKey, connected },
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'key' });
+    } catch (e) { /* ignore */ }
+
+    res.json({ connected, tenants: testRes.data?.data?.length || 0 });
+  } catch (error) {
+    res.json({ connected: false, error: error.response?.data?.message || error.message });
+  }
+});
+
+// GET /api/admin/users — list all users with subscription + comms status
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+  try {
+    // Fetch all users
+    const { data: allUsers, error } = await supabase.from('users')
+      .select('id, email, first_name, last_name, business_name, subscription_status, plan_name, trial_end, created_at')
+      .order('id', { ascending: true });
+    if (error) return res.status(500).json({ error: 'Failed to fetch users' });
+
+    // Fetch communication settings for all users
+    const { data: commSettings } = await supabase.from('communication_settings')
+      .select('user_id, connection_status, openphone_connected, cached_phone_numbers');
+
+    const commMap = {};
+    (commSettings || []).forEach(s => { commMap[s.user_id] = s; });
+
+    const users = (allUsers || []).map(u => ({
+      id: u.id,
+      name: `${u.first_name || ''} ${u.last_name || ''}`.trim(),
+      email: u.email,
+      businessName: u.business_name,
+      subscriptionStatus: u.subscription_status || 'free',
+      planName: u.plan_name,
+      trialEnd: u.trial_end,
+      createdAt: u.created_at,
+      sigcoreConnected: commMap[u.id]?.connection_status === 'connected',
+      openphoneConnected: commMap[u.id]?.openphone_connected || false,
+      phoneNumberCount: (commMap[u.id]?.cached_phone_numbers || []).length,
+    }));
+
+    res.json({ users });
+  } catch (error) {
+    console.error('Admin users error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// ============================================================
+// END ADMIN DASHBOARD
+// ============================================================
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
