@@ -34435,11 +34435,11 @@ app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
 // GET /api/admin/users — list all users with subscription + comms status
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
-    // Fetch all users
+    // Fetch all users — use * to avoid missing column errors
     const { data: allUsers, error } = await supabase.from('users')
-      .select('id, email, first_name, last_name, business_name, subscription_status, plan_name, trial_end, created_at')
+      .select('*')
       .order('id', { ascending: true });
-    if (error) return res.status(500).json({ error: 'Failed to fetch users' });
+    if (error) { console.error('Admin users query error:', error); return res.status(500).json({ error: 'Failed to fetch users' }); }
 
     // Fetch communication settings for all users
     const { data: commSettings } = await supabase.from('communication_settings')
