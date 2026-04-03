@@ -33695,6 +33695,621 @@ app.patch('/api/team-members/:id/payout-preferences', authenticateToken, async (
 // END CLEANER LEDGER SYSTEM
 // ============================================================
 
+// ============================================================
+// COMMUNICATIONS SYSTEM (Sigcore-backed)
+// ============================================================
+
+const SIGCORE_URL = process.env.SIGCORE_URL || 'https://sigcore-production.up.railway.app/api';
+const SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
+
+// Helper: make authenticated request to Sigcore
+async function sigcoreRequest(method, path, tenantApiKey, data = null) {
+  const config = {
+    method,
+    url: `${SIGCORE_URL}${path}`,
+    headers: { 'x-api-key': tenantApiKey, 'Content-Type': 'application/json' },
+  };
+  if (data) config.data = data;
+  return axios(config);
+}
+
+// Helper: get user's Sigcore settings
+async function getSigcoreSettings(userId) {
+  const { data, error } = await supabase.from('communication_settings').select('*').eq('user_id', userId).maybeSingle();
+  if (error) throw new Error('Failed to fetch communication settings');
+  return data;
+}
+
+// Helper: normalize phone to E.164
+function normalizePhone(phone) {
+  if (!phone) return null;
+  const digits = phone.replace(/[^\d+]/g, '');
+  if (digits.startsWith('+')) return digits;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits;
+}
+
+// Helper: auto-link conversation to customer/lead by phone
+async function autoLinkConversation(userId, conversationId, phone) {
+  if (!phone) return;
+  const normalized = normalizePhone(phone);
+  if (!normalized) return;
+  // Try customers first
+  const { data: customer } = await supabase.from('customers').select('id').eq('user_id', userId).ilike('phone', `%${normalized.slice(-10)}%`).limit(1).maybeSingle();
+  if (customer) {
+    await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', conversationId);
+    return;
+  }
+  // Try leads (if table exists)
+  try {
+    const { data: lead } = await supabase.from('leads').select('id').eq('user_id', userId).ilike('phone', `%${normalized.slice(-10)}%`).limit(1).maybeSingle();
+    if (lead) {
+      await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', conversationId);
+    }
+  } catch (e) { /* leads table may not exist */ }
+}
+
+// ── Phase 2: Connect/Disconnect/Status ──
+
+// POST /api/communications/connect-openphone — provision Sigcore tenant, connect OpenPhone, register webhook
+app.post('/api/communications/connect-openphone', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { apiKey } = req.body;
+    if (!apiKey) return res.status(400).json({ error: 'OpenPhone API key is required' });
+    if (!SIGCORE_WORKSPACE_KEY) return res.status(500).json({ error: 'Sigcore workspace key not configured' });
+
+    // 1. Provision tenant (idempotent)
+    const provisionRes = await sigcoreRequest('POST', '/tenants/provision', SIGCORE_WORKSPACE_KEY, {
+      externalTenantId: String(userId),
+      displayName: `ServiceFlow User ${userId}`
+    });
+    const { tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {};
+    if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
+
+    // 2. Connect OpenPhone via Sigcore
+    await sigcoreRequest('POST', '/integrations/openphone/connect', tenantApiKey, { apiKey });
+
+    // 3. Fetch phone numbers
+    const numbersRes = await sigcoreRequest('GET', '/integrations/openphone/numbers', tenantApiKey);
+    const phoneNumbers = numbersRes.data?.data || numbersRes.data || [];
+
+    // 4. Register webhook subscriber
+    const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : 'https://service-flow-backend-production-4568.up.railway.app';
+    const webhookRes = await sigcoreRequest('POST', '/v1/webhook-subscriptions', tenantApiKey, {
+      name: 'Service Flow CRM',
+      webhookUrl: `${baseUrl}/api/communications/webhooks/sigcore`,
+      events: ['message.sent', 'message.delivered', 'message.failed', 'message.inbound', 'call.started', 'call.completed', 'call.missed'],
+      metadata: { userId }
+    });
+    const subscription = webhookRes.data?.data || webhookRes.data || {};
+
+    // 5. Store settings
+    await supabase.from('communication_settings').upsert({
+      user_id: userId,
+      sigcore_tenant_id: tenantId,
+      sigcore_tenant_api_key: tenantApiKey,
+      sigcore_webhook_subscription_id: subscription.id || null,
+      sigcore_webhook_secret: subscription.secret || null,
+      connection_status: 'connected',
+      openphone_connected: true,
+      cached_phone_numbers: phoneNumbers,
+      connected_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+
+    console.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
+    res.json({ success: true, phoneNumbers, tenantId });
+  } catch (error) {
+    console.error('Communications connect error:', error.response?.data || error.message);
+    const msg = error.response?.data?.message || error.response?.data?.error || error.message || 'Failed to connect OpenPhone';
+    res.status(error.response?.status || 500).json({ error: msg });
+  }
+});
+
+// GET /api/communications/status
+app.get('/api/communications/status', authenticateToken, async (req, res) => {
+  try {
+    const settings = await getSigcoreSettings(req.user.userId);
+    if (!settings || settings.connection_status !== 'connected') {
+      return res.json({ connected: false, phoneNumbers: [] });
+    }
+    res.json({
+      connected: true,
+      openphoneConnected: settings.openphone_connected,
+      phoneNumbers: settings.cached_phone_numbers || [],
+      connectedAt: settings.connected_at,
+      preferences: settings.preferences || {}
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch communication status' });
+  }
+});
+
+// GET /api/communications/phone-numbers
+app.get('/api/communications/phone-numbers', authenticateToken, async (req, res) => {
+  try {
+    const settings = await getSigcoreSettings(req.user.userId);
+    if (!settings?.sigcore_tenant_api_key) return res.json({ phoneNumbers: [] });
+    // Refresh from Sigcore
+    try {
+      const numbersRes = await sigcoreRequest('GET', '/integrations/openphone/numbers', settings.sigcore_tenant_api_key);
+      const phoneNumbers = numbersRes.data?.data || numbersRes.data || [];
+      await supabase.from('communication_settings').update({ cached_phone_numbers: phoneNumbers, updated_at: new Date().toISOString() }).eq('user_id', req.user.userId);
+      return res.json({ phoneNumbers });
+    } catch (e) {
+      return res.json({ phoneNumbers: settings.cached_phone_numbers || [] });
+    }
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch phone numbers' });
+  }
+});
+
+// DELETE /api/communications/disconnect-openphone
+app.delete('/api/communications/disconnect-openphone', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const settings = await getSigcoreSettings(userId);
+    if (!settings?.sigcore_tenant_api_key) return res.json({ success: true });
+
+    // Disconnect from Sigcore (best effort)
+    try { await sigcoreRequest('DELETE', '/integrations/openphone/disconnect', settings.sigcore_tenant_api_key); } catch (e) { console.warn('Sigcore disconnect warning:', e.message); }
+    // Remove webhook subscription
+    if (settings.sigcore_webhook_subscription_id) {
+      try { await sigcoreRequest('DELETE', `/v1/webhook-subscriptions/${settings.sigcore_webhook_subscription_id}`, settings.sigcore_tenant_api_key); } catch (e) { console.warn('Webhook unsubscribe warning:', e.message); }
+    }
+
+    await supabase.from('communication_settings').update({
+      connection_status: 'disconnected', openphone_connected: false,
+      cached_phone_numbers: [], sigcore_webhook_subscription_id: null,
+      updated_at: new Date().toISOString()
+    }).eq('user_id', userId);
+
+    console.log(`[Communications] OpenPhone disconnected for user ${userId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Communications disconnect error:', error.message);
+    res.status(500).json({ error: 'Failed to disconnect OpenPhone' });
+  }
+});
+
+// PUT /api/communications/settings/preferences
+app.put('/api/communications/settings/preferences', authenticateToken, async (req, res) => {
+  try {
+    const { error } = await supabase.from('communication_settings').upsert({
+      user_id: req.user.userId,
+      preferences: req.body,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+    if (error) return res.status(500).json({ error: 'Failed to save preferences' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save preferences' });
+  }
+});
+
+// ── Phase 3: Webhook Ingestion from Sigcore ──
+
+// POST /api/communications/webhooks/sigcore — receives events from Sigcore (NO auth middleware)
+app.post('/api/communications/webhooks/sigcore', async (req, res) => {
+  // Return 200 immediately — process async
+  res.status(200).json({ received: true });
+
+  try {
+    const event = req.headers['x-callio-event'] || req.body?.event;
+    const payload = req.body?.data || req.body;
+    if (!event || !payload) return;
+
+    console.log(`[Webhook] Sigcore event: ${event}`, JSON.stringify(payload).substring(0, 200));
+
+    // Determine user by matching phone number to communication_settings
+    const fromNumber = normalizePhone(payload.fromNumber || payload.from_number);
+    const toNumber = normalizePhone(payload.toNumber || payload.to_number);
+    const sigcoreConvId = payload.conversationId;
+
+    // Find user from settings (match by phone number in cached_phone_numbers)
+    let userId = null;
+    const { data: allSettings } = await supabase.from('communication_settings').select('user_id, cached_phone_numbers').eq('connection_status', 'connected');
+    for (const s of (allSettings || [])) {
+      const numbers = (s.cached_phone_numbers || []).map(n => normalizePhone(n.number || n.phoneNumber || n));
+      if (numbers.includes(fromNumber) || numbers.includes(toNumber)) {
+        userId = s.user_id;
+        break;
+      }
+    }
+    if (!userId && payload.metadata?.userId) userId = parseInt(payload.metadata.userId);
+    if (!userId) { console.warn('[Webhook] Could not identify user for event:', event); return; }
+
+    // Determine participant phone (the external party, not our number)
+    const { data: settings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
+    const ourNumbers = (settings?.cached_phone_numbers || []).map(n => normalizePhone(n.number || n.phoneNumber || n));
+    const isInbound = payload.direction === 'inbound' || payload.direction === 'in' || event.includes('inbound') || event.includes('received');
+    const participantPhone = isInbound ? fromNumber : toNumber;
+    const ourNumber = isInbound ? toNumber : fromNumber;
+
+    // Find or create conversation
+    let conversation = null;
+    if (sigcoreConvId) {
+      const { data: existing } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
+      conversation = existing;
+    }
+    if (!conversation && participantPhone) {
+      const { data: byPhone } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle();
+      conversation = byPhone;
+    }
+    if (!conversation) {
+      const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
+        user_id: userId,
+        sigcore_conversation_id: sigcoreConvId,
+        provider: 'openphone',
+        channel: event.includes('call') ? 'call' : 'sms',
+        participant_phone: participantPhone,
+        participant_name: payload.contactName || null,
+        last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
+        last_event_at: payload.createdAt || new Date().toISOString(),
+        unread_count: isInbound ? 1 : 0,
+        is_read: !isInbound,
+      }).select().single();
+      if (createErr) { console.error('[Webhook] Create conversation error:', createErr); return; }
+      conversation = created;
+      // Auto-link to customer/lead
+      autoLinkConversation(userId, conversation.id, participantPhone);
+    }
+
+    // Handle message events
+    if (event.includes('message')) {
+      const sigcoreMessageId = payload.messageId || payload.id;
+      // Deduplicate
+      if (sigcoreMessageId) {
+        const { data: existing } = await supabase.from('communication_messages').select('id').eq('sigcore_message_id', sigcoreMessageId).maybeSingle();
+        if (existing) {
+          // Update status only
+          if (payload.status) await supabase.from('communication_messages').update({ status: payload.status }).eq('id', existing.id);
+          return;
+        }
+      }
+      await supabase.from('communication_messages').insert({
+        conversation_id: conversation.id,
+        sigcore_message_id: sigcoreMessageId,
+        provider_message_id: payload.providerMessageId || null,
+        direction: isInbound ? 'in' : 'out',
+        channel: 'sms',
+        body: payload.body || payload.content || '',
+        from_number: fromNumber,
+        to_number: toNumber,
+        sender_role: isInbound ? 'customer' : 'agent',
+        status: payload.status || 'delivered',
+        metadata: { event, sigcoreConvId },
+        created_at: payload.createdAt || new Date().toISOString()
+      });
+
+      // Update conversation
+      const updates = { last_event_at: payload.createdAt || new Date().toISOString(), updated_at: new Date().toISOString() };
+      if (payload.body) updates.last_preview = payload.body.substring(0, 200);
+      if (isInbound) updates.unread_count = (conversation.unread_count || 0) + 1;
+      if (sigcoreConvId && !conversation.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+      await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
+    }
+
+    // Handle call events
+    if (event.includes('call')) {
+      const sigcoreCallId = payload.callId || payload.id;
+      if (sigcoreCallId) {
+        const { data: existing } = await supabase.from('communication_calls').select('id').eq('sigcore_call_id', sigcoreCallId).maybeSingle();
+        if (existing) return; // Already processed
+      }
+      await supabase.from('communication_calls').insert({
+        conversation_id: conversation.id,
+        sigcore_call_id: sigcoreCallId,
+        provider_call_id: payload.providerCallId || null,
+        direction: isInbound ? 'in' : 'out',
+        from_number: fromNumber,
+        to_number: toNumber,
+        duration_seconds: payload.duration || payload.durationSeconds || 0,
+        status: payload.status || (event.includes('missed') ? 'missed' : 'completed'),
+        metadata: { event },
+        created_at: payload.createdAt || new Date().toISOString()
+      });
+      const callPreview = event.includes('missed') ? 'Missed call' : `Call (${Math.floor((payload.duration || 0) / 60)}m)`;
+      await supabase.from('communication_conversations').update({
+        last_preview: callPreview,
+        last_event_at: payload.createdAt || new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }).eq('id', conversation.id);
+    }
+  } catch (error) {
+    console.error('[Webhook] Processing error:', error.message);
+  }
+});
+
+// ── Phase 4: Sync/Backfill from Sigcore ──
+
+app.post('/api/communications/sync', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const settings = await getSigcoreSettings(userId);
+    if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
+
+    const tenantKey = settings.sigcore_tenant_api_key;
+
+    // Trigger sync at Sigcore
+    try { await sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }); } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
+
+    // Fetch conversations from Sigcore
+    let page = 1;
+    let totalSynced = 0;
+    let totalMessages = 0;
+
+    while (page <= 20) { // Cap at 20 pages
+      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=50`, tenantKey);
+      const conversations = convRes.data?.data || [];
+      if (conversations.length === 0) break;
+
+      for (const conv of conversations) {
+        const participantPhone = normalizePhone(conv.participantPhoneNumber);
+        // Upsert conversation
+        const { data: localConv, error: convErr } = await supabase.from('communication_conversations').upsert({
+          user_id: userId,
+          sigcore_conversation_id: conv.id || conv.externalId,
+          provider: 'openphone',
+          channel: 'sms',
+          participant_phone: participantPhone,
+          participant_name: conv.contactName || conv.metadata?.conversationName || null,
+          last_preview: conv.lastMessage || null,
+          last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
+          metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'sigcore_conversation_id', ignoreDuplicates: false }).select().single();
+
+        if (convErr) { console.error('[Sync] Conv upsert error:', convErr); continue; }
+
+        // Auto-link
+        if (!localConv.customer_id && !localConv.lead_id) {
+          autoLinkConversation(userId, localConv.id, participantPhone);
+        }
+
+        // Fetch messages for this conversation
+        try {
+          const msgRes = await sigcoreRequest('GET', `/conversations/${conv.id}/messages`, tenantKey);
+          const messages = msgRes.data?.data || [];
+          for (const msg of messages) {
+            const sigcoreId = msg.id;
+            // Deduplicate
+            const { data: existing } = await supabase.from('communication_messages').select('id').eq('sigcore_message_id', sigcoreId).maybeSingle();
+            if (existing) continue;
+
+            await supabase.from('communication_messages').insert({
+              conversation_id: localConv.id,
+              sigcore_message_id: sigcoreId,
+              provider_message_id: msg.providerMessageId || null,
+              direction: msg.direction === 'in' ? 'in' : 'out',
+              channel: msg.channel || 'sms',
+              body: msg.body || '',
+              from_number: normalizePhone(msg.fromNumber),
+              to_number: normalizePhone(msg.toNumber),
+              sender_role: msg.direction === 'in' ? 'customer' : 'agent',
+              status: msg.status || 'delivered',
+              metadata: { sigcoreConvId: conv.id },
+              created_at: msg.createdAt || new Date().toISOString()
+            });
+            totalMessages++;
+          }
+        } catch (e) { console.warn('[Sync] Messages fetch error for conv:', conv.id, e.message); }
+
+        totalSynced++;
+      }
+      page++;
+    }
+
+    console.log(`[Sync] Synced ${totalSynced} conversations, ${totalMessages} messages for user ${userId}`);
+    res.json({ success: true, conversations: totalSynced, messages: totalMessages });
+  } catch (error) {
+    console.error('Communications sync error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Sync failed' });
+  }
+});
+
+// ── Phase 5: Conversations API ──
+
+// GET /api/communications/conversations
+app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { filter, search, archived } = req.query;
+
+    let query = supabase.from('communication_conversations').select('*, customers(first_name, last_name, phone, email)')
+      .eq('user_id', userId).order('last_event_at', { ascending: false, nullsFirst: false });
+
+    if (archived !== 'true') query = query.eq('is_archived', false);
+    if (filter === 'unread') query = query.gt('unread_count', 0);
+    if (search) {
+      query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,last_preview.ilike.%${search}%`);
+    }
+
+    const { data, error } = await query.limit(100);
+    if (error) return res.status(500).json({ error: 'Failed to fetch conversations' });
+
+    // Map to frontend shape
+    const conversations = (data || []).map(c => ({
+      id: c.id,
+      sigcoreConversationId: c.sigcore_conversation_id,
+      displayName: c.participant_name || c.customers?.first_name ? `${c.customers?.first_name || ''} ${c.customers?.last_name || ''}`.trim() : '',
+      fallbackIdentifier: c.participant_phone,
+      lastPreview: c.last_preview,
+      lastEventAt: c.last_event_at,
+      unreadCount: c.unread_count || 0,
+      channels: [c.channel || 'sms'],
+      isArchived: c.is_archived,
+      customerId: c.customer_id,
+      leadId: c.lead_id,
+    }));
+
+    res.json({ conversations });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch conversations' });
+  }
+});
+
+// GET /api/communications/conversations/:id
+app.get('/api/communications/conversations/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: conv, error: convErr } = await supabase.from('communication_conversations')
+      .select('*, customers(id, first_name, last_name, phone, email)')
+      .eq('id', id).eq('user_id', userId).single();
+    if (convErr || !conv) return res.status(404).json({ error: 'Conversation not found' });
+
+    // Fetch messages
+    const { data: messages } = await supabase.from('communication_messages')
+      .select('*').eq('conversation_id', id).order('created_at', { ascending: true });
+
+    // Fetch calls
+    const { data: calls } = await supabase.from('communication_calls')
+      .select('*').eq('conversation_id', id).order('created_at', { ascending: true });
+
+    // Merge into unified timeline
+    const events = [
+      ...(messages || []).map(m => ({
+        id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
+        type: m.direction === 'in' ? 'message_in' : 'message_out',
+        senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
+        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id
+      })),
+      ...(calls || []).map(c => ({
+        id: `call-${c.id}`, conversationId: id, channel: 'call',
+        type: c.direction === 'in' ? 'call_in' : 'call_out',
+        senderRole: c.direction === 'in' ? 'customer' : 'agent',
+        text: c.status === 'missed' ? 'Missed call' : 'Call',
+        timestamp: c.created_at, callDurationSeconds: c.duration_seconds,
+        sigcoreId: c.sigcore_call_id
+      }))
+    ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // Mark as read
+    if (conv.unread_count > 0) {
+      await supabase.from('communication_conversations').update({ unread_count: 0, is_read: true }).eq('id', id);
+    }
+
+    // Get available send channels from phone numbers
+    const settings = await getSigcoreSettings(userId);
+    const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
+
+    // Build lead data from customer
+    let lead = null;
+    if (conv.customers) {
+      lead = {
+        id: conv.customers.id, name: `${conv.customers.first_name || ''} ${conv.customers.last_name || ''}`.trim(),
+        phone: conv.customers.phone, email: conv.customers.email,
+        source: conv.provider, tags: [], status: 'Customer'
+      };
+    }
+
+    res.json({ events, availableSendChannels, lead, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
+  } catch (error) {
+    console.error('Conversation detail error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversation' });
+  }
+});
+
+// POST /api/communications/conversations/:id/send — send via Sigcore
+app.post('/api/communications/conversations/:id/send', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { text, channel } = req.body;
+    if (!text?.trim()) return res.status(400).json({ error: 'Message text is required' });
+
+    const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
+    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+    const settings = await getSigcoreSettings(userId);
+    if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
+
+    // Find sender (first available phone number)
+    const phoneNumbers = settings.cached_phone_numbers || [];
+    if (phoneNumbers.length === 0) return res.status(400).json({ error: 'No phone numbers available' });
+
+    // Send via Sigcore
+    let sendResult;
+    if (conv.sigcore_conversation_id) {
+      // Use conversation-based send
+      sendResult = await sigcoreRequest('POST', '/messages', settings.sigcore_tenant_api_key, {
+        body: text.trim(),
+        senderId: phoneNumbers[0].id || phoneNumbers[0].senderId,
+        conversationId: conv.sigcore_conversation_id
+      });
+    } else {
+      // Use phone-based send
+      sendResult = await sigcoreRequest('POST', '/internal/messages/send', settings.sigcore_tenant_api_key, {
+        businessId: String(userId),
+        toPhone: conv.participant_phone,
+        body: text.trim()
+      });
+    }
+
+    const sentMsg = sendResult.data?.data || sendResult.data || {};
+
+    // Insert local copy
+    const { data: localMsg } = await supabase.from('communication_messages').insert({
+      conversation_id: conv.id,
+      sigcore_message_id: sentMsg.id || null,
+      provider_message_id: sentMsg.providerMessageId || null,
+      direction: 'out', channel: 'sms', body: text.trim(),
+      from_number: phoneNumbers[0]?.number || phoneNumbers[0]?.phoneNumber,
+      to_number: conv.participant_phone,
+      sender_role: 'agent', status: sentMsg.status || 'sent',
+      created_at: new Date().toISOString()
+    }).select().single();
+
+    // Update conversation
+    await supabase.from('communication_conversations').update({
+      last_preview: text.trim().substring(0, 200),
+      last_event_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('id', conv.id);
+
+    res.json({
+      id: `msg-${localMsg?.id}`, conversationId: id, channel: 'openphone',
+      type: 'message_out', senderRole: 'agent', text: text.trim(),
+      timestamp: new Date().toISOString(), status: sentMsg.status || 'sent'
+    });
+  } catch (error) {
+    console.error('Send message error:', error.response?.data || error.message);
+    res.status(500).json({ error: error.response?.data?.message || 'Failed to send message' });
+  }
+});
+
+// PATCH /api/communications/conversations/:id — update CRM state (archive, read, link)
+app.patch('/api/communications/conversations/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { is_archived, is_read, unread_count, customer_id, lead_id } = req.body;
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (is_archived !== undefined) updates.is_archived = is_archived;
+    if (is_read !== undefined) updates.is_read = is_read;
+    if (unread_count !== undefined) updates.unread_count = unread_count;
+    if (customer_id !== undefined) updates.customer_id = customer_id;
+    if (lead_id !== undefined) updates.lead_id = lead_id;
+
+    const { error } = await supabase.from('communication_conversations').update(updates).eq('id', id).eq('user_id', userId);
+    if (error) return res.status(500).json({ error: 'Failed to update conversation' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update conversation' });
+  }
+});
+
+// ============================================================
+// END COMMUNICATIONS SYSTEM
+// ============================================================
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found' });
