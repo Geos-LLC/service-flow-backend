@@ -33706,10 +33706,10 @@ let SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
 // Load Sigcore config from DB on startup
 (async () => {
   try {
-    const { data } = await supabase.from('admin_global_settings').select('value').eq('key', 'sigcore').maybeSingle();
-    if (data?.value) {
-      if (data.value.sigcore_url) SIGCORE_URL = data.value.sigcore_url;
-      if (data.value.sigcore_workspace_key) SIGCORE_WORKSPACE_KEY = data.value.sigcore_workspace_key;
+    const { data } = await supabase.from('communication_settings').select('*').eq('sigcore_tenant_id', 'global_workspace').maybeSingle();
+    if (data) {
+      if (data.preferences?.sigcore_url) SIGCORE_URL = data.preferences.sigcore_url;
+      if (data.sigcore_tenant_api_key) SIGCORE_WORKSPACE_KEY = data.sigcore_tenant_api_key;
       console.log('[Sigcore] Loaded config from DB:', SIGCORE_URL ? 'URL set' : 'no URL', SIGCORE_WORKSPACE_KEY ? 'key set' : 'no key');
     }
   } catch (e) { /* table may not exist yet */ }
@@ -34355,44 +34355,52 @@ function authenticateAdmin(req, res, next) {
 // GET /api/admin/global-settings — Sigcore connection config
 app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
-    const { data: setting } = await supabase.from('admin_global_settings').select('*').eq('key', 'sigcore').maybeSingle();
+    // Read from communication_settings where sigcore_tenant_id='global_workspace'
+    const { data: setting } = await supabase.from('communication_settings').select('*').eq('sigcore_tenant_id', 'global_workspace').maybeSingle();
+    if (setting) {
+      return res.json({
+        sigcoreUrl: setting.preferences?.sigcore_url || SIGCORE_URL || '',
+        sigcoreWorkspaceKey: setting.sigcore_tenant_api_key || '',
+        sigcoreConnected: setting.connection_status === 'connected',
+      });
+    }
+    // Fallback to in-memory
     res.json({
-      sigcoreUrl: setting?.value?.sigcore_url || process.env.SIGCORE_URL || '',
-      sigcoreWorkspaceKey: setting?.value?.sigcore_workspace_key || process.env.SIGCORE_WORKSPACE_KEY || '',
-      sigcoreConnected: setting?.value?.connected || false,
+      sigcoreUrl: SIGCORE_URL || '',
+      sigcoreWorkspaceKey: SIGCORE_WORKSPACE_KEY || '',
+      sigcoreConnected: !!SIGCORE_WORKSPACE_KEY,
     });
   } catch (error) {
-    // Table might not exist yet — return env defaults
-    res.json({
-      sigcoreUrl: process.env.SIGCORE_URL || '',
-      sigcoreWorkspaceKey: process.env.SIGCORE_WORKSPACE_KEY ? '••••••' + process.env.SIGCORE_WORKSPACE_KEY.slice(-8) : '',
-      sigcoreConnected: !!process.env.SIGCORE_WORKSPACE_KEY,
-    });
+    res.json({ sigcoreUrl: SIGCORE_URL || '', sigcoreWorkspaceKey: SIGCORE_WORKSPACE_KEY || '', sigcoreConnected: false });
   }
 });
 
 // PUT /api/admin/global-settings — save Sigcore URL + workspace key
+// Uses communication_settings table (user_id=0 as global marker) since admin_global_settings may not exist
 app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
     const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
     if (!sigcoreWorkspaceKey) return res.status(400).json({ error: 'Workspace API key is required' });
 
-    // Ensure table exists
-    try {
-      await supabase.from('admin_global_settings').select('key').limit(1);
-    } catch (e) {
-      await axios.post('https://api.supabase.com/v1/projects/ezyhbvskbwmwgwyduqpt/database/query', {
-        query: "CREATE TABLE IF NOT EXISTS public.admin_global_settings (key text PRIMARY KEY, value jsonb DEFAULT '{}'::jsonb, updated_at timestamptz DEFAULT NOW()); NOTIFY pgrst, 'reload schema';"
-      }, { headers: { Authorization: 'Bearer sbp_c389bf53aa31e8d1880ee5889c9d88842919af64', 'Content-Type': 'application/json' } }).catch(() => {});
-    }
-
     const url = sigcoreUrl || 'https://sigcore-production.up.railway.app/api';
 
-    await supabase.from('admin_global_settings').upsert({
-      key: 'sigcore',
-      value: { sigcore_url: url, sigcore_workspace_key: sigcoreWorkspaceKey, connected: false },
+    // Store globally — find the first user (account owner) to anchor the record
+    const { data: firstUser } = await supabase.from('users').select('id').order('id', { ascending: true }).limit(1).single();
+    const globalUserId = firstUser?.id || 1;
+
+    const { error: upsertErr } = await supabase.from('communication_settings').upsert({
+      user_id: globalUserId,
+      sigcore_tenant_id: 'global_workspace',
+      sigcore_tenant_api_key: sigcoreWorkspaceKey,
+      connection_status: 'connected',
+      preferences: { sigcore_url: url, is_global: true },
       updated_at: new Date().toISOString()
-    }, { onConflict: 'key' });
+    }, { onConflict: 'user_id' });
+
+    if (upsertErr) {
+      console.error('Admin save error:', upsertErr);
+      return res.status(500).json({ error: 'Failed to save: ' + upsertErr.message });
+    }
 
     // Update in-memory for immediate use
     SIGCORE_URL = url;
