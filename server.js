@@ -4004,10 +4004,7 @@ function isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, d
     if (!isJobAssignedToWorker(job, worker.id)) continue;
 
     const jobStartMin = schedTimeToMinutes(job.scheduled_time);
-    const rawDuration = job.duration || durationMinutes;
-    // Multi-cleaner jobs: wall-clock time = total duration / number of workers
-    const jobWorkers = parseInt(job.workers) || 1;
-    const jobDuration = jobWorkers > 1 ? Math.round(rawDuration / jobWorkers) : rawDuration;
+    const jobDuration = job.duration || durationMinutes;
     const jobEndMin = jobStartMin + jobDuration;
 
     // Use per-job location-based driving time if available, else global fallback
@@ -20383,16 +20380,17 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           const hr = parseFloat(member.hourly_rate) || 0;
           const cp = parseFloat(member.commission_percentage) || 0;
           let amount = 0;
-          if (hr > 0 && cp > 0) amount = ((hours / mc) * hr) + ((revenue / mc) * cp / 100);
+          // Duration is wall-clock time — each cleaner works full hours; only revenue is split
+          if (hr > 0 && cp > 0) amount = (hours * hr) + ((revenue / mc) * cp / 100);
           else if (cp > 0) amount = (revenue / mc) * cp / 100;
-          else if (hr > 0) amount = (hours / mc) * hr;
+          else if (hr > 0) amount = hours * hr;
 
           const projected = {
             team_member_id: member.id,
             job_id: job.id,
             type: 'earning',
             amount: parseFloat(amount.toFixed(2)),
-            metadata: { hours: hours / mc, revenue, hourly_rate: hr, commission_pct: cp, member_count: mc, projected: true }
+            metadata: { hours, revenue, hourly_rate: hr, commission_pct: cp, member_count: mc, projected: true }
           };
           if (!entriesByMember[member.id]) entriesByMember[member.id] = [];
           entriesByMember[member.id].push(projected);
@@ -20463,11 +20461,11 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
               commissionSalary += entryRevenue * (entryCommPct / 100);
               commissionRevenueBase += entryRevenue;
             }
-            // Use estimated hours from job for display, not real time from ledger
+            // Use estimated hours from job for display — duration is wall-clock time per cleaner
             if (entry.job_id && allJobsById[entry.job_id]) {
               const j = allJobsById[entry.job_id];
               const estMin = j.duration || j.estimated_duration || 0;
-              totalHours += estMin > 0 ? (estMin / 60 / mc) : entryHours;
+              totalHours += estMin > 0 ? (estMin / 60) : entryHours;
             } else {
               totalHours += entryHours;
             }
@@ -20870,9 +20868,9 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
           hours = parseFloat(job.estimated_duration) / 60;
         }
 
-        // Multi-cleaner jobs: each cleaner works hours/memberCount
+        // Duration is wall-clock time — each cleaner works the full hours
+        // Only revenue is split among members
         const jobMemberCount = job._memberCount || 1;
-        hours = hours / jobMemberCount;
 
         // Get revenue — split per member for multi-cleaner jobs
         const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0) / jobMemberCount;
@@ -32263,18 +32261,19 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     // but still get tips/incentives below
     if (!isManager) {
       let earningAmount = 0;
+      // Duration is wall-clock time — each cleaner works the full hours
+      // Only commission/revenue is split by memberCount
       if (hourlyRate > 0 && commissionPct > 0) {
-        // Hybrid: hourly + commission (same as Payroll)
-        const hourlyPay = (hoursWorked / memberCount) * hourlyRate;
+        // Hybrid: hourly (full hours) + commission (split revenue)
+        const hourlyPay = hoursWorked * hourlyRate;
         const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
         earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
       } else if (commissionPct > 0) {
         earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
       } else if (hourlyRate > 0) {
-        earningAmount = parseFloat(((hoursWorked / memberCount) * hourlyRate).toFixed(2));
+        earningAmount = parseFloat((hoursWorked * hourlyRate).toFixed(2));
       }
       // No fallback: if worker has no hourly rate and no commission, earning = $0
-      // (matches Payroll which gives hourlySalary=0 + commission=0)
 
       if (earningAmount > 0) {
         ledgerEntries.push({
@@ -32285,7 +32284,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
           amount: earningAmount,
           effective_date: effectiveDate,
           note: `Earning for job #${jobId}`,
-          metadata: { hours: hoursWorked / memberCount, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+          metadata: { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
           created_by: userId
         });
       }
