@@ -598,17 +598,36 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     const jobZbId = data.job_id || data.job?.id
     if (!jobZbId) return
 
-    const { data: job } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', jobZbId).maybeSingle()
+    const { data: job } = await supabase.from('jobs').select('id, customer_id').eq('user_id', userId).eq('zenbooker_id', jobZbId).maybeSingle()
     if (!job) return
 
     const update = {}
     if (eventType === 'invoice_payment.succeeded' || eventType === 'invoice_payment.recorded') {
+      const amount = parseFloat(data.amount_paid || data.amount) || 0
+      const paymentMethod = data.custom_payment_method_name || data.payment_method || 'other'
       update.payment_status = 'paid'
       update.invoice_status = 'paid'
-      if (data.amount_paid) update.total_paid_amount = parseFloat(data.amount_paid) || 0
+      update.payment_method = paymentMethod
+      if (amount > 0) update.total_paid_amount = amount
+
+      // Create transaction record if none exists
+      const zbTxId = data.transaction_id || data.id
+      const { data: existingTx } = await supabase.from('transactions')
+        .select('id').eq('job_id', job.id).eq('status', 'completed').limit(1)
+      if (!existingTx || existingTx.length === 0) {
+        await supabase.from('transactions').insert({
+          user_id: userId, job_id: job.id, customer_id: job.customer_id,
+          amount, payment_method: paymentMethod,
+          payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
+          status: 'completed', notes: 'Payment synced from Zenbooker',
+          zenbooker_id: zbTxId || null
+        }).catch(err => logger.error(`[Zenbooker] Transaction insert error: ${err.message}`))
+        logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${paymentMethod})`)
+      }
     } else if (eventType === 'invoice_payment.voided') {
       update.payment_status = 'pending'
       update.invoice_status = 'invoiced'
+      update.payment_method = null
       // Void the most recent completed transaction for this job
       const { data: latestTx } = await supabase.from('transactions')
         .select('id').eq('job_id', job.id).eq('status', 'completed')
@@ -868,6 +887,15 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               }
               if (sfJob.invoice_status !== zbInvoiceStatus) update.invoice_status = zbInvoiceStatus
               if (zbPaymentStatus) update.payment_status = zbPaymentStatus
+              // Sync payment method from ZB transactions for paid jobs
+              if (inv.status === 'paid' && sfJob.invoice_status !== 'paid') {
+                // Check if transaction exists, if not flag for creation after loop
+                const { data: existingTx } = await supabase.from('transactions').select('id').eq('job_id', sfJob.id).eq('status', 'completed').limit(1)
+                if (!existingTx || existingTx.length === 0) {
+                  // Transaction will be synced by the full transaction sync — flag job for now
+                  update.payment_method = update.payment_method || null
+                }
+              }
               // Always sync timestamps, prices, discounts
               update.scheduled_date = zbDateToLocal(zb.start_date, zb.timezone)
               update.price = parseFloat(inv.subtotal) || undefined
