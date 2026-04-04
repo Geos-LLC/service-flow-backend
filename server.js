@@ -33710,7 +33710,7 @@ let SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
     if (data) {
       if (data.preferences?.sigcore_url) SIGCORE_URL = data.preferences.sigcore_url;
       if (data.sigcore_tenant_api_key) SIGCORE_WORKSPACE_KEY = data.sigcore_tenant_api_key;
-      console.log('[Sigcore] Loaded config from DB:', SIGCORE_URL ? 'URL set' : 'no URL', SIGCORE_WORKSPACE_KEY ? 'key set' : 'no key');
+      logger.log('[Sigcore] Loaded config from DB: ' + (SIGCORE_URL ? 'URL set' : 'no URL') + ', ' + (SIGCORE_WORKSPACE_KEY ? 'key set' : 'no key'));
     }
   } catch (e) { /* table may not exist yet */ }
 })();
@@ -33755,7 +33755,7 @@ async function autoLinkConversation(userId, conversationId, phone) {
   const { data: customer, error: custErr } = await supabase.from('customers')
     .select('id, first_name, last_name')
     .eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
-  if (custErr) console.warn('[AutoLink] Customer query error:', custErr.message);
+  if (custErr) logger.warn('[AutoLink] Customer query error:', custErr.message);
   if (customer) {
     const name = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
     await supabase.from('communication_conversations').update({
@@ -33833,10 +33833,10 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
       updated_at: new Date().toISOString()
     }, { onConflict: 'user_id' });
 
-    console.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
+    logger.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
     res.json({ success: true, phoneNumbers, tenantId });
   } catch (error) {
-    console.error('Communications connect error:', error.response?.data || error.message);
+    logger.error('Communications connect error:', error.response?.data || error.message);
     const msg = error.response?.data?.message || error.response?.data?.error || error.message || 'Failed to connect OpenPhone';
     res.status(error.response?.status || 500).json({ error: msg });
   }
@@ -33888,10 +33888,10 @@ app.delete('/api/communications/disconnect-openphone', authenticateToken, async 
     if (!settings?.sigcore_tenant_api_key) return res.json({ success: true });
 
     // Disconnect from Sigcore (best effort)
-    try { await sigcoreRequest('DELETE', '/integrations/openphone/disconnect', settings.sigcore_tenant_api_key); } catch (e) { console.warn('Sigcore disconnect warning:', e.message); }
+    try { await sigcoreRequest('DELETE', '/integrations/openphone/disconnect', settings.sigcore_tenant_api_key); } catch (e) { logger.warn('Sigcore disconnect warning:', e.message); }
     // Remove webhook subscription
     if (settings.sigcore_webhook_subscription_id) {
-      try { await sigcoreRequest('DELETE', `/v1/webhook-subscriptions/${settings.sigcore_webhook_subscription_id}`, settings.sigcore_tenant_api_key); } catch (e) { console.warn('Webhook unsubscribe warning:', e.message); }
+      try { await sigcoreRequest('DELETE', `/v1/webhook-subscriptions/${settings.sigcore_webhook_subscription_id}`, settings.sigcore_tenant_api_key); } catch (e) { logger.warn('Webhook unsubscribe warning:', e.message); }
     }
 
     await supabase.from('communication_settings').update({
@@ -33900,10 +33900,10 @@ app.delete('/api/communications/disconnect-openphone', authenticateToken, async 
       updated_at: new Date().toISOString()
     }).eq('user_id', userId);
 
-    console.log(`[Communications] OpenPhone disconnected for user ${userId}`);
+    logger.log(`[Communications] OpenPhone disconnected for user ${userId}`);
     res.json({ success: true });
   } catch (error) {
-    console.error('Communications disconnect error:', error.message);
+    logger.error('Communications disconnect error:', error.message);
     res.status(500).json({ error: 'Failed to disconnect OpenPhone' });
   }
 });
@@ -33935,7 +33935,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
     const payload = req.body?.data || req.body;
     if (!event || !payload) return;
 
-    console.log(`[Webhook] Sigcore event: ${event}`, JSON.stringify(payload).substring(0, 200));
+    logger.log(`[Webhook] Sigcore event: ${event}`, JSON.stringify(payload).substring(0, 200));
 
     // Determine user by matching phone number to communication_settings
     const fromNumber = normalizePhone(payload.fromNumber || payload.from_number);
@@ -33953,7 +33953,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }
     }
     if (!userId && payload.metadata?.userId) userId = parseInt(payload.metadata.userId);
-    if (!userId) { console.warn('[Webhook] Could not identify user for event:', event); return; }
+    if (!userId) { logger.warn('[Webhook] Could not identify user for event:', event); return; }
 
     // Determine participant phone (the external party, not our number)
     const { data: settings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
@@ -33985,7 +33985,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         unread_count: isInbound ? 1 : 0,
         is_read: !isInbound,
       }).select().single();
-      if (createErr) { console.error('[Webhook] Create conversation error:', createErr); return; }
+      if (createErr) { logger.error('[Webhook] Create conversation error:', createErr); return; }
       conversation = created;
       // Auto-link to customer/lead
       autoLinkConversation(userId, conversation.id, participantPhone);
@@ -34053,7 +34053,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }).eq('id', conversation.id);
     }
   } catch (error) {
-    console.error('[Webhook] Processing error:', error.message);
+    logger.error('[Webhook] Processing error:', error.message);
   }
 });
 
@@ -34078,7 +34078,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       for (const pnId of phoneNumberIds) {
         sigcoreRequest('POST', '/integrations/sync', tenantKey, {
           syncMessages: true, phoneNumberId: pnId, provider: 'openphone'
-        }).catch(e => console.warn(`[Sync] Sigcore background sync for ${pnId}:`, e.message));
+        }).catch(e => logger.warn(`[Sync] Sigcore background sync for ${pnId}:`, e.message));
       }
     }
 
@@ -34094,9 +34094,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         const days = maxConversations > 0 ? 7 : 90; // test = 7 days, full = 90 days
         const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?phoneNumberId=${pnId}&days=${days}`, tenantKey);
         const convs = convRes.data?.data || convRes.data || [];
-        console.log(`[Sync] Fetched ${convs.length} conversations for phone ${pnId} (${days} days)`);
+        logger.log(`[Sync] Fetched ${convs.length} conversations for phone ${pnId} (${days} days)`);
         allConversations = allConversations.concat(convs.map(c => ({ ...c, _phoneNumberId: pnId })));
-      } catch (e) { console.warn(`[Sync] Failed to fetch conversations for ${pnId}:`, e.message); }
+      } catch (e) { logger.warn(`[Sync] Failed to fetch conversations for ${pnId}:`, e.message); }
     }
 
     // Sort by most recent first, apply limit
@@ -34152,7 +34152,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
               last_event_at: lastActivity,
               metadata: { phoneNumberId },
             }).select().single();
-            if (convErr) { console.error('[Sync] Insert error:', convErr.message); commSyncProgress[userId].errors++; continue; }
+            if (convErr) { logger.error('[Sync] Insert error:', convErr.message); commSyncProgress[userId].errors++; continue; }
             localConv = created;
           }
 
@@ -34196,9 +34196,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         } catch (e) { commSyncProgress[userId].errors++; }
       }
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
-    console.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
+    logger.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
   } catch (error) {
-    console.error('Sync error:', error.response?.data || error.message);
+    logger.error('Sync error:', error.response?.data || error.message);
     commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
   }
 }
@@ -34245,7 +34245,7 @@ app.post('/api/communications/relink', authenticateToken, async (req, res) => {
       const result = await autoLinkConversation(userId, conv.id, conv.participant_phone);
       if (result) linked++;
     }
-    console.log(`[Relink] Linked ${linked}/${(unlinked || []).length} conversations for user ${userId}`);
+    logger.log(`[Relink] Linked ${linked}/${(unlinked || []).length} conversations for user ${userId}`);
     res.json({ total: (unlinked || []).length, linked });
   } catch (error) {
     res.status(500).json({ error: 'Relink failed' });
@@ -34355,7 +34355,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
 
     res.json({ events, availableSendChannels, lead, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
   } catch (error) {
-    console.error('Conversation detail error:', error);
+    logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
   }
 });
@@ -34423,7 +34423,7 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
       timestamp: new Date().toISOString(), status: sentMsg.status || 'sent'
     });
   } catch (error) {
-    console.error('Send message error:', error.response?.data || error.message);
+    logger.error('Send message error:', error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data?.message || 'Failed to send message' });
   }
 });
@@ -34529,7 +34529,7 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
     }, { onConflict: 'user_id' });
 
     if (upsertErr) {
-      console.error('Admin save error:', upsertErr);
+      logger.error('Admin save error:', upsertErr);
       return res.status(500).json({ error: 'Failed to save: ' + upsertErr.message });
     }
 
@@ -34539,7 +34539,7 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Admin save settings error:', error);
+    logger.error('Admin save settings error:', error);
     res.status(500).json({ error: 'Failed to save settings' });
   }
 });
@@ -34579,7 +34579,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     const { data: allUsers, error } = await supabase.from('users')
       .select('*')
       .order('id', { ascending: true });
-    if (error) { console.error('Admin users query error:', error); return res.status(500).json({ error: 'Failed to fetch users' }); }
+    if (error) { logger.error('Admin users query error:', error); return res.status(500).json({ error: 'Failed to fetch users' }); }
 
     // Fetch communication settings for all users
     const { data: commSettings } = await supabase.from('communication_settings')
@@ -34604,7 +34604,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
 
     res.json({ users });
   } catch (error) {
-    console.error('Admin users error:', error);
+    logger.error('Admin users error:', error);
     res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
