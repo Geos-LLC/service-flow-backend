@@ -34072,8 +34072,15 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
 
-    // Skip Sigcore POST /integrations/sync — it syncs ALL numbers and is slow.
-    // We fetch directly from OpenPhone via Sigcore's live endpoint per phone number.
+    // Trigger Sigcore sync for each of our phone numbers (background, non-blocking)
+    // This stores conversations in Sigcore's DB for future webhook-based updates
+    if (!skipSigcoreSync) {
+      for (const pnId of phoneNumberIds) {
+        sigcoreRequest('POST', '/integrations/sync', tenantKey, {
+          syncMessages: true, phoneNumberId: pnId, provider: 'openphone'
+        }).catch(e => console.warn(`[Sync] Sigcore background sync for ${pnId}:`, e.message));
+      }
+    }
 
     // Fetch conversations directly from OpenPhone via Sigcore's live endpoint
     // This bypasses Sigcore's stored conversations (which may only have Callio's data)
