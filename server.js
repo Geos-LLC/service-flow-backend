@@ -34080,7 +34080,6 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     // Sync per phone number to ensure we only get conversations for our numbers
     let totalSynced = 0;
     let totalMessages = 0;
-    const perNumberLimit = maxConversations > 0 ? Math.ceil(maxConversations / Math.max(phoneNumberIds.length, 1)) : 0;
 
     // If no phone number IDs, fetch all (fallback)
     const numbersToSync = phoneNumberIds.length > 0 ? phoneNumberIds : [null];
@@ -34097,11 +34096,13 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     commSyncProgress[userId].phase = 'syncing';
 
     for (const pnId of numbersToSync) {
+      if (maxConversations > 0 && totalSynced >= maxConversations) break;
       const filter = pnId ? `&phoneNumberId=${pnId}` : '';
-      const numberLimit = perNumberLimit || 0;
+      // Each number gets the remaining limit (not split evenly)
+      const remaining = maxConversations > 0 ? maxConversations - totalSynced : 0;
       let page = 1;
-      const pageSize = numberLimit > 0 ? Math.min(numberLimit, 50) : 50;
-      const maxPages = numberLimit > 0 ? Math.ceil(numberLimit / pageSize) : 100;
+      const pageSize = remaining > 0 ? Math.min(remaining, 50) : 50;
+      const maxPages = remaining > 0 ? Math.ceil(remaining / pageSize) : 100;
 
     while (page <= maxPages) {
       if (maxConversations > 0 && totalSynced >= maxConversations) break;
