@@ -32785,6 +32785,46 @@ app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
   }
 });
 
+// PATCH /api/ledger/cash-collected/:jobId/:teamMemberId - Update cash collected amount for a specific member on a job
+app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const jobId = parseInt(req.params.jobId);
+    const teamMemberId = parseInt(req.params.teamMemberId);
+    const { amount } = req.body;
+
+    if (amount === undefined) return res.status(400).json({ error: 'amount is required' });
+
+    // Verify job belongs to user
+    const { data: job } = await supabase.from('jobs').select('id, scheduled_date').eq('id', jobId).eq('user_id', userId).single();
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    const parsedAmount = Math.abs(parseFloat(amount));
+    const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
+
+    // Delete existing cash_collected entry for this member on this job
+    await supabase.from('cleaner_ledger').delete()
+      .eq('job_id', jobId).eq('team_member_id', teamMemberId).eq('type', 'cash_collected');
+
+    // Create new entry if amount > 0
+    if (parsedAmount > 0) {
+      await supabase.from('cleaner_ledger').insert({
+        user_id: userId, team_member_id: teamMemberId, job_id: jobId,
+        type: 'cash_collected', amount: -parsedAmount,
+        effective_date: effectiveDate,
+        note: `Cash collected for job #${jobId} (manual)`,
+        metadata: { manual: true },
+        created_by: userId
+      });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update cash collected error:', error);
+    res.status(500).json({ error: 'Failed to update cash collected' });
+  }
+});
+
 // POST /api/ledger/cash-to-company - Record cash delivered to company (no salary impact)
 app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
   try {
