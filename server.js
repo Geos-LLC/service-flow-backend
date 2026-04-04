@@ -34072,72 +34072,67 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
 
-    // Trigger Sigcore OpenPhone sync only for full syncs (not test/limited)
-    if (!skipSigcoreSync) {
-      commSyncProgress[userId].phase = 'sigcore_sync';
-      try {
-        await Promise.race([
-          sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Sigcore sync trigger timeout')), 30000))
-        ]);
-      } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
-    }
+    // Skip Sigcore POST /integrations/sync — it syncs ALL numbers and is slow.
+    // We fetch directly from OpenPhone via Sigcore's live endpoint per phone number.
 
-    // Fetch all conversations from Sigcore, filter client-side by our phone numbers
+    // Fetch conversations directly from OpenPhone via Sigcore's live endpoint
+    // This bypasses Sigcore's stored conversations (which may only have Callio's data)
     let totalSynced = 0;
     let totalMessages = 0;
-    let totalSkipped = 0;
 
-    // Count total
-    const countRes = await sigcoreRequest('GET', '/conversations?page=1&limit=1', tenantKey);
-    const totalAvailable = countRes.data?.meta?.total || 0;
-    const totalLimit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
+    // Get conversations for each of our phone numbers from OpenPhone (via Sigcore)
+    let allConversations = [];
+    for (const pnId of phoneNumberIds) {
+      try {
+        const days = maxConversations > 0 ? 7 : 90; // test = 7 days, full = 90 days
+        const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?phoneNumberId=${pnId}&days=${days}`, tenantKey);
+        const convs = convRes.data?.data || convRes.data || [];
+        console.log(`[Sync] Fetched ${convs.length} conversations for phone ${pnId} (${days} days)`);
+        allConversations = allConversations.concat(convs.map(c => ({ ...c, _phoneNumberId: pnId })));
+      } catch (e) { console.warn(`[Sync] Failed to fetch conversations for ${pnId}:`, e.message); }
+    }
+
+    // Sort by most recent first, apply limit
+    allConversations.sort((a, b) => new Date(b.lastActivityAt || b.createdAt || 0) - new Date(a.lastActivityAt || a.createdAt || 0));
+    if (maxConversations > 0) allConversations = allConversations.slice(0, maxConversations);
+
+    const totalLimit = allConversations.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
 
-    let page = 1;
-    const pageSize = 50;
-    const maxPages = maxConversations > 0 ? 20 : 100; // cap pages
+      for (const conv of allConversations) {
 
-    while (page <= maxPages) {
-      if (maxConversations > 0 && totalSynced >= maxConversations) break;
-      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}`, tenantKey);
-      const conversations = convRes.data?.data || [];
-      if (conversations.length === 0) break;
+        // OpenPhone conversations endpoint returns different fields than Sigcore stored conversations
+        const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participants?.[0]);
+        const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
+        const contactName = conv.contactName || conv.name || conv.resolvedName || null;
+        const lastMsg = conv.lastMessage || conv.snippet || null;
+        const lastActivity = conv.lastActivityAt || conv.lastMessageAt || conv.updatedAt || null;
+        const phoneNumberId = conv._phoneNumberId || conv.phoneNumberId || null;
 
-      for (const conv of conversations) {
-        if (maxConversations > 0 && totalSynced >= maxConversations) break;
-
-        // Filter: only sync conversations from OUR phone numbers
-        if (ourPhoneNumbers.length > 0) {
-          const convPhone = normalizePhone(conv.phoneNumber);
-          if (convPhone && !ourPhoneNumbers.includes(convPhone)) {
-            totalSkipped++;
-            continue; // Not our number — skip
-          }
-        }
-
-        const participantPhone = normalizePhone(conv.participantPhoneNumber);
         try {
-          const sigcoreConvId = conv.id || conv.externalId;
-          // Check if already exists
           let localConv = null;
+          // Try to find by sigcore ID or by participant phone
           const { data: existing } = await supabase.from('communication_conversations')
             .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
+          if (!existing && participantPhone) {
+            const { data: byPhone } = await supabase.from('communication_conversations')
+              .select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle();
+            if (byPhone) {
+              // Update sigcore ID on existing
+              await supabase.from('communication_conversations').update({ sigcore_conversation_id: sigcoreConvId }).eq('id', byPhone.id);
+            }
+          }
+          const found = existing || (participantPhone ? (await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle()).data : null);
 
-          // Determine best name: Sigcore contactName or metadata
-          const sigcoreName = conv.contactName || conv.metadata?.conversationName || null;
-
-          if (existing) {
-            const updates = {
-              last_preview: conv.lastMessage || existing.last_preview,
-              last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || existing.last_event_at,
-              updated_at: new Date().toISOString()
-            };
-            // Only overwrite name if we have a better one from Sigcore and existing has none
-            if (sigcoreName && !existing.participant_name) updates.participant_name = sigcoreName;
-            const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', existing.id).select().single();
-            localConv = updated || existing;
+          if (found) {
+            const updates = { updated_at: new Date().toISOString() };
+            if (lastMsg && !found.last_preview) updates.last_preview = lastMsg;
+            if (lastActivity) updates.last_event_at = lastActivity;
+            if (contactName && !found.participant_name) updates.participant_name = contactName;
+            if (!found.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+            const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
+            localConv = updated || found;
           } else {
             const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
               user_id: userId,
@@ -34145,12 +34140,12 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
               provider: 'openphone',
               channel: 'sms',
               participant_phone: participantPhone,
-              participant_name: sigcoreName,
-              last_preview: conv.lastMessage || null,
-              last_event_at: conv.lastMessageAt || conv.metadata?.lastActivityAt || null,
-              metadata: { sigcoreExternalId: conv.externalId, phoneNumberId: conv.metadata?.phoneNumberId },
+              participant_name: contactName,
+              last_preview: lastMsg,
+              last_event_at: lastActivity,
+              metadata: { phoneNumberId },
             }).select().single();
-            if (convErr) { console.error('[Sync] Insert conv error:', convErr.message); commSyncProgress[userId].errors++; continue; }
+            if (convErr) { console.error('[Sync] Insert error:', convErr.message); commSyncProgress[userId].errors++; continue; }
             localConv = created;
           }
 
@@ -34193,12 +34188,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           commSyncProgress[userId].messages = totalMessages;
         } catch (e) { commSyncProgress[userId].errors++; }
       }
-      if (maxConversations > 0 && totalSynced >= maxConversations) break;
-      page++;
-    } // end while pages
-
-    commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, skipped: totalSkipped, phase: 'done' };
-    console.log(`[Sync] Done: ${totalSynced} synced, ${totalSkipped} skipped (other numbers), ${totalMessages} messages for user ${userId}`);
+    commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
+    console.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
   } catch (error) {
     console.error('Sync error:', error.response?.data || error.message);
     commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
