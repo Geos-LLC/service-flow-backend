@@ -34066,27 +34066,46 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
   commSyncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' };
 
   try {
+    // Get the user's phone number IDs to filter conversations to only their numbers
+    const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
+    const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
+    const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
+
     // Trigger Sigcore OpenPhone sync only for full syncs (not test/limited)
     if (!skipSigcoreSync) {
       commSyncProgress[userId].phase = 'sigcore_sync';
       try { await sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }); } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
     }
 
-    // Count total conversations from Sigcore
-    const countRes = await sigcoreRequest('GET', '/conversations?page=1&limit=1', tenantKey);
-    const totalAvailable = countRes.data?.meta?.total || countRes.data?.data?.length || 0;
-    const limit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
-    commSyncProgress[userId].total = limit;
-    commSyncProgress[userId].phase = 'syncing';
-
-    let page = 1;
+    // Sync per phone number to ensure we only get conversations for our numbers
     let totalSynced = 0;
     let totalMessages = 0;
-    const pageSize = maxConversations > 0 ? Math.min(maxConversations, 50) : 50;
-    const maxPages = maxConversations > 0 ? Math.ceil(maxConversations / pageSize) : 100;
+    const perNumberLimit = maxConversations > 0 ? Math.ceil(maxConversations / Math.max(phoneNumberIds.length, 1)) : 0;
+
+    // If no phone number IDs, fetch all (fallback)
+    const numbersToSync = phoneNumberIds.length > 0 ? phoneNumberIds : [null];
+
+    // Count total first
+    let totalAvailable = 0;
+    for (const pnId of numbersToSync) {
+      const filter = pnId ? `&phoneNumberId=${pnId}` : '';
+      const countRes = await sigcoreRequest('GET', `/conversations?page=1&limit=1${filter}`, tenantKey);
+      totalAvailable += countRes.data?.meta?.total || 0;
+    }
+    const totalLimit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
+    commSyncProgress[userId].total = totalLimit;
+    commSyncProgress[userId].phase = 'syncing';
+
+    for (const pnId of numbersToSync) {
+      const filter = pnId ? `&phoneNumberId=${pnId}` : '';
+      const numberLimit = perNumberLimit || 0;
+      let page = 1;
+      const pageSize = numberLimit > 0 ? Math.min(numberLimit, 50) : 50;
+      const maxPages = numberLimit > 0 ? Math.ceil(numberLimit / pageSize) : 100;
 
     while (page <= maxPages) {
-      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}`, tenantKey);
+      if (maxConversations > 0 && totalSynced >= maxConversations) break;
+      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}${filter}`, tenantKey);
       const conversations = convRes.data?.data || [];
       if (conversations.length === 0) break;
 
@@ -34171,9 +34190,10 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       }
       if (maxConversations > 0 && totalSynced >= maxConversations) break;
       page++;
-    }
+    } // end while pages
+    } // end for each phone number
 
-    commSyncProgress[userId] = { status: 'complete', total: limit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
+    commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
     console.log(`[Sync] Done: ${totalSynced}/${limit} conversations, ${totalMessages} messages for user ${userId}`);
   } catch (error) {
     console.error('Sync error:', error.response?.data || error.message);
