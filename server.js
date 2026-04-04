@@ -20429,6 +20429,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       let commissionRevenueBase = 0;
       let totalTips = 0;
       let totalIncentives = 0;
+      let totalCashCollected = 0;
       let totalHours = 0;
       const jobIdSet = new Set();
       const jobEntriesMap = {}; // job_id -> { earning, tip, incentive }
@@ -20474,6 +20475,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalTips += amount;
         } else if (entry.type === 'incentive') {
           totalIncentives += amount;
+        } else if (entry.type === 'cash_collected') {
+          totalCashCollected += amount; // negative value — offsets balance
         }
 
         // Track jobs
@@ -20509,7 +20512,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
       }
 
-      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives;
+      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives + totalCashCollected;
 
       // Build job details for expandable rows
       const jobDetails = Object.entries(jobEntriesMap).map(([jobId, entries]) => {
@@ -20542,7 +20545,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           hourlySalary: parseFloat(jobHourlySalary.toFixed(2)),
           commission: parseFloat(jobCommission.toFixed(2)),
           tip: parseFloat((parseFloat(entries.tip?.amount) || 0).toFixed(2)),
-          incentive: parseFloat((parseFloat(entries.incentive?.amount) || 0).toFixed(2))
+          incentive: parseFloat((parseFloat(entries.incentive?.amount) || 0).toFixed(2)),
+          cashCollected: parseFloat((parseFloat(entries.cash_collected?.amount) || 0).toFixed(2))
         };
       }).sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
@@ -20579,6 +20583,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         commissionRevenueBase: parseFloat(commissionRevenueBase.toFixed(2)),
         totalTips: parseFloat(totalTips.toFixed(2)),
         totalIncentives: parseFloat(totalIncentives.toFixed(2)),
+        totalCashCollected: parseFloat(totalCashCollected.toFixed(2)),
         totalSalary: parseFloat(totalSalary.toFixed(2)),
         hasHourlyRate: !!member.hourly_rate,
         hasCommission: !!member.commission_percentage,
@@ -20612,6 +20617,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalCommission = sortedTeamMembers.reduce((sum, item) => sum + (item?.commissionSalary || 0), 0);
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
+    const grandTotalCashCollected = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalCashCollected || 0), 0);
     const grandTotalJobRevenue = totalBusinessRevenue;
     const allUniqueJobIds = new Set();
     sortedTeamMembers.forEach(item => { (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id)); });
@@ -20630,6 +20636,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalCommission: parseFloat(grandTotalCommission.toFixed(2)),
         totalTips: parseFloat(grandTotalTips.toFixed(2)),
         totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
+        totalCashCollected: parseFloat(grandTotalCashCollected.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2)),
         totalJobCount: grandTotalJobCount,
         totalJobRevenue: parseFloat(grandTotalJobRevenue.toFixed(2))
