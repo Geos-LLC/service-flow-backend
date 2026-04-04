@@ -34109,7 +34109,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       for (const conv of allConversations) {
 
         // OpenPhone conversations endpoint returns different fields than Sigcore stored conversations
-        const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participants?.[0]);
+        const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber || conv.participants?.[0]);
         const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
         const contactName = conv.contactName || conv.name || conv.resolvedName || null;
         const lastMsg = conv.lastMessage || conv.snippet || null;
