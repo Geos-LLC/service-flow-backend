@@ -20529,10 +20529,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           customerName: globalCustomerMap[job?.customer_id] || '',
           status: job?.status,
           memberCount: mc,
-          hours: job?.hours_worked ? parseFloat((parseFloat(job.hours_worked) / mc).toFixed(2)) : parseFloat(((job?.duration || job?.estimated_duration || 0) / 60 / mc).toFixed(2)),
+          hours: job?.hours_worked ? parseFloat(parseFloat(job.hours_worked).toFixed(2)) : parseFloat(((job?.duration || job?.estimated_duration || 0) / 60).toFixed(2)),
           hoursOverridden: !!job?.hours_worked,
-          // Real time from start_time/end_time (informational)
-          realHours: (job?.start_time && job?.end_time && (new Date(job.end_time) - new Date(job.start_time)) > 60000) ? parseFloat(((new Date(job.end_time) - new Date(job.start_time)) / (1000 * 60 * 60) / mc).toFixed(2)) : null,
+          // Real time from start_time/end_time (informational) — wall-clock per cleaner
+          realHours: (job?.start_time && job?.end_time && (new Date(job.end_time) - new Date(job.start_time)) > 60000) ? parseFloat(((new Date(job.end_time) - new Date(job.start_time)) / (1000 * 60 * 60)).toFixed(2)) : null,
           startTime: job?.start_time || null,
           endTime: job?.end_time || null,
           estimatedDuration: job?.duration || job?.estimated_duration || null,
