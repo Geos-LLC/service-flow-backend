@@ -33758,6 +33758,21 @@ app.patch('/api/team-members/:id/payout-preferences', authenticateToken, async (
 // ============================================================
 
 // ============================================================
+// SF WORKSPACES — ensure tables exist on startup
+// ============================================================
+(async () => {
+  try {
+    // Check if sf_workspaces exists by trying a query
+    const { error } = await supabase.from('sf_workspaces').select('id').limit(1);
+    if (error && (error.code === 'PGRST205' || error.message?.includes('not find'))) {
+      logger.log('[Startup] sf_workspaces table not found — needs manual creation. Run migrations/003_sf_workspaces.sql in Supabase SQL Editor.');
+    } else {
+      logger.log('[Startup] sf_workspaces table exists');
+    }
+  } catch (e) { /* ignore */ }
+})();
+
+// ============================================================
 // COMMUNICATIONS SYSTEM (Sigcore-backed)
 // ============================================================
 
@@ -33843,6 +33858,122 @@ async function autoLinkConversation(userId, conversationId, phone) {
   } catch (e) { /* leads table may not exist */ }
   return null;
 }
+
+// ── SF Workspace helpers ──
+
+// Get or create SF workspace for a user
+async function getOrCreateSfWorkspace(userId) {
+  // Check if user already has a workspace
+  const { data: membership } = await supabase.from('sf_workspace_users')
+    .select('workspace_id, sf_workspaces(id, name, sigcore_workspace_id, sigcore_business_id)')
+    .eq('user_id', userId).eq('status', 'active').maybeSingle();
+
+  if (membership?.sf_workspaces) return membership.sf_workspaces;
+  if (membership?.workspace_id) {
+    const { data: ws } = await supabase.from('sf_workspaces').select('*').eq('id', membership.workspace_id).single();
+    if (ws) return ws;
+  }
+
+  // No workspace — create one
+  const { data: user } = await supabase.from('users').select('id, business_name, email, phone').eq('id', userId).single();
+  if (!user) return null;
+
+  const { data: workspace, error: wsErr } = await supabase.from('sf_workspaces').insert({
+    name: user.business_name || `Workspace ${userId}`,
+  }).select().single();
+
+  if (wsErr) { logger.error('[SF Workspace] Create error: ' + wsErr.message); return null; }
+
+  // Create membership
+  await supabase.from('sf_workspace_users').insert({
+    workspace_id: workspace.id,
+    user_id: userId,
+    role: 'owner',
+  });
+
+  // Register with Sigcore if connected
+  if (SIGCORE_URL && SIGCORE_WORKSPACE_KEY) {
+    try {
+      // Create/resolve business in Sigcore
+      const bizRes = await sigcoreRequest('POST', '/v1/businesses', SIGCORE_WORKSPACE_KEY, {
+        name: user.business_name || `SF User ${userId}`,
+        external_id: `sf-${userId}`,
+        main_phone: user.phone || undefined,
+        main_email: user.email || undefined,
+      });
+      const business = bizRes.data?.data || {};
+
+      if (business.id) {
+        // Register product workspace
+        const wsRes = await sigcoreRequest('POST', `/v1/businesses/${business.id}/workspaces`, SIGCORE_WORKSPACE_KEY, {
+          product_type: 'serviceflow',
+          workspace_name: workspace.name,
+          external_workspace_id: String(workspace.id),
+        });
+        const productWs = wsRes.data?.data || {};
+
+        // Update local workspace with Sigcore IDs
+        await supabase.from('sf_workspaces').update({
+          sigcore_workspace_id: productWs.id || null,
+          sigcore_business_id: business.id || null,
+          updated_at: new Date().toISOString(),
+        }).eq('id', workspace.id);
+
+        workspace.sigcore_workspace_id = productWs.id;
+        workspace.sigcore_business_id = business.id;
+
+        // Register phone/email as shared assets
+        if (user.phone) {
+          try {
+            const assetRes = await sigcoreRequest('POST', '/v1/assets', SIGCORE_WORKSPACE_KEY, {
+              asset_type: 'phone', value: user.phone,
+            });
+            const asset = assetRes.data?.data || {};
+            if (asset.id && productWs.id) {
+              await sigcoreRequest('POST', `/v1/assets/${asset.id}/links`, SIGCORE_WORKSPACE_KEY, {
+                workspace_id: productWs.id, role: 'business_contact', purpose: 'main_business_line', is_primary: true,
+              });
+            }
+          } catch (e) { logger.warn('[SF Workspace] Phone asset registration: ' + e.message); }
+        }
+        if (user.email) {
+          try {
+            const assetRes = await sigcoreRequest('POST', '/v1/assets', SIGCORE_WORKSPACE_KEY, {
+              asset_type: 'email', value: user.email,
+            });
+            const asset = assetRes.data?.data || {};
+            if (asset.id && productWs.id) {
+              await sigcoreRequest('POST', `/v1/assets/${asset.id}/links`, SIGCORE_WORKSPACE_KEY, {
+                workspace_id: productWs.id, role: 'business_contact', is_primary: true,
+              });
+            }
+          } catch (e) { logger.warn('[SF Workspace] Email asset registration: ' + e.message); }
+        }
+
+        logger.log(`[SF Workspace] Registered workspace ${workspace.id} with Sigcore business ${business.id}`);
+      }
+    } catch (e) { logger.warn('[SF Workspace] Sigcore registration: ' + e.message); }
+  }
+
+  return workspace;
+}
+
+// GET /api/workspace — get current user's workspace (creates if needed)
+app.get('/api/workspace', authenticateToken, async (req, res) => {
+  try {
+    const workspace = await getOrCreateSfWorkspace(req.user.userId);
+    if (!workspace) return res.status(500).json({ error: 'Failed to get workspace' });
+
+    // Get members
+    const { data: members } = await supabase.from('sf_workspace_users')
+      .select('id, user_id, role, status, users(first_name, last_name, email)')
+      .eq('workspace_id', workspace.id);
+
+    res.json({ workspace, members: members || [] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get workspace' });
+  }
+});
 
 // ── Phase 2: Connect/Disconnect/Status ──
 
@@ -34702,6 +34833,22 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   } catch (error) {
     logger.error('Admin users error:', error);
     res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// POST /api/admin/run-migration — run a specific migration SQL
+app.post('/api/admin/run-migration', authenticateAdmin, async (req, res) => {
+  try {
+    const { sql } = req.body;
+    if (!sql) return res.status(400).json({ error: 'SQL is required' });
+    const { data, error } = await supabase.rpc('exec_sql', { sql_query: sql }).catch(() => ({ data: null, error: 'rpc not available' }));
+    if (error) {
+      // Fallback: try direct query via raw SQL (won't work with Supabase JS client, but try)
+      return res.status(500).json({ error: 'Cannot run raw SQL via Supabase client. Run manually in Supabase SQL Editor.', sql_provided: sql });
+    }
+    res.json({ success: true, data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
