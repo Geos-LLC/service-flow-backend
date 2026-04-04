@@ -534,21 +534,11 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     }
 
     const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
+    let jobId
     if (existing) {
+      jobId = existing.id
       await supabase.from('jobs').update(mapped).eq('id', existing.id)
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
-
-      // Create/rebuild ledger entries when job is completed or edited while completed
-      if (mapped.status === 'completed' && createLedgerEntriesForCompletedJob) {
-        try {
-          // Delete existing entries first (handles edits to price/tips/etc on completed jobs)
-          await supabase.from('cleaner_ledger').delete().eq('job_id', existing.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-          await createLedgerEntriesForCompletedJob(existing.id, userId)
-          logger.log(`[Zenbooker] Ledger entries rebuilt for job ${existing.id} (${eventType})`)
-        } catch (ledgerErr) {
-          logger.error(`[Zenbooker] Ledger rebuild failed for job ${existing.id}: ${ledgerErr.message}`)
-        }
-      }
 
       // Delete ledger entries when job is cancelled via Zenbooker webhook
       if (mapped.status === 'cancelled') {
@@ -557,14 +547,40 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       }
     } else {
       const { data: newJob } = await supabase.from('jobs').insert(mapped).select('id').single()
+      jobId = newJob?.id
       logger.log(`[Zenbooker] Job created: ${data.id} (${eventType})`)
+    }
 
-      // Create ledger entries if job is already completed on creation
-      if (mapped.status === 'completed' && newJob?.id && createLedgerEntriesForCompletedJob) {
+    // ── Sync team assignments for ALL assigned providers ──
+    if (jobId) {
+      const providers = zbJob.assigned_providers || []
+      const zbMemberIds = providers.map(p => teamMap[p.id]).filter(Boolean)
+      if (zbMemberIds.length > 1) {
+        const { data: existingAssignments } = await supabase.from('job_team_assignments').select('team_member_id').eq('job_id', jobId)
+        const existingIds = new Set((existingAssignments || []).map(a => a.team_member_id))
+        const needsUpdate = zbMemberIds.some(id => !existingIds.has(id)) || existingIds.size !== zbMemberIds.length
+        if (needsUpdate) {
+          await supabase.from('job_team_assignments').delete().eq('job_id', jobId)
+          const assignments = zbMemberIds.map((id, idx) => ({
+            job_id: jobId, team_member_id: id, is_primary: idx === 0
+          }))
+          const { error: assignErr } = await supabase.from('job_team_assignments').insert(assignments)
+          if (assignErr) logger.error(`[Zenbooker] Assignment sync error job ${jobId}: ${JSON.stringify(assignErr)}`)
+          else logger.log(`[Zenbooker] Synced ${zbMemberIds.length} team assignments for job ${jobId}`)
+        }
+      } else if (zbMemberIds.length <= 1) {
+        // Single or no provider — clean up any stale multi-assignments
+        await supabase.from('job_team_assignments').delete().eq('job_id', jobId)
+      }
+
+      // Create/rebuild ledger entries when job is completed
+      if (mapped.status === 'completed' && createLedgerEntriesForCompletedJob) {
         try {
-          await createLedgerEntriesForCompletedJob(newJob.id, userId)
+          await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+          await createLedgerEntriesForCompletedJob(jobId, userId)
+          logger.log(`[Zenbooker] Ledger entries rebuilt for job ${jobId} (${eventType})`)
         } catch (ledgerErr) {
-          logger.error(`[Zenbooker] Ledger creation failed for new job ${newJob.id}: ${ledgerErr.message}`)
+          logger.error(`[Zenbooker] Ledger rebuild failed for job ${jobId}: ${ledgerErr.message}`)
         }
       }
     }
