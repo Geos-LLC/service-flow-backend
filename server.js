@@ -34201,7 +34201,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     } // end for each phone number
 
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
-    console.log(`[Sync] Done: ${totalSynced}/${limit} conversations, ${totalMessages} messages for user ${userId}`);
+    console.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
   } catch (error) {
     console.error('Sync error:', error.response?.data || error.message);
     commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
