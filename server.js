@@ -34075,7 +34075,12 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     // Trigger Sigcore OpenPhone sync only for full syncs (not test/limited)
     if (!skipSigcoreSync) {
       commSyncProgress[userId].phase = 'sigcore_sync';
-      try { await sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }); } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
+      try {
+        await Promise.race([
+          sigcoreRequest('POST', '/integrations/sync', tenantKey, { syncMessages: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Sigcore sync trigger timeout')), 30000))
+        ]);
+      } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
     }
 
     // Sync per phone number to ensure we only get conversations for our numbers
