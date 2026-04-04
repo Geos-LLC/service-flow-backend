@@ -500,7 +500,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
   // Webhook Handlers
   // ══════════════════════════════════════
   async function handleJobEvent(eventType, data, userId, apiKey) {
-    if (!data?.id) return
+    // ZZB may send job ID as 'id', 'job_id', or nested in 'job.id'
+    const jobZbId = data?.id || data?.job_id || data?.job?.id
+    if (!jobZbId) {
+      logger.error(`[Zenbooker] handleJobEvent: no job ID found in ${eventType} payload: ${JSON.stringify(data).substring(0, 200)}`)
+      return
+    }
+    data.id = jobZbId
 
     // For created/rescheduled/status changes — fetch full job from API for complete data
     let zbJob = data
@@ -820,10 +826,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
           }
 
           if (entity === 'reconcile') {
-            // Fetch ALL jobs from Zenbooker and update status/invoice/team assignments for existing SF jobs
+            // Fetch ALL jobs from Zenbooker (including cancelled) and update status/invoice/team assignments
             syncProgress[userId] = { status: 'running', phase: 'Fetching jobs...', progress: 5 }
             const zbJobs = await zbFetchAll(apiKey, '/jobs')
-            logger.log(`[Zenbooker] Reconcile: ${zbJobs.length} jobs from Zenbooker`)
+            // ZZB excludes cancelled jobs by default — fetch them separately
+            const zbCancelledJobs = await zbFetchAll(apiKey, '/jobs', { canceled: 'true' })
+            const seenIds = new Set(zbJobs.map(j => j.id))
+            zbCancelledJobs.forEach(j => { if (!seenIds.has(j.id)) zbJobs.push(j) })
+            logger.log(`[Zenbooker] Reconcile: ${zbJobs.length} jobs from Zenbooker (incl ${zbCancelledJobs.length} cancelled)`)
 
             // Build team map for assignment lookups
             const { data: team } = await supabase.from('team_members').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
@@ -848,7 +858,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               const zbPaymentStatus = inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null)
 
               const update = {}
-              if (sfJob.status !== zbStatus) update.status = zbStatus
+              if (sfJob.status !== zbStatus) {
+                update.status = zbStatus
+                // Remove ledger entries when job is cancelled
+                if (zbStatus === 'cancelled' && sfJob.status !== 'cancelled') {
+                  await supabase.from('cleaner_ledger').delete().eq('job_id', sfJob.id)
+                  logger.log(`[Zenbooker] Reconcile: removed ledger for cancelled job ${sfJob.id}`)
+                }
+              }
               if (sfJob.invoice_status !== zbInvoiceStatus) update.invoice_status = zbInvoiceStatus
               if (zbPaymentStatus) update.payment_status = zbPaymentStatus
               // Always sync timestamps, prices, discounts
@@ -991,7 +1008,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         return res.status(400).json({ error: 'Missing event or data' })
       }
 
-      logger.log(`[Zenbooker] Webhook received: ${event}`)
+      logger.log(`[Zenbooker] Webhook received: ${event} | data keys: ${Object.keys(data || {}).join(',')} | data.id: ${data?.id || 'MISSING'} | data.job_id: ${data?.job_id || 'none'}`)
 
       // Find the user by checking who has this Zenbooker connection
       // (account_id from webhook payload can help if multiple users)
