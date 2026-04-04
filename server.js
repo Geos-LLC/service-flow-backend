@@ -34168,27 +34168,36 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             }
           }
 
-          // Fetch messages
-          try {
-            const msgRes = await sigcoreRequest('GET', `/conversations/${conv.id}/messages`, tenantKey);
-            const messages = msgRes.data?.data || [];
-            for (const msg of messages) {
-              const sigcoreId = msg.id;
-              const { data: existing } = await supabase.from('communication_messages').select('id').eq('sigcore_message_id', sigcoreId).maybeSingle();
-              if (existing) continue;
-              await supabase.from('communication_messages').insert({
-                conversation_id: localConv.id, sigcore_message_id: sigcoreId,
-                provider_message_id: msg.providerMessageId || null,
-                direction: msg.direction === 'in' ? 'in' : 'out', channel: msg.channel || 'sms',
-                body: msg.body || '', from_number: normalizePhone(msg.fromNumber),
-                to_number: normalizePhone(msg.toNumber),
-                sender_role: msg.direction === 'in' ? 'customer' : 'agent',
-                status: msg.status || 'delivered', metadata: { sigcoreConvId: conv.id },
-                created_at: msg.createdAt || new Date().toISOString()
-              });
-              totalMessages++;
-            }
-          } catch (e) { commSyncProgress[userId].errors++; }
+          // Fetch messages via live OpenPhone endpoint (phoneNumberId + participant)
+          if (participantPhone && phoneNumberId) {
+            try {
+              const msgRes = await sigcoreRequest('GET',
+                `/integrations/openphone/messages?phoneNumberId=${phoneNumberId}&participant=${encodeURIComponent(participantPhone)}`,
+                tenantKey);
+              const messages = msgRes.data?.data || [];
+              for (const msg of messages) {
+                const msgId = msg.providerMessageId || msg.id;
+                if (!msgId) continue;
+                const { data: existing } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
+                if (existing) continue;
+                const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+                await supabase.from('communication_messages').insert({
+                  conversation_id: localConv.id,
+                  sigcore_message_id: msg.id || null,
+                  provider_message_id: msgId,
+                  direction, channel: 'sms',
+                  body: msg.body || msg.content || '',
+                  from_number: normalizePhone(msg.fromNumber || msg.from),
+                  to_number: normalizePhone(msg.toNumber || msg.to),
+                  sender_role: direction === 'in' ? 'customer' : 'agent',
+                  status: msg.status || 'delivered',
+                  metadata: { phoneNumberId },
+                  created_at: msg.createdAt || msg.timestamp || new Date().toISOString()
+                });
+                totalMessages++;
+              }
+            } catch (e) { logger.warn(`[Sync] Messages fetch error for ${participantPhone}: ${e.message}`); commSyncProgress[userId].errors++; }
+          }
 
           totalSynced++;
           commSyncProgress[userId].synced = totalSynced;
