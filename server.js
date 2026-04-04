@@ -33745,16 +33745,17 @@ function normalizePhone(phone) {
 
 // Helper: auto-link conversation to customer/lead by phone
 async function autoLinkConversation(userId, conversationId, phone) {
-  if (!phone) return;
+  if (!phone) return null;
   const normalized = normalizePhone(phone);
-  if (!normalized) return;
+  if (!normalized) return null;
   const last10 = normalized.slice(-10);
-  if (last10.length < 7) return; // too short to match
+  if (last10.length < 7) return null;
 
-  // Try customers first
-  const { data: customer } = await supabase.from('customers')
+  // Try customers first — match by last 10 digits
+  const { data: customer, error: custErr } = await supabase.from('customers')
     .select('id, first_name, last_name')
     .eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
+  if (custErr) console.warn('[AutoLink] Customer query error:', custErr.message);
   if (customer) {
     const name = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
     await supabase.from('communication_conversations').update({
@@ -34229,6 +34230,26 @@ app.post('/api/communications/sync', authenticateToken, async (req, res) => {
 app.get('/api/communications/sync/progress', authenticateToken, (req, res) => {
   const progress = commSyncProgress[req.user.userId] || { status: 'idle', total: 0, synced: 0, messages: 0 };
   res.json(progress);
+});
+
+// POST /api/communications/relink — re-run customer/lead matching on all unlinked conversations
+app.post('/api/communications/relink', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: unlinked } = await supabase.from('communication_conversations')
+      .select('id, participant_phone, participant_name')
+      .eq('user_id', userId).is('customer_id', null).is('lead_id', null);
+
+    let linked = 0;
+    for (const conv of (unlinked || [])) {
+      const result = await autoLinkConversation(userId, conv.id, conv.participant_phone);
+      if (result) linked++;
+    }
+    console.log(`[Relink] Linked ${linked}/${(unlinked || []).length} conversations for user ${userId}`);
+    res.json({ total: (unlinked || []).length, linked });
+  } catch (error) {
+    res.status(500).json({ error: 'Relink failed' });
+  }
 });
 
 // ── Phase 5: Conversations API ──
