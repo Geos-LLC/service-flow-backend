@@ -4004,7 +4004,10 @@ function isSlotFreeForWorker(slotStartTime, slotEndTime, worker, existingJobs, d
     if (!isJobAssignedToWorker(job, worker.id)) continue;
 
     const jobStartMin = schedTimeToMinutes(job.scheduled_time);
-    const jobDuration = job.duration || durationMinutes;
+    const rawDuration = job.duration || durationMinutes;
+    // Multi-cleaner jobs: wall-clock time = total duration / number of workers
+    const jobWorkers = parseInt(job.workers) || 1;
+    const jobDuration = jobWorkers > 1 ? Math.round(rawDuration / jobWorkers) : rawDuration;
     const jobEndMin = jobStartMin + jobDuration;
 
     // Use per-job location-based driving time if available, else global fallback
@@ -4225,7 +4228,7 @@ async function generateAvailableSlots({ userId, dateStr, durationMinutes, servic
   const { data: existingJobs, error: jobsError } = await supabase
     .from('jobs')
     .select(`
-      scheduled_time, duration, team_member_id, status, id,
+      scheduled_time, duration, workers, team_member_id, status, id,
       service_address_street, service_address_city, service_address_state, service_address_zip,
       job_team_assignments!left(team_member_id, is_primary)
     `)
@@ -4402,7 +4405,7 @@ async function validateBookingSlot({ userId, dateStr, timeStr, durationMinutes, 
   let jobsQuery = supabase
     .from('jobs')
     .select(`
-      scheduled_time, duration, team_member_id, status, id,
+      scheduled_time, duration, workers, team_member_id, status, id,
       service_address_street, service_address_city, service_address_state, service_address_zip,
       job_team_assignments!left(team_member_id, is_primary)
     `)
@@ -20797,8 +20800,16 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
       jobsByMember[member.id] = [];
     });
 
+    // Count members per job from assignments (for splitting hours/revenue)
+    const memberCountByJobId = {};
+    (assignments || []).forEach(assignment => {
+      const jobId = assignment.jobs?.id;
+      if (jobId) memberCountByJobId[jobId] = (memberCountByJobId[jobId] || 0) + 1;
+    });
+
     // Add direct jobs
     (allJobs || []).forEach(job => {
+      job._memberCount = memberCountByJobId[job.id] || 1;
       if (job.team_member_id && jobsByMember[job.team_member_id]) {
         jobsByMember[job.team_member_id].push(job);
       }
@@ -20811,6 +20822,7 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
       if (job && job.user_id === userId && jobsByMember[memberId]) {
         // Check if job is already added (avoid duplicates)
         if (!jobsByMember[memberId].find(j => j.id === job.id)) {
+          job._memberCount = memberCountByJobId[job.id] || 1;
           jobsByMember[memberId].push(job);
         }
       }
@@ -20858,8 +20870,12 @@ app.get('/api/analytics/salary', authenticateToken, async (req, res) => {
           hours = parseFloat(job.estimated_duration) / 60;
         }
 
-        // Get revenue
-        const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0);
+        // Multi-cleaner jobs: each cleaner works hours/memberCount
+        const jobMemberCount = job._memberCount || 1;
+        hours = hours / jobMemberCount;
+
+        // Get revenue — split per member for multi-cleaner jobs
+        const revenue = parseFloat(job.total || job.total_amount || job.invoice_amount || job.price || 0) / jobMemberCount;
 
         // Calculate hourly salary
         if (member.hourly_rate && hours > 0) {
