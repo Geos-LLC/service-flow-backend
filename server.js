@@ -34087,15 +34087,26 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     let totalSynced = 0;
     let totalMessages = 0;
 
-    // Get conversations from OpenPhone via Sigcore — fetch ALL, don't filter by phone number
-    // (OpenPhone may route all conversations through the Primary number even if multiple numbers exist)
+    // Get conversations from OpenPhone via Sigcore, filter to only our numbers
     let allConversations = [];
     try {
       const days = maxConversations > 0 ? 7 : 30;
       const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, tenantKey);
-      const convs = convRes.data?.data || convRes.data || [];
-      logger.log(`[Sync] Fetched ${convs.length} conversations from OpenPhone (${days} days)`);
-      allConversations = convs.map(c => ({ ...c, _phoneNumberId: c.phoneNumberId || phoneNumberIds[0] }));
+      const allConvs = convRes.data?.data || convRes.data || [];
+      logger.log(`[Sync] Fetched ${allConvs.length} total conversations from OpenPhone (${days} days)`);
+
+      // Filter to only conversations on OUR phone numbers
+      if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
+        allConversations = allConvs.filter(c => {
+          const convPhone = normalizePhone(c.phoneNumber);
+          const convPnId = c.phoneNumberId;
+          return ourPhoneNumbers.includes(convPhone) || phoneNumberIds.includes(convPnId);
+        });
+        logger.log(`[Sync] After phone filter: ${allConversations.length} conversations (filtered from ${allConvs.length})`);
+      } else {
+        allConversations = allConvs;
+      }
+      allConversations = allConversations.map(c => ({ ...c, _phoneNumberId: c.phoneNumberId || phoneNumberIds[0] }));
     } catch (e) { logger.error(`[Sync] Failed to fetch conversations: ${e.message}`); }
 
     // Sort by most recent first, apply limit
