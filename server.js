@@ -34168,35 +34168,50 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             }
           }
 
-          // Fetch messages via live OpenPhone endpoint (phoneNumberId + participant)
+          // Fetch messages — try Sigcore live endpoint first, fallback to direct OpenPhone API
           if (participantPhone && phoneNumberId) {
+            let messages = [];
             try {
               const msgRes = await sigcoreRequest('GET',
                 `/integrations/openphone/messages?phoneNumberId=${phoneNumberId}&participant=${encodeURIComponent(participantPhone)}`,
                 tenantKey);
-              const messages = msgRes.data?.data || [];
-              for (const msg of messages) {
-                const msgId = msg.providerMessageId || msg.id;
-                if (!msgId) continue;
-                const { data: existing } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
-                if (existing) continue;
-                const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
-                await supabase.from('communication_messages').insert({
-                  conversation_id: localConv.id,
-                  sigcore_message_id: msg.id || null,
-                  provider_message_id: msgId,
-                  direction, channel: 'sms',
-                  body: msg.body || msg.content || '',
-                  from_number: normalizePhone(msg.fromNumber || msg.from),
-                  to_number: normalizePhone(msg.toNumber || msg.to),
-                  sender_role: direction === 'in' ? 'customer' : 'agent',
-                  status: msg.status || 'delivered',
-                  metadata: { phoneNumberId },
-                  created_at: msg.createdAt || msg.timestamp || new Date().toISOString()
+              messages = msgRes.data?.data || [];
+            } catch (sigcoreErr) {
+              // Sigcore endpoint not deployed yet — fallback to direct OpenPhone API
+              try {
+                const opRes = await axios.get('https://api.openphone.com/v1/messages', {
+                  params: { phoneNumberId, participants: [participantPhone], maxResults: 50 },
+                  headers: { 'Authorization': tenantKey },
+                  timeout: 15000
                 });
-                totalMessages++;
+                messages = (opRes.data?.data || []).map(m => ({
+                  providerMessageId: m.id, direction: m.direction === 'incoming' ? 'in' : 'out',
+                  body: m.content || m.text || '', from: m.from, to: Array.isArray(m.to) ? m.to[0] : m.to,
+                  createdAt: m.createdAt, status: m.status || 'delivered'
+                }));
+              } catch (opErr) {
+                logger.warn(`[Sync] Direct OpenPhone messages error for ${participantPhone}: ${opErr.message}`);
               }
-            } catch (e) { logger.warn(`[Sync] Messages fetch error for ${participantPhone}: ${e.message}`); commSyncProgress[userId].errors++; }
+            }
+            for (const msg of messages) {
+              const msgId = msg.providerMessageId || msg.id;
+              if (!msgId) continue;
+              const { data: existing } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
+              if (existing) continue;
+              const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+              await supabase.from('communication_messages').insert({
+                conversation_id: localConv.id, sigcore_message_id: null,
+                provider_message_id: msgId, direction, channel: 'sms',
+                body: msg.body || msg.content || '',
+                from_number: normalizePhone(msg.fromNumber || msg.from),
+                to_number: normalizePhone(msg.toNumber || msg.to),
+                sender_role: direction === 'in' ? 'customer' : 'agent',
+                status: msg.status || 'delivered', metadata: { phoneNumberId },
+                created_at: msg.createdAt || msg.timestamp || new Date().toISOString()
+              });
+              totalMessages++;
+            }
+            if (messages.length === 0) commSyncProgress[userId].errors++;
           }
 
           totalSynced++;
