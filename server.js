@@ -34083,41 +34083,39 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       } catch (e) { console.warn('Sigcore sync trigger:', e.message); }
     }
 
-    // Sync per phone number to ensure we only get conversations for our numbers
+    // Fetch all conversations from Sigcore, filter client-side by our phone numbers
     let totalSynced = 0;
     let totalMessages = 0;
+    let totalSkipped = 0;
 
-    // If no phone number IDs, fetch all (fallback)
-    const numbersToSync = phoneNumberIds.length > 0 ? phoneNumberIds : [null];
-
-    // Count total first
-    let totalAvailable = 0;
-    for (const pnId of numbersToSync) {
-      const filter = pnId ? `&phoneNumberId=${pnId}` : '';
-      const countRes = await sigcoreRequest('GET', `/conversations?page=1&limit=1${filter}`, tenantKey);
-      totalAvailable += countRes.data?.meta?.total || 0;
-    }
+    // Count total
+    const countRes = await sigcoreRequest('GET', '/conversations?page=1&limit=1', tenantKey);
+    const totalAvailable = countRes.data?.meta?.total || 0;
     const totalLimit = maxConversations > 0 ? Math.min(maxConversations, totalAvailable) : totalAvailable;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
 
-    for (const pnId of numbersToSync) {
-      if (maxConversations > 0 && totalSynced >= maxConversations) break;
-      const filter = pnId ? `&phoneNumberId=${pnId}` : '';
-      // Each number gets the remaining limit (not split evenly)
-      const remaining = maxConversations > 0 ? maxConversations - totalSynced : 0;
-      let page = 1;
-      const pageSize = remaining > 0 ? Math.min(remaining, 50) : 50;
-      const maxPages = remaining > 0 ? Math.ceil(remaining / pageSize) : 100;
+    let page = 1;
+    const pageSize = 50;
+    const maxPages = maxConversations > 0 ? 20 : 100; // cap pages
 
     while (page <= maxPages) {
       if (maxConversations > 0 && totalSynced >= maxConversations) break;
-      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}${filter}`, tenantKey);
+      const convRes = await sigcoreRequest('GET', `/conversations?page=${page}&limit=${pageSize}`, tenantKey);
       const conversations = convRes.data?.data || [];
       if (conversations.length === 0) break;
 
       for (const conv of conversations) {
         if (maxConversations > 0 && totalSynced >= maxConversations) break;
+
+        // Filter: only sync conversations from OUR phone numbers
+        if (ourPhoneNumbers.length > 0) {
+          const convPhone = normalizePhone(conv.phoneNumber);
+          if (convPhone && !ourPhoneNumbers.includes(convPhone)) {
+            totalSkipped++;
+            continue; // Not our number — skip
+          }
+        }
 
         const participantPhone = normalizePhone(conv.participantPhoneNumber);
         try {
@@ -34198,10 +34196,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       if (maxConversations > 0 && totalSynced >= maxConversations) break;
       page++;
     } // end while pages
-    } // end for each phone number
 
-    commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
-    console.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
+    commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, skipped: totalSkipped, phase: 'done' };
+    console.log(`[Sync] Done: ${totalSynced} synced, ${totalSkipped} skipped (other numbers), ${totalMessages} messages for user ${userId}`);
   } catch (error) {
     console.error('Sync error:', error.response?.data || error.message);
     commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
