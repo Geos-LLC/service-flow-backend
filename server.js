@@ -20284,7 +20284,6 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         .select('team_member_id, amount')
         .eq('user_id', userId)
         .eq('type', 'cash_collected')
-        .is('payout_batch_id', null)
         .lt('effective_date', startDate);
       const result = {};
       (priorCash || []).forEach(e => {
