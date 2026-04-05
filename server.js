@@ -33076,9 +33076,37 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     return { skipped: true, reason: 'No unpaid entries found for this period' };
   }
 
-  // Calculate total
-  const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
-  const roundedTotal = parseFloat(totalAmount.toFixed(2));
+  // Calculate current period total
+  const periodTotal = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+
+  // Calculate prior balance (same logic as payroll's fetchPriorCash)
+  // prior = total balance across all time - current period entries
+  let priorBalance = 0;
+  try {
+    let allEntries = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data: page } = await supabase.from('cleaner_ledger')
+        .select('amount, effective_date, type')
+        .eq('user_id', userId)
+        .eq('team_member_id', teamMemberId)
+        .range(from, from + pageSize - 1);
+      allEntries = allEntries.concat(page || []);
+      if (!page || page.length < pageSize) break;
+      from += pageSize;
+    }
+    const totalBalance = allEntries.reduce((s, e) => s + parseFloat(e.amount), 0);
+    const currentPeriod = allEntries
+      .filter(e => e.type !== 'payout' && e.effective_date >= periodStart && e.effective_date <= periodEnd)
+      .reduce((s, e) => s + parseFloat(e.amount), 0);
+    const prior = totalBalance - currentPeriod;
+    if (prior < -0.01) priorBalance = parseFloat(prior.toFixed(2));
+  } catch (priorErr) {
+    console.error(`[Payout] Error calculating prior balance for member ${teamMemberId}:`, priorErr);
+  }
+
+  const roundedTotal = parseFloat((periodTotal + priorBalance).toFixed(2));
 
   // Create payout batch
   const { data: batch, error: batchError } = await supabase
