@@ -347,7 +347,7 @@ cron.schedule('0 9 * * *', async () => {
       `)
       .eq('is_recurring', true)
       .lte('next_billing_date', new Date().toISOString().split('T')[0])
-      .in('status', ['completed', 'paid']);
+      .eq('status', 'completed');
 
     if (error) {
       console.error('❌ Error fetching recurring jobs:', error);
@@ -6459,7 +6459,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     }
 
     // === LEDGER INTEGRATION: Create ledger entries when job is completed or paid ===
-    if ((status === 'completed' || status === 'paid') && previousStatus !== 'completed' && previousStatus !== 'paid') {
+    if (status === 'completed' && previousStatus !== 'completed') {
       try {
         await createLedgerEntriesForCompletedJob(id, userId);
       } catch (ledgerError) {
@@ -6469,7 +6469,7 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
 
     // === LEDGER CLEANUP: Remove ledger entries when job leaves completed status ===
     // Covers: cancel, reschedule, reset to pending, or any status change FROM completed
-    const completedStatuses = ['completed', 'complete', 'paid'];
+    const completedStatuses = ['completed', 'complete'];
     if (completedStatuses.includes(previousStatus) && !completedStatuses.includes(status)) {
       try {
         const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).select('id');
@@ -15548,7 +15548,7 @@ app.get('/api/territories', authenticateToken, async (req, res) => {
       }
       
       const totalJobs = jobs.length;
-      const completedJobs = jobs.filter(job => job.status === 'completed' || job.status === 'paid');
+      const completedJobs = jobs.filter(job => job.status === 'completed');
       const completedJobsCount = completedJobs.length;
       const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0);
       const avgJobValue = completedJobsCount > 0 ? Math.round((totalRevenue / completedJobsCount) * 100) / 100 : 0;
@@ -15610,7 +15610,7 @@ app.get('/api/territories/:id', async (req, res) => {
     }
     
     const totalJobs = jobs ? jobs.length : 0;
-    const completedJobs = jobs ? jobs.filter(job => job.status === 'completed' || job.status === 'paid') : [];
+    const completedJobs = jobs ? jobs.filter(job => job.status === 'completed') : [];
     const completedJobsCount = completedJobs.length;
     const totalRevenue = completedJobs.reduce((sum, job) => sum + (job.invoice_amount || 0), 0);
     const avgJobValue = completedJobsCount > 0 ? totalRevenue / completedJobsCount : 0;
@@ -16345,10 +16345,10 @@ app.get('/api/analytics/overview', async (req, res) => {
       const [jobStats] = await connection.query(`
         SELECT 
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status IN ('completed','paid') THEN j.id END) as completed_jobs,
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
           COUNT(DISTINCT CASE WHEN j.status = 'pending' THEN j.id END) as pending_jobs,
           COUNT(DISTINCT CASE WHEN j.status = 'cancelled' THEN j.id END) as cancelled_jobs,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN s.duration ELSE NULL END) as avg_job_duration
+          AVG(CASE WHEN j.status = 'completed' THEN s.duration ELSE NULL END) as avg_job_duration
         FROM jobs j
         LEFT JOIN services s ON j.service_id = s.id
         WHERE j.user_id = ? ${dateFilter}
@@ -16455,9 +16455,9 @@ app.get('/api/analytics/team-performance', async (req, res) => {
           tm.last_name,
           tm.role,
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status IN ('completed','paid') THEN j.id END) as completed_jobs,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE NULL END) as avg_job_value,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE 0 END) as total_revenue
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
+          AVG(CASE WHEN j.status = 'completed' THEN s.price ELSE NULL END) as avg_job_value,
+          SUM(CASE WHEN j.status = 'completed' THEN s.price ELSE 0 END) as total_revenue
         FROM team_members tm
         LEFT JOIN jobs j ON tm.id = j.team_member_id AND j.user_id = ? ${dateFilter}
         LEFT JOIN services s ON j.service_id = s.id
@@ -16504,8 +16504,8 @@ app.get('/api/analytics/customer-insights', async (req, res) => {
           c.last_name,
           c.email,
           COUNT(DISTINCT j.id) as total_jobs,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE 0 END) as lifetime_value,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE NULL END) as avg_job_value,
+          SUM(CASE WHEN j.status = 'completed' THEN s.price ELSE 0 END) as lifetime_value,
+          AVG(CASE WHEN j.status = 'completed' THEN s.price ELSE NULL END) as avg_job_value,
           MAX(j.scheduled_date) as last_job_date
         FROM customers c
         LEFT JOIN jobs j ON c.id = j.customer_id AND j.user_id = ? ${dateFilter}
@@ -17115,9 +17115,9 @@ app.get('/api/analytics/service-performance', async (req, res) => {
           s.name,
           s.price,
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status IN ('completed','paid') THEN j.id END) as completed_jobs,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE 0 END) as total_revenue,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN s.price ELSE NULL END) as avg_job_value
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
+          SUM(CASE WHEN j.status = 'completed' THEN s.price ELSE 0 END) as total_revenue,
+          AVG(CASE WHEN j.status = 'completed' THEN s.price ELSE NULL END) as avg_job_value
         FROM services s
         LEFT JOIN jobs j ON s.id = j.service_id AND j.user_id = ? ${dateFilter}
         WHERE s.user_id = ?
@@ -17154,10 +17154,10 @@ app.get('/api/territories/:id/analytics', async (req, res) => {
       const [analytics] = await connection.query(`
         SELECT 
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status IN ('completed','paid') THEN j.id END) as completed_jobs,
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
           COUNT(DISTINCT CASE WHEN j.status = 'cancelled' THEN j.id END) as cancelled_jobs,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN COALESCE(i.total_amount, 0) ELSE 0 END) as total_revenue,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN i.total_amount ELSE NULL END) as avg_job_value,
+          SUM(CASE WHEN j.status = 'completed' THEN COALESCE(i.total_amount, 0) ELSE 0 END) as total_revenue,
+          AVG(CASE WHEN j.status = 'completed' THEN i.total_amount ELSE NULL END) as avg_job_value,
           COUNT(DISTINCT j.customer_id) as unique_customers
         FROM jobs j
         LEFT JOIN invoices i ON j.id = i.job_id
@@ -17169,7 +17169,7 @@ app.get('/api/territories/:id/analytics', async (req, res) => {
         SELECT 
           DATE_FORMAT(j.scheduled_date, '%Y-%m') as month,
           COUNT(DISTINCT j.id) as job_count,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN COALESCE(i.total_amount, 0) ELSE 0 END) as revenue
+          SUM(CASE WHEN j.status = 'completed' THEN COALESCE(i.total_amount, 0) ELSE 0 END) as revenue
         FROM jobs j
         LEFT JOIN invoices i ON j.id = i.job_id
         WHERE j.territory_id = ? ${dateFilter}
@@ -17920,9 +17920,9 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
       
       const jobs = ownerJobs || [];
       const totalJobs = jobs.length;
-      const completedJobs = jobs.filter(job => job.status === 'completed' || job.status === 'paid').length;
+      const completedJobs = jobs.filter(job => job.status === 'completed').length;
       const avgJobValue = completedJobs > 0
-        ? Math.round((jobs.filter(job => job.status === 'completed' || job.status === 'paid')
+        ? Math.round((jobs.filter(job => job.status === 'completed')
             .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
         : 0;
 
@@ -18036,9 +18036,9 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     const processedTeamMembers = (teamMembers || []).map(member => {
       const jobs = jobsByMember[member.id] || [];
       const totalJobs = jobs.length;
-      const completedJobs = jobs.filter(job => job.status === 'completed' || job.status === 'paid').length;
+      const completedJobs = jobs.filter(job => job.status === 'completed').length;
       const avgJobValue = completedJobs > 0
-        ? Math.round((jobs.filter(job => job.status === 'completed' || job.status === 'paid')
+        ? Math.round((jobs.filter(job => job.status === 'completed')
             .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
         : 0;
 
@@ -18071,10 +18071,10 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
         if (!processedTeamMembers[accountOwnerIndex].jobs || processedTeamMembers[accountOwnerIndex].jobs.length === 0) {
           processedTeamMembers[accountOwnerIndex].jobs = jobsByMember[accountOwnerInTeam.id] || [];
           processedTeamMembers[accountOwnerIndex].total_jobs = processedTeamMembers[accountOwnerIndex].jobs.length;
-          processedTeamMembers[accountOwnerIndex].completed_jobs = processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed' || job.status === 'paid').length;
+          processedTeamMembers[accountOwnerIndex].completed_jobs = processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed').length;
           const completedJobs = processedTeamMembers[accountOwnerIndex].completed_jobs;
           processedTeamMembers[accountOwnerIndex].avg_job_value = completedJobs > 0
-            ? Math.round((processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed' || job.status === 'paid')
+            ? Math.round((processedTeamMembers[accountOwnerIndex].jobs.filter(job => job.status === 'completed')
                 .reduce((sum, job) => sum + (job.invoice_amount || 0), 0) / completedJobs) * 100) / 100
             : 0;
         }
@@ -20278,33 +20278,22 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Payouts settle prior debt, so they're never "current period" for this calculation
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      let allEntries = [];
-      let from = 0;
-      const pageSize = 1000;
-      while (true) {
-        const { data: page } = await supabase.from('cleaner_ledger')
-          .select('team_member_id, amount, effective_date, type')
-          .eq('user_id', userId)
-          .range(from, from + pageSize - 1);
-        allEntries = allEntries.concat(page || []);
-        if (!page || page.length < pageSize) break;
-        from += pageSize;
-      }
-      const totalByMember = {};
-      const currentPeriodByMember = {};
-      (allEntries || []).forEach(e => {
-        const mid = e.team_member_id;
-        const amt = parseFloat(e.amount);
-        totalByMember[mid] = (totalByMember[mid] || 0) + amt;
-        // Only count non-payout entries as "current period" — payouts always settle prior debt
-        if (e.type !== 'payout' && e.effective_date >= startDate && (!endDate || e.effective_date <= endDate)) {
-          currentPeriodByMember[mid] = (currentPeriodByMember[mid] || 0) + amt;
-        }
-      });
+      // Prior cash = unpaid cash_collected entries from before the current period
+      // These are actual cash the cleaner collected and hasn't returned yet
+      const { data: priorCash } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount')
+        .eq('user_id', userId)
+        .eq('type', 'cash_collected')
+        .lt('effective_date', startDate);
       const result = {};
-      for (const [mid, total] of Object.entries(totalByMember)) {
-        const prior = total - (currentPeriodByMember[mid] || 0);
-        if (prior < -0.01) result[mid] = parseFloat(prior.toFixed(2));
+      (priorCash || []).forEach(e => {
+        const mid = e.team_member_id;
+        result[mid] = (result[mid] || 0) + parseFloat(e.amount);
+      });
+      // Only return negative values (member owes cash)
+      for (const mid of Object.keys(result)) {
+        if (result[mid] >= -0.01) delete result[mid];
+        else result[mid] = parseFloat(result[mid].toFixed(2));
       }
       return result;
     };
@@ -20327,7 +20316,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       allJobsById[job.id] = job;
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
-      // Only count completed jobs in revenue (unless includeScheduled)
+      // Only count completed/paid jobs in revenue (unless includeScheduled)
       if (!includeScheduled && s !== 'completed') return;
       // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
@@ -20368,7 +20357,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // ===== Include projected entries for scheduled/in-progress jobs when jobFilter=all =====
     if (includeScheduled) {
       const cancelStatuses = ['cancelled', 'canceled', 'cancel'];
-      const completedStatuses = ['completed', 'paid'];
+      const completedStatuses = ['completed'];
       const jobsWithLedger = new Set((ledgerEntries || []).map(e => e.job_id).filter(Boolean));
       const teamMemberMap = {};
       (teamMembers || []).forEach(m => { teamMemberMap[m.id] = m; });
@@ -22326,7 +22315,7 @@ app.get('/api/team-members/dashboard/:teamMemberId', async (req, res) => {
         }
         return jobDateString === todayString;
       });
-      const completedJobs = jobs.filter(job => job.status === 'completed' || job.status === 'paid');
+      const completedJobs = jobs.filter(job => job.status === 'completed');
 
       const stats = {
         totalJobs: jobs.length,
@@ -22466,11 +22455,11 @@ app.get('/api/team-analytics', async (req, res) => {
           tm.last_name,
           tm.role,
           COUNT(DISTINCT all_jobs.job_id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN all_jobs.status IN ('completed','paid') THEN all_jobs.job_id END) as completed_jobs,
+          COUNT(DISTINCT CASE WHEN all_jobs.status = 'completed' THEN all_jobs.job_id END) as completed_jobs,
           COUNT(DISTINCT CASE WHEN all_jobs.status IN ('pending', 'confirmed', 'scheduled', 'rescheduled', 'in-progress', 'en-route', 'started') THEN all_jobs.job_id END) as active_jobs,
-          AVG(CASE WHEN all_jobs.status IN ('completed','paid') THEN all_jobs.invoice_amount END) as avg_job_value,
-          SUM(CASE WHEN all_jobs.status IN ('completed','paid') THEN all_jobs.invoice_amount END) as total_revenue,
-          AVG(CASE WHEN all_jobs.status IN ('completed','paid') THEN TIMESTAMPDIFF(MINUTE, all_jobs.scheduled_date, all_jobs.updated_at) END) as avg_completion_time
+          AVG(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as avg_job_value,
+          SUM(CASE WHEN all_jobs.status = 'completed' THEN all_jobs.invoice_amount END) as total_revenue,
+          AVG(CASE WHEN all_jobs.status = 'completed' THEN TIMESTAMPDIFF(MINUTE, all_jobs.scheduled_date, all_jobs.updated_at) END) as avg_completion_time
         FROM team_members tm
         LEFT JOIN (
           SELECT j.id as job_id, j.team_member_id, j.status, j.invoice_amount, j.scheduled_date, j.updated_at
@@ -22499,9 +22488,9 @@ app.get('/api/team-analytics', async (req, res) => {
         SELECT 
           (SELECT COUNT(DISTINCT id) FROM team_members WHERE user_id = ? AND status = 'active') as total_team_members,
           COUNT(DISTINCT j.id) as total_jobs,
-          COUNT(DISTINCT CASE WHEN j.status IN ('completed','paid') THEN j.id END) as completed_jobs,
-          SUM(CASE WHEN j.status IN ('completed','paid') THEN j.invoice_amount ELSE 0 END) as total_revenue,
-          AVG(CASE WHEN j.status IN ('completed','paid') THEN j.invoice_amount END) as avg_job_value
+          COUNT(DISTINCT CASE WHEN j.status = 'completed' THEN j.id END) as completed_jobs,
+          SUM(CASE WHEN j.status = 'completed' THEN j.invoice_amount ELSE 0 END) as total_revenue,
+          AVG(CASE WHEN j.status = 'completed' THEN j.invoice_amount END) as avg_job_value
         FROM jobs j
         WHERE j.id IN (
           SELECT DISTINCT job_id FROM (
@@ -25216,10 +25205,10 @@ app.get('/api/team-members/:id/performance', async (req, res) => {
           // Get performance metrics
           const [metricsResult] = await connection.query(`
             SELECT 
-              COUNT(CASE WHEN j.status IN ('completed','paid') THEN 1 END) as jobs_completed,
+              COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as jobs_completed,
               AVG(CASE WHEN j.rating IS NOT NULL THEN j.rating ELSE NULL END) as average_rating,
-              SUM(CASE WHEN j.status IN ('completed','paid') THEN j.duration ELSE 0 END) as hours_worked,
-              SUM(CASE WHEN j.status IN ('completed','paid') THEN j.total_amount ELSE 0 END) as revenue_generated
+              SUM(CASE WHEN j.status = 'completed' THEN j.duration ELSE 0 END) as hours_worked,
+              SUM(CASE WHEN j.status = 'completed' THEN j.total_amount ELSE 0 END) as revenue_generated
             FROM jobs j
             WHERE j.team_member_id = ?
             AND j.scheduled_date >= DATE_SUB(NOW(), INTERVAL 30 DAY)
@@ -25238,7 +25227,7 @@ app.get('/api/team-members/:id/performance', async (req, res) => {
             LEFT JOIN customers c ON j.customer_id = c.id
             LEFT JOIN services s ON j.service_id = s.id
             WHERE j.team_member_id = ?
-            AND j.status IN ('completed','paid')
+            AND j.status = 'completed'
             ORDER BY j.completed_date DESC
             LIMIT 10
           `, [id]);
@@ -32199,7 +32188,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   // Only create ledger entries for completed/paid jobs
   const jobStatus = (job.status || '').toLowerCase();
-  if (jobStatus !== 'completed' && jobStatus !== 'paid') {
+  if (jobStatus !== 'completed') {
     return;
   }
 
@@ -32376,7 +32365,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     .select('amount, payment_method')
     .eq('job_id', jobId)
     .eq('status', 'completed')
-    .ilike('payment_method', '%cash%');
+    .eq('payment_method', 'cash');
   if (cashTxs && cashTxs.length > 0) {
     const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
     if (totalCash > 0) {
@@ -32848,7 +32837,7 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
 
     // Get total cash for this job from transactions
     const { data: cashTxs } = await supabase.from('transactions')
-      .select('amount').eq('job_id', jobId).eq('status', 'completed').ilike('payment_method', '%cash%');
+      .select('amount').eq('job_id', jobId).eq('status', 'completed').eq('payment_method', 'cash');
     const totalCash = (cashTxs || []).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
 
     // Get all assigned members for this job
@@ -34206,10 +34195,11 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     if (!apiKey) return res.status(400).json({ error: 'OpenPhone API key is required' });
     if (!SIGCORE_WORKSPACE_KEY) return res.status(500).json({ error: 'Sigcore workspace key not configured' });
 
-    // 1. Provision tenant (idempotent)
+    // 1. Provision Sigcore tenant for the SF app (not per-user — the app is the tenant, users are sub-entities)
+    // Fixed externalTenantId: all SF users share one Sigcore tenant ("Service Flow")
     const provisionRes = await sigcoreRequest('POST', '/tenants/provision', SIGCORE_WORKSPACE_KEY, {
-      externalTenantId: String(userId),
-      displayName: `ServiceFlow User ${userId}`
+      externalTenantId: 'serviceflow-app',
+      displayName: 'Service Flow'
     });
     const { tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {};
     if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
@@ -34218,9 +34208,8 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     await sigcoreRequest('POST', '/integrations/openphone/connect', tenantApiKey, { apiKey });
 
     // 2b. Also connect at workspace level so conversations/messages endpoints can find the integration
-    // (Sigcore's GET /openphone/conversations only queries workspace-scoped CommunicationIntegration, not tenant-scoped)
-    try { await sigcoreRequest('POST', '/integrations/openphone/connect', SIGCORE_WORKSPACE_KEY, { apiKey }); }
-    catch (e) { logger.warn('[Communications] Workspace-level connect failed (non-fatal):', e.message); }
+    // (Sigcore's GET /openphone/conversations only queries workspace-scoped integrations, not tenant-scoped)
+    await sigcoreRequest('POST', '/integrations/openphone/connect', SIGCORE_WORKSPACE_KEY, { apiKey });
 
     // 3. Fetch phone numbers
     const numbersRes = await sigcoreRequest('GET', '/integrations/openphone/numbers', tenantApiKey);
@@ -34533,7 +34522,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     let allConversations = [];
     try {
       const days = maxConversations > 0 ? 7 : 30;
-      // Use workspace key — Sigcore conversations endpoint only queries workspace-scoped integrations
+      // Use workspace key (not tenant key) — Sigcore conversations endpoint only queries workspace-scoped integrations
       const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, SIGCORE_WORKSPACE_KEY);
       const allConvs = convRes.data?.data || convRes.data || [];
       logger.log(`[Sync] Fetched ${allConvs.length} total conversations from OpenPhone (${days} days)`);

@@ -133,7 +133,6 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     'late': 'late',
     'complete': 'completed',
     'completed': 'completed',
-    'paid': 'paid',
   }
 
   // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
@@ -154,10 +153,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
   function mapJob(zb, userId, lookups) {
     const { customerMap, serviceMap, teamMap, territoryMap } = lookups
+    const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
     const inv = zb.invoice || {}
-    const baseStatus = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
-    // If job is completed and invoice is paid, mark as paid
-    const status = (baseStatus === 'completed' && inv.status === 'paid') ? 'paid' : baseStatus
     const addr = zb.service_address || {}
     const assignedProvider = zb.assigned_providers?.[0]
 
@@ -609,10 +606,6 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     if (eventType === 'invoice_payment.succeeded' || eventType === 'invoice_payment.recorded') {
       const amount = parseFloat(data.amount_paid || data.amount) || 0
       const paymentMethod = data.custom_payment_method_name || data.payment_method || 'other'
-      // Move job status to paid if currently completed
-      if (job.status === 'completed' || job.status === 'complete') {
-        update.status = 'paid'
-      }
       update.payment_status = 'paid'
       update.invoice_status = 'paid'
       update.payment_method = paymentMethod
@@ -888,9 +881,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               if (!sfJob) { skipped++; continue }
 
               // ── Update status/invoice ──
+              const zbStatus = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
               const inv = zb.invoice || {}
-              const zbBaseStatus = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
-              const zbStatus = (zbBaseStatus === 'completed' && inv.status === 'paid') ? 'paid' : zbBaseStatus
               const zbInvoiceStatus = inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft')
               const zbPaymentStatus = inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null)
 
