@@ -20274,46 +20274,29 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior period balance per member
-    // Net of: all non-payout entries before period start + all payouts that settle prior periods
-    // (payouts may have effective_date in current period but cover prior period entries)
+    // 4. Prior debt per member = total balance (all time) minus current period entries
+    // If negative after removing current period, member owes from prior periods
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      // All non-payout entries before period start
-      const { data: priorEntries } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount')
-        .eq('user_id', userId)
-        .neq('type', 'payout')
-        .lt('effective_date', startDate);
-      // All payout entries (regardless of date — check batch period_end)
-      const { data: allPayouts } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount, payout_batch_id')
-        .eq('user_id', userId)
-        .eq('type', 'payout');
-      // Get batch period_end for each payout to determine if it covers prior period
-      const batchIds = [...new Set((allPayouts || []).map(p => p.payout_batch_id).filter(Boolean))];
-      let batchPeriods = {};
-      if (batchIds.length > 0) {
-        const { data: batches } = await supabase.from('cleaner_payout_batch')
-          .select('id, period_end').in('id', batchIds);
-        (batches || []).forEach(b => { batchPeriods[b.id] = b.period_end; });
-      }
-
-      const byMember = {};
-      (priorEntries || []).forEach(e => {
-        byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount);
-      });
-      // Include payouts whose batch period_end is before current period start
-      (allPayouts || []).forEach(p => {
-        const periodEnd = batchPeriods[p.payout_batch_id];
-        if (periodEnd && periodEnd < startDate) {
-          byMember[p.team_member_id] = (byMember[p.team_member_id] || 0) + parseFloat(p.amount);
+      // Sum ALL entries (all time)
+      const { data: allEntries } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount, effective_date')
+        .eq('user_id', userId);
+      const totalByMember = {};
+      const currentPeriodByMember = {};
+      (allEntries || []).forEach(e => {
+        const mid = e.team_member_id;
+        const amt = parseFloat(e.amount);
+        totalByMember[mid] = (totalByMember[mid] || 0) + amt;
+        if (e.effective_date >= startDate && (!endDate || e.effective_date <= endDate)) {
+          currentPeriodByMember[mid] = (currentPeriodByMember[mid] || 0) + amt;
         }
       });
-
+      // Prior balance = total - current period
       const result = {};
-      for (const [mid, amt] of Object.entries(byMember)) {
-        if (amt < -0.01) result[mid] = parseFloat(amt.toFixed(2));
+      for (const [mid, total] of Object.entries(totalByMember)) {
+        const prior = total - (currentPeriodByMember[mid] || 0);
+        if (prior < -0.01) result[mid] = parseFloat(prior.toFixed(2));
       }
       return result;
     };
