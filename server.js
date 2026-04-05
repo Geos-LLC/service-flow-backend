@@ -20274,31 +20274,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior unpaid cash balance per member (before period start)
-    // = sum of all prior entries (earnings + cash_collected + payouts). If negative, member owes cash back.
+    // 4. Prior unreturned cash per member (before period start)
+    // = cash_collected + cash_to_company (cash_to_company offsets cash_collected when cleaner returns cash)
     const fetchPriorCash = async () => {
       if (!startDate) return {};
       const { data } = await supabase.from('cleaner_ledger')
         .select('team_member_id, amount, type')
         .eq('user_id', userId)
+        .in('type', ['cash_collected', 'cash_to_company'])
         .lt('effective_date', startDate);
-      // Calculate prior balance per member, then extract just the unpaid cash portion
-      const priorBalance = {};
-      const priorCash = {};
+      const byMember = {};
       (data || []).forEach(e => {
-        const mid = e.team_member_id;
-        priorBalance[mid] = (priorBalance[mid] || 0) + parseFloat(e.amount);
-        if (e.type === 'cash_collected') priorCash[mid] = (priorCash[mid] || 0) + parseFloat(e.amount);
+        byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount);
       });
-      // Only show unpaid cash: if prior balance is negative, the member owes cash
-      // The unpaid portion is min(abs(priorCash), abs(priorBalance)) when balance < 0
+      // Only return members with unreturned cash (negative value = they still hold cash)
       const result = {};
-      for (const mid of Object.keys(priorCash)) {
-        const balance = priorBalance[mid] || 0;
-        if (balance < 0) {
-          // Member owes money — show the negative balance as unpaid cash
-          result[mid] = balance;
-        }
+      for (const [mid, amt] of Object.entries(byMember)) {
+        if (amt < 0) result[mid] = amt;
       }
       return result;
     };
