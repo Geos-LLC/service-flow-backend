@@ -20278,9 +20278,18 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Payouts settle prior debt, so they're never "current period" for this calculation
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      const { data: allEntries } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount, effective_date, type')
-        .eq('user_id', userId);
+      let allEntries = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        const { data: page } = await supabase.from('cleaner_ledger')
+          .select('team_member_id, amount, effective_date, type')
+          .eq('user_id', userId)
+          .range(from, from + pageSize - 1);
+        allEntries = allEntries.concat(page || []);
+        if (!page || page.length < pageSize) break;
+        from += pageSize;
+      }
       const totalByMember = {};
       const currentPeriodByMember = {};
       (allEntries || []).forEach(e => {
