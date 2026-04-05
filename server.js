@@ -33072,12 +33072,28 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     throw new Error(`Failed to fetch unpaid entries: ${fetchError.message}`);
   }
 
-  if (!unpaidEntries || unpaidEntries.length === 0) {
+  // Also include unpaid cash_collected from prior periods (carry-over debt)
+  const { data: priorCashEntries, error: priorCashError } = await supabase
+    .from('cleaner_ledger')
+    .select('id, amount, type')
+    .eq('user_id', userId)
+    .eq('team_member_id', teamMemberId)
+    .is('payout_batch_id', null)
+    .lt('effective_date', periodStart)
+    .eq('type', 'cash_collected');
+
+  if (priorCashError) {
+    console.error(`[Payout] Error fetching prior cash entries: ${priorCashError.message}`);
+  }
+
+  const allEntries = [...(unpaidEntries || []), ...(priorCashEntries || [])];
+
+  if (allEntries.length === 0) {
     return { skipped: true, reason: 'No unpaid entries found for this period' };
   }
 
   // Calculate total
-  const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+  const totalAmount = allEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
   const roundedTotal = parseFloat(totalAmount.toFixed(2));
 
   // Create payout batch
@@ -33101,8 +33117,8 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     throw new Error(`Failed to create payout batch: ${batchError.message}`);
   }
 
-  // Attach ledger entries to this batch
-  const entryIds = unpaidEntries.map(e => e.id);
+  // Attach ledger entries to this batch (including prior cash carry-over)
+  const entryIds = allEntries.map(e => e.id);
   const { error: attachError } = await supabase
     .from('cleaner_ledger')
     .update({ payout_batch_id: batch.id })
@@ -33119,11 +33135,11 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     batch,
     entry_count: entryIds.length,
     entries_summary: {
-      earnings: unpaidEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
-      tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
-      incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
-      cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
-      adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
+      earnings: allEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
+      tips: allEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
+      incentives: allEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
+      cash_offsets: allEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
+      adjustments: allEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
     }
   };
 }
