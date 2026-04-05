@@ -34214,8 +34214,13 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     const { tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {};
     if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
 
-    // 2. Connect OpenPhone via Sigcore
+    // 2. Connect OpenPhone via Sigcore (tenant-level for webhooks)
     await sigcoreRequest('POST', '/integrations/openphone/connect', tenantApiKey, { apiKey });
+
+    // 2b. Also connect at workspace level so conversations/messages endpoints can find the integration
+    // (Sigcore's GET /openphone/conversations only queries workspace-scoped CommunicationIntegration, not tenant-scoped)
+    try { await sigcoreRequest('POST', '/integrations/openphone/connect', SIGCORE_WORKSPACE_KEY, { apiKey }); }
+    catch (e) { logger.warn('[Communications] Workspace-level connect failed (non-fatal):', e.message); }
 
     // 3. Fetch phone numbers
     const numbersRes = await sigcoreRequest('GET', '/integrations/openphone/numbers', tenantApiKey);
@@ -34528,12 +34533,16 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     let allConversations = [];
     try {
       const days = maxConversations > 0 ? 7 : 30;
-      const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, tenantKey);
+      // Use workspace key — Sigcore conversations endpoint only queries workspace-scoped integrations
+      const convRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, SIGCORE_WORKSPACE_KEY);
       const allConvs = convRes.data?.data || convRes.data || [];
       logger.log(`[Sync] Fetched ${allConvs.length} total conversations from OpenPhone (${days} days)`);
 
       // Filter to only conversations on OUR phone numbers
       if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
+        logger.log(`[Sync] Our phoneNumberIds: ${JSON.stringify(phoneNumberIds)}`);
+        logger.log(`[Sync] Our phones: ${JSON.stringify(ourPhoneNumbers)}`);
+        if (allConvs[0]) logger.log(`[Sync] Sample conv: phoneNumber=${allConvs[0].phoneNumber}, phoneNumberId=${allConvs[0].phoneNumberId}, keys=${Object.keys(allConvs[0]).join(',')}`);
         allConversations = allConvs.filter(c => {
           const convPhone = normalizePhone(c.phoneNumber);
           const convPnId = c.phoneNumberId;
@@ -34619,9 +34628,10 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           if (participantPhone && phoneNumberId) {
             let messages = [];
             try {
+              // Use workspace key — Sigcore messages endpoint only queries workspace-scoped integrations
               const msgRes = await sigcoreRequest('GET',
                 `/integrations/openphone/messages?phoneNumberId=${phoneNumberId}&participant=${encodeURIComponent(participantPhone)}`,
-                tenantKey);
+                SIGCORE_WORKSPACE_KEY);
               messages = msgRes.data?.data || [];
             } catch (sigcoreErr) {
               // Sigcore endpoint not deployed yet — fallback to direct OpenPhone API
