@@ -20501,8 +20501,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalHours = scheduledHours;
       }
 
-      // For managers with includeScheduled: project full period salary and commission
-      if (isManagerOrOwner && includeScheduled) {
+      // Managers/schedulers: always calculate from scheduled hours and total revenue
+      // Their pay is not per-job — it's based on their schedule and business revenue
+      if (isManagerOrOwner) {
         if (hourlyRate > 0 && scheduledHours > 0) {
           hourlySalary = scheduledHours * hourlyRate;
         }
