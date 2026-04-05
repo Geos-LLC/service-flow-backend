@@ -20274,23 +20274,46 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior unreturned cash per member (before period start)
-    // = cash_collected + cash_to_company (cash_to_company offsets cash_collected when cleaner returns cash)
+    // 4. Prior period balance per member
+    // Net of: all non-payout entries before period start + all payouts that settle prior periods
+    // (payouts may have effective_date in current period but cover prior period entries)
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      const { data } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount, type')
+      // All non-payout entries before period start
+      const { data: priorEntries } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount')
         .eq('user_id', userId)
-        .in('type', ['cash_collected', 'cash_to_company'])
+        .neq('type', 'payout')
         .lt('effective_date', startDate);
+      // All payout entries (regardless of date — check batch period_end)
+      const { data: allPayouts } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount, payout_batch_id')
+        .eq('user_id', userId)
+        .eq('type', 'payout');
+      // Get batch period_end for each payout to determine if it covers prior period
+      const batchIds = [...new Set((allPayouts || []).map(p => p.payout_batch_id).filter(Boolean))];
+      let batchPeriods = {};
+      if (batchIds.length > 0) {
+        const { data: batches } = await supabase.from('cleaner_payout_batch')
+          .select('id, period_end').in('id', batchIds);
+        (batches || []).forEach(b => { batchPeriods[b.id] = b.period_end; });
+      }
+
       const byMember = {};
-      (data || []).forEach(e => {
+      (priorEntries || []).forEach(e => {
         byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount);
       });
-      // Only return members with unreturned cash (negative value = they still hold cash)
+      // Include payouts whose batch period_end is before current period start
+      (allPayouts || []).forEach(p => {
+        const periodEnd = batchPeriods[p.payout_batch_id];
+        if (periodEnd && periodEnd < startDate) {
+          byMember[p.team_member_id] = (byMember[p.team_member_id] || 0) + parseFloat(p.amount);
+        }
+      });
+
       const result = {};
       for (const [mid, amt] of Object.entries(byMember)) {
-        if (amt < 0) result[mid] = amt;
+        if (amt < -0.01) result[mid] = parseFloat(amt.toFixed(2));
       }
       return result;
     };
