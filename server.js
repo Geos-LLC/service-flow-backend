@@ -33037,11 +33037,12 @@ app.post('/api/ledger/payout-batch/all', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'periodStart and periodEnd are required' });
     }
 
-    // Get ALL team members (active + inactive)
+    // Only process active team members for batch payouts
     const { data: members, error: membersError } = await supabase
       .from('team_members')
       .select('id, first_name, last_name, status')
-      .eq('user_id', userId);
+      .eq('user_id', userId)
+      .eq('status', 'active');
 
     if (membersError) {
       return res.status(500).json({ error: 'Failed to fetch team members' });
