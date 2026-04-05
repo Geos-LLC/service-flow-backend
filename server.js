@@ -20274,29 +20274,44 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior balance per member — only UNPAID entries before current period
-    // Entries in a payout batch (paid or pending) are already settled/claimed.
-    // Only unbatched entries represent remaining prior debt.
+    // 4. Prior debt per member
+    // Sum all entries before current period. For payouts, use the batch's period_end
+    // (not effective_date) since payouts are often dated after the period they cover.
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      const byMember = {};
-      let from = 0;
-      const pageSize = 1000;
-      while (true) {
-        const { data: entries, error } = await supabase.from('cleaner_ledger')
-          .select('team_member_id, amount')
-          .eq('user_id', userId)
-          .neq('type', 'payout')
-          .is('payout_batch_id', null)
-          .lt('effective_date', startDate)
-          .range(from, from + pageSize - 1);
-        if (error) { console.error('[Payroll] Prior cash fetch error:', error); break; }
-        (entries || []).forEach(e => {
-          byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount);
-        });
-        if (!entries || entries.length < pageSize) break;
-        from += pageSize;
+      // All non-payout entries before period start
+      const { data: priorEntries } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount')
+        .eq('user_id', userId).neq('type', 'payout')
+        .lt('effective_date', startDate);
+      // All payouts with their batch info
+      const { data: payoutEntries } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount, payout_batch_id')
+        .eq('user_id', userId).eq('type', 'payout');
+      // Get batch period_end for each payout
+      const batchIds = [...new Set((payoutEntries || []).map(p => p.payout_batch_id).filter(Boolean))];
+      const batchPeriodEnd = {};
+      if (batchIds.length > 0) {
+        for (let i = 0; i < batchIds.length; i += 50) {
+          const chunk = batchIds.slice(i, i + 50);
+          const { data: batches } = await supabase.from('cleaner_payout_batch')
+            .select('id, period_end').in('id', chunk);
+          (batches || []).forEach(b => { batchPeriodEnd[b.id] = b.period_end; });
+        }
       }
+
+      const byMember = {};
+      (priorEntries || []).forEach(e => {
+        byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount);
+      });
+      // Include payouts whose batch covers prior period (period_end < current start)
+      (payoutEntries || []).forEach(p => {
+        const pe = batchPeriodEnd[p.payout_batch_id];
+        if (pe && pe < startDate) {
+          byMember[p.team_member_id] = (byMember[p.team_member_id] || 0) + parseFloat(p.amount);
+        }
+      });
+
       const result = {};
       for (const [mid, amt] of Object.entries(byMember)) {
         if (amt < -0.01) result[mid] = parseFloat(amt.toFixed(2));
