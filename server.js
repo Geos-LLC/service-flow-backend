@@ -20274,8 +20274,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    const [membersResult, ledgerEntries, allJobs] = await Promise.all([
-      membersPromise, fetchLedgerEntries(), fetchJobs()
+    // 4. Prior cash_collected totals per member (before period start) for carry-over display
+    const fetchPriorCash = async () => {
+      if (!startDate) return {};
+      const { data } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount')
+        .eq('user_id', userId).eq('type', 'cash_collected')
+        .lt('effective_date', startDate);
+      const byMember = {};
+      (data || []).forEach(e => { byMember[e.team_member_id] = (byMember[e.team_member_id] || 0) + parseFloat(e.amount); });
+      return byMember;
+    };
+
+    const [membersResult, ledgerEntries, allJobs, priorCashByMember] = await Promise.all([
+      membersPromise, fetchLedgerEntries(), fetchJobs(), fetchPriorCash()
     ]);
 
     const { data: teamMembers, error: membersError } = membersResult;
@@ -20585,6 +20597,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalTips: parseFloat(totalTips.toFixed(2)),
         totalIncentives: parseFloat(totalIncentives.toFixed(2)),
         totalCashCollected: parseFloat(totalCashCollected.toFixed(2)),
+        priorCashCollected: parseFloat((priorCashByMember[member.id] || 0).toFixed(2)),
         totalSalary: parseFloat(totalSalary.toFixed(2)),
         hasHourlyRate: !!member.hourly_rate,
         hasCommission: !!member.commission_percentage,
