@@ -32785,7 +32785,7 @@ app.post('/api/ledger/cash-collected', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /api/ledger/cash-collected/:jobId/:teamMemberId - Update cash collected amount for a specific member on a job
+// PATCH /api/ledger/cash-collected/:jobId/:teamMemberId - Update cash collected for a member, redistribute remainder to others
 app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -32796,26 +32796,60 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
     if (amount === undefined) return res.status(400).json({ error: 'amount is required' });
 
     // Verify job belongs to user
-    const { data: job } = await supabase.from('jobs').select('id, scheduled_date').eq('id', jobId).eq('user_id', userId).single();
+    const { data: job } = await supabase.from('jobs').select('id, scheduled_date, team_member_id').eq('id', jobId).eq('user_id', userId).single();
     if (!job) return res.status(404).json({ error: 'Job not found' });
 
     const parsedAmount = Math.abs(parseFloat(amount));
     const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-    // Delete existing cash_collected entry for this member on this job
-    await supabase.from('cleaner_ledger').delete()
-      .eq('job_id', jobId).eq('team_member_id', teamMemberId).eq('type', 'cash_collected');
+    // Get total cash for this job from transactions
+    const { data: cashTxs } = await supabase.from('transactions')
+      .select('amount').eq('job_id', jobId).eq('status', 'completed').ilike('payment_method', '%cash%');
+    const totalCash = (cashTxs || []).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
 
-    // Create new entry if amount > 0
-    if (parsedAmount > 0) {
-      await supabase.from('cleaner_ledger').insert({
-        user_id: userId, team_member_id: teamMemberId, job_id: jobId,
-        type: 'cash_collected', amount: -parsedAmount,
-        effective_date: effectiveDate,
-        note: `Cash collected for job #${jobId} (manual)`,
-        metadata: { manual: true },
-        created_by: userId
-      });
+    // Get all assigned members for this job
+    const { data: assignments } = await supabase.from('job_team_assignments').select('team_member_id').eq('job_id', jobId);
+    let allMemberIds = (assignments || []).map(a => a.team_member_id);
+    if (allMemberIds.length === 0 && job.team_member_id) allMemberIds = [job.team_member_id];
+
+    // Delete ALL cash_collected entries for this job (we'll rebuild them)
+    await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).eq('type', 'cash_collected');
+
+    const entries = [];
+    if (totalCash > 0 && allMemberIds.length > 0) {
+      // Set the edited member's amount
+      const editedAmount = Math.min(parsedAmount, totalCash);
+      if (editedAmount > 0) {
+        entries.push({
+          user_id: userId, team_member_id: teamMemberId, job_id: jobId,
+          type: 'cash_collected', amount: -editedAmount,
+          effective_date: effectiveDate,
+          note: `Cash collected for job #${jobId}`,
+          metadata: { manual: true },
+          created_by: userId
+        });
+      }
+
+      // Distribute remainder to other members evenly
+      const remainder = totalCash - editedAmount;
+      const otherMembers = allMemberIds.filter(id => id !== teamMemberId);
+      if (remainder > 0 && otherMembers.length > 0) {
+        const perMember = parseFloat((remainder / otherMembers.length).toFixed(2));
+        for (const mid of otherMembers) {
+          entries.push({
+            user_id: userId, team_member_id: mid, job_id: jobId,
+            type: 'cash_collected', amount: -perMember,
+            effective_date: effectiveDate,
+            note: `Cash collected for job #${jobId}`,
+            metadata: { redistributed: true },
+            created_by: userId
+          });
+        }
+      }
+    }
+
+    if (entries.length > 0) {
+      await supabase.from('cleaner_ledger').insert(entries);
     }
 
     res.json({ success: true });
