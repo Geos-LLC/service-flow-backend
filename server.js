@@ -33938,6 +33938,148 @@ async function autoLinkConversation(userId, conversationId, phone) {
   return null;
 }
 
+// ── Deterministic Endpoint Routing ──
+
+/**
+ * 5-step deterministic routing pipeline.
+ * Returns the workspace + user that should handle an inbound event.
+ * NEVER uses scoring. Each step is an exact-match database query.
+ * Multiple matches at any step = ambiguous = do NOT auto-route.
+ */
+async function resolveEndpointRoute({ provider, providerAccountId, endpointId, phoneNumber, channel, conversationId }) {
+  const result = { routed: false, workspaceId: null, userId: null, step: null, route: null, ambiguous: false, candidates: [] };
+
+  // Step A: EXACT ENDPOINT MATCH (provider + endpoint_id + channel)
+  if (endpointId && provider && channel) {
+    const { data: routes } = await supabase.from('communication_endpoint_routes')
+      .select('*').eq('provider', provider).eq('endpoint_id', endpointId).eq('channel', channel).eq('is_active', true);
+
+    if (routes?.length === 1) {
+      const route = routes[0];
+      const userId = await resolveWorkspaceOwner(route.workspace_id);
+      logger.log(`[Route] Step A: exact endpoint ${provider}/${endpointId}/${channel} → workspace ${route.workspace_id}`);
+      return { routed: true, workspaceId: route.workspace_id, userId, step: 'A', route, ambiguous: false, candidates: [] };
+    }
+    if (routes?.length > 1) {
+      logger.warn(`[Route] Step A: AMBIGUOUS - ${routes.length} routes for ${provider}/${endpointId}/${channel}`);
+      return { ...result, ambiguous: true, candidates: routes, step: 'A' };
+    }
+  }
+
+  // Step B: EXACT CONVERSATION MATCH (existing thread by provider conversation ID)
+  if (conversationId) {
+    const { data: conv } = await supabase.from('communication_conversations')
+      .select('id, user_id').eq('sigcore_conversation_id', conversationId).maybeSingle();
+
+    if (conv?.user_id) {
+      const { data: wsUser } = await supabase.from('sf_workspace_users')
+        .select('workspace_id').eq('user_id', conv.user_id).eq('status', 'active').maybeSingle();
+      logger.log(`[Route] Step B: conversation ${conversationId} → user ${conv.user_id}`);
+      return { routed: true, workspaceId: wsUser?.workspace_id || null, userId: conv.user_id, step: 'B', route: null, ambiguous: false, candidates: [] };
+    }
+  }
+
+  // Step C: REGISTERED INTEGRATION MATCH (provider + provider_account_id — exactly 1 only)
+  if (providerAccountId && provider) {
+    const { data: routes } = await supabase.from('communication_endpoint_routes')
+      .select('*').eq('provider', provider).eq('provider_account_id', providerAccountId).eq('is_active', true)
+      .order('priority', { ascending: false });
+
+    if (routes?.length === 1) {
+      const route = routes[0];
+      const userId = await resolveWorkspaceOwner(route.workspace_id);
+      logger.log(`[Route] Step C: integration ${provider}/${providerAccountId} → workspace ${route.workspace_id}`);
+      return { routed: true, workspaceId: route.workspace_id, userId, step: 'C', route, ambiguous: false, candidates: [] };
+    }
+    if (routes?.length > 1) {
+      logger.warn(`[Route] Step C: AMBIGUOUS - ${routes.length} routes for ${provider}/${providerAccountId}`);
+      return { ...result, ambiguous: true, candidates: routes, step: 'C' };
+    }
+  }
+
+  // Step D: PHONE ASSET FALLBACK (strict — exactly 1 active route only)
+  if (phoneNumber) {
+    const normalized = normalizePhone(phoneNumber);
+    if (normalized) {
+      const { data: routes } = await supabase.from('communication_endpoint_routes')
+        .select('*').eq('phone_number', normalized).eq('is_active', true)
+        .order('priority', { ascending: false });
+
+      if (routes?.length === 1) {
+        const route = routes[0];
+        const userId = await resolveWorkspaceOwner(route.workspace_id);
+        logger.log(`[Route] Step D: phone ${normalized} → workspace ${route.workspace_id}`);
+        return { routed: true, workspaceId: route.workspace_id, userId, step: 'D', route, ambiguous: false, candidates: [] };
+      }
+      if (routes?.length > 1) {
+        logger.warn(`[Route] Step D: AMBIGUOUS - ${routes.length} routes for phone ${normalized}`);
+        return { ...result, ambiguous: true, candidates: routes, step: 'D' };
+      }
+    }
+  }
+
+  // Step E: NO MATCH — do not auto-route
+  logger.warn(`[Route] Step E: no deterministic route`, { provider, endpointId, phoneNumber, channel, conversationId });
+  return result;
+}
+
+// Resolve workspace owner (userId) from workspace_id
+async function resolveWorkspaceOwner(workspaceId) {
+  if (!workspaceId) return null;
+  const { data } = await supabase.from('sf_workspace_users')
+    .select('user_id').eq('workspace_id', workspaceId).eq('role', 'owner').eq('status', 'active').maybeSingle();
+  return data?.user_id || null;
+}
+
+// Register endpoint routes for a set of phone numbers (used on connect/provision)
+async function registerEndpointRoutes(workspaceId, provider, phoneNumbers, routeSource = 'auto_connect') {
+  const registered = [];
+  for (const pn of phoneNumbers) {
+    const phoneNormalized = normalizePhone(pn.number || pn.phoneNumber);
+    const epId = pn.id || pn.phoneNumberId;
+    const accountId = pn.accountId || pn.providerAccountId || null;
+
+    for (const ch of ['sms', 'voice']) {
+      // Skip voice for SMS-only numbers, SMS for voice-only
+      if (ch === 'sms' && pn.capabilities?.sms === false) continue;
+      if (ch === 'voice' && pn.capabilities?.voice === false) continue;
+
+      // Check if exists first (partial unique index may not support upsert)
+      const { data: existing } = await supabase.from('communication_endpoint_routes')
+        .select('id').eq('provider', provider).eq('endpoint_id', epId).eq('channel', ch).eq('is_active', true).maybeSingle();
+
+      if (existing) {
+        // Update
+        await supabase.from('communication_endpoint_routes').update({
+          workspace_id: workspaceId, provider_account_id: accountId,
+          phone_number: phoneNormalized, updated_at: new Date().toISOString(),
+        }).eq('id', existing.id);
+      } else {
+        // Insert
+        await supabase.from('communication_endpoint_routes').insert({
+          workspace_id: workspaceId, provider, provider_account_id: accountId,
+          endpoint_id: epId, phone_number: phoneNormalized, channel: ch,
+          role: 'sigcore_registered_number', route_source: routeSource,
+          is_active: true, activated_at: new Date().toISOString(),
+        });
+      }
+      registered.push({ provider, endpointId: epId, channel: ch, phone: phoneNormalized });
+    }
+  }
+  logger.log(`[Route] Registered ${registered.length} endpoint routes for workspace ${workspaceId}`);
+  return registered;
+}
+
+// Deactivate all endpoint routes for a workspace + provider
+async function deactivateEndpointRoutes(workspaceId, provider) {
+  const { data: deactivated } = await supabase.from('communication_endpoint_routes')
+    .update({ is_active: false, deactivated_at: new Date().toISOString() })
+    .eq('workspace_id', workspaceId).eq('provider', provider).eq('is_active', true)
+    .select('id');
+  logger.log(`[Route] Deactivated ${deactivated?.length || 0} routes for workspace ${workspaceId}/${provider}`);
+  return deactivated?.length || 0;
+}
+
 // ── SF Workspace helpers ──
 
 // Get or create SF workspace for a user
@@ -34105,6 +34247,12 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
       updated_at: new Date().toISOString()
     }, { onConflict: 'user_id' });
 
+    // 6. Register deterministic endpoint routes
+    const workspace = await getOrCreateSfWorkspace(userId);
+    if (workspace?.id && phoneNumbers.length > 0) {
+      await registerEndpointRoutes(workspace.id, 'openphone', phoneNumbers, 'auto_connect');
+    }
+
     logger.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
     res.json({ success: true, phoneNumbers, tenantId });
   } catch (error) {
@@ -34172,6 +34320,10 @@ app.delete('/api/communications/disconnect-openphone', authenticateToken, async 
       updated_at: new Date().toISOString()
     }).eq('user_id', userId);
 
+    // Deactivate endpoint routes
+    const workspace = await getOrCreateSfWorkspace(userId);
+    if (workspace?.id) await deactivateEndpointRoutes(workspace.id, 'openphone');
+
     logger.log(`[Communications] OpenPhone disconnected for user ${userId}`);
     res.json({ success: true });
   } catch (error) {
@@ -34209,30 +34361,43 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 
     logger.log(`[Webhook] Sigcore event: ${event}`, JSON.stringify(payload).substring(0, 200));
 
-    // Determine user by matching phone number to communication_settings
+    // Extract routing inputs from webhook payload
     const fromNumber = normalizePhone(payload.fromNumber || payload.from_number);
     const toNumber = normalizePhone(payload.toNumber || payload.to_number);
     const sigcoreConvId = payload.conversationId;
+    const endpointId = payload.phoneNumberId || payload.endpoint_id;
+    const providerAccountId = payload.accountId || payload.provider_account_id;
+    const isInbound = payload.direction === 'inbound' || payload.direction === 'in' || event.includes('inbound') || event.includes('received');
+    const ourEndpointPhone = isInbound ? toNumber : fromNumber;
+    const participantPhone = isInbound ? fromNumber : toNumber;
+    const channel = event.includes('call') ? 'voice' : 'sms';
 
-    // Find user from settings (match by phone number in cached_phone_numbers)
+    // ── Deterministic routing pipeline ──
+    const routeResult = await resolveEndpointRoute({
+      provider: 'openphone',
+      providerAccountId,
+      endpointId,
+      phoneNumber: ourEndpointPhone,
+      channel,
+      conversationId: sigcoreConvId,
+    });
+
     let userId = null;
-    const { data: allSettings } = await supabase.from('communication_settings').select('user_id, cached_phone_numbers').eq('connection_status', 'connected');
-    for (const s of (allSettings || [])) {
-      const numbers = (s.cached_phone_numbers || []).map(n => normalizePhone(n.number || n.phoneNumber || n));
-      if (numbers.includes(fromNumber) || numbers.includes(toNumber)) {
-        userId = s.user_id;
-        break;
+    if (routeResult.routed) {
+      userId = routeResult.userId;
+    } else if (routeResult.ambiguous) {
+      logger.error(`[Webhook] AMBIGUOUS routing - event dropped`, { event, endpointId, phone: ourEndpointPhone, step: routeResult.step, candidates: routeResult.candidates?.length });
+      return; // Do NOT auto-route ambiguous events
+    } else {
+      // Legacy fallback (deprecated — will be removed after full migration)
+      if (payload.metadata?.userId) {
+        userId = parseInt(payload.metadata.userId);
+        logger.warn(`[Webhook] LEGACY FALLBACK - using metadata.userId=${userId}. Register endpoint routes to fix.`);
+      } else {
+        logger.warn('[Webhook] No route found and no metadata fallback', { event, endpointId, phone: ourEndpointPhone });
+        return;
       }
     }
-    if (!userId && payload.metadata?.userId) userId = parseInt(payload.metadata.userId);
-    if (!userId) { logger.warn('[Webhook] Could not identify user for event:', event); return; }
-
-    // Determine participant phone (the external party, not our number)
-    const { data: settings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
-    const ourNumbers = (settings?.cached_phone_numbers || []).map(n => normalizePhone(n.number || n.phoneNumber || n));
-    const isInbound = payload.direction === 'inbound' || payload.direction === 'in' || event.includes('inbound') || event.includes('received');
-    const participantPhone = isInbound ? fromNumber : toNumber;
-    const ourNumber = isInbound ? toNumber : fromNumber;
 
     // Find or create conversation
     let conversation = null;
@@ -34933,6 +35098,106 @@ app.post('/api/admin/run-migration', authenticateAdmin, async (req, res) => {
 
 // ============================================================
 // END ADMIN DASHBOARD
+// ============================================================
+
+// ============================================================
+// ENDPOINT ROUTES CRUD + BACKFILL
+// ============================================================
+
+// GET /api/v1/endpoint-routes — list routes (filterable)
+app.get('/api/v1/endpoint-routes', authenticateToken, async (req, res) => {
+  try {
+    const { provider, workspace_id, is_active } = req.query;
+    let query = supabase.from('communication_endpoint_routes').select('*');
+    if (provider) query = query.eq('provider', provider);
+    if (workspace_id) query = query.eq('workspace_id', parseInt(workspace_id));
+    if (is_active !== undefined) query = query.eq('is_active', is_active === 'true');
+    else query = query.eq('is_active', true); // default to active only
+    const { data, error } = await query.order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ routes: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/v1/endpoint-routes/resolve — runtime resolution test
+app.get('/api/v1/endpoint-routes/resolve', authenticateToken, async (req, res) => {
+  try {
+    const result = await resolveEndpointRoute({
+      provider: req.query.provider, providerAccountId: req.query.provider_account_id,
+      endpointId: req.query.endpoint_id, phoneNumber: req.query.phone_number,
+      channel: req.query.channel || 'sms', conversationId: req.query.conversation_id,
+    });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/v1/endpoint-routes — register a route
+app.post('/api/v1/endpoint-routes', authenticateToken, async (req, res) => {
+  try {
+    const { workspace_id, provider, provider_account_id, endpoint_id, phone_number, channel, role, purpose, priority } = req.body;
+    if (!workspace_id || !provider) return res.status(400).json({ error: 'workspace_id and provider required' });
+
+    // Check ownership
+    const { data: wsUser } = await supabase.from('sf_workspace_users').select('id')
+      .eq('workspace_id', workspace_id).eq('user_id', req.user.userId).maybeSingle();
+    if (!wsUser) return res.status(403).json({ error: 'Not a member of this workspace' });
+
+    const { data: route, error } = await supabase.from('communication_endpoint_routes').insert({
+      workspace_id, provider, provider_account_id: provider_account_id || null,
+      endpoint_id: endpoint_id || null, phone_number: phone_number ? normalizePhone(phone_number) : null,
+      channel: channel || 'sms', role: role || null, purpose: purpose || null,
+      priority: priority || 0, is_active: true, route_source: 'manual',
+      activated_at: new Date().toISOString(),
+    }).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ route });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/v1/endpoint-routes/:id — update route
+app.patch('/api/v1/endpoint-routes/:id', authenticateToken, async (req, res) => {
+  try {
+    const updates = { ...req.body, updated_at: new Date().toISOString() };
+    if (updates.is_active === false) updates.deactivated_at = new Date().toISOString();
+    const { data, error } = await supabase.from('communication_endpoint_routes')
+      .update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ route: data });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/v1/endpoint-routes/:id — deactivate route
+app.delete('/api/v1/endpoint-routes/:id', authenticateToken, async (req, res) => {
+  try {
+    await supabase.from('communication_endpoint_routes').update({
+      is_active: false, deactivated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/backfill-endpoint-routes — backfill routes for all connected users
+app.post('/api/admin/backfill-endpoint-routes', authenticateAdmin, async (req, res) => {
+  try {
+    const { data: connected } = await supabase.from('communication_settings')
+      .select('user_id, cached_phone_numbers').eq('connection_status', 'connected');
+
+    let totalRoutes = 0;
+    for (const settings of (connected || [])) {
+      const workspace = await getOrCreateSfWorkspace(settings.user_id);
+      if (!workspace?.id) continue;
+      const phoneNumbers = settings.cached_phone_numbers || [];
+      if (phoneNumbers.length === 0) continue;
+      const routes = await registerEndpointRoutes(workspace.id, 'openphone', phoneNumbers, 'backfill');
+      totalRoutes += routes.length;
+    }
+
+    res.json({ success: true, users_processed: (connected || []).length, routes_registered: totalRoutes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// END ENDPOINT ROUTES
 // ============================================================
 
 // 404 handler
