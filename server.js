@@ -32376,8 +32376,15 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     });
   }
 
-  // Batch insert all ledger entries
+  // Batch insert all ledger entries (delete first to prevent duplicates from race conditions)
   if (ledgerEntries.length > 0) {
+    // Re-check right before insert to handle concurrent webhook calls
+    const { data: raceCheck } = await supabase.from('cleaner_ledger').select('id').eq('job_id', jobId).limit(1);
+    if (raceCheck && raceCheck.length > 0) {
+      console.log(`Ledger: Entries already exist for job ${jobId} (race condition avoided), skipping`);
+      return;
+    }
+
     const { error: insertError } = await supabase
       .from('cleaner_ledger')
       .insert(ledgerEntries);
