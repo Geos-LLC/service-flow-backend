@@ -624,6 +624,15 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         }).catch(err => logger.error(`[Zenbooker] Transaction insert error: ${err.message}`))
         logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${paymentMethod})`)
       }
+
+      // For cash payments: rebuild cash_collected ledger entries (transaction must exist first)
+      if (paymentMethod.toLowerCase() === 'cash' && createLedgerEntriesForCompletedJob) {
+        await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+        await createLedgerEntriesForCompletedJob(job.id, userId).catch(err => {
+          logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
+        })
+        logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
+      }
     } else if (eventType === 'invoice_payment.voided') {
       update.payment_status = 'pending'
       update.invoice_status = 'invoiced'
