@@ -20278,33 +20278,23 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // Payouts settle prior debt, so they're never "current period" for this calculation
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      let allEntries = [];
-      let from = 0;
-      const pageSize = 1000;
-      while (true) {
-        const { data: page } = await supabase.from('cleaner_ledger')
-          .select('team_member_id, amount, effective_date, type')
-          .eq('user_id', userId)
-          .range(from, from + pageSize - 1);
-        allEntries = allEntries.concat(page || []);
-        if (!page || page.length < pageSize) break;
-        from += pageSize;
-      }
-      const totalByMember = {};
-      const currentPeriodByMember = {};
-      (allEntries || []).forEach(e => {
-        const mid = e.team_member_id;
-        const amt = parseFloat(e.amount);
-        totalByMember[mid] = (totalByMember[mid] || 0) + amt;
-        // Only count non-payout entries as "current period" — payouts always settle prior debt
-        if (e.type !== 'payout' && e.effective_date >= startDate && (!endDate || e.effective_date <= endDate)) {
-          currentPeriodByMember[mid] = (currentPeriodByMember[mid] || 0) + amt;
-        }
-      });
+      // Prior cash = unpaid cash_collected entries from before the current period
+      // These are actual cash the cleaner collected and hasn't returned yet
+      const { data: priorCash } = await supabase.from('cleaner_ledger')
+        .select('team_member_id, amount')
+        .eq('user_id', userId)
+        .eq('type', 'cash_collected')
+        .is('payout_batch_id', null)
+        .lt('effective_date', startDate);
       const result = {};
-      for (const [mid, total] of Object.entries(totalByMember)) {
-        const prior = total - (currentPeriodByMember[mid] || 0);
-        if (prior < -0.01) result[mid] = parseFloat(prior.toFixed(2));
+      (priorCash || []).forEach(e => {
+        const mid = e.team_member_id;
+        result[mid] = (result[mid] || 0) + parseFloat(e.amount);
+      });
+      // Only return negative values (member owes cash)
+      for (const mid of Object.keys(result)) {
+        if (result[mid] >= -0.01) delete result[mid];
+        else result[mid] = parseFloat(result[mid].toFixed(2));
       }
       return result;
     };
@@ -32971,37 +32961,9 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     return { skipped: true, reason: 'No unpaid entries found for this period' };
   }
 
-  // Calculate current period total
-  const periodTotal = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
-
-  // Calculate prior balance (same logic as payroll's fetchPriorCash)
-  // prior = total balance across all time - current period entries
-  let priorBalance = 0;
-  try {
-    let allEntries = [];
-    let from = 0;
-    const pageSize = 1000;
-    while (true) {
-      const { data: page } = await supabase.from('cleaner_ledger')
-        .select('amount, effective_date, type')
-        .eq('user_id', userId)
-        .eq('team_member_id', teamMemberId)
-        .range(from, from + pageSize - 1);
-      allEntries = allEntries.concat(page || []);
-      if (!page || page.length < pageSize) break;
-      from += pageSize;
-    }
-    const totalBalance = allEntries.reduce((s, e) => s + parseFloat(e.amount), 0);
-    const currentPeriod = allEntries
-      .filter(e => e.type !== 'payout' && e.effective_date >= periodStart && e.effective_date <= periodEnd)
-      .reduce((s, e) => s + parseFloat(e.amount), 0);
-    const prior = totalBalance - currentPeriod;
-    if (prior < -0.01) priorBalance = parseFloat(prior.toFixed(2));
-  } catch (priorErr) {
-    console.error(`[Payout] Error calculating prior balance for member ${teamMemberId}:`, priorErr);
-  }
-
-  const roundedTotal = parseFloat((periodTotal + priorBalance).toFixed(2));
+  // Calculate total
+  const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+  const roundedTotal = parseFloat(totalAmount.toFixed(2));
 
   // Create payout batch
   const { data: batch, error: batchError } = await supabase
