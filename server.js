@@ -32365,7 +32365,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     .select('amount, payment_method')
     .eq('job_id', jobId)
     .eq('status', 'completed')
-    .ilike('payment_method', '%cash%');
+    .eq('payment_method', 'cash');
   if (cashTxs && cashTxs.length > 0) {
     const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
     if (totalCash > 0) {
@@ -32837,7 +32837,7 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
 
     // Get total cash for this job from transactions
     const { data: cashTxs } = await supabase.from('transactions')
-      .select('amount').eq('job_id', jobId).eq('status', 'completed').ilike('payment_method', '%cash%');
+      .select('amount').eq('job_id', jobId).eq('status', 'completed').eq('payment_method', 'cash');
     const totalCash = (cashTxs || []).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
 
     // Get all assigned members for this job
