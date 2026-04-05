@@ -34339,10 +34339,11 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     if (!apiKey) return res.status(400).json({ error: 'OpenPhone API key is required' });
     if (!SIGCORE_WORKSPACE_KEY) return res.status(500).json({ error: 'Sigcore workspace key not configured' });
 
-    // 1. Provision tenant (idempotent)
+    // 1. Provision Sigcore tenant for the SF app (not per-user — the app is the tenant, users are sub-entities)
+    // Fixed externalTenantId: all SF users share one Sigcore tenant ("Service Flow")
     const provisionRes = await sigcoreRequest('POST', '/tenants/provision', SIGCORE_WORKSPACE_KEY, {
-      externalTenantId: String(userId),
-      displayName: `ServiceFlow User ${userId}`
+      externalTenantId: 'serviceflow-app',
+      displayName: 'Service Flow'
     });
     const { tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {};
     if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
