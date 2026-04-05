@@ -32952,6 +32952,111 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
 
 // Shared function to create a payout batch for a team member
 async function createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, source = 'manual') {
+  // ── Ensure manager/scheduler salary entries exist for the payout period ──
+  try {
+    const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+    const { data: member } = await supabase.from('team_members')
+      .select('id, role, hourly_rate, commission_percentage, availability, salary_start_date')
+      .eq('id', teamMemberId).eq('user_id', userId).single();
+
+    if (member && managerRoles.includes((member.role || '').toLowerCase())) {
+      const hourlyRate = parseFloat(member.hourly_rate) || 0;
+      const commissionPct = parseFloat(member.commission_percentage) || 0;
+      const salaryStart = member.salary_start_date ? String(member.salary_start_date).split('T')[0].split(' ')[0] : null;
+      // Cap period: don't generate before salary_start_date or after today
+      const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
+      const effectiveStart = salaryStart && salaryStart > periodStart ? salaryStart : periodStart;
+      const effectiveEnd = periodEnd > todayStr ? todayStr : periodEnd;
+
+      // Generate missing scheduled salary entries
+      if (hourlyRate > 0 && member.availability && effectiveStart <= effectiveEnd) {
+        // Check which dates already have salary entries
+        const { data: existingSal } = await supabase.from('cleaner_ledger')
+          .select('effective_date').eq('user_id', userId).eq('team_member_id', teamMemberId)
+          .is('job_id', null).eq('type', 'earning')
+          .gte('effective_date', effectiveStart).lte('effective_date', effectiveEnd)
+          .contains('metadata', { is_manager_salary: true });
+        const existingDates = new Set((existingSal || []).map(e => e.effective_date));
+
+        const salEntries = [];
+        const d = new Date(effectiveStart + 'T00:00:00');
+        const endD = new Date(effectiveEnd + 'T00:00:00');
+        while (d <= endD) {
+          const dayStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+          if (!existingDates.has(dayStr)) {
+            const scheduledHours = calculateScheduledHoursFromAvailability(member.availability, dayStr, dayStr);
+            if (scheduledHours > 0) {
+              salEntries.push({
+                user_id: userId, team_member_id: parseInt(teamMemberId), job_id: null, type: 'earning',
+                amount: parseFloat((scheduledHours * hourlyRate).toFixed(2)),
+                effective_date: dayStr,
+                note: `Scheduled salary: ${scheduledHours.toFixed(1)}h × $${hourlyRate}/hr (${dayStr})`,
+                metadata: { scheduled_hours: scheduledHours, hourly_rate: hourlyRate, is_manager_salary: true },
+                created_by: userId
+              });
+            }
+          }
+          d.setDate(d.getDate() + 1);
+        }
+        if (salEntries.length > 0) {
+          const { error: salErr } = await supabase.from('cleaner_ledger').insert(salEntries);
+          if (salErr) console.error(`[Payout] Error generating salary entries for member ${teamMemberId}:`, salErr);
+          else console.log(`[Payout] Generated ${salEntries.length} salary entries for member ${teamMemberId} (${effectiveStart} to ${effectiveEnd})`);
+        }
+      }
+
+      // Generate missing commission entries
+      if (commissionPct > 0 && effectiveStart <= effectiveEnd) {
+        // Check which dates already have commission entries
+        const { data: existingComm } = await supabase.from('cleaner_ledger')
+          .select('effective_date').eq('user_id', userId).eq('team_member_id', teamMemberId)
+          .is('job_id', null).eq('type', 'earning')
+          .gte('effective_date', effectiveStart).lte('effective_date', effectiveEnd)
+          .contains('metadata', { is_manager_commission: true });
+        const existingCommDates = new Set((existingComm || []).map(e => e.effective_date));
+
+        // Get completed/paid jobs revenue grouped by day in the period
+        const { data: periodJobs } = await supabase.from('jobs')
+          .select('id, scheduled_date, service_price, price, additional_fees, total, total_amount, status')
+          .eq('user_id', userId)
+          .in('status', ['completed', 'paid'])
+          .gte('scheduled_date', effectiveStart)
+          .lte('scheduled_date', effectiveEnd + ' 23:59:59');
+
+        if (periodJobs && periodJobs.length > 0) {
+          const revenueByDay = {};
+          periodJobs.forEach(j => {
+            const jd = String(j.scheduled_date || '').split('T')[0].split(' ')[0];
+            if (!existingCommDates.has(jd)) {
+              const sp = parseFloat(j.service_price) || parseFloat(j.price) || 0;
+              const rev = sp > 0 ? sp + (parseFloat(j.additional_fees) || 0) : (parseFloat(j.total) || parseFloat(j.total_amount) || 0);
+              revenueByDay[jd] = (revenueByDay[jd] || 0) + rev;
+            }
+          });
+
+          const commEntries = Object.entries(revenueByDay)
+            .filter(([, rev]) => rev > 0)
+            .map(([dayStr, dayRevenue]) => ({
+              user_id: userId, team_member_id: parseInt(teamMemberId), job_id: null, type: 'earning',
+              amount: parseFloat((dayRevenue * (commissionPct / 100)).toFixed(2)),
+              effective_date: dayStr,
+              note: `Commission on revenue: $${dayRevenue.toFixed(2)} × ${commissionPct}% (${dayStr})`,
+              metadata: { commission_pct: commissionPct, day_revenue: dayRevenue, is_manager_commission: true },
+              created_by: userId
+            }));
+
+          if (commEntries.length > 0) {
+            const { error: commErr } = await supabase.from('cleaner_ledger').insert(commEntries);
+            if (commErr) console.error(`[Payout] Error generating commission entries for member ${teamMemberId}:`, commErr);
+            else console.log(`[Payout] Generated ${commEntries.length} commission entries for member ${teamMemberId}`);
+          }
+        }
+      }
+    }
+  } catch (mgrErr) {
+    console.error(`[Payout] Error ensuring manager entries for member ${teamMemberId}:`, mgrErr);
+  }
+
   // Fetch unpaid ledger entries in the period
   const { data: unpaidEntries, error: fetchError } = await supabase
     .from('cleaner_ledger')
