@@ -133,6 +133,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     'late': 'late',
     'complete': 'completed',
     'completed': 'completed',
+    'paid': 'paid',
   }
 
   // Convert UTC ISO date to local time string "YYYY-MM-DD HH:MM:SS" in the job's timezone
@@ -193,6 +194,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       // Only set tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips with 0)
       ...(parseFloat(inv.tip || inv.tip_amount) > 0 ? { tip_amount: parseFloat(inv.tip || inv.tip_amount) } : {}),
       invoice_status: inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft'),
+      payment_status: inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null),
       is_recurring: zb.recurring === true,
       zenbooker_id: zb.id,
     }
@@ -579,8 +581,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         await supabase.from('job_team_assignments').delete().eq('job_id', jobId)
       }
 
-      // Create/rebuild ledger entries when job is completed
-      if (mapped.status === 'completed' && createLedgerEntriesForCompletedJob) {
+      // Create/rebuild ledger entries when job is completed or paid
+      if ((mapped.status === 'completed' || mapped.status === 'paid') && createLedgerEntriesForCompletedJob) {
         try {
           await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
           await createLedgerEntriesForCompletedJob(jobId, userId)
