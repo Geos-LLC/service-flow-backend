@@ -34529,9 +34529,6 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
       // Filter to only conversations on OUR phone numbers
       if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
-        logger.log(`[Sync] Our phoneNumberIds: ${JSON.stringify(phoneNumberIds)}`);
-        logger.log(`[Sync] Our phones: ${JSON.stringify(ourPhoneNumbers)}`);
-        if (allConvs[0]) logger.log(`[Sync] Sample conv: phoneNumber=${allConvs[0].phoneNumber}, phoneNumberId=${allConvs[0].phoneNumberId}, keys=${Object.keys(allConvs[0]).join(',')}`);
         allConversations = allConvs.filter(c => {
           const convPhone = normalizePhone(c.phoneNumber);
           const convPnId = c.phoneNumberId;
@@ -34581,7 +34578,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             const updates = { updated_at: new Date().toISOString() };
             if (lastMsg && !found.last_preview) updates.last_preview = lastMsg;
             if (lastActivity) updates.last_event_at = lastActivity;
-            if (contactName && !found.participant_name) updates.participant_name = contactName;
+            if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
             if (!found.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
             const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
             localConv = updated || found;
@@ -34606,8 +34603,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           // Auto-link to SF customer/lead by phone — also sets name from customer if matched
           if (!localConv.customer_id && !localConv.lead_id) {
             const linkResult = await autoLinkConversation(userId, localConv.id, participantPhone);
-            if (linkResult?.name && !localConv.participant_name) {
-              // Re-read to get updated name
+            if (linkResult?.name) {
               const { data: refreshed } = await supabase.from('communication_conversations').select('*').eq('id', localConv.id).single();
               if (refreshed) localConv = refreshed;
             }
