@@ -33152,8 +33152,19 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     return { skipped: true, reason: 'No unpaid entries found for this period' };
   }
 
-  // Calculate total
-  const totalAmount = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+  // Calculate total from current period entries
+  const periodTotal = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+
+  // Include prior period negative batch debt (carry-forward)
+  const { data: negativeBatches } = await supabase.from('cleaner_payout_batch')
+    .select('total_amount')
+    .eq('user_id', userId)
+    .eq('team_member_id', parseInt(teamMemberId))
+    .eq('status', 'paid')
+    .lt('total_amount', 0)
+    .lt('period_end', periodStart);
+  const priorDebt = (negativeBatches || []).reduce((sum, b) => sum + parseFloat(b.total_amount), 0);
+  const totalAmount = periodTotal + priorDebt;
   const roundedTotal = parseFloat(totalAmount.toFixed(2));
 
   // Create payout batch
