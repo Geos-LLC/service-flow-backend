@@ -34599,8 +34599,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
 
-    // Single API call: GET /conversations?includeMessages=true — Sigcore fetches messages+calls in parallel
-    const syncKey = SIGCORE_WORKSPACE_KEY;
+    // Use the user's tenant key — NOT the workspace key — to respect tenant isolation
+    const syncKey = tenantKey;
     let totalSynced = 0;
     let totalMessages = 0;
 
