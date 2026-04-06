@@ -32357,12 +32357,13 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Check if ledger entries already exist for this job (idempotency)
-  // Check any entry type (not just 'earning') to handle manager-only jobs with only tip/incentive entries
+  // Check if earning entries already exist for this job (idempotency)
+  // Only check 'earning' type — cash_collected/payout entries may exist from separate flows
   const { data: existingEntries } = await supabase
     .from('cleaner_ledger')
     .select('id')
     .eq('job_id', jobId)
+    .in('type', ['earning', 'tip', 'incentive'])
     .limit(1);
 
   if (existingEntries && existingEntries.length > 0) {
