@@ -34638,18 +34638,40 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             for (const msg of messages) {
               const msgId = msg.providerMessageId || msg.id;
               if (!msgId) continue;
-              const { data: existing } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
-              if (existing) continue;
               const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+              const mediaUrls = msg.metadata?.mediaUrls || [];
+              const media = msg.metadata?.media || [];
+              const body = msg.body || msg.content || '';
+              const fromNum = normalizePhone(msg.fromNumber || msg.from);
+              const toNum = normalizePhone(msg.toNumber || msg.to);
+              const status = msg.status || 'delivered';
+              const createdAt = msg.createdAt || msg.timestamp || new Date().toISOString();
+
+              const { data: existing } = await supabase.from('communication_messages')
+                .select('id, body, metadata').eq('provider_message_id', msgId).maybeSingle();
+
+              if (existing) {
+                // Update if record is missing data (media, body, etc.)
+                const existingMedia = existing.metadata?.mediaUrls || [];
+                const needsUpdate = (mediaUrls.length > 0 && existingMedia.length === 0)
+                  || (body && !existing.body)
+                  || (body && existing.body !== body);
+                if (needsUpdate) {
+                  await supabase.from('communication_messages').update({
+                    body, metadata: { ...existing.metadata, phoneNumberId, mediaUrls, media },
+                  }).eq('id', existing.id);
+                  totalMessages++;
+                }
+                continue;
+              }
+
               await supabase.from('communication_messages').insert({
                 conversation_id: localConv.id, sigcore_message_id: null,
                 provider_message_id: msgId, direction, channel: 'sms',
-                body: msg.body || msg.content || '',
-                from_number: normalizePhone(msg.fromNumber || msg.from),
-                to_number: normalizePhone(msg.toNumber || msg.to),
+                body, from_number: fromNum, to_number: toNum,
                 sender_role: direction === 'in' ? 'customer' : 'agent',
-                status: msg.status || 'delivered', metadata: { phoneNumberId },
-                created_at: msg.createdAt || msg.timestamp || new Date().toISOString()
+                status, metadata: { phoneNumberId, mediaUrls, media },
+                created_at: createdAt
               });
               totalMessages++;
             }
