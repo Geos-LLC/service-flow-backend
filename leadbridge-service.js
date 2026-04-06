@@ -193,9 +193,9 @@ module.exports = (supabase, logger) => {
       let lbToken, lbUserId
       try {
         const loginRes = await lbRequest('POST', '/auth/login', null, { email, password })
-        // LB login uses x-www-form-urlencoded or JSON — adapt to response
-        lbToken = loginRes.data?.access_token || loginRes.data?.token
-        lbUserId = loginRes.data?.user?.id || loginRes.data?.userId
+        // LB returns { user: { id, email, ... }, token: "jwt..." }
+        lbToken = loginRes.data?.token
+        lbUserId = loginRes.data?.user?.id
         if (!lbToken) return res.status(401).json({ error: 'LeadBridge login failed — no token returned' })
       } catch (e) {
         const msg = e.response?.data?.message || e.message
@@ -206,7 +206,8 @@ module.exports = (supabase, logger) => {
       let accounts = []
       try {
         const acctRes = await lbRequest('GET', '/v1/platforms/saved-accounts', lbToken)
-        accounts = acctRes.data?.accounts || acctRes.data || []
+        // LB returns { count, accounts: [...] }
+        accounts = acctRes.data?.accounts || []
       } catch (e) {
         logger.warn('[LB] Failed to fetch accounts:', e.message)
       }
@@ -223,24 +224,39 @@ module.exports = (supabase, logger) => {
 
       // 4. Create provider accounts for each LB account
       for (const acct of accounts) {
-        const platform = acct.platform || acct.platformName || 'thumbtack'
-        const channel = platform.toLowerCase()
-        const externalId = acct.id || acct.savedAccountId || acct.businessId
-        const businessId = acct.businessId || acct.externalBusinessId
-        const name = acct.businessName || acct.name || `${platform} Account`
+        // LB SavedAccount: { id, platform, businessId, businessName, emailHint, imageUrl, webhookId, tokenDead, ... }
+        const platform = (acct.platform || 'thumbtack').toLowerCase()
+        const channel = platform
+        const externalId = acct.id  // LB saved account UUID
+        const businessId = acct.businessId
+        const name = acct.businessName || `${platform} Account`
 
-        await supabase.from('communication_provider_accounts').upsert({
-          user_id: userId,
-          provider: 'leadbridge',
-          channel,
-          external_account_id: externalId,
-          external_business_id: businessId,
-          display_name: name,
-          account_email: acct.accountEmail || email,
-          status: 'active',
-          webhook_status: 'pending',
-          metadata: { platform, raw: acct },
-        }, { onConflict: 'user_id,provider,channel,external_account_id', ignoreDuplicates: false })
+        // Upsert: find existing or create
+        const { data: existing } = await supabase.from('communication_provider_accounts')
+          .select('id').eq('user_id', userId).eq('provider', 'leadbridge')
+          .eq('channel', channel).eq('external_account_id', externalId).maybeSingle()
+
+        if (existing) {
+          await supabase.from('communication_provider_accounts').update({
+            display_name: name, status: 'active',
+            webhook_status: acct.webhookId ? 'active' : 'pending',
+            metadata: { platform, businessId, imageUrl: acct.imageUrl, tokenDead: acct.tokenDead },
+          }).eq('id', existing.id)
+        } else {
+          await supabase.from('communication_provider_accounts').insert({
+            user_id: userId,
+            provider: 'leadbridge',
+            channel,
+            external_account_id: externalId,
+            external_business_id: businessId,
+            display_name: name,
+            account_email: acct.emailHint || email,
+            status: 'active',
+            webhook_status: acct.webhookId ? 'active' : 'pending',
+            webhook_id: acct.webhookId,
+            metadata: { platform, businessId, imageUrl: acct.imageUrl, tokenDead: acct.tokenDead },
+          })
+        }
       }
 
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
@@ -502,11 +518,15 @@ module.exports = (supabase, logger) => {
         syncProgress[userId].phase = `syncing_${platform}`
 
         try {
-          // Fetch leads from LB for this account
+          // Fetch leads from LB — response: { count, leads: NormalizedLead[] }
           const limit = maxLeads > 0 ? maxLeads : 50
-          const leadsPath = `/v1/${platform}/leads?limit=${limit}&savedAccountId=${acct.external_account_id}`
+          const leadsPath = `/v1/${platform}/leads?limit=${limit}`
           const leadsRes = await lbRequest('GET', leadsPath, lbToken)
-          const leads = leadsRes.data?.leads || leadsRes.data || []
+          const allLeads = leadsRes.data?.leads || []
+          // Filter to this account's businessId
+          const leads = acct.external_business_id
+            ? allLeads.filter(l => l.businessId === acct.external_business_id)
+            : allLeads
 
           syncProgress[userId].total += leads.length
           logger.log(`[LB Sync] ${platform}: ${leads.length} leads for account ${acct.display_name}`)
@@ -523,26 +543,28 @@ module.exports = (supabase, logger) => {
               })
 
               // Upsert conversation
+              // LB NormalizedLead: { id, externalRequestId, threadId, customerName, customerPhone, message, status, ... }
               const conv = await upsertConversation(userId, {
                 provider: 'leadbridge',
                 channel,
-                externalConvId: lead.threadId || lead.id,
+                externalConvId: lead.threadId || lead.externalRequestId || lead.id,
                 externalLeadId: lead.id,
                 participantPhone: lead.customerPhone,
                 participantName: lead.customerName,
                 identityId: identity?.id,
                 providerAccountId: acct.id,
-                lastMessage: lead.message || lead.lastMessage,
-                lastActivity: lead.updatedAt || lead.createdAt,
+                lastMessage: lead.message,
+                lastActivity: lead.lastMessageAt || lead.updatedAt || lead.createdAt,
               })
 
               if (!conv) { syncProgress[userId].errors++; continue }
 
-              // Fetch messages for this lead
+              // Fetch messages — LB response: { platform, leadId, count, messages: Message[] }
+              // Message: { id, externalMessageId, sender: "pro"|"customer"|"system", content, sentAt, ... }
               try {
-                const msgsPath = `/v1/${platform}/leads/${lead.externalRequestId || lead.id}/messages`
+                const msgsPath = `/v1/${platform}/leads/${lead.id}/messages`
                 const msgsRes = await lbRequest('GET', msgsPath, lbToken)
-                const messages = msgsRes.data?.messages || msgsRes.data || []
+                const messages = msgsRes.data?.messages || []
 
                 for (const msg of messages) {
                   const msgId = msg.externalMessageId || msg.id
@@ -553,22 +575,22 @@ module.exports = (supabase, logger) => {
                     .eq('external_message_id', msgId).maybeSingle()
                   if (existing) continue
 
-                  const direction = (msg.sender === 'customer' || msg.direction === 'inbound') ? 'in' : 'out'
+                  const direction = msg.sender === 'customer' ? 'in' : 'out'
                   await supabase.from('communication_messages').insert({
                     conversation_id: conv.id,
                     external_message_id: msgId,
                     direction,
                     channel,
-                    body: msg.content || msg.body || msg.message || '',
-                    sender_role: direction === 'in' ? 'customer' : 'agent',
-                    status: 'delivered',
-                    sent_at: msg.sentAt || msg.createdAt,
-                    created_at: msg.sentAt || msg.createdAt || new Date().toISOString(),
+                    body: msg.content || '',
+                    sender_role: msg.sender === 'customer' ? 'customer' : msg.sender === 'system' ? 'system' : 'agent',
+                    status: msg.deliveredAt ? 'delivered' : 'sent',
+                    sent_at: msg.sentAt,
+                    delivered_at: msg.deliveredAt || null,
+                    created_at: msg.sentAt || new Date().toISOString(),
                   })
                   totalMessages++
                 }
               } catch (e) {
-                // Messages fetch failed for this lead — non-fatal
                 logger.warn(`[LB Sync] Messages for lead ${lead.id}: ${e.message}`)
               }
 
