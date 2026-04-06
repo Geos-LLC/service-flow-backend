@@ -35012,24 +35012,38 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
   }
 });
 
-// GET /api/communications/conversations/:id
+// GET /api/communications/conversations/:id?limit=20&before=2026-04-01T00:00:00Z
 app.get('/api/communications/conversations/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
+    const limit = parseInt(req.query.limit) || 20;
+    const before = req.query.before; // ISO timestamp cursor for loading older messages
 
     const { data: conv, error: convErr } = await supabase.from('communication_conversations')
       .select('*')
       .eq('id', id).eq('user_id', userId).single();
     if (convErr || !conv) return res.status(404).json({ error: 'Conversation not found' });
 
-    // Fetch messages
-    const { data: messages } = await supabase.from('communication_messages')
-      .select('*').eq('conversation_id', id).order('created_at', { ascending: true });
+    // Fetch messages — last N, with cursor for pagination
+    let msgQuery = supabase.from('communication_messages')
+      .select('*').eq('conversation_id', id).order('created_at', { ascending: false }).limit(limit);
+    if (before) msgQuery = msgQuery.lt('created_at', before);
+    const { data: messagesDesc } = await msgQuery;
+    const messages = (messagesDesc || []).reverse(); // Reverse to chronological order
 
-    // Fetch calls
-    const { data: calls } = await supabase.from('communication_calls')
-      .select('*').eq('conversation_id', id).order('created_at', { ascending: true });
+    // Fetch calls — same window
+    let callQuery = supabase.from('communication_calls')
+      .select('*').eq('conversation_id', id).order('created_at', { ascending: false }).limit(limit);
+    if (before) callQuery = callQuery.lt('created_at', before);
+    const { data: callsDesc } = await callQuery;
+    const calls = (callsDesc || []).reverse();
+
+    // Total counts for "load more" indicator
+    const { count: totalMessages } = await supabase.from('communication_messages')
+      .select('id', { count: 'exact', head: true }).eq('conversation_id', id);
+    const { count: totalCalls } = await supabase.from('communication_calls')
+      .select('id', { count: 'exact', head: true }).eq('conversation_id', id);
 
     // Merge into unified timeline
     const events = [
@@ -35077,7 +35091,11 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
       }
     }
 
-    res.json({ events, availableSendChannels, lead, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
+    const totalEvents = (totalMessages || 0) + (totalCalls || 0);
+    const hasMore = events.length < totalEvents;
+    const oldestTimestamp = events.length > 0 ? events[0].timestamp : null;
+
+    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
   } catch (error) {
     logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
