@@ -32111,10 +32111,11 @@ app.post('/api/sheets/export-jobs', authenticateToken, async (req, res) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
-    message: 'Server is running'
+    message: 'Server is running',
+    version: 'v2026-04-06a'
   });
 });
 
