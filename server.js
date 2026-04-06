@@ -34710,26 +34710,33 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
 
-    // Workspace key for reading Sigcore stored data (conversations have no tenantId due to TypeORM bug)
+    // Workspace key for reading Sigcore stored data
     const syncKey = SIGCORE_WORKSPACE_KEY;
+    logger.log(`[Sync] Config: URL=${SIGCORE_URL}, key=${syncKey ? syncKey.substring(0,15) + '...' : 'EMPTY'}`);
     let totalSynced = 0;
     let totalMessages = 0;
 
+    if (!syncKey || !SIGCORE_URL) {
+      logger.error(`[Sync] ABORT: missing SIGCORE_URL or SIGCORE_WORKSPACE_KEY`);
+      commSyncProgress[userId] = { status: 'error', phase: 'error', error: 'Sigcore not configured' };
+      return;
+    }
+
     // Phase 1: Trigger Sigcore full sync in background (non-blocking)
-    // This fetches from OpenPhone and stores data including webhook media, recordings, transcripts
     sigcoreRequest('POST', '/integrations/sync', syncKey, {
       syncMessages: true, forceRefresh: false, provider: 'openphone',
       onlySavedContacts: false, limit: maxConversations > 0 ? maxConversations : 50
     }).catch(e => logger.warn(`[Sync] Sigcore background sync: ${e.response?.status || ''} ${e.message}`));
 
-    // Phase 2: Read Sigcore's stored conversations (already has data from previous syncs + webhooks)
-    // This includes media URLs, recordings, transcripts that the live API doesn't expose
+    // Phase 2: Read stored conversations from Sigcore
     let allConvs = [];
     try {
+      const url = `${SIGCORE_URL}/conversations?limit=100`;
+      logger.log(`[Sync] GET ${url}`);
       const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
+      logger.log(`[Sync] Response: status=${convsRes.status}, body keys=${Object.keys(convsRes.data || {}).join(',')}, data=${Array.isArray(convsRes.data?.data) ? convsRes.data.data.length : 'not-array'}, meta=${JSON.stringify(convsRes.data?.meta || {})}`);
       allConvs = convsRes.data?.data || convsRes.data || [];
-      logger.log(`[Sync] Raw response keys: ${Object.keys(convsRes.data || {}).join(',')}, data length: ${allConvs.length}, status: ${convsRes.status}`);
-    } catch (e) { logger.error(`[Sync] Read conversations error: ${e.response?.status} ${e.response?.data?.message || e.message}`); }
+    } catch (e) { logger.error(`[Sync] Read error: ${e.response?.status} ${JSON.stringify(e.response?.data || {})} ${e.message}`); }
 
     logger.log(`[Sync] Read ${allConvs.length} stored conversations from Sigcore`);
 
