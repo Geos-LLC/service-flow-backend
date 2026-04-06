@@ -34069,13 +34069,16 @@ let SIGCORE_WORKSPACE_KEY = process.env.SIGCORE_WORKSPACE_KEY || '';
 
 // Helper: make authenticated request to Sigcore
 async function sigcoreRequest(method, path, tenantApiKey, data = null) {
+  const t = Date.now();
   const config = {
     method,
     url: `${SIGCORE_URL}${path}`,
     headers: { 'x-api-key': tenantApiKey, 'Content-Type': 'application/json' },
   };
   if (data) config.data = data;
-  return axios(config);
+  const res = await axios(config);
+  logger.log(`[API] ${method} ${path.substring(0, 80)} → ${res.status} (${Date.now() - t}ms)`);
+  return res;
 }
 
 // Helper: get user's Sigcore settings
@@ -34792,14 +34795,13 @@ const commSyncProgress = {};
 // Core sync function (runs in background)
 async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreSync = false) {
   commSyncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' };
+  const t0 = Date.now();
+  const timer = (label) => logger.log(`[Sync] ⏱ ${label}: ${Date.now() - t0}ms`);
 
   try {
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
-
-    // Workspace key for reading Sigcore stored data
     const syncKey = SIGCORE_WORKSPACE_KEY;
-    logger.log(`[Sync] Config: URL=${SIGCORE_URL}, key=${syncKey ? syncKey.substring(0,15) + '...' : 'EMPTY'}`);
     let totalSynced = 0;
     let totalMessages = 0;
 
@@ -34809,18 +34811,15 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       return;
     }
 
-    // Fetch conversations from OpenPhone via Sigcore
-    // Full sync (maxConversations=0): GET /openphone/conversations/all — all pages, parallel per phone
-    // Test sync (maxConversations>0): GET /openphone/conversations?days=7 — recent only, fast
+    timer('start');
+
     let allConvs = [];
     let contactNameMap = {};
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
-
     const isFullSync = maxConversations === 0;
     commSyncProgress[userId].phase = isFullSync ? 'full_sync' : 'fetching';
 
     if (isFullSync) {
-      // Full sync: single call, Sigcore paginates all pages in parallel per phone number
       try {
         const allRes = await sigcoreRequest('GET', '/integrations/openphone/conversations/all?includeMessages=true&messageLimit=50', syncKey);
         const convs = allRes.data?.data || allRes.data || [];
@@ -34831,12 +34830,12 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           const name = c.contactName || c.conversationName;
           if (name) contactNameMap[phone] = name;
         }
-        logger.log(`[Sync] Full sync: ${allConvs.length} conversations from Sigcore`);
+        timer(`full_sync fetched ${allConvs.length} conversations`);
       } catch (e) { logger.error(`[Sync] Full sync error: ${e.message}`); }
     } else {
-      // Test sync: fetch recent conversations per phone number
       const days = 7;
       for (const pnId of phoneNumberIds) {
+        const t1 = Date.now();
         try {
           const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&includeMessages=true&messageLimit=50`, syncKey);
           const liveConvs = liveRes.data?.data || liveRes.data || [];
@@ -34847,9 +34846,10 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             const name = lc.contactName || lc.conversationName;
             if (name) contactNameMap[phone] = name;
           }
+          logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
         } catch (e) { logger.warn(`[Sync] Live conversations for ${pnId}: ${e.message}`); }
       }
-      logger.log(`[Sync] Test sync: ${allConvs.length} conversations`);
+      timer(`test_sync fetched ${allConvs.length} conversations`);
     }
 
     // Filter to only our phone numbers
@@ -34859,7 +34859,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       );
     }
 
-    // Deduplicate by participant+endpoint
+    // Deduplicate
     const seen = new Set();
     allConvs = allConvs.filter(c => {
       const key = `${normalizePhone(c.phoneNumber)}:${normalizePhone(c.participantPhoneNumber)}`;
@@ -34868,11 +34868,12 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       return true;
     });
 
-    // Already sorted by OpenPhone's lastActivityAt (most recent first from the API)
     if (maxConversations > 0) allConvs = allConvs.slice(0, maxConversations);
     let convs = allConvs;
+    timer(`filtered to ${convs.length} conversations`);
 
-    // Quick name lookup from SF CRM (fast local DB queries)
+    // Quick CRM name lookup (local DB only — no external calls)
+    const t2 = Date.now();
     try {
       const { data: sfCustomers } = await supabase.from('customers').select('first_name, last_name, phone').eq('user_id', userId);
       for (const c of (sfCustomers || [])) {
@@ -34891,8 +34892,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         }
       }
     } catch (e) { /* leads table may not exist */ }
-
-    logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} (from live + CRM)`);
+    logger.log(`[Sync] ⏱ CRM lookup: ${Object.keys(contactNameMap).length} names in ${Date.now() - t2}ms`);
 
     // Background: slow Sigcore contact lookup for unnamed phones (non-blocking)
     const unnamed = convs.filter(c => {
@@ -35077,8 +35077,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         commSyncProgress[userId].messages = totalMessages;
       } catch (e) { logger.error('[Sync] Conv error:', e.message); commSyncProgress[userId].errors++; }
     }
+    timer(`upserted ${totalSynced} conversations, ${totalMessages} messages`);
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
-    logger.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
+    logger.log(`[Sync] DONE in ${Date.now() - t0}ms: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages`);
   } catch (error) {
     logger.error('Sync error:', error.response?.data || error.message);
     commSyncProgress[userId] = { ...commSyncProgress[userId], status: 'error', phase: 'error', error: error.message };
