@@ -34710,8 +34710,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
 
-    // Tenant-scoped key for all Sigcore calls
-    const syncKey = tenantKey;
+    // Workspace key for reading Sigcore stored data (conversations have no tenantId due to TypeORM bug)
+    const syncKey = SIGCORE_WORKSPACE_KEY;
     let totalSynced = 0;
     let totalMessages = 0;
 
