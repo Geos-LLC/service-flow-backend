@@ -34749,9 +34749,19 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} from ${liveConvs.length} live conversations`);
     } catch (e) { logger.warn(`[Sync] Live contact lookup failed: ${e.message}`); }
 
-    logger.log(`[Sync] Read ${allConvs.length} stored conversations from Sigcore`);
+    // Filter to only OUR phone numbers (workspace key returns all tenants' conversations)
+    const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
+    const ourPhoneIds = phoneNumberIds;
+    if (ourPhoneNumbers.length > 0) {
+      allConvs = allConvs.filter(c => {
+        const convPhone = normalizePhone(c.phoneNumber);
+        const convPnId = c.metadata?.phoneNumberId || c.phoneNumberId;
+        return ourPhoneNumbers.includes(convPhone) || ourPhoneIds.includes(convPnId);
+      });
+    }
+    logger.log(`[Sync] ${allConvs.length} conversations for our phones (filtered from stored)`);
 
-    // Apply limit and sort
+    // Sort and limit
     let convs = allConvs;
     convs.sort((a, b) => new Date(b.lastMessageAt || b.updatedAt || 0) - new Date(a.lastMessageAt || a.updatedAt || 0));
     if (maxConversations > 0) convs = convs.slice(0, maxConversations);
