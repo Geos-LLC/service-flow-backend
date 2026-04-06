@@ -34596,101 +34596,73 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
   commSyncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' };
 
   try {
-    // Get the user's phone number IDs to filter conversations to only their numbers
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
-    const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
 
-    // Trigger Sigcore sync for each of our phone numbers (background, non-blocking)
-    // This stores conversations in Sigcore's DB for future webhook-based updates
-    if (!skipSigcoreSync) {
-      for (const pnId of phoneNumberIds) {
-        sigcoreRequest('POST', '/integrations/sync', tenantKey, {
-          syncMessages: true, phoneNumberId: pnId, provider: 'openphone'
-        }).catch(e => logger.warn(`[Sync] Sigcore background sync for ${pnId}:`, e.message));
-      }
+    // Phase 1: Trigger Sigcore's full sync (it handles conversations, messages, calls, recordings, transcripts, contacts)
+    commSyncProgress[userId].phase = 'sigcore_sync';
+    const syncKey = SIGCORE_WORKSPACE_KEY;
+    for (const pnId of phoneNumberIds) {
+      try {
+        await sigcoreRequest('POST', '/integrations/sync', syncKey, {
+          syncMessages: true, forceRefresh: true, phoneNumberId: pnId,
+          provider: 'openphone', onlySavedContacts: false,
+          limit: maxConversations > 0 ? maxConversations : 50
+        });
+        logger.log(`[Sync] Triggered Sigcore sync for phoneNumberId ${pnId}`);
+      } catch (e) { logger.warn(`[Sync] Sigcore sync trigger failed for ${pnId}: ${e.message}`); }
     }
 
-    // Single API call to Sigcore: fetch conversations + messages in one request
-    // Sigcore parallelizes OpenPhone message fetches internally (batch-of-5)
+    // Phase 2: Poll Sigcore sync status until complete (max 120s)
+    commSyncProgress[userId].phase = 'waiting_sigcore';
+    const maxWait = 120000;
+    const start = Date.now();
+    let sigcoreDone = false;
+    while (Date.now() - start < maxWait) {
+      try {
+        const statusRes = await sigcoreRequest('GET', '/integrations/sync/status', syncKey);
+        const st = statusRes.data?.data || statusRes.data || {};
+        if (st.status === 'completed' || st.status === 'cancelled' || !st.status) { sigcoreDone = true; break; }
+        if (st.status === 'error') { logger.error('[Sync] Sigcore sync error:', st.message); sigcoreDone = true; break; }
+      } catch (e) { sigcoreDone = true; break; }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    if (!sigcoreDone) logger.warn('[Sync] Sigcore sync timed out after 120s, continuing with available data');
+
+    // Phase 3: Read synced data from Sigcore's stored conversations
+    commSyncProgress[userId].phase = 'reading';
     let totalSynced = 0;
     let totalMessages = 0;
 
-    let allConversations = [];
-    try {
-      const days = maxConversations > 0 ? 7 : 30;
-      // Pass phoneNumberId filter so Sigcore only fetches for our numbers
-      const pnFilter = phoneNumberIds.length === 1 ? `&phoneNumberId=${phoneNumberIds[0]}` : '';
-      const convRes = await sigcoreRequest('GET',
-        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50${pnFilter}`,
-        SIGCORE_WORKSPACE_KEY);
-      const allConvs = convRes.data?.data || convRes.data || [];
+    const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
+    const sigcoreConvs = convsRes.data?.data || convsRes.data || [];
+    logger.log(`[Sync] Read ${sigcoreConvs.length} conversations from Sigcore`);
 
-      // Check if Sigcore returned embedded messages (new endpoint) or just conversations (old endpoint)
-      const hasEmbeddedMessages = allConvs.length > 0 && allConvs[0].messages !== undefined;
-      logger.log(`[Sync] Fetched ${allConvs.length} conversations from Sigcore (${days} days, embedded=${hasEmbeddedMessages})`);
+    // Apply limit
+    let convs = sigcoreConvs;
+    if (maxConversations > 0) convs = convs.slice(0, maxConversations);
 
-      // Filter to only conversations on OUR phone numbers
-      if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
-        allConversations = allConvs.filter(c => {
-          const convPhone = normalizePhone(c.phoneNumber);
-          const convPnId = c.phoneNumberId;
-          return ourPhoneNumbers.includes(convPhone) || phoneNumberIds.includes(convPnId);
-        });
-      } else {
-        allConversations = allConvs;
-      }
-
-      // Sort by most recent first, apply limit
-      allConversations.sort((a, b) => new Date(b.lastMessageAt || b.lastActivityAt || 0) - new Date(a.lastMessageAt || a.lastActivityAt || 0));
-      if (maxConversations > 0) allConversations = allConversations.slice(0, maxConversations);
-
-      // Fallback: if Sigcore didn't return embedded messages, fetch per-conversation
-      if (!hasEmbeddedMessages && allConversations.length > 0) {
-        logger.log(`[Sync] No embedded messages — fetching per-conversation (${allConversations.length} convs)`);
-        for (const conv of allConversations) {
-          const pPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
-          const pnId = conv.phoneNumberId;
-          if (!pPhone || !pnId) continue;
-          try {
-            const msgRes = await sigcoreRequest('GET',
-              `/integrations/openphone/messages?phoneNumberId=${pnId}&participant=${encodeURIComponent(pPhone)}`,
-              SIGCORE_WORKSPACE_KEY);
-            conv.messages = msgRes.data?.data || [];
-          } catch (e) { conv.messages = []; }
-        }
-      }
-    } catch (e) { logger.error(`[Sync] Failed to fetch conversations: ${e.message}`); }
-
-    const totalLimit = allConversations.length;
+    const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
 
-    for (const conv of allConversations) {
-      const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber || conv.participants?.[0]);
-      const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
-      const contactName = conv.contactName || conv.name || conv.resolvedName || null;
-      const lastMsg = conv.lastMessage || conv.snippet || null;
-      const lastActivity = conv.lastActivityAt || conv.lastMessageAt || conv.updatedAt || null;
-      const phoneNumberId = conv.phoneNumberId || null;
+    for (const conv of convs) {
+      const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
+      const sigcoreConvId = conv.id || conv.externalId;
+      const contactName = conv.metadata?.contactName || conv.contactName || null;
+      const phoneNumberId = conv.metadata?.phoneNumberId || conv.phoneNumberId || null;
+      const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
 
       try {
+        // Upsert conversation in SF
         let localConv = null;
-        // Find existing by sigcore ID or participant phone
         const { data: existing } = await supabase.from('communication_conversations')
           .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
-        if (!existing && participantPhone) {
-          const { data: byPhone } = await supabase.from('communication_conversations')
-            .select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle();
-          if (byPhone) {
-            await supabase.from('communication_conversations').update({ sigcore_conversation_id: sigcoreConvId }).eq('id', byPhone.id);
-          }
-        }
-        const found = existing || (participantPhone ? (await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle()).data : null);
+        const found = existing || (participantPhone ? (await supabase.from('communication_conversations')
+          .select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle()).data : null);
 
         if (found) {
           const updates = { updated_at: new Date().toISOString() };
-          if (lastMsg && !found.last_preview) updates.last_preview = lastMsg;
           if (lastActivity) updates.last_event_at = lastActivity;
           if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
           if (!found.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
@@ -34698,104 +34670,85 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           localConv = updated || found;
         } else {
           const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
-            user_id: userId,
-            sigcore_conversation_id: sigcoreConvId,
-            provider: 'openphone',
-            channel: 'sms',
-            participant_phone: participantPhone,
-            participant_name: contactName,
-            last_preview: lastMsg,
-            last_event_at: lastActivity,
-            metadata: { phoneNumberId },
+            user_id: userId, sigcore_conversation_id: sigcoreConvId,
+            provider: 'openphone', channel: 'sms',
+            participant_phone: participantPhone, participant_name: contactName,
+            last_event_at: lastActivity, metadata: { phoneNumberId },
           }).select().single();
-          if (convErr) { logger.error('[Sync] Insert error:', convErr.message); commSyncProgress[userId].errors++; continue; }
+          if (convErr) { commSyncProgress[userId].errors++; continue; }
           localConv = created;
         }
-
         if (!localConv) { commSyncProgress[userId].errors++; continue; }
 
-        // Auto-link to SF customer/lead by phone
+        // Auto-link to SF customer/lead
         if (!localConv.customer_id && !localConv.lead_id) {
-          const linkResult = await autoLinkConversation(userId, localConv.id, participantPhone);
-          if (linkResult?.name) {
-            const { data: refreshed } = await supabase.from('communication_conversations').select('*').eq('id', localConv.id).single();
-            if (refreshed) localConv = refreshed;
-          }
+          await autoLinkConversation(userId, localConv.id, participantPhone);
         }
 
-        // Process embedded messages (already fetched by Sigcore in parallel)
-        const messages = conv.messages || [];
+        // Read messages + calls from Sigcore in parallel
+        const [msgsResult, callsResult] = await Promise.allSettled([
+          sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages`, syncKey).then(r => r.data?.data || r.data || []),
+          sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || r.data || []),
+        ]);
+        const messages = msgsResult.status === 'fulfilled' ? msgsResult.value : [];
+        const calls = callsResult.status === 'fulfilled' ? callsResult.value : [];
+
         for (const msg of messages) {
           const msgId = msg.providerMessageId || msg.id;
           if (!msgId) continue;
           const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
           const mediaUrls = msg.metadata?.mediaUrls || [];
           const media = msg.metadata?.media || [];
-          const body = msg.body || msg.content || '';
-          const fromNum = normalizePhone(msg.fromNumber || msg.from);
-          const toNum = normalizePhone(msg.toNumber || msg.to);
-          const status = msg.status || 'delivered';
-          const createdAt = msg.createdAt || msg.timestamp || new Date().toISOString();
+          const body = msg.body || '';
 
           const { data: existingMsg } = await supabase.from('communication_messages')
-            .select('id, body, metadata').eq('provider_message_id', msgId).maybeSingle();
+            .select('id').eq('provider_message_id', msgId).maybeSingle();
 
           if (existingMsg) {
             await supabase.from('communication_messages').update({
-              body: body || existingMsg.body,
-              from_number: fromNum || undefined,
-              to_number: toNum || undefined,
-              status,
-              metadata: { ...existingMsg.metadata, phoneNumberId, mediaUrls, media },
+              body: body || undefined, status: msg.status || 'delivered',
+              metadata: { phoneNumberId, mediaUrls, media },
             }).eq('id', existingMsg.id);
-            totalMessages++;
-            continue;
+          } else {
+            await supabase.from('communication_messages').insert({
+              conversation_id: localConv.id, provider_message_id: msgId,
+              direction, channel: 'sms', body,
+              from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
+              sender_role: direction === 'in' ? 'customer' : 'agent',
+              status: msg.status || 'delivered',
+              metadata: { phoneNumberId, mediaUrls, media },
+              created_at: msg.createdAt || new Date().toISOString(),
+            });
           }
-
-          await supabase.from('communication_messages').insert({
-            conversation_id: localConv.id, sigcore_message_id: null,
-            provider_message_id: msgId, direction, channel: 'sms',
-            body, from_number: fromNum, to_number: toNum,
-            sender_role: direction === 'in' ? 'customer' : 'agent',
-            status, metadata: { phoneNumberId, mediaUrls, media },
-            created_at: createdAt
-          });
           totalMessages++;
         }
 
-        // Process embedded calls (fetched by Sigcore in parallel alongside messages)
-        const calls = conv.calls || [];
         for (const call of calls) {
           const callId = call.providerCallId || call.id;
           if (!callId) continue;
-          const { data: existingCall } = await supabase.from('communication_calls')
-            .select('id, metadata').eq('provider_call_id', callId).maybeSingle();
-
-          const callDirection = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
+          const callDir = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
           const callMeta = {
             phoneNumberId,
             recordingUrl: call.recordingUrl || null,
             voicemailUrl: call.voicemailUrl || null,
             transcription: call.transcription || null,
-            participants: call.metadata?.participants || [],
           };
+
+          const { data: existingCall } = await supabase.from('communication_calls')
+            .select('id').eq('provider_call_id', callId).maybeSingle();
 
           if (existingCall) {
             await supabase.from('communication_calls').update({
-              duration_seconds: call.duration || existingCall.duration_seconds || 0,
-              status: call.status || existingCall.status,
-              metadata: { ...existingCall.metadata, ...callMeta },
+              duration_seconds: call.duration || 0, status: call.status || 'completed',
+              metadata: callMeta,
             }).eq('id', existingCall.id);
           } else {
             await supabase.from('communication_calls').insert({
-              conversation_id: localConv.id,
-              provider_call_id: callId,
-              direction: callDirection,
-              from_number: normalizePhone(call.fromNumber),
+              conversation_id: localConv.id, provider_call_id: callId,
+              direction: callDir, from_number: normalizePhone(call.fromNumber),
               to_number: normalizePhone(call.toNumber),
               duration_seconds: call.duration || 0,
-              status: call.status || 'completed',
-              metadata: callMeta,
+              status: call.status || 'completed', metadata: callMeta,
               created_at: call.createdAt || new Date().toISOString(),
             });
           }
