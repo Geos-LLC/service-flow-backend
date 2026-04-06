@@ -1174,10 +1174,11 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
 app.get('/api/health', async (req, res) => {
   try {
     // Simple health check without external dependencies
-    res.json({ 
-      status: 'OK', 
+    res.json({
+      status: 'OK',
       message: 'Server is healthy',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      version: 'v2026-04-06a'
     });
   } catch (error) {
     console.error('Health check error:', error);
