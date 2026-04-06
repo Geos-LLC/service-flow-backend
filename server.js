@@ -34871,22 +34871,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     if (maxConversations > 0) allConvs = allConvs.slice(0, maxConversations);
     let convs = allConvs;
 
-    // Bulk lookup contact names via Sigcore (fast DB query + OpenPhone fallback)
-    const allParticipantPhones = convs
-      .map(c => normalizePhone(c.participantPhoneNumber || c.participantPhone))
-      .filter(Boolean);
-    if (allParticipantPhones.length > 0) {
-      try {
-        const namesRes = await sigcoreRequest('POST', '/integrations/openphone/contact-names', syncKey, { phoneNumbers: allParticipantPhones });
-        const names = namesRes.data?.data || namesRes.data || {};
-        for (const [phone, name] of Object.entries(names)) {
-          if (name) contactNameMap[normalizePhone(phone)] = name;
-        }
-        logger.log(`[Sync] Bulk contact lookup: ${Object.keys(names).length} names for ${allParticipantPhones.length} phones`);
-      } catch (e) { logger.warn(`[Sync] Bulk contact lookup failed: ${e.message}`); }
-    }
-
-    // Also check SF's own customers/leads tables
+    // Quick name lookup from SF CRM (fast local DB queries)
     try {
       const { data: sfCustomers } = await supabase.from('customers').select('first_name, last_name, phone').eq('user_id', userId);
       for (const c of (sfCustomers || [])) {
@@ -34906,17 +34891,32 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       }
     } catch (e) { /* leads table may not exist */ }
 
-    logger.log(`[Sync] Total contact names: ${Object.keys(contactNameMap).length}`);
+    logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} (from live + CRM)`);
 
-    // Background: trigger contacts sync for any still unnamed
+    // Background: slow Sigcore contact lookup for unnamed phones (non-blocking)
     const unnamed = convs.filter(c => {
       const phone = normalizePhone(c.participantPhoneNumber || c.participantPhone);
       return phone && !contactNameMap[phone] && !c.contactName;
     });
     if (unnamed.length > 0) {
+      // Non-blocking: resolve names in background and update DB after sync completes
+      setImmediate(async () => {
+        try {
+          const phones = unnamed.map(c => normalizePhone(c.participantPhoneNumber || c.participantPhone)).filter(Boolean);
+          const namesRes = await sigcoreRequest('POST', '/integrations/openphone/contact-names', syncKey, { phoneNumbers: phones });
+          const names = namesRes.data?.data || namesRes.data || {};
+          for (const [phone, name] of Object.entries(names)) {
+            if (name) {
+              await supabase.from('communication_conversations')
+                .update({ participant_name: name })
+                .eq('user_id', userId).eq('participant_phone', normalizePhone(phone))
+                .is('participant_name', null);
+            }
+          }
+          logger.log(`[Sync] Background name resolve: ${Object.keys(names).length} names for ${phones.length} unnamed`);
+        } catch (e) { /* non-fatal */ }
+      });
       try {
-        sigcoreRequest('POST', '/integrations/sync/openphone-contacts', syncKey, { limit: 5000 })
-          .catch(() => {});
       } catch (e) { /* non-fatal */ }
     }
 
