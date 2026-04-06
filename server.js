@@ -34838,7 +34838,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       // Fetch both phones in parallel
       const phoneResults = await Promise.allSettled(phoneNumberIds.map(async (pnId) => {
         const t1 = Date.now();
-        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
+        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&skipContactLookup=true`, syncKey);
         const liveConvs = liveRes.data?.data || liveRes.data || [];
         logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
         return liveConvs;
