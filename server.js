@@ -34963,15 +34963,20 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
         type: m.direction === 'in' ? 'message_in' : 'message_out',
         senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
-        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id
+        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
+        mediaUrls: m.metadata?.mediaUrls || [],
+        media: m.metadata?.media || [],
       })),
       ...(calls || []).map(c => ({
         id: `call-${c.id}`, conversationId: id, channel: 'call',
         type: c.direction === 'in' ? 'call_in' : 'call_out',
         senderRole: c.direction === 'in' ? 'customer' : 'agent',
-        text: c.status === 'missed' ? 'Missed call' : 'Call',
+        text: c.status === 'missed' ? 'Missed call' : c.status === 'voicemail' ? 'Voicemail' : 'Call',
         timestamp: c.created_at, callDurationSeconds: c.duration_seconds,
-        sigcoreId: c.sigcore_call_id
+        sigcoreId: c.sigcore_call_id,
+        recordingUrl: c.metadata?.recordingUrl || null,
+        voicemailUrl: c.metadata?.voicemailUrl || null,
+        transcription: c.metadata?.transcription || null,
       }))
     ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
