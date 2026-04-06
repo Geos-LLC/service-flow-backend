@@ -34737,17 +34737,38 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     } catch (e) { logger.error(`[Sync] Read conversations error: ${e.message}`); }
 
     // Get contact names from live OpenPhone endpoint (does contact lookup)
+    // Fetch for each of our phone numbers to cover all conversations
     const days = maxConversations > 0 ? 7 : 30;
+    for (const pnId of phoneNumberIds) {
+      try {
+        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
+        const liveConvs = liveRes.data?.data || liveRes.data || [];
+        for (const lc of liveConvs) {
+          if (lc.contactName && lc.participantPhone) {
+            contactNameMap[normalizePhone(lc.participantPhone)] = lc.contactName;
+          }
+        }
+      } catch (e) { /* continue to next phone */ }
+    }
+    logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} resolved`);
+
+    // Also check names from SF's own customers/leads tables
+    const { data: sfCustomers } = await supabase.from('customers').select('first_name, last_name, phone').eq('user_id', userId);
+    for (const c of (sfCustomers || [])) {
+      if (c.phone) {
+        const name = `${c.first_name || ''} ${c.last_name || ''}`.trim();
+        if (name) contactNameMap[normalizePhone(c.phone)] = contactNameMap[normalizePhone(c.phone)] || name;
+      }
+    }
     try {
-      const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, syncKey);
-      const liveConvs = liveRes.data?.data || liveRes.data || [];
-      for (const lc of liveConvs) {
-        if (lc.contactName && lc.participantPhone) {
-          contactNameMap[normalizePhone(lc.participantPhone)] = lc.contactName;
+      const { data: sfLeads } = await supabase.from('leads').select('first_name, last_name, name, phone').eq('user_id', userId);
+      for (const l of (sfLeads || [])) {
+        if (l.phone) {
+          const name = l.name || `${l.first_name || ''} ${l.last_name || ''}`.trim();
+          if (name) contactNameMap[normalizePhone(l.phone)] = contactNameMap[normalizePhone(l.phone)] || name;
         }
       }
-      logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} from ${liveConvs.length} live conversations`);
-    } catch (e) { logger.warn(`[Sync] Live contact lookup failed: ${e.message}`); }
+    } catch (e) { /* leads table may not exist */ }
 
     // Filter to only OUR phone numbers (workspace key returns all tenants' conversations)
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
@@ -34766,6 +34787,20 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     convs.sort((a, b) => new Date(b.lastMessageAt || b.updatedAt || 0) - new Date(a.lastMessageAt || a.updatedAt || 0));
     if (maxConversations > 0) convs = convs.slice(0, maxConversations);
 
+    // For conversations without names that aren't in the live results,
+    // check Sigcore stored contacts (from previous full syncs)
+    const unnamed = convs.filter(c => {
+      const phone = normalizePhone(c.participantPhoneNumber || c.participantPhone);
+      return phone && !contactNameMap[phone] && !c.contactName && !c.metadata?.contactName;
+    });
+    if (unnamed.length > 0) {
+      try {
+        // Trigger a contacts sync on Sigcore (non-blocking — names will be available next sync)
+        sigcoreRequest('POST', '/integrations/sync/openphone-contacts', syncKey, { limit: 5000 })
+          .catch(() => {});
+      } catch (e) { /* non-fatal */ }
+    }
+
     const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
@@ -34774,7 +34809,15 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
       const endpointPhone = normalizePhone(conv.phoneNumber);
       const sigcoreConvId = conv.id || conv.externalId;
-      const contactName = conv.contactName || conv.metadata?.contactName || contactNameMap[participantPhone] || null;
+      // Resolve name: Sigcore contact → live lookup → SF CRM → auto-detect from message content
+      let contactName = conv.contactName || conv.metadata?.contactName || contactNameMap[participantPhone] || null;
+      if (!contactName && conv.lastMessage) {
+        const msg = conv.lastMessage.toLowerCase();
+        if (msg.includes('thumbtack') || msg.includes('thmtk.com')) contactName = 'Thumbtack';
+        else if (msg.includes('leadbridge') || msg.includes('[tt]') || msg.includes('[yelp]')) contactName = 'LeadBridge';
+        else if (msg.includes('yelp')) contactName = 'Yelp';
+        else if (msg.includes('homeadvisor') || msg.includes('angi')) contactName = 'HomeAdvisor';
+      }
       const phoneNumberId = (conv.metadata?.phoneNumberId) || conv.phoneNumberId || null;
       const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
 
