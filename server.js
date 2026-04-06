@@ -20377,23 +20377,34 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior debt per member = total balance (all time) minus current period non-payout entries
-    // Payouts settle prior debt, so they're never "current period" for this calculation
+    // 4. Prior period NET balance per member (unpaid entries before current period)
+    // This is the real carry-over: earnings + tips + incentives + cash_collected + adjustments
+    // that haven't been settled by a payout batch yet.
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      // Prior cash = unpaid cash_collected entries from before the current period
-      // These are actual cash the cleaner collected and hasn't returned yet
-      const { data: priorCash } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount')
-        .eq('user_id', userId)
-        .eq('type', 'cash_collected')
-        .lt('effective_date', startDate);
+      // Fetch all UNPAID non-payout entries from before the current period
+      let priorEntries = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        const { data: page, error } = await supabase.from('cleaner_ledger')
+          .select('team_member_id, amount, type')
+          .eq('user_id', userId)
+          .is('payout_batch_id', null)
+          .neq('type', 'payout')
+          .lt('effective_date', startDate)
+          .range(from, from + pageSize - 1);
+        if (error) break;
+        priorEntries = priorEntries.concat(page || []);
+        if (!page || page.length < pageSize) break;
+        from += pageSize;
+      }
       const result = {};
-      (priorCash || []).forEach(e => {
+      (priorEntries || []).forEach(e => {
         const mid = e.team_member_id;
         result[mid] = (result[mid] || 0) + parseFloat(e.amount);
       });
-      // Only return negative values (member owes cash)
+      // Only return negative values (member owes money from prior periods)
       for (const mid of Object.keys(result)) {
         if (result[mid] >= -0.01) delete result[mid];
         else result[mid] = parseFloat(result[mid].toFixed(2));
@@ -34531,15 +34542,16 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }
     }
 
-    // Find or create conversation
+    // Find or create conversation — deterministic key: endpoint_phone + participant_phone
     let conversation = null;
     if (sigcoreConvId) {
       const { data: existing } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
       conversation = existing;
     }
-    if (!conversation && participantPhone) {
-      const { data: byPhone } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle();
-      conversation = byPhone;
+    if (!conversation && ourEndpointPhone && participantPhone) {
+      const { data: byIdentity } = await supabase.from('communication_conversations')
+        .select('*').eq('user_id', userId).eq('endpoint_phone', ourEndpointPhone).eq('participant_phone', participantPhone).maybeSingle();
+      conversation = byIdentity;
     }
     if (!conversation) {
       const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
@@ -34547,6 +34559,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         sigcore_conversation_id: sigcoreConvId,
         provider: 'openphone',
         channel: event.includes('call') ? 'call' : 'sms',
+        endpoint_phone: ourEndpointPhone,
         participant_phone: participantPhone,
         participant_name: payload.contactName || null,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
@@ -34673,30 +34686,48 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
     for (const conv of convs) {
       const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
+      const endpointPhone = normalizePhone(conv.phoneNumber); // Our business number
       const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
       const contactName = conv.contactName || conv.metadata?.contactName || null;
       const phoneNumberId = conv.phoneNumberId || null;
       const lastActivity = conv.lastMessageAt || conv.lastActivityAt || null;
 
+      if (!participantPhone || !endpointPhone) {
+        commSyncProgress[userId].errors++;
+        continue;
+      }
+
       try {
-        // Upsert conversation in SF
+        // Deterministic conversation identity: user + endpoint + participant
+        // Step 1: try sigcore conversation ID (most specific)
+        // Step 2: try composite key (endpoint_phone + participant_phone)
+        // NEVER fall back to participant_phone alone — that merges conversations across business numbers
         let localConv = null;
-        const { data: existing } = await supabase.from('communication_conversations')
-          .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
-        const found = existing || (participantPhone ? (await supabase.from('communication_conversations')
-          .select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle()).data : null);
+        let found = null;
+        if (sigcoreConvId) {
+          const { data: bySigcore } = await supabase.from('communication_conversations')
+            .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
+          found = bySigcore;
+        }
+        if (!found) {
+          const { data: byIdentity } = await supabase.from('communication_conversations')
+            .select('*').eq('user_id', userId).eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle();
+          found = byIdentity;
+        }
 
         if (found) {
           const updates = { updated_at: new Date().toISOString() };
           if (lastActivity) updates.last_event_at = lastActivity;
           if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
-          if (!found.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+          if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
+          if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
           const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
           localConv = updated || found;
         } else {
           const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
             user_id: userId, sigcore_conversation_id: sigcoreConvId,
             provider: 'openphone', channel: 'sms',
+            endpoint_phone: endpointPhone,
             participant_phone: participantPhone, participant_name: contactName,
             last_event_at: lastActivity, metadata: { phoneNumberId },
           }).select().single();
@@ -34863,6 +34894,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       sigcoreConversationId: c.sigcore_conversation_id,
       displayName: c.participant_name || '',
       fallbackIdentifier: c.participant_phone,
+      endpointPhone: c.endpoint_phone,
       lastPreview: c.last_preview,
       lastEventAt: c.last_event_at,
       unreadCount: c.unread_count || 0,
