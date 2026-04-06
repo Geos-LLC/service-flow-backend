@@ -34744,9 +34744,11 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
         const liveConvs = liveRes.data?.data || liveRes.data || [];
         for (const lc of liveConvs) {
-          if (lc.contactName && lc.participantPhone) {
-            contactNameMap[normalizePhone(lc.participantPhone)] = lc.contactName;
-          }
+          const phone = normalizePhone(lc.participantPhone);
+          if (!phone) continue;
+          // Priority: contactName (from contact lookup) > conversationName (from OpenPhone conversation)
+          const name = lc.contactName || lc.conversationName;
+          if (name && !contactNameMap[phone]) contactNameMap[phone] = name;
         }
       } catch (e) { /* continue to next phone */ }
     }
