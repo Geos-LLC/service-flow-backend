@@ -34599,59 +34599,44 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
 
-    // Phase 1: Trigger Sigcore's full sync (it handles conversations, messages, calls, recordings, transcripts, contacts)
-    commSyncProgress[userId].phase = 'sigcore_sync';
+    // Single API call: GET /conversations?includeMessages=true — Sigcore fetches messages+calls in parallel
     const syncKey = SIGCORE_WORKSPACE_KEY;
-    for (const pnId of phoneNumberIds) {
-      try {
-        await sigcoreRequest('POST', '/integrations/sync', syncKey, {
-          syncMessages: true, forceRefresh: true, phoneNumberId: pnId,
-          provider: 'openphone', onlySavedContacts: false,
-          limit: maxConversations > 0 ? maxConversations : 50
-        });
-        logger.log(`[Sync] Triggered Sigcore sync for phoneNumberId ${pnId}`);
-      } catch (e) { logger.warn(`[Sync] Sigcore sync trigger failed for ${pnId}: ${e.message}`); }
-    }
-
-    // Phase 2: Poll Sigcore sync status until complete (max 120s)
-    commSyncProgress[userId].phase = 'waiting_sigcore';
-    const maxWait = 120000;
-    const start = Date.now();
-    let sigcoreDone = false;
-    while (Date.now() - start < maxWait) {
-      try {
-        const statusRes = await sigcoreRequest('GET', '/integrations/sync/status', syncKey);
-        const st = statusRes.data?.data || statusRes.data || {};
-        if (st.status === 'completed' || st.status === 'cancelled' || !st.status) { sigcoreDone = true; break; }
-        if (st.status === 'error') { logger.error('[Sync] Sigcore sync error:', st.message); sigcoreDone = true; break; }
-      } catch (e) { sigcoreDone = true; break; }
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    if (!sigcoreDone) logger.warn('[Sync] Sigcore sync timed out after 120s, continuing with available data');
-
-    // Phase 3: Read synced data from Sigcore's stored conversations
-    commSyncProgress[userId].phase = 'reading';
     let totalSynced = 0;
     let totalMessages = 0;
 
-    const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
-    const sigcoreConvs = convsRes.data?.data || convsRes.data || [];
-    logger.log(`[Sync] Read ${sigcoreConvs.length} conversations from Sigcore`);
+    const days = maxConversations > 0 ? 7 : 30;
+    const pnFilter = phoneNumberIds.length === 1 ? `&phoneNumberId=${phoneNumberIds[0]}` : '';
+    let allConvs = [];
+    try {
+      const convRes = await sigcoreRequest('GET',
+        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50${pnFilter}`,
+        syncKey);
+      allConvs = convRes.data?.data || convRes.data || [];
+    } catch (e) { logger.error(`[Sync] Fetch error: ${e.message}`); }
 
-    // Apply limit
-    let convs = sigcoreConvs;
+    // Filter to our phone numbers
+    const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
+    let convs = allConvs;
+    if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
+      convs = allConvs.filter(c =>
+        ourPhoneNumbers.includes(normalizePhone(c.phoneNumber)) || phoneNumberIds.includes(c.phoneNumberId)
+      );
+    }
+    convs.sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
     if (maxConversations > 0) convs = convs.slice(0, maxConversations);
+
+    logger.log(`[Sync] ${convs.length} conversations (from ${allConvs.length}), embedded=${convs[0]?.messages !== undefined}`);
 
     const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
 
     for (const conv of convs) {
-      const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
-      const sigcoreConvId = conv.id || conv.externalId;
-      const contactName = conv.metadata?.contactName || conv.contactName || null;
-      const phoneNumberId = conv.metadata?.phoneNumberId || conv.phoneNumberId || null;
-      const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
+      const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
+      const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
+      const contactName = conv.contactName || conv.metadata?.contactName || null;
+      const phoneNumberId = conv.phoneNumberId || null;
+      const lastActivity = conv.lastMessageAt || conv.lastActivityAt || null;
 
       try {
         // Upsert conversation in SF
@@ -34685,13 +34670,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           await autoLinkConversation(userId, localConv.id, participantPhone);
         }
 
-        // Read messages + calls from Sigcore in parallel
-        const [msgsResult, callsResult] = await Promise.allSettled([
-          sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages`, syncKey).then(r => r.data?.data || r.data || []),
-          sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || r.data || []),
-        ]);
-        const messages = msgsResult.status === 'fulfilled' ? msgsResult.value : [];
-        const calls = callsResult.status === 'fulfilled' ? callsResult.value : [];
+        // Use embedded messages + calls from the batch response
+        const messages = conv.messages || [];
+        const calls = conv.calls || [];
 
         for (const msg of messages) {
           const msgId = msg.providerMessageId || msg.id;
