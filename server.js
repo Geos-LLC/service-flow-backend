@@ -20377,23 +20377,34 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior debt per member = total balance (all time) minus current period non-payout entries
-    // Payouts settle prior debt, so they're never "current period" for this calculation
+    // 4. Prior period NET balance per member (unpaid entries before current period)
+    // This is the real carry-over: earnings + tips + incentives + cash_collected + adjustments
+    // that haven't been settled by a payout batch yet.
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      // Prior cash = unpaid cash_collected entries from before the current period
-      // These are actual cash the cleaner collected and hasn't returned yet
-      const { data: priorCash } = await supabase.from('cleaner_ledger')
-        .select('team_member_id, amount')
-        .eq('user_id', userId)
-        .eq('type', 'cash_collected')
-        .lt('effective_date', startDate);
+      // Fetch all UNPAID non-payout entries from before the current period
+      let priorEntries = [];
+      let from = 0;
+      const pageSize = 1000;
+      while (true) {
+        const { data: page, error } = await supabase.from('cleaner_ledger')
+          .select('team_member_id, amount, type')
+          .eq('user_id', userId)
+          .is('payout_batch_id', null)
+          .neq('type', 'payout')
+          .lt('effective_date', startDate)
+          .range(from, from + pageSize - 1);
+        if (error) break;
+        priorEntries = priorEntries.concat(page || []);
+        if (!page || page.length < pageSize) break;
+        from += pageSize;
+      }
       const result = {};
-      (priorCash || []).forEach(e => {
+      (priorEntries || []).forEach(e => {
         const mid = e.team_member_id;
         result[mid] = (result[mid] || 0) + parseFloat(e.amount);
       });
-      // Only return negative values (member owes cash)
+      // Only return negative values (member owes money from prior periods)
       for (const mid of Object.keys(result)) {
         if (result[mid] >= -0.01) delete result[mid];
         else result[mid] = parseFloat(result[mid].toFixed(2));
