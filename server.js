@@ -20510,8 +20510,32 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         }
       }
     }
+    // Also detect completed jobs with ledger entries (cash_collected) but NO earnings
+    const jobsWithAnyEntry = new Set();
+    const jobsWithEarning = new Set();
+    (ledgerEntries || []).forEach(e => {
+      if (e.job_id) {
+        jobsWithAnyEntry.add(e.job_id);
+        if (e.type === 'earning') jobsWithEarning.add(e.job_id);
+      }
+    });
+    // Also check completed jobs with NO ledger entries at all
+    (allJobs || []).forEach(job => {
+      if ((job.status || '').toLowerCase() === 'completed' && !jobsWithAnyEntry.has(job.id)) {
+        staleJobIds.add(job.id);
+      }
+    });
+    jobsWithAnyEntry.forEach(jobId => {
+      if (!jobsWithEarning.has(jobId)) {
+        const job = allJobsById[jobId];
+        if (job && (job.status || '').toLowerCase() === 'completed') {
+          staleJobIds.add(jobId);
+        }
+      }
+    });
+
     if (staleJobIds.size > 0) {
-      console.log(`[Payroll] Auto-rebuilding ${staleJobIds.size} stale job ledger entries: ${[...staleJobIds].join(', ')}`);
+      console.log(`[Payroll] Auto-rebuilding ${staleJobIds.size} stale/missing job ledger entries: ${[...staleJobIds].join(', ')}`);
       for (const jobId of staleJobIds) {
         await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive']);
         try { await createLedgerEntriesForCompletedJob(jobId, req.user.userId); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
