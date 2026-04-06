@@ -34197,18 +34197,32 @@ async function resolveEndpointRoute({ provider, providerAccountId, endpointId, p
   if (phoneNumber) {
     const normalized = normalizePhone(phoneNumber);
     if (normalized) {
-      const { data: routes } = await supabase.from('communication_endpoint_routes')
-        .select('*').eq('phone_number', normalized).eq('is_active', true)
-        .order('priority', { ascending: false });
+      // Try with channel filter first (sms and voice are different routes for same phone)
+      let query = supabase.from('communication_endpoint_routes')
+        .select('*').eq('phone_number', normalized).eq('is_active', true);
+      if (channel) query = query.eq('channel', channel);
+      const { data: routes } = await query.order('priority', { ascending: false });
 
       if (routes?.length === 1) {
         const route = routes[0];
         const userId = await resolveWorkspaceOwner(route.workspace_id);
-        logger.log(`[Route] Step D: phone ${normalized} → workspace ${route.workspace_id}`);
+        logger.log(`[Route] Step D: phone ${normalized}/${channel || 'any'} → workspace ${route.workspace_id}`);
         return { routed: true, workspaceId: route.workspace_id, userId, step: 'D', route, ambiguous: false, candidates: [] };
       }
+      // If channel filter gave 0, try without channel (any route for this phone)
+      if (routes?.length === 0 && channel) {
+        const { data: anyRoutes } = await supabase.from('communication_endpoint_routes')
+          .select('*').eq('phone_number', normalized).eq('is_active', true).limit(1);
+        if (anyRoutes?.length === 1) {
+          const route = anyRoutes[0];
+          const userId = await resolveWorkspaceOwner(route.workspace_id);
+          logger.log(`[Route] Step D: phone ${normalized} (any channel) → workspace ${route.workspace_id}`);
+          return { routed: true, workspaceId: route.workspace_id, userId, step: 'D', route, ambiguous: false, candidates: [] };
+        }
+      }
       if (routes?.length > 1) {
-        logger.warn(`[Route] Step D: AMBIGUOUS - ${routes.length} routes for phone ${normalized}`);
+        // Multiple routes for same phone+channel — still ambiguous
+        logger.warn(`[Route] Step D: AMBIGUOUS - ${routes.length} routes for phone ${normalized}/${channel}`);
         return { ...result, ambiguous: true, candidates: routes, step: 'D' };
       }
     }
