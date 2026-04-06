@@ -34736,41 +34736,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       allConvs = convsRes.data?.data || convsRes.data || [];
     } catch (e) { logger.error(`[Sync] Read conversations error: ${e.message}`); }
 
-    // Get contact names from live OpenPhone endpoint (does contact lookup)
-    // Fetch for each of our phone numbers to cover all conversations
-    const days = maxConversations > 0 ? 7 : 30;
-    for (const pnId of phoneNumberIds) {
-      try {
-        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
-        const liveConvs = liveRes.data?.data || liveRes.data || [];
-        for (const lc of liveConvs) {
-          const phone = normalizePhone(lc.participantPhone);
-          if (!phone) continue;
-          // Priority: contactName (from contact lookup) > conversationName (from OpenPhone conversation)
-          const name = lc.contactName || lc.conversationName;
-          if (name && !contactNameMap[phone]) contactNameMap[phone] = name;
-        }
-      } catch (e) { /* continue to next phone */ }
-    }
-    logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} resolved`);
-
-    // Also check names from SF's own customers/leads tables
-    const { data: sfCustomers } = await supabase.from('customers').select('first_name, last_name, phone').eq('user_id', userId);
-    for (const c of (sfCustomers || [])) {
-      if (c.phone) {
-        const name = `${c.first_name || ''} ${c.last_name || ''}`.trim();
-        if (name) contactNameMap[normalizePhone(c.phone)] = contactNameMap[normalizePhone(c.phone)] || name;
-      }
-    }
-    try {
-      const { data: sfLeads } = await supabase.from('leads').select('first_name, last_name, name, phone').eq('user_id', userId);
-      for (const l of (sfLeads || [])) {
-        if (l.phone) {
-          const name = l.name || `${l.first_name || ''} ${l.last_name || ''}`.trim();
-          if (name) contactNameMap[normalizePhone(l.phone)] = contactNameMap[normalizePhone(l.phone)] || name;
-        }
-      }
-    } catch (e) { /* leads table may not exist */ }
+    // Phase 2b: After reading conversations, collect all participant phones and do a bulk lookup
+    // This happens below after filtering to our phones
 
     // Filter to only OUR phone numbers (workspace key returns all tenants' conversations)
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
@@ -34789,15 +34756,50 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     convs.sort((a, b) => new Date(b.lastMessageAt || b.updatedAt || 0) - new Date(a.lastMessageAt || a.updatedAt || 0));
     if (maxConversations > 0) convs = convs.slice(0, maxConversations);
 
-    // For conversations without names that aren't in the live results,
-    // check Sigcore stored contacts (from previous full syncs)
+    // Bulk lookup contact names via Sigcore (fast DB query + OpenPhone fallback)
+    const allParticipantPhones = convs
+      .map(c => normalizePhone(c.participantPhoneNumber || c.participantPhone))
+      .filter(Boolean);
+    if (allParticipantPhones.length > 0) {
+      try {
+        const namesRes = await sigcoreRequest('POST', '/integrations/openphone/contact-names', syncKey, { phoneNumbers: allParticipantPhones });
+        const names = namesRes.data?.data || namesRes.data || {};
+        for (const [phone, name] of Object.entries(names)) {
+          if (name) contactNameMap[normalizePhone(phone)] = name;
+        }
+        logger.log(`[Sync] Bulk contact lookup: ${Object.keys(names).length} names for ${allParticipantPhones.length} phones`);
+      } catch (e) { logger.warn(`[Sync] Bulk contact lookup failed: ${e.message}`); }
+    }
+
+    // Also check SF's own customers/leads tables
+    try {
+      const { data: sfCustomers } = await supabase.from('customers').select('first_name, last_name, phone').eq('user_id', userId);
+      for (const c of (sfCustomers || [])) {
+        if (c.phone) {
+          const name = `${c.first_name || ''} ${c.last_name || ''}`.trim();
+          if (name && !contactNameMap[normalizePhone(c.phone)]) contactNameMap[normalizePhone(c.phone)] = name;
+        }
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      const { data: sfLeads } = await supabase.from('leads').select('first_name, last_name, name, phone').eq('user_id', userId);
+      for (const l of (sfLeads || [])) {
+        if (l.phone) {
+          const name = l.name || `${l.first_name || ''} ${l.last_name || ''}`.trim();
+          if (name && !contactNameMap[normalizePhone(l.phone)]) contactNameMap[normalizePhone(l.phone)] = name;
+        }
+      }
+    } catch (e) { /* leads table may not exist */ }
+
+    logger.log(`[Sync] Total contact names: ${Object.keys(contactNameMap).length}`);
+
+    // Background: trigger contacts sync for any still unnamed
     const unnamed = convs.filter(c => {
       const phone = normalizePhone(c.participantPhoneNumber || c.participantPhone);
-      return phone && !contactNameMap[phone] && !c.contactName && !c.metadata?.contactName;
+      return phone && !contactNameMap[phone] && !c.contactName;
     });
     if (unnamed.length > 0) {
       try {
-        // Trigger a contacts sync on Sigcore (non-blocking — names will be available next sync)
         sigcoreRequest('POST', '/integrations/sync/openphone-contacts', syncKey, { limit: 5000 })
           .catch(() => {});
       } catch (e) { /* non-fatal */ }
