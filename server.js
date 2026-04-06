@@ -34809,56 +34809,57 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       return;
     }
 
-    // Phase 1: Trigger Sigcore full sync in background (non-blocking)
-    sigcoreRequest('POST', '/integrations/sync', syncKey, {
-      syncMessages: true, forceRefresh: false, provider: 'openphone',
-      onlySavedContacts: false, limit: maxConversations > 0 ? maxConversations : 50
-    }).catch(e => logger.warn(`[Sync] Sigcore background sync: ${e.response?.status || ''} ${e.message}`));
-
-    // Phase 2: Get conversation list from live OpenPhone endpoint (correct ordering + names)
-    // Then read messages/calls from Sigcore stored data (has webhook media, recordings)
+    // Fetch conversations from OpenPhone via Sigcore
+    // Full sync (maxConversations=0): GET /openphone/conversations/all — all pages, parallel per phone
+    // Test sync (maxConversations>0): GET /openphone/conversations?days=7 — recent only, fast
     let allConvs = [];
     let contactNameMap = {};
     const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
 
-    // Fetch live conversations per phone number (gives us correct OpenPhone ordering + conversationName)
-    const days = maxConversations > 0 ? 7 : 30;
-    for (const pnId of phoneNumberIds) {
+    const isFullSync = maxConversations === 0;
+    commSyncProgress[userId].phase = isFullSync ? 'full_sync' : 'fetching';
+
+    if (isFullSync) {
+      // Full sync: single call, Sigcore paginates all pages in parallel per phone number
       try {
-        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
-        const liveConvs = liveRes.data?.data || liveRes.data || [];
-        for (const lc of liveConvs) {
-          const phone = normalizePhone(lc.participantPhone);
+        const allRes = await sigcoreRequest('GET', '/integrations/openphone/conversations/all?includeMessages=true&messageLimit=50', syncKey);
+        const convs = allRes.data?.data || allRes.data || [];
+        for (const c of convs) {
+          const phone = normalizePhone(c.participantPhone);
           if (!phone) continue;
-          // Use live data as the conversation source (correct order + names)
-          allConvs.push({
-            ...lc,
-            participantPhoneNumber: lc.participantPhone,
-            id: null, // Will be looked up from stored data
-          });
-          const name = lc.contactName || lc.conversationName;
+          allConvs.push({ ...c, participantPhoneNumber: c.participantPhone });
+          const name = c.contactName || c.conversationName;
           if (name) contactNameMap[phone] = name;
         }
-      } catch (e) { logger.warn(`[Sync] Live conversations for ${pnId}: ${e.message}`); }
+        logger.log(`[Sync] Full sync: ${allConvs.length} conversations from Sigcore`);
+      } catch (e) { logger.error(`[Sync] Full sync error: ${e.message}`); }
+    } else {
+      // Test sync: fetch recent conversations per phone number
+      const days = 7;
+      for (const pnId of phoneNumberIds) {
+        try {
+          const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&includeMessages=true&messageLimit=50`, syncKey);
+          const liveConvs = liveRes.data?.data || liveRes.data || [];
+          for (const lc of liveConvs) {
+            const phone = normalizePhone(lc.participantPhone);
+            if (!phone) continue;
+            allConvs.push({ ...lc, participantPhoneNumber: lc.participantPhone });
+            const name = lc.contactName || lc.conversationName;
+            if (name) contactNameMap[phone] = name;
+          }
+        } catch (e) { logger.warn(`[Sync] Live conversations for ${pnId}: ${e.message}`); }
+      }
+      logger.log(`[Sync] Test sync: ${allConvs.length} conversations`);
     }
 
-    // Build a stored conversations index for looking up Sigcore IDs (needed for message/call reads)
-    let storedIndex = {};
-    try {
-      const storedRes = await sigcoreRequest('GET', '/conversations?limit=500', syncKey);
-      const storedConvs = storedRes.data?.data || storedRes.data || [];
-      for (const sc of storedConvs) {
-        const phone = normalizePhone(sc.participantPhoneNumber);
-        const endpoint = normalizePhone(sc.phoneNumber);
-        if (phone && endpoint) {
-          storedIndex[`${endpoint}:${phone}`] = sc;
-        }
-      }
-    } catch (e) { logger.warn(`[Sync] Stored index: ${e.message}`); }
+    // Filter to only our phone numbers
+    if (ourPhoneNumbers.length > 0) {
+      allConvs = allConvs.filter(c =>
+        ourPhoneNumbers.includes(normalizePhone(c.phoneNumber)) || phoneNumberIds.includes(c.phoneNumberId)
+      );
+    }
 
-    logger.log(`[Sync] ${allConvs.length} live conversations, ${Object.keys(storedIndex).length} stored index entries`);
-
-    // Deduplicate (same participant+endpoint from different time windows)
+    // Deduplicate by participant+endpoint
     const seen = new Set();
     allConvs = allConvs.filter(c => {
       const key = `${normalizePhone(c.phoneNumber)}:${normalizePhone(c.participantPhoneNumber)}`;
@@ -34927,13 +34928,10 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     for (const conv of convs) {
       const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
       const endpointPhone = normalizePhone(conv.phoneNumber);
-      // Look up the Sigcore stored conversation ID for this participant+endpoint
-      const storedKey = `${endpointPhone}:${participantPhone}`;
-      const storedConv = storedIndex[storedKey];
-      const sigcoreConvId = storedConv?.id || storedConv?.externalId || conv.id || conv.externalId;
+      const sigcoreConvId = conv.externalId || conv.id;
       // Resolve name: Sigcore contact → live lookup → SF CRM → auto-detect from message content
-      let contactName = conv.contactName || conv.metadata?.contactName || contactNameMap[participantPhone] || null;
-      const lastMsg = conv.lastMessage || storedConv?.lastMessage;
+      let contactName = conv.contactName || conv.conversationName || contactNameMap[participantPhone] || null;
+      const lastMsg = conv.lastMessage;
       if (!contactName && lastMsg) {
         const msg = lastMsg.toLowerCase();
         if (msg.includes('thumbtack') || msg.includes('thmtk.com')) contactName = 'Thumbtack';
