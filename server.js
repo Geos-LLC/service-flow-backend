@@ -34636,10 +34636,48 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           totalMessages++;
         }
 
+        // Process embedded calls (fetched by Sigcore in parallel alongside messages)
+        const calls = conv.calls || [];
+        for (const call of calls) {
+          const callId = call.providerCallId || call.id;
+          if (!callId) continue;
+          const { data: existingCall } = await supabase.from('communication_calls')
+            .select('id, metadata').eq('provider_call_id', callId).maybeSingle();
+
+          const callDirection = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
+          const callMeta = {
+            phoneNumberId,
+            recordingUrl: call.recordingUrl || null,
+            voicemailUrl: call.voicemailUrl || null,
+            transcription: call.transcription || null,
+            participants: call.metadata?.participants || [],
+          };
+
+          if (existingCall) {
+            await supabase.from('communication_calls').update({
+              duration_seconds: call.duration || existingCall.duration_seconds || 0,
+              status: call.status || existingCall.status,
+              metadata: { ...existingCall.metadata, ...callMeta },
+            }).eq('id', existingCall.id);
+          } else {
+            await supabase.from('communication_calls').insert({
+              conversation_id: localConv.id,
+              provider_call_id: callId,
+              direction: callDirection,
+              from_number: normalizePhone(call.fromNumber),
+              to_number: normalizePhone(call.toNumber),
+              duration_seconds: call.duration || 0,
+              status: call.status || 'completed',
+              metadata: callMeta,
+              created_at: call.createdAt || new Date().toISOString(),
+            });
+          }
+        }
+
         totalSynced++;
         commSyncProgress[userId].synced = totalSynced;
         commSyncProgress[userId].messages = totalMessages;
-      } catch (e) { commSyncProgress[userId].errors++; }
+      } catch (e) { logger.error('[Sync] Conv error:', e.message); commSyncProgress[userId].errors++; }
     }
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
     logger.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
