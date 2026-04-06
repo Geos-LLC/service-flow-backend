@@ -34749,6 +34749,14 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           const msgId = msg.providerMessageId || msg.id;
           if (!msgId) continue;
           const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+
+          // Guard: only attach messages that involve our endpoint phone
+          // Prevents cross-tenant messages (e.g. LeadBridge Twilio) from leaking into SF conversations
+          const msgFrom = normalizePhone(msg.fromNumber || msg.from);
+          const msgTo = normalizePhone(msg.toNumber || msg.to);
+          if (endpointPhone && msgFrom !== endpointPhone && msgTo !== endpointPhone) {
+            continue; // This message doesn't belong to this conversation's endpoint
+          }
           const mediaUrls = msg.metadata?.mediaUrls || [];
           const media = msg.metadata?.media || [];
           const body = msg.body || '';
