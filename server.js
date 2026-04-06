@@ -20377,18 +20377,20 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior period NET balance per member (unpaid entries before current period)
-    // This is the real carry-over: earnings + tips + incentives + cash_collected + adjustments
-    // that haven't been settled by a payout batch yet.
+    // 4. Prior period debt per member — two sources:
+    // A) Unpaid entries before current period (no batch yet)
+    // B) Negative paid batches from prior periods (cash debt carry-forward)
     const fetchPriorCash = async () => {
       if (!startDate) return {};
-      // Fetch all UNPAID non-payout entries from before the current period
+      const result = {};
+
+      // A) Unpaid entries before current period (not yet in any batch)
       let priorEntries = [];
       let from = 0;
       const pageSize = 1000;
       while (true) {
         const { data: page, error } = await supabase.from('cleaner_ledger')
-          .select('team_member_id, amount, type')
+          .select('team_member_id, amount')
           .eq('user_id', userId)
           .is('payout_batch_id', null)
           .neq('type', 'payout')
@@ -20399,11 +20401,25 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         if (!page || page.length < pageSize) break;
         from += pageSize;
       }
-      const result = {};
       (priorEntries || []).forEach(e => {
         const mid = e.team_member_id;
         result[mid] = (result[mid] || 0) + parseFloat(e.amount);
       });
+
+      // B) Negative paid batches from prior periods — debt carry-forward
+      // When a batch is negative (cleaner owes), marking it paid acknowledges
+      // the debt but doesn't recover the money. It carries to the next period.
+      const { data: negativeBatches } = await supabase.from('cleaner_payout_batch')
+        .select('team_member_id, total_amount')
+        .eq('user_id', userId)
+        .eq('status', 'paid')
+        .lt('total_amount', 0)
+        .lt('period_end', startDate);
+      (negativeBatches || []).forEach(b => {
+        const mid = b.team_member_id;
+        result[mid] = (result[mid] || 0) + parseFloat(b.total_amount);
+      });
+
       // Only return negative values (member owes money from prior periods)
       for (const mid of Object.keys(result)) {
         if (result[mid] >= -0.01) delete result[mid];
@@ -33259,7 +33275,11 @@ app.patch('/api/ledger/payout-batch/:id/pay', authenticateToken, async (req, res
 
     const paidAt = new Date().toISOString();
 
-    // Create payout ledger entry (negative amount - settling the balance)
+    // Create payout ledger entry — negates the batch total to settle the balance
+    // Positive batch +$200 → payout -$200 (money paid out to cleaner)
+    // Negative batch -$66 → payout +$66 (acknowledges debt, zeroes the batch entries)
+    // For negative batches, the debt carries forward via prior-period batch lookup
+    const payoutAmount = -parseFloat(batch.total_amount);
     const { error: payoutEntryError } = await supabase
       .from('cleaner_ledger')
       .insert({
@@ -33267,7 +33287,7 @@ app.patch('/api/ledger/payout-batch/:id/pay', authenticateToken, async (req, res
         team_member_id: batch.team_member_id,
         job_id: null,
         type: 'payout',
-        amount: -Math.abs(batch.total_amount), // Negative: money paid out
+        amount: parseFloat(payoutAmount.toFixed(2)),
         effective_date: paidAt.split('T')[0],
         note: note || `Payout batch #${batch.id} settled`,
         metadata: { payout_batch_id: batch.id },
