@@ -78,7 +78,9 @@ function deleteBatch(entries, batchId) {
 }
 
 /**
- * Mark batch as paid — create a payout entry (negative amount)
+ * Mark batch as paid — create a payout entry that negates the batch total
+ * Positive batch +$200 → payout -$200 (money paid out)
+ * Negative batch -$66 → payout +$66 (settles entries, debt carries via batch lookup)
  */
 function markBatchPaid(entries, batch) {
   batch.status = 'paid';
@@ -87,10 +89,67 @@ function markBatchPaid(entries, batch) {
     id: Math.floor(Math.random() * 10000) + 90000,
     team_member_id: batch.team_member_id,
     type: 'payout',
-    amount: -Math.abs(batch.total_amount),
+    amount: -parseFloat(batch.total_amount),
     effective_date: '2026-03-31',
     payout_batch_id: batch.id
   });
+}
+
+/**
+ * Calculate prior period debt — two sources:
+ * A) Unpaid entries before period (no batch)
+ * B) Negative paid batch amounts from prior periods (carry-forward)
+ */
+function calculatePriorDebt(entries, batches, teamMemberId, periodStart) {
+  // A) Unpaid entries before period
+  let debt = entries
+    .filter(e =>
+      e.team_member_id === teamMemberId &&
+      !e.payout_batch_id &&
+      e.type !== 'payout' &&
+      e.effective_date < periodStart
+    )
+    .reduce((sum, e) => sum + e.amount, 0);
+
+  // B) Negative paid batches from prior periods
+  (batches || []).forEach(b => {
+    if (b.team_member_id === teamMemberId &&
+        b.status === 'paid' &&
+        b.total_amount < 0 &&
+        b.period_end < periodStart) {
+      debt += b.total_amount;
+    }
+  });
+
+  return debt < -0.01 ? parseFloat(debt.toFixed(2)) : 0;
+}
+
+/**
+ * Detect stale ledger entries — job data changed but ledger wasn't rebuilt
+ */
+function detectStaleEntries(entries, jobs) {
+  const staleJobIds = [];
+  const earningsByJob = {};
+  entries.forEach(e => {
+    if (e.type === 'earning' && e.job_id && e.metadata && !e.metadata.is_manager_salary && !e.metadata.is_manager_commission) {
+      if (!earningsByJob[e.job_id]) earningsByJob[e.job_id] = [];
+      earningsByJob[e.job_id].push(e);
+    }
+  });
+  for (const [jobId, jobEntries] of Object.entries(earningsByJob)) {
+    const job = jobs.find(j => j.id === parseInt(jobId));
+    if (!job) continue;
+    const currentHours = job.hours_worked || (job.duration ? job.duration / 60 : 0);
+    const currentRevenue = job.service_price + (job.additional_fees || 0);
+    for (const e of jobEntries) {
+      const meta = e.metadata || {};
+      if (Math.abs((meta.hours || 0) - currentHours) > 0.01 || Math.abs((meta.revenue || 0) - currentRevenue) > 0.01) {
+        staleJobIds.push(parseInt(jobId));
+        break;
+      }
+    }
+  }
+  return staleJobIds;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -544,5 +603,156 @@ describe('Job Status Change — Ledger Cleanup', () => {
     // Complete again → fresh entries created
     simulateStatusChange(entries, 501, 'pending', 'completed', 100);
     expect(entries.length).toBe(2);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Negative Batch Payout Entry (carry-forward debt)
+// ═══════════════════════════════════════════════════════════════
+
+describe('Negative Batch — Payout Entry and Debt Carry-Forward', () => {
+  test('positive batch payout entry is negative (money paid out)', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 500, '2026-03-22'),
+    ];
+    const result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, result.batch);
+
+    const payoutEntry = entries.find(e => e.type === 'payout');
+    expect(payoutEntry.amount).toBe(-500); // money paid out to cleaner
+  });
+
+  test('negative batch payout entry is positive (settles ledger, debt carries via batch)', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 113.40, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    expect(result.batch.total_amount).toBe(-66.60);
+
+    markBatchPaid(entries, result.batch);
+
+    const payoutEntry = entries.find(e => e.type === 'payout');
+    expect(payoutEntry.amount).toBe(66.60); // positive — settles the entries
+    // Entries net: 113.40 + (-180) + 66.60 = 0 (settled at ledger level)
+    const totalNet = entries.reduce((s, e) => s + e.amount, 0);
+    expect(totalNet).toBeCloseTo(0, 2);
+  });
+
+  test('negative paid batch carries debt to next period via batch lookup', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 113.40, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, result.batch);
+    const batches = [result.batch];
+
+    // Prior debt for next period (Mar 29-Apr 4): -$66.60 from negative batch
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
+    expect(priorDebt).toBe(-66.60);
+  });
+
+  test('positive paid batch does NOT carry debt', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 500, '2026-03-22'),
+    ];
+    const result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, result.batch);
+    const batches = [result.batch];
+
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
+    expect(priorDebt).toBe(0); // no debt — cleaner was paid
+  });
+
+  test('unpaid entries without batch show as prior debt', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 50, '2026-03-22'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-22'),
+    ];
+    // No batch created — entries are unsettled
+
+    const priorDebt = calculatePriorDebt(entries, [], 100, '2026-03-29');
+    expect(priorDebt).toBe(-130); // 50 + (-180) = -130
+  });
+
+  test('settled entries do NOT show as prior debt (only batch amount does)', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 113.40, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, result.batch);
+    const batches = [result.batch];
+
+    // Entries are settled (have payout_batch_id) — don't double-count
+    // Only the batch amount (-66.60) shows as prior debt
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
+    expect(priorDebt).toBe(-66.60); // NOT -133.20 (no double counting)
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Stale Ledger Entry Detection
+// ═══════════════════════════════════════════════════════════════
+
+describe('Stale Ledger Entry Detection', () => {
+  test('detects stale entry when job duration changed', () => {
+    const entries = [
+      { id: 1, team_member_id: 100, type: 'earning', amount: 175, job_id: 501,
+        metadata: { hours: 7, revenue: 350, hourly_rate: 25, member_count: 1 } },
+    ];
+    const jobs = [{ id: 501, duration: 210, service_price: 350, additional_fees: 0 }]; // duration changed: 420→210
+
+    const stale = detectStaleEntries(entries, jobs);
+    expect(stale).toContain(501);
+  });
+
+  test('detects stale entry when service_price changed', () => {
+    const entries = [
+      { id: 1, team_member_id: 100, type: 'earning', amount: 105, job_id: 501,
+        metadata: { hours: 3.5, revenue: 350, hourly_rate: 0, commission_pct: 60, member_count: 2 } },
+    ];
+    const jobs = [{ id: 501, duration: 210, service_price: 400, additional_fees: 0 }]; // price changed
+
+    const stale = detectStaleEntries(entries, jobs);
+    expect(stale).toContain(501);
+  });
+
+  test('does NOT flag entry when job data matches', () => {
+    const entries = [
+      { id: 1, team_member_id: 100, type: 'earning', amount: 87.50, job_id: 501,
+        metadata: { hours: 3.5, revenue: 350, hourly_rate: 25, member_count: 1 } },
+    ];
+    const jobs = [{ id: 501, duration: 210, service_price: 350, additional_fees: 0 }];
+
+    const stale = detectStaleEntries(entries, jobs);
+    expect(stale).toHaveLength(0);
+  });
+
+  test('ignores manager salary/commission entries', () => {
+    const entries = [
+      { id: 1, team_member_id: 100, type: 'earning', amount: 30, job_id: null,
+        metadata: { is_manager_salary: true, scheduled_hours: 8, hourly_rate: 3.75 } },
+      { id: 2, team_member_id: 100, type: 'earning', amount: 7, job_id: null,
+        metadata: { is_manager_commission: true, day_revenue: 350 } },
+    ];
+    const jobs = []; // no job match needed for manager entries
+
+    const stale = detectStaleEntries(entries, jobs);
+    expect(stale).toHaveLength(0);
+  });
+
+  test('multi-member job: flags when any member entry is stale', () => {
+    const entries = [
+      { id: 1, team_member_id: 100, type: 'earning', amount: 105, job_id: 501,
+        metadata: { hours: 3.5, revenue: 350, commission_pct: 60, member_count: 2 } },
+      { id: 2, team_member_id: 200, type: 'earning', amount: 175, job_id: 501,
+        metadata: { hours: 7, revenue: 350, hourly_rate: 25, member_count: 2 } }, // stale hours
+    ];
+    const jobs = [{ id: 501, duration: 210, service_price: 350, additional_fees: 0 }];
+
+    const stale = detectStaleEntries(entries, jobs);
+    expect(stale).toContain(501);
   });
 });

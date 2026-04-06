@@ -32357,12 +32357,13 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Check if ledger entries already exist for this job (idempotency)
-  // Check any entry type (not just 'earning') to handle manager-only jobs with only tip/incentive entries
+  // Check if earning entries already exist for this job (idempotency)
+  // Only check 'earning' type — cash_collected/payout entries may exist from separate flows
   const { data: existingEntries } = await supabase
     .from('cleaner_ledger')
     .select('id')
     .eq('job_id', jobId)
+    .in('type', ['earning', 'tip', 'incentive'])
     .limit(1);
 
   if (existingEntries && existingEntries.length > 0) {
@@ -34672,45 +34673,44 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const { data: userSettings } = await supabase.from('communication_settings').select('cached_phone_numbers').eq('user_id', userId).maybeSingle();
     const phoneNumberIds = (userSettings?.cached_phone_numbers || []).map(pn => pn.id).filter(Boolean);
 
-    // Use the user's tenant key — NOT the workspace key — to respect tenant isolation
+    // Tenant-scoped key for all Sigcore calls
     const syncKey = tenantKey;
     let totalSynced = 0;
     let totalMessages = 0;
 
-    const days = maxConversations > 0 ? 7 : 30;
-    const pnFilter = phoneNumberIds.length === 1 ? `&phoneNumberId=${phoneNumberIds[0]}` : '';
+    // Phase 1: Trigger Sigcore full sync in background (non-blocking)
+    // This fetches from OpenPhone and stores data including webhook media, recordings, transcripts
+    sigcoreRequest('POST', '/integrations/sync', syncKey, {
+      syncMessages: true, forceRefresh: false, provider: 'openphone',
+      onlySavedContacts: false, limit: maxConversations > 0 ? maxConversations : 50
+    }).catch(e => logger.warn(`[Sync] Sigcore background sync: ${e.response?.status || ''} ${e.message}`));
+
+    // Phase 2: Read Sigcore's stored conversations (already has data from previous syncs + webhooks)
+    // This includes media URLs, recordings, transcripts that the live API doesn't expose
     let allConvs = [];
     try {
-      const convRes = await sigcoreRequest('GET',
-        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50${pnFilter}`,
-        syncKey);
-      allConvs = convRes.data?.data || convRes.data || [];
-    } catch (e) { logger.error(`[Sync] Fetch error: ${e.message}`); }
+      const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
+      allConvs = convsRes.data?.data || convsRes.data || [];
+    } catch (e) { logger.error(`[Sync] Read conversations error: ${e.message}`); }
 
-    // Filter to our phone numbers
-    const ourPhoneNumbers = (userSettings?.cached_phone_numbers || []).map(pn => normalizePhone(pn.number)).filter(Boolean);
+    logger.log(`[Sync] Read ${allConvs.length} stored conversations from Sigcore`);
+
+    // Apply limit and sort
     let convs = allConvs;
-    if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
-      convs = allConvs.filter(c =>
-        ourPhoneNumbers.includes(normalizePhone(c.phoneNumber)) || phoneNumberIds.includes(c.phoneNumberId)
-      );
-    }
-    convs.sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
+    convs.sort((a, b) => new Date(b.lastMessageAt || b.updatedAt || 0) - new Date(a.lastMessageAt || a.updatedAt || 0));
     if (maxConversations > 0) convs = convs.slice(0, maxConversations);
-
-    logger.log(`[Sync] ${convs.length} conversations (from ${allConvs.length}), embedded=${convs[0]?.messages !== undefined}`);
 
     const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
 
     for (const conv of convs) {
-      const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
-      const endpointPhone = normalizePhone(conv.phoneNumber); // Our business number
-      const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
-      const contactName = conv.contactName || conv.metadata?.contactName || null;
-      const phoneNumberId = conv.phoneNumberId || null;
-      const lastActivity = conv.lastMessageAt || conv.lastActivityAt || null;
+      const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
+      const endpointPhone = normalizePhone(conv.phoneNumber);
+      const sigcoreConvId = conv.id || conv.externalId;
+      const contactName = conv.metadata?.contactName || conv.contactName || null;
+      const phoneNumberId = (conv.metadata?.phoneNumberId) || conv.phoneNumberId || null;
+      const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
 
       if (!participantPhone || !endpointPhone) {
         commSyncProgress[userId].errors++;
@@ -34761,9 +34761,17 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           await autoLinkConversation(userId, localConv.id, participantPhone);
         }
 
-        // Use embedded messages + calls from the batch response
-        const messages = conv.messages || [];
-        const calls = conv.calls || [];
+        // Read messages + calls from Sigcore stored data (has webhook media, recordings, transcripts)
+        let messages = [];
+        let calls = [];
+        try {
+          const [msgsRes, callsRes] = await Promise.all([
+            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages`, syncKey).then(r => r.data?.data || r.data || []),
+            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || r.data || []),
+          ]);
+          messages = msgsRes;
+          calls = callsRes;
+        } catch (e) { logger.warn(`[Sync] Read msgs/calls for ${sigcoreConvId}: ${e.message}`); }
 
         for (const msg of messages) {
           const msgId = msg.providerMessageId || msg.id;
@@ -34963,15 +34971,20 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
         type: m.direction === 'in' ? 'message_in' : 'message_out',
         senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
-        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id
+        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
+        mediaUrls: m.metadata?.mediaUrls || [],
+        media: m.metadata?.media || [],
       })),
       ...(calls || []).map(c => ({
         id: `call-${c.id}`, conversationId: id, channel: 'call',
         type: c.direction === 'in' ? 'call_in' : 'call_out',
         senderRole: c.direction === 'in' ? 'customer' : 'agent',
-        text: c.status === 'missed' ? 'Missed call' : 'Call',
+        text: c.status === 'missed' ? 'Missed call' : c.status === 'voicemail' ? 'Voicemail' : 'Call',
         timestamp: c.created_at, callDurationSeconds: c.duration_seconds,
-        sigcoreId: c.sigcore_call_id
+        sigcoreId: c.sigcore_call_id,
+        recordingUrl: c.metadata?.recordingUrl || null,
+        voicemailUrl: c.metadata?.voicemailUrl || null,
+        transcription: c.metadata?.transcription || null,
       }))
     ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
