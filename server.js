@@ -1054,6 +1054,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
 // Test Supabase connection
@@ -35140,13 +35141,14 @@ app.post('/api/communications/relink', authenticateToken, async (req, res) => {
 app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { filter, search, archived } = req.query;
+    const { filter, search, archived, channel } = req.query;
 
     let query = supabase.from('communication_conversations').select('*')
       .eq('user_id', userId).order('last_event_at', { ascending: false, nullsFirst: false });
 
     if (archived !== 'true') query = query.eq('is_archived', false);
     if (filter === 'unread') query = query.gt('unread_count', 0);
+    if (channel) query = query.eq('channel', channel);
     if (search) {
       query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,last_preview.ilike.%${search}%`);
     }
@@ -35284,6 +35286,42 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
 
     const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+    // Route to LeadBridge for thumbtack/yelp conversations
+    if (conv.provider === 'leadbridge' && (conv.channel === 'thumbtack' || conv.channel === 'yelp')) {
+      const lbSettings = await supabase.from('communication_settings')
+        .select('leadbridge_integration_token').eq('user_id', userId).maybeSingle();
+      if (!lbSettings?.data?.leadbridge_integration_token) return res.status(400).json({ error: 'LeadBridge not connected' });
+      const lbToken = lbSettings.data.leadbridge_integration_token;
+      const platform = conv.channel;
+      const leadId = conv.external_lead_id || conv.external_conversation_id;
+      if (!leadId) return res.status(400).json({ error: 'No lead ID for this conversation' });
+
+      try {
+        const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api';
+        const sendRes = await axios.post(`${LB_BASE}/v1/${platform}/leads/${leadId}/message`, {
+          content: text.trim(),
+        }, { headers: { 'Authorization': `Bearer ${lbToken}` }, timeout: 15000 });
+
+        const sentMsg = sendRes.data || {};
+        await supabase.from('communication_messages').insert({
+          conversation_id: conv.id,
+          external_message_id: sentMsg.externalMessageId || sentMsg.id || null,
+          direction: 'out', channel: conv.channel, body: text.trim(),
+          sender_role: 'agent', status: 'sent',
+          created_at: new Date().toISOString(),
+        });
+        await supabase.from('communication_conversations').update({
+          last_preview: text.trim().substring(0, 200),
+          last_event_at: new Date().toISOString(),
+        }).eq('id', conv.id);
+
+        return res.json({ id: sentMsg.id, conversationId: id, channel: conv.channel, text: text.trim(), status: 'sent' });
+      } catch (e) {
+        logger.error('[LB Send] Error:', e.response?.data || e.message);
+        return res.status(500).json({ error: e.response?.data?.message || 'Failed to send via LeadBridge' });
+      }
+    }
 
     const settings = await getSigcoreSettings(userId);
     if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
