@@ -34626,6 +34626,28 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       conversation = byIdentity;
     }
     if (!conversation) {
+      // Resolve contact name: payload → SF customers/leads → auto-detect from message
+      let contactName = payload.contactName || null;
+      if (!contactName && participantPhone) {
+        const last10 = participantPhone.slice(-10);
+        if (last10.length >= 7) {
+          const { data: cust } = await supabase.from('customers').select('first_name, last_name').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
+          if (cust) contactName = `${cust.first_name || ''} ${cust.last_name || ''}`.trim() || null;
+          if (!contactName) {
+            try {
+              const { data: lead } = await supabase.from('leads').select('first_name, last_name, name').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle();
+              if (lead) contactName = lead.name || `${lead.first_name || ''} ${lead.last_name || ''}`.trim() || null;
+            } catch (e) { /* leads table may not exist */ }
+          }
+        }
+      }
+      if (!contactName && payload.body) {
+        const msg = (payload.body || '').toLowerCase();
+        if (msg.includes('thumbtack') || msg.includes('thmtk.com')) contactName = 'Thumbtack';
+        else if (msg.includes('[tt]') || msg.includes('[yelp]') || msg.includes('leadbridge')) contactName = 'LeadBridge';
+        else if (msg.includes('yelp')) contactName = 'Yelp';
+      }
+
       const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
         user_id: userId,
         sigcore_conversation_id: sigcoreConvId,
@@ -34633,7 +34655,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         channel: event.includes('call') ? 'call' : 'sms',
         endpoint_phone: ourEndpointPhone,
         participant_phone: participantPhone,
-        participant_name: payload.contactName || null,
+        participant_name: contactName,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
         last_event_at: payload.createdAt || new Date().toISOString(),
         unread_count: isInbound ? 1 : 0,
