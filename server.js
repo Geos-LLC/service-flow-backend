@@ -34834,20 +34834,27 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       } catch (e) { logger.error(`[Sync] Full sync error: ${e.message}`); }
     } else {
       const days = 7;
-      for (const pnId of phoneNumberIds) {
+      // Test sync: conversations only (no includeMessages) — messages come from webhooks
+      // Fetch both phones in parallel
+      const phoneResults = await Promise.allSettled(phoneNumberIds.map(async (pnId) => {
         const t1 = Date.now();
-        try {
-          const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&includeMessages=true&messageLimit=50`, syncKey);
-          const liveConvs = liveRes.data?.data || liveRes.data || [];
-          for (const lc of liveConvs) {
+        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}`, syncKey);
+        const liveConvs = liveRes.data?.data || liveRes.data || [];
+        logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
+        return liveConvs;
+      }));
+      for (const result of phoneResults) {
+        if (result.status === 'fulfilled') {
+          for (const lc of result.value) {
             const phone = normalizePhone(lc.participantPhone);
             if (!phone) continue;
             allConvs.push({ ...lc, participantPhoneNumber: lc.participantPhone });
             const name = lc.contactName || lc.conversationName;
             if (name) contactNameMap[phone] = name;
           }
-          logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
-        } catch (e) { logger.warn(`[Sync] Live conversations for ${pnId}: ${e.message}`); }
+        } else {
+          logger.warn(`[Sync] Phone fetch failed: ${result.reason?.message}`);
+        }
       }
       timer(`test_sync fetched ${allConvs.length} conversations`);
     }
@@ -34991,17 +34998,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           await autoLinkConversation(userId, localConv.id, participantPhone);
         }
 
-        // Read messages + calls from Sigcore stored data (has webhook media, recordings, transcripts)
-        let messages = [];
-        let calls = [];
-        try {
-          const [msgsRes, callsRes] = await Promise.all([
-            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages`, syncKey).then(r => r.data?.data || r.data || []),
-            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || r.data || []),
-          ]);
-          messages = msgsRes;
-          calls = callsRes;
-        } catch (e) { logger.warn(`[Sync] Read msgs/calls for ${sigcoreConvId}: ${e.message}`); }
+        // Messages + calls: embedded from full sync, or empty for test sync (webhooks handle real-time)
+        const messages = conv.messages || [];
+        const calls = conv.calls || [];
 
         for (const msg of messages) {
           const msgId = msg.providerMessageId || msg.id;
