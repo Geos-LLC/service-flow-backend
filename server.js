@@ -34531,15 +34531,16 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }
     }
 
-    // Find or create conversation
+    // Find or create conversation — deterministic key: endpoint_phone + participant_phone
     let conversation = null;
     if (sigcoreConvId) {
       const { data: existing } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
       conversation = existing;
     }
-    if (!conversation && participantPhone) {
-      const { data: byPhone } = await supabase.from('communication_conversations').select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle();
-      conversation = byPhone;
+    if (!conversation && ourEndpointPhone && participantPhone) {
+      const { data: byIdentity } = await supabase.from('communication_conversations')
+        .select('*').eq('user_id', userId).eq('endpoint_phone', ourEndpointPhone).eq('participant_phone', participantPhone).maybeSingle();
+      conversation = byIdentity;
     }
     if (!conversation) {
       const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
@@ -34547,6 +34548,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         sigcore_conversation_id: sigcoreConvId,
         provider: 'openphone',
         channel: event.includes('call') ? 'call' : 'sms',
+        endpoint_phone: ourEndpointPhone,
         participant_phone: participantPhone,
         participant_name: payload.contactName || null,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
@@ -34673,30 +34675,48 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
     for (const conv of convs) {
       const participantPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
+      const endpointPhone = normalizePhone(conv.phoneNumber); // Our business number
       const sigcoreConvId = conv.id || conv.conversationId || conv.externalId;
       const contactName = conv.contactName || conv.metadata?.contactName || null;
       const phoneNumberId = conv.phoneNumberId || null;
       const lastActivity = conv.lastMessageAt || conv.lastActivityAt || null;
 
+      if (!participantPhone || !endpointPhone) {
+        commSyncProgress[userId].errors++;
+        continue;
+      }
+
       try {
-        // Upsert conversation in SF
+        // Deterministic conversation identity: user + endpoint + participant
+        // Step 1: try sigcore conversation ID (most specific)
+        // Step 2: try composite key (endpoint_phone + participant_phone)
+        // NEVER fall back to participant_phone alone — that merges conversations across business numbers
         let localConv = null;
-        const { data: existing } = await supabase.from('communication_conversations')
-          .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
-        const found = existing || (participantPhone ? (await supabase.from('communication_conversations')
-          .select('*').eq('user_id', userId).eq('participant_phone', participantPhone).maybeSingle()).data : null);
+        let found = null;
+        if (sigcoreConvId) {
+          const { data: bySigcore } = await supabase.from('communication_conversations')
+            .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
+          found = bySigcore;
+        }
+        if (!found) {
+          const { data: byIdentity } = await supabase.from('communication_conversations')
+            .select('*').eq('user_id', userId).eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle();
+          found = byIdentity;
+        }
 
         if (found) {
           const updates = { updated_at: new Date().toISOString() };
           if (lastActivity) updates.last_event_at = lastActivity;
           if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
-          if (!found.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+          if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
+          if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
           const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
           localConv = updated || found;
         } else {
           const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
             user_id: userId, sigcore_conversation_id: sigcoreConvId,
             provider: 'openphone', channel: 'sms',
+            endpoint_phone: endpointPhone,
             participant_phone: participantPhone, participant_name: contactName,
             last_event_at: lastActivity, metadata: { phoneNumberId },
           }).select().single();
@@ -34863,6 +34883,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       sigcoreConversationId: c.sigcore_conversation_id,
       displayName: c.participant_name || '',
       fallbackIdentifier: c.participant_phone,
+      endpointPhone: c.endpoint_phone,
       lastPreview: c.last_preview,
       lastEventAt: c.last_event_at,
       unreadCount: c.unread_count || 0,
