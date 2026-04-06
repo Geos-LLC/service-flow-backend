@@ -34699,6 +34699,13 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       if (payload.body) updates.last_preview = payload.body.substring(0, 200);
       if (isInbound) updates.unread_count = (conversation.unread_count || 0) + 1;
       if (sigcoreConvId && !conversation.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+      // Auto-detect name from message if conversation has no name
+      if (!conversation.participant_name && payload.body) {
+        const msg = (payload.body || '').toLowerCase();
+        if (msg.includes('thumbtack') || msg.includes('thmtk.com')) updates.participant_name = 'Thumbtack';
+        else if (msg.includes('[tt]') || msg.includes('[yelp]') || msg.includes('leadbridge')) updates.participant_name = 'LeadBridge';
+        else if (msg.includes('yelp')) updates.participant_name = 'Yelp';
+      }
       await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
     }
 
