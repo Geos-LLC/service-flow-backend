@@ -34728,15 +34728,26 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       onlySavedContacts: false, limit: maxConversations > 0 ? maxConversations : 50
     }).catch(e => logger.warn(`[Sync] Sigcore background sync: ${e.response?.status || ''} ${e.message}`));
 
-    // Phase 2: Read stored conversations from Sigcore
+    // Phase 2: Read stored conversations + get contact names from live endpoint
     let allConvs = [];
+    let contactNameMap = {}; // participantPhone → name from live OpenPhone contacts
     try {
-      const url = `${SIGCORE_URL}/conversations?limit=100`;
-      logger.log(`[Sync] GET ${url}`);
       const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
-      logger.log(`[Sync] Response: status=${convsRes.status}, body keys=${Object.keys(convsRes.data || {}).join(',')}, data=${Array.isArray(convsRes.data?.data) ? convsRes.data.data.length : 'not-array'}, meta=${JSON.stringify(convsRes.data?.meta || {})}`);
       allConvs = convsRes.data?.data || convsRes.data || [];
-    } catch (e) { logger.error(`[Sync] Read error: ${e.response?.status} ${JSON.stringify(e.response?.data || {})} ${e.message}`); }
+    } catch (e) { logger.error(`[Sync] Read conversations error: ${e.message}`); }
+
+    // Get contact names from live OpenPhone endpoint (does contact lookup)
+    const days = maxConversations > 0 ? 7 : 30;
+    try {
+      const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}`, syncKey);
+      const liveConvs = liveRes.data?.data || liveRes.data || [];
+      for (const lc of liveConvs) {
+        if (lc.contactName && lc.participantPhone) {
+          contactNameMap[normalizePhone(lc.participantPhone)] = lc.contactName;
+        }
+      }
+      logger.log(`[Sync] Contact names: ${Object.keys(contactNameMap).length} from ${liveConvs.length} live conversations`);
+    } catch (e) { logger.warn(`[Sync] Live contact lookup failed: ${e.message}`); }
 
     logger.log(`[Sync] Read ${allConvs.length} stored conversations from Sigcore`);
 
@@ -34753,7 +34764,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
       const endpointPhone = normalizePhone(conv.phoneNumber);
       const sigcoreConvId = conv.id || conv.externalId;
-      const contactName = conv.metadata?.contactName || conv.contactName || null;
+      const contactName = conv.contactName || conv.metadata?.contactName || contactNameMap[participantPhone] || null;
       const phoneNumberId = (conv.metadata?.phoneNumberId) || conv.phoneNumberId || null;
       const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
 
