@@ -34728,7 +34728,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     try {
       const convsRes = await sigcoreRequest('GET', '/conversations?limit=100', syncKey);
       allConvs = convsRes.data?.data || convsRes.data || [];
-    } catch (e) { logger.error(`[Sync] Read conversations error: ${e.message}`); }
+      logger.log(`[Sync] Raw response keys: ${Object.keys(convsRes.data || {}).join(',')}, data length: ${allConvs.length}, status: ${convsRes.status}`);
+    } catch (e) { logger.error(`[Sync] Read conversations error: ${e.response?.status} ${e.response?.data?.message || e.message}`); }
 
     logger.log(`[Sync] Read ${allConvs.length} stored conversations from Sigcore`);
 
