@@ -35083,6 +35083,13 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     const { data, error } = await query.limit(100);
     if (error) return res.status(500).json({ error: 'Failed to fetch conversations' });
 
+    // Build endpoint phone → symbol map from cached phone numbers
+    const settings = await getSigcoreSettings(userId);
+    const phoneSymbols = {};
+    for (const pn of (settings?.cached_phone_numbers || [])) {
+      if (pn.number) phoneSymbols[normalizePhone(pn.number)] = pn.symbol || null;
+    }
+
     // Map to frontend shape
     const conversations = (data || []).map(c => ({
       id: c.id,
@@ -35090,6 +35097,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       displayName: c.participant_name || '',
       fallbackIdentifier: c.participant_phone,
       endpointPhone: c.endpoint_phone,
+      endpointSymbol: phoneSymbols[normalizePhone(c.endpoint_phone)] || null,
       lastPreview: c.last_preview,
       lastEventAt: c.last_event_at,
       unreadCount: c.unread_count || 0,
