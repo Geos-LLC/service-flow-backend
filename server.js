@@ -34665,6 +34665,50 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       conversation = created;
       // Auto-link to customer/lead
       autoLinkConversation(userId, conversation.id, participantPhone);
+
+      // Background: fetch full message history from Sigcore for this new conversation
+      if (sigcoreConvId && SIGCORE_WORKSPACE_KEY) {
+        setImmediate(async () => {
+          try {
+            const [msgsRes, callsRes] = await Promise.all([
+              sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages`, SIGCORE_WORKSPACE_KEY).then(r => r.data?.data || []).catch(() => []),
+              sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, SIGCORE_WORKSPACE_KEY).then(r => r.data?.data || []).catch(() => []),
+            ]);
+            for (const msg of msgsRes) {
+              const msgId = msg.providerMessageId || msg.id;
+              if (!msgId) continue;
+              const { data: ex } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
+              if (ex) continue;
+              const dir = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+              await supabase.from('communication_messages').insert({
+                conversation_id: conversation.id, provider_message_id: msgId,
+                direction: dir, channel: 'sms', body: msg.body || '',
+                from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
+                sender_role: dir === 'in' ? 'customer' : 'agent',
+                status: msg.status || 'delivered',
+                metadata: { mediaUrls: msg.metadata?.mediaUrls || [], media: msg.metadata?.media || [] },
+                created_at: msg.createdAt || new Date().toISOString(),
+              });
+            }
+            for (const call of callsRes) {
+              const callId = call.providerCallId || call.id;
+              if (!callId) continue;
+              const { data: ex } = await supabase.from('communication_calls').select('id').eq('provider_call_id', callId).maybeSingle();
+              if (ex) continue;
+              const callDir = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
+              await supabase.from('communication_calls').insert({
+                conversation_id: conversation.id, provider_call_id: callId,
+                direction: callDir, from_number: normalizePhone(call.fromNumber),
+                to_number: normalizePhone(call.toNumber),
+                duration_seconds: call.duration || 0, status: call.status || 'completed',
+                metadata: { recordingUrl: call.recordingUrl || null, voicemailUrl: call.voicemailUrl || null, transcription: call.transcription || null },
+                created_at: call.createdAt || new Date().toISOString(),
+              });
+            }
+            if (msgsRes.length || callsRes.length) logger.log(`[Webhook] Backfilled ${msgsRes.length} msgs + ${callsRes.length} calls for new conv ${conversation.id}`);
+          } catch (e) { logger.warn(`[Webhook] Backfill error: ${e.message}`); }
+        });
+      }
     }
 
     // Handle message events
