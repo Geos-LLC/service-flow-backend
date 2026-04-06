@@ -34512,12 +34512,16 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     let allConversations = [];
     try {
       const days = maxConversations > 0 ? 7 : 30;
-      const limit = maxConversations > 0 ? maxConversations : 50;
+      // Pass phoneNumberId filter so Sigcore only fetches for our numbers
+      const pnFilter = phoneNumberIds.length === 1 ? `&phoneNumberId=${phoneNumberIds[0]}` : '';
       const convRes = await sigcoreRequest('GET',
-        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50`,
+        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50${pnFilter}`,
         SIGCORE_WORKSPACE_KEY);
       const allConvs = convRes.data?.data || convRes.data || [];
-      logger.log(`[Sync] Fetched ${allConvs.length} conversations with messages from Sigcore (${days} days)`);
+
+      // Check if Sigcore returned embedded messages (new endpoint) or just conversations (old endpoint)
+      const hasEmbeddedMessages = allConvs.length > 0 && allConvs[0].messages !== undefined;
+      logger.log(`[Sync] Fetched ${allConvs.length} conversations from Sigcore (${days} days, embedded=${hasEmbeddedMessages})`);
 
       // Filter to only conversations on OUR phone numbers
       if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
@@ -34533,6 +34537,22 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       // Sort by most recent first, apply limit
       allConversations.sort((a, b) => new Date(b.lastMessageAt || b.lastActivityAt || 0) - new Date(a.lastMessageAt || a.lastActivityAt || 0));
       if (maxConversations > 0) allConversations = allConversations.slice(0, maxConversations);
+
+      // Fallback: if Sigcore didn't return embedded messages, fetch per-conversation
+      if (!hasEmbeddedMessages && allConversations.length > 0) {
+        logger.log(`[Sync] No embedded messages — fetching per-conversation (${allConversations.length} convs)`);
+        for (const conv of allConversations) {
+          const pPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
+          const pnId = conv.phoneNumberId;
+          if (!pPhone || !pnId) continue;
+          try {
+            const msgRes = await sigcoreRequest('GET',
+              `/integrations/openphone/messages?phoneNumberId=${pnId}&participant=${encodeURIComponent(pPhone)}`,
+              SIGCORE_WORKSPACE_KEY);
+            conv.messages = msgRes.data?.data || [];
+          } catch (e) { conv.messages = []; }
+        }
+      }
     } catch (e) { logger.error(`[Sync] Failed to fetch conversations: ${e.message}`); }
 
     const totalLimit = allConversations.length;
