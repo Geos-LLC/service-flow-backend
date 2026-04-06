@@ -20211,6 +20211,110 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
   return totalHours;
 }
 
+// Ensure manager salary/commission ledger entries exist for the queried period.
+// Entries are generated daily but only persisted when triggers fire (availability save, rate change, backfill).
+// This function fills gaps so payroll always shows correct numbers.
+async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodStart, periodEnd, completedJobs) {
+  const todayStr = (() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); })();
+  const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
+  const effectiveEnd = (!periodEnd || periodEnd > todayStr) ? todayStr : periodEnd;
+
+  for (const mgr of managers) {
+    if (!managerRoles.includes((mgr.role || '').toLowerCase())) continue;
+    const hourlyRate = parseFloat(mgr.hourly_rate) || 0;
+    const commPct = parseFloat(mgr.commission_percentage) || 0;
+    if (hourlyRate === 0 && commPct === 0) continue;
+
+    const mgrStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
+    const effectiveStart = (mgrStart && (!periodStart || mgrStart > periodStart)) ? mgrStart : (periodStart || mgrStart || todayStr);
+    if (!effectiveStart || effectiveStart > effectiveEnd) continue;
+
+    // Fetch existing entries for this member in the period
+    let existingEntries = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data: page } = await supabase.from('cleaner_ledger')
+        .select('effective_date, metadata')
+        .eq('user_id', userId).eq('team_member_id', mgr.id)
+        .is('job_id', null).eq('type', 'earning')
+        .gte('effective_date', effectiveStart).lte('effective_date', effectiveEnd)
+        .range(from, from + pageSize - 1);
+      existingEntries = existingEntries.concat(page || []);
+      if (!page || page.length < pageSize) break;
+      from += pageSize;
+    }
+
+    const existingSalaryDates = new Set();
+    const existingCommDates = new Set();
+    existingEntries.forEach(e => {
+      const meta = e.metadata || {};
+      if (meta.is_manager_salary) existingSalaryDates.add(e.effective_date);
+      if (meta.is_manager_commission) existingCommDates.add(e.effective_date);
+    });
+
+    const newEntries = [];
+
+    // Generate missing salary entries from availability
+    if (hourlyRate > 0 && mgr.availability) {
+      const avail = typeof mgr.availability === 'string' ? JSON.parse(mgr.availability) : mgr.availability;
+      const d = new Date(effectiveStart + 'T00:00:00');
+      const end = new Date(effectiveEnd + 'T00:00:00');
+      while (d <= end) {
+        const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+        if (!existingSalaryDates.has(ds)) {
+          const sh = calculateScheduledHoursFromAvailability(avail, ds, ds);
+          if (sh > 0) {
+            newEntries.push({
+              user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
+              amount: parseFloat((sh * hourlyRate).toFixed(2)),
+              effective_date: ds,
+              note: `Scheduled salary: ${sh.toFixed(1)}h × $${hourlyRate}/hr (${ds})`,
+              metadata: { scheduled_hours: sh, hourly_rate: hourlyRate, is_manager_salary: true },
+              created_by: userId
+            });
+          }
+        }
+        d.setDate(d.getDate() + 1);
+      }
+    }
+
+    // Generate missing commission entries from daily completed job revenue
+    if (commPct > 0) {
+      const dailyRevenue = {};
+      (completedJobs || []).forEach(job => {
+        if ((job.status || '').toLowerCase() !== 'completed') return;
+        const jd = String(job.scheduled_date || '').split('T')[0].split(' ')[0];
+        if (jd < effectiveStart || jd > effectiveEnd) return;
+        const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+        const rev = svcP > 0
+          ? svcP + (parseFloat(job.additional_fees) || 0)
+          : (parseFloat(job.total) || parseFloat(job.total_amount) || 0);
+        dailyRevenue[jd] = (dailyRevenue[jd] || 0) + rev;
+      });
+      for (const [dayStr, dayRev] of Object.entries(dailyRevenue)) {
+        if (dayRev > 0 && !existingCommDates.has(dayStr)) {
+          newEntries.push({
+            user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
+            amount: parseFloat((dayRev * commPct / 100).toFixed(2)),
+            effective_date: dayStr,
+            note: `Commission: $${dayRev.toFixed(2)} × ${commPct}% (${dayStr})`,
+            metadata: { commission_pct: commPct, day_revenue: dayRev, is_manager_commission: true },
+            created_by: userId
+          });
+        }
+      }
+    }
+
+    if (newEntries.length > 0) {
+      for (let c = 0; c < newEntries.length; c += 100) {
+        await supabase.from('cleaner_ledger').insert(newEntries.slice(c, c + 100));
+      }
+      console.log(`[Payroll] Auto-generated ${newEntries.length} manager entries for ${mgr.first_name} ${mgr.last_name} (${effectiveStart} to ${effectiveEnd})`);
+    }
+  }
+}
+
 // Get payroll summary for all team members — reads from cleaner_ledger (single source of truth)
 app.get('/api/payroll', authenticateToken, async (req, res) => {
   try {
@@ -20297,15 +20401,18 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return result;
     };
 
-    const [membersResult, ledgerEntries, allJobs, priorCashByMember] = await Promise.all([
-      membersPromise, fetchLedgerEntries(), fetchJobs(), fetchPriorCash()
-    ]);
+    // Phase 1: Fetch team members + jobs in parallel
+    const [membersResult, allJobs] = await Promise.all([membersPromise, fetchJobs()]);
 
     const { data: teamMembers, error: membersError } = membersResult;
     if (membersError) {
       console.error('Error fetching team members:', membersError);
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
+
+    // Phase 2: Ensure manager salary/commission entries exist, then fetch ledger + prior cash
+    await ensureManagerEntriesForPeriod(supabase, req.user.userId, teamMembers || [], startDate, endDate, allJobs);
+    const [ledgerEntries, priorCashByMember] = await Promise.all([fetchLedgerEntries(), fetchPriorCash()]);
 
     // ===== Build lookup maps =====
     const allJobsById = {};
@@ -34512,12 +34619,16 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     let allConversations = [];
     try {
       const days = maxConversations > 0 ? 7 : 30;
-      const limit = maxConversations > 0 ? maxConversations : 50;
+      // Pass phoneNumberId filter so Sigcore only fetches for our numbers
+      const pnFilter = phoneNumberIds.length === 1 ? `&phoneNumberId=${phoneNumberIds[0]}` : '';
       const convRes = await sigcoreRequest('GET',
-        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50`,
+        `/integrations/openphone/conversations?days=${days}&includeMessages=true&messageLimit=50${pnFilter}`,
         SIGCORE_WORKSPACE_KEY);
       const allConvs = convRes.data?.data || convRes.data || [];
-      logger.log(`[Sync] Fetched ${allConvs.length} conversations with messages from Sigcore (${days} days)`);
+
+      // Check if Sigcore returned embedded messages (new endpoint) or just conversations (old endpoint)
+      const hasEmbeddedMessages = allConvs.length > 0 && allConvs[0].messages !== undefined;
+      logger.log(`[Sync] Fetched ${allConvs.length} conversations from Sigcore (${days} days, embedded=${hasEmbeddedMessages})`);
 
       // Filter to only conversations on OUR phone numbers
       if (ourPhoneNumbers.length > 0 || phoneNumberIds.length > 0) {
@@ -34536,6 +34647,22 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       // Sort by most recent first, apply limit
       allConversations.sort((a, b) => new Date(b.lastMessageAt || b.lastActivityAt || 0) - new Date(a.lastMessageAt || a.lastActivityAt || 0));
       if (maxConversations > 0) allConversations = allConversations.slice(0, maxConversations);
+
+      // Fallback: if Sigcore didn't return embedded messages, fetch per-conversation
+      if (!hasEmbeddedMessages && allConversations.length > 0) {
+        logger.log(`[Sync] No embedded messages — fetching per-conversation (${allConversations.length} convs)`);
+        for (const conv of allConversations) {
+          const pPhone = normalizePhone(conv.participantPhone || conv.participantPhoneNumber);
+          const pnId = conv.phoneNumberId;
+          if (!pPhone || !pnId) continue;
+          try {
+            const msgRes = await sigcoreRequest('GET',
+              `/integrations/openphone/messages?phoneNumberId=${pnId}&participant=${encodeURIComponent(pPhone)}`,
+              SIGCORE_WORKSPACE_KEY);
+            conv.messages = msgRes.data?.data || [];
+          } catch (e) { conv.messages = []; }
+        }
+      }
     } catch (e) { logger.error(`[Sync] Failed to fetch conversations: ${e.message}`); }
 
     const totalLimit = allConversations.length;
@@ -34639,10 +34766,48 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           totalMessages++;
         }
 
+        // Process embedded calls (fetched by Sigcore in parallel alongside messages)
+        const calls = conv.calls || [];
+        for (const call of calls) {
+          const callId = call.providerCallId || call.id;
+          if (!callId) continue;
+          const { data: existingCall } = await supabase.from('communication_calls')
+            .select('id, metadata').eq('provider_call_id', callId).maybeSingle();
+
+          const callDirection = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
+          const callMeta = {
+            phoneNumberId,
+            recordingUrl: call.recordingUrl || null,
+            voicemailUrl: call.voicemailUrl || null,
+            transcription: call.transcription || null,
+            participants: call.metadata?.participants || [],
+          };
+
+          if (existingCall) {
+            await supabase.from('communication_calls').update({
+              duration_seconds: call.duration || existingCall.duration_seconds || 0,
+              status: call.status || existingCall.status,
+              metadata: { ...existingCall.metadata, ...callMeta },
+            }).eq('id', existingCall.id);
+          } else {
+            await supabase.from('communication_calls').insert({
+              conversation_id: localConv.id,
+              provider_call_id: callId,
+              direction: callDirection,
+              from_number: normalizePhone(call.fromNumber),
+              to_number: normalizePhone(call.toNumber),
+              duration_seconds: call.duration || 0,
+              status: call.status || 'completed',
+              metadata: callMeta,
+              created_at: call.createdAt || new Date().toISOString(),
+            });
+          }
+        }
+
         totalSynced++;
         commSyncProgress[userId].synced = totalSynced;
         commSyncProgress[userId].messages = totalMessages;
-      } catch (e) { commSyncProgress[userId].errors++; }
+      } catch (e) { logger.error('[Sync] Conv error:', e.message); commSyncProgress[userId].errors++; }
     }
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
     logger.log(`[Sync] Done: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages for user ${userId}`);
