@@ -34656,17 +34656,15 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
                 .select('id, body, metadata').eq('provider_message_id', msgId).maybeSingle();
 
               if (existing) {
-                // Update if record is missing data (media, body, etc.)
-                const existingMedia = existing.metadata?.mediaUrls || [];
-                const needsUpdate = (mediaUrls.length > 0 && existingMedia.length === 0)
-                  || (body && !existing.body)
-                  || (body && existing.body !== body);
-                if (needsUpdate) {
-                  await supabase.from('communication_messages').update({
-                    body, metadata: { ...existing.metadata, phoneNumberId, mediaUrls, media },
-                  }).eq('id', existing.id);
-                  totalMessages++;
-                }
+                // Always refresh with latest data from source
+                await supabase.from('communication_messages').update({
+                  body: body || existing.body,
+                  from_number: fromNum || undefined,
+                  to_number: toNum || undefined,
+                  status,
+                  metadata: { ...existing.metadata, phoneNumberId, mediaUrls, media },
+                }).eq('id', existing.id);
+                totalMessages++;
                 continue;
               }
 
