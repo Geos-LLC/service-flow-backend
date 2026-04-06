@@ -20412,7 +20412,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     // Phase 2: Ensure manager salary/commission entries exist, then fetch ledger + prior cash
     await ensureManagerEntriesForPeriod(supabase, req.user.userId, teamMembers || [], startDate, endDate, allJobs);
-    const [ledgerEntries, priorCashByMember] = await Promise.all([fetchLedgerEntries(), fetchPriorCash()]);
+    const [ledgerEntriesInitial, priorCashByMember] = await Promise.all([fetchLedgerEntries(), fetchPriorCash()]);
+    let ledgerEntries = ledgerEntriesInitial;
 
     // ===== Build lookup maps =====
     const allJobsById = {};
@@ -20452,6 +20453,45 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     }
     // Backfill customer names into revenueJobsList
     revenueJobsList.forEach(rj => { rj.customerName = globalCustomerMap[allJobsById[rj.id]?.customer_id] || ''; });
+
+    // ===== Detect stale ledger entries and auto-rebuild =====
+    // When job data changes (duration, price) outside the payroll edit flow (e.g. ZZB sync),
+    // ledger entries become stale. Detect and rebuild them here.
+    const staleJobIds = new Set();
+    const earningsByJob = {};
+    (ledgerEntries || []).forEach(e => {
+      if (e.type === 'earning' && e.job_id && e.metadata && !e.metadata.is_manager_salary && !e.metadata.is_manager_commission) {
+        if (!earningsByJob[e.job_id]) earningsByJob[e.job_id] = [];
+        earningsByJob[e.job_id].push(e);
+      }
+    });
+    for (const [jobId, entries] of Object.entries(earningsByJob)) {
+      const job = allJobsById[jobId];
+      if (!job) continue;
+      const currentHours = parseFloat(job.hours_worked) || (job.duration ? job.duration / 60 : (job.estimated_duration ? job.estimated_duration / 60 : 0));
+      const currentRevenue = (() => {
+        const sp = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+        return sp > 0 ? sp + (parseFloat(job.additional_fees) || 0) : (parseFloat(job.total) || parseFloat(job.total_amount) || 0);
+      })();
+      for (const e of entries) {
+        const meta = e.metadata || {};
+        const ledgerHours = meta.hours || 0;
+        const ledgerRevenue = meta.revenue || 0;
+        if (Math.abs(ledgerHours - currentHours) > 0.01 || Math.abs(ledgerRevenue - currentRevenue) > 0.01) {
+          staleJobIds.add(parseInt(jobId));
+          break;
+        }
+      }
+    }
+    if (staleJobIds.size > 0) {
+      console.log(`[Payroll] Auto-rebuilding ${staleJobIds.size} stale job ledger entries: ${[...staleJobIds].join(', ')}`);
+      for (const jobId of staleJobIds) {
+        await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive']);
+        try { await createLedgerEntriesForCompletedJob(jobId, req.user.userId); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
+      }
+      // Re-fetch ledger entries after rebuild
+      ledgerEntries = await fetchLedgerEntries();
+    }
 
     // ===== Group ledger entries by team member =====
     const entriesByMember = {};
