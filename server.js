@@ -34610,6 +34610,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           }
 
           // Fetch messages — try Sigcore live endpoint first, fallback to direct OpenPhone API
+          if (!participantPhone || !phoneNumberId) {
+            logger.warn(`[Sync] Skipping messages: participantPhone=${participantPhone}, phoneNumberId=${phoneNumberId}`);
+          }
           if (participantPhone && phoneNumberId) {
             let messages = [];
             try {
@@ -34618,7 +34621,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
                 `/integrations/openphone/messages?phoneNumberId=${phoneNumberId}&participant=${encodeURIComponent(participantPhone)}`,
                 SIGCORE_WORKSPACE_KEY);
               messages = msgRes.data?.data || [];
+              logger.log(`[Sync] Sigcore msgs for ${participantPhone}: ${messages.length}, sample keys: ${messages[0] ? Object.keys(messages[0]).join(',') : 'none'}`);
             } catch (sigcoreErr) {
+              logger.warn(`[Sync] Sigcore messages error for ${participantPhone}: ${sigcoreErr.response?.status} ${sigcoreErr.message}`);
               // Sigcore endpoint not deployed yet — fallback to direct OpenPhone API
               try {
                 const opRes = await axios.get('https://api.openphone.com/v1/messages', {
