@@ -670,7 +670,9 @@ module.exports = (supabase, logger) => {
               // Fetch messages — LB response: { platform, leadId, count, messages: Message[] }
               // Message: { id, externalMessageId, sender: "pro"|"customer"|"system", content, sentAt, ... }
               try {
-                const msgsPath = `/v1/${platform}/leads/${lead.id}/messages`
+                // Always use /v1/thumbtack/leads/:id/messages — the LB leads service
+                // handles both platforms internally (checks lead.platform)
+                const msgsPath = `/v1/thumbtack/leads/${lead.id}/messages`
                 const msgsRes = await lbRequest('GET', msgsPath, lbToken)
                 const messages = msgsRes.data?.messages || []
 

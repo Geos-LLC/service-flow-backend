@@ -35514,7 +35514,8 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
 
       try {
         const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api';
-        const sendRes = await axios.post(`${LB_BASE}/v1/${platform}/leads/${leadId}/message`, {
+        // Always use /v1/thumbtack/leads/:id/message — LB leads service handles both platforms
+        const sendRes = await axios.post(`${LB_BASE}/v1/thumbtack/leads/${leadId}/message`, {
           message: text.trim(),
         }, { headers: { 'Authorization': `Bearer ${lbToken}` }, timeout: 15000 });
 
