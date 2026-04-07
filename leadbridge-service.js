@@ -80,6 +80,75 @@ module.exports = (supabase, logger) => {
     return digits
   }
 
+  // ══════════════════════════════════════
+  // Location Resolution Service
+  //
+  // Shared by webhook handler AND sync handler — single code path.
+  // Never called from two different implementations.
+  //
+  // Resolution order (explicit, no fuzzy matching):
+  //   1. Exact: provider_account_id + external_location_id → sf_location_id
+  //   2. Account fallback: provider_account_id with mapping_type='account_level' → sf_location_id
+  //   3. Unresolved: { locationId: null, resolution: 'unresolved' }
+  //
+  // Returns: { locationId: number|null, resolution: string, locationName: string|null }
+  // ══════════════════════════════════════
+
+  async function resolveConversationLocation({ providerAccountId, externalLocationId, externalBusinessId }) {
+    if (!providerAccountId) {
+      return { locationId: null, resolution: 'no_account', locationName: null }
+    }
+
+    // Step 1: Exact match — provider account + external location ID
+    if (externalLocationId) {
+      const { data: exact } = await supabase
+        .from('communication_account_location_mappings')
+        .select('sf_location_id, external_location_name')
+        .eq('provider_account_id', providerAccountId)
+        .eq('external_location_id', externalLocationId)
+        .eq('is_active', true)
+        .maybeSingle()
+
+      if (exact) {
+        // Fetch location name
+        const { data: loc } = await supabase
+          .from('sf_locations').select('name, short_name')
+          .eq('id', exact.sf_location_id).maybeSingle()
+
+        return {
+          locationId: exact.sf_location_id,
+          resolution: 'exact',
+          locationName: loc?.short_name || loc?.name || exact.external_location_name || null,
+        }
+      }
+    }
+
+    // Step 2: Account-level fallback — provider account mapped to exactly 1 location
+    const { data: accountMappings } = await supabase
+      .from('communication_account_location_mappings')
+      .select('sf_location_id, external_location_name')
+      .eq('provider_account_id', providerAccountId)
+      .eq('mapping_type', 'account_level')
+      .eq('is_active', true)
+
+    if (accountMappings?.length === 1) {
+      const mapping = accountMappings[0]
+      const { data: loc } = await supabase
+        .from('sf_locations').select('name, short_name')
+        .eq('id', mapping.sf_location_id).maybeSingle()
+
+      return {
+        locationId: mapping.sf_location_id,
+        resolution: 'account_fallback',
+        locationName: loc?.short_name || loc?.name || mapping.external_location_name || null,
+      }
+    }
+
+    // Step 3: Unresolved — no mapping found (valid state)
+    // Conversation will still be stored and displayed with "Unassigned Location" badge
+    return { locationId: null, resolution: 'unresolved', locationName: null }
+  }
+
   // Get or create participant identity
   async function upsertParticipantIdentity(userId, { phone, email, displayName, lbContactId, channel }) {
     const normalized = normalizePhone(phone)
@@ -127,8 +196,15 @@ module.exports = (supabase, logger) => {
 
   // Upsert conversation from LB data
   async function upsertConversation(userId, { provider, channel, externalConvId, externalLeadId,
-    participantPhone, participantName, identityId, providerAccountId, lastMessage, lastActivity }) {
-    const endpointPhone = null // LB conversations don't have a "our phone" — they're platform threads
+    participantPhone, participantName, identityId, providerAccountId, lastMessage, lastActivity,
+    externalLocationId, externalBusinessId, externalLocationName }) {
+
+    // Resolve location via shared service
+    const location = await resolveConversationLocation({
+      providerAccountId,
+      externalLocationId,
+      externalBusinessId,
+    })
 
     // Find existing by external_conversation_id
     let conv = null
@@ -155,8 +231,13 @@ module.exports = (supabase, logger) => {
       if (providerAccountId && !conv.provider_account_id) updates.provider_account_id = providerAccountId
       if (externalConvId && !conv.external_conversation_id) updates.external_conversation_id = externalConvId
       if (externalLeadId && !conv.external_lead_id) updates.external_lead_id = externalLeadId
+      // Location fields — always update raw, update resolved only if newly resolved
+      if (externalLocationId) updates.external_location_id = externalLocationId
+      if (externalBusinessId) updates.external_business_id = externalBusinessId
+      if (externalLocationName) updates.external_location_name = externalLocationName
+      if (location.locationId && !conv.sf_location_id) updates.sf_location_id = location.locationId
       await supabase.from('communication_conversations').update(updates).eq('id', conv.id)
-      return { ...conv, ...updates }
+      return { ...conv, ...updates, _locationResolution: location.resolution }
     }
 
     // Create new
@@ -174,6 +255,11 @@ module.exports = (supabase, logger) => {
       last_event_at: lastActivity || new Date().toISOString(),
       unread_count: 0,
       sync_state: 'synced',
+      // Location fields
+      sf_location_id: location.locationId,
+      external_location_id: externalLocationId || null,
+      external_business_id: externalBusinessId || null,
+      external_location_name: externalLocationName || null,
     }).select().single()
 
     if (error) { logger.error('[LB] Conv insert error:', error.message); return null }
@@ -434,6 +520,15 @@ module.exports = (supabase, logger) => {
       })
 
       // Upsert conversation
+      // Resolve provider account for this event
+      let resolvedAccountId = null
+      if (event.account_id) {
+        const { data: pa } = await supabase.from('communication_provider_accounts')
+          .select('id').eq('provider', 'leadbridge').eq('external_account_id', event.account_id)
+          .eq('status', 'active').maybeSingle()
+        resolvedAccountId = pa?.id
+      }
+
       const conv = await upsertConversation(userId, {
         provider: 'leadbridge',
         channel,
@@ -442,8 +537,13 @@ module.exports = (supabase, logger) => {
         participantPhone: participant.phone,
         participantName: participant.name,
         identityId: identity?.id,
+        providerAccountId: resolvedAccountId,
         lastMessage: message.body,
         lastActivity: event.occurred_at || new Date().toISOString(),
+        // Location fields from webhook payload
+        externalLocationId: thread.external_location_id || event.location_id || null,
+        externalBusinessId: thread.external_business_id || event.business_id || null,
+        externalLocationName: thread.external_location_name || event.location_name || null,
       })
 
       if (!conv) return
@@ -557,6 +657,10 @@ module.exports = (supabase, logger) => {
                 providerAccountId: acct.id,
                 lastMessage: lead.message,
                 lastActivity: lead.lastMessageAt || lead.updatedAt || lead.createdAt,
+                // Location fields — from LB lead + provider account
+                externalLocationId: lead.locationId || null,
+                externalBusinessId: lead.businessId || acct.external_business_id || null,
+                externalLocationName: lead.locationName || acct.display_name || null,
               })
 
               if (!conv) { syncProgress[userId].errors++; continue }
