@@ -35153,6 +35153,174 @@ app.get('/api/communications/provider-accounts', authenticateToken, async (req, 
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// LOCATIONS — lightweight operational entity for communications
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/locations — list locations for the user
+app.get('/api/locations', authenticateToken, async (req, res) => {
+  try {
+    const { data } = await supabase.from('sf_locations')
+      .select('*').eq('user_id', req.user.userId).eq('is_active', true)
+      .order('name', { ascending: true });
+    res.json({ locations: (data || []).map(l => ({
+      id: l.id, name: l.name, shortName: l.short_name,
+      city: l.city, state: l.state, zipCode: l.zip_code,
+      isActive: l.is_active,
+    })) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch locations' });
+  }
+});
+
+// POST /api/locations — create a location
+app.post('/api/locations', authenticateToken, async (req, res) => {
+  try {
+    const { name, shortName, address, city, state, zipCode, timezone } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
+
+    const { data, error } = await supabase.from('sf_locations').insert({
+      user_id: req.user.userId,
+      name: name.trim(),
+      short_name: shortName?.trim() || null,
+      address: address || null, city: city || null,
+      state: state || null, zip_code: zipCode || null,
+      timezone: timezone || null,
+    }).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ location: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create location' });
+  }
+});
+
+// PATCH /api/locations/:id — update a location
+app.patch('/api/locations/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, shortName, address, city, state, zipCode, timezone, isActive } = req.body;
+    const updates = {};
+    if (name !== undefined) updates.name = name.trim();
+    if (shortName !== undefined) updates.short_name = shortName?.trim() || null;
+    if (address !== undefined) updates.address = address;
+    if (city !== undefined) updates.city = city;
+    if (state !== undefined) updates.state = state;
+    if (zipCode !== undefined) updates.zip_code = zipCode;
+    if (timezone !== undefined) updates.timezone = timezone;
+    if (isActive !== undefined) updates.is_active = isActive;
+
+    const { data, error } = await supabase.from('sf_locations')
+      .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId)
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ location: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update location' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// LOCATION MAPPINGS — provider account ↔ SF location
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/communications/location-mappings — list active mappings with account + location info
+app.get('/api/communications/location-mappings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: mappings } = await supabase.from('communication_account_location_mappings')
+      .select('*').eq('is_active', true);
+
+    // Enrich with account + location names
+    const { data: accounts } = await supabase.from('communication_provider_accounts')
+      .select('id, display_name, channel, external_account_id').eq('user_id', userId);
+    const { data: locations } = await supabase.from('sf_locations')
+      .select('id, name, short_name').eq('user_id', userId);
+
+    const accountMap = {};
+    for (const a of (accounts || [])) accountMap[a.id] = a;
+    const locationMap = {};
+    for (const l of (locations || [])) locationMap[l.id] = l;
+
+    // Filter to this user's accounts only
+    const userAccountIds = new Set((accounts || []).map(a => a.id));
+    const userMappings = (mappings || []).filter(m => userAccountIds.has(m.provider_account_id));
+
+    res.json({ mappings: userMappings.map(m => {
+      const acct = accountMap[m.provider_account_id];
+      const loc = locationMap[m.sf_location_id];
+      return {
+        id: m.id,
+        providerAccountId: m.provider_account_id,
+        accountName: acct?.display_name || null,
+        accountChannel: acct?.channel || null,
+        sfLocationId: m.sf_location_id,
+        locationName: loc?.name || null,
+        locationShortName: loc?.short_name || null,
+        provider: m.provider,
+        channel: m.channel,
+        externalLocationId: m.external_location_id,
+        externalBusinessId: m.external_business_id,
+        externalLocationName: m.external_location_name,
+        mappingType: m.mapping_type,
+      };
+    }) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch location mappings' });
+  }
+});
+
+// POST /api/communications/location-mappings — create or update a mapping
+app.post('/api/communications/location-mappings', authenticateToken, async (req, res) => {
+  try {
+    const { providerAccountId, sfLocationId, provider, channel, externalLocationId,
+      externalBusinessId, externalLocationName, mappingType } = req.body;
+
+    if (!providerAccountId || !sfLocationId) {
+      return res.status(400).json({ error: 'providerAccountId and sfLocationId required' });
+    }
+
+    // Verify ownership
+    const { data: acct } = await supabase.from('communication_provider_accounts')
+      .select('id').eq('id', providerAccountId).eq('user_id', req.user.userId).maybeSingle();
+    if (!acct) return res.status(404).json({ error: 'Provider account not found' });
+
+    const { data: loc } = await supabase.from('sf_locations')
+      .select('id').eq('id', sfLocationId).eq('user_id', req.user.userId).maybeSingle();
+    if (!loc) return res.status(404).json({ error: 'Location not found' });
+
+    // Upsert: deactivate existing for same account+external_location, then insert
+    if (externalLocationId) {
+      await supabase.from('communication_account_location_mappings')
+        .update({ is_active: false })
+        .eq('provider_account_id', providerAccountId)
+        .eq('external_location_id', externalLocationId)
+        .eq('is_active', true);
+    } else {
+      await supabase.from('communication_account_location_mappings')
+        .update({ is_active: false })
+        .eq('provider_account_id', providerAccountId)
+        .eq('mapping_type', 'account_level')
+        .eq('is_active', true);
+    }
+
+    const { data: created, error } = await supabase.from('communication_account_location_mappings').insert({
+      provider_account_id: providerAccountId,
+      sf_location_id: sfLocationId,
+      provider: provider || 'leadbridge',
+      channel: channel || 'thumbtack',
+      external_location_id: externalLocationId || null,
+      external_business_id: externalBusinessId || null,
+      external_location_name: externalLocationName || null,
+      mapping_type: mappingType || (externalLocationId ? 'location_level' : 'account_level'),
+      is_active: true,
+    }).select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ mapping: created });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create location mapping' });
+  }
+});
+
 // GET /api/communications/conversations
 app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
   try {
@@ -35166,6 +35334,13 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     if (filter === 'unread') query = query.gt('unread_count', 0);
     if (channel) query = query.eq('channel', channel);
     if (accountId) query = query.eq('provider_account_id', parseInt(accountId));
+    // Location filter: ?locationId=123 or ?locationId=unassigned
+    const locationId = req.query.locationId;
+    if (locationId === 'unassigned') {
+      query = query.is('sf_location_id', null).eq('provider', 'leadbridge');
+    } else if (locationId) {
+      query = query.eq('sf_location_id', parseInt(locationId));
+    }
     if (search) {
       query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,last_preview.ilike.%${search}%`);
     }
@@ -35188,9 +35363,18 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       accountMap[pa.id] = { displayName: pa.display_name, channel: pa.channel, externalId: pa.external_account_id };
     }
 
+    // Build location lookup
+    const { data: sfLocations } = await supabase.from('sf_locations')
+      .select('id, name, short_name').eq('user_id', userId);
+    const locationMap = {};
+    for (const l of (sfLocations || [])) {
+      locationMap[l.id] = { name: l.name, shortName: l.short_name };
+    }
+
     // Map to frontend shape
     const conversations = (data || []).map(c => {
       const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
+      const loc = c.sf_location_id ? locationMap[c.sf_location_id] : null;
       return {
         id: c.id,
         sigcoreConversationId: c.sigcore_conversation_id,
@@ -35207,8 +35391,13 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         isArchived: c.is_archived,
         customerId: c.customer_id,
         leadId: c.lead_id,
+        // Account info (secondary metadata)
         providerAccountId: c.provider_account_id || null,
         accountName: account?.displayName || null,
+        // Location info (primary operational unit)
+        locationId: c.sf_location_id || null,
+        locationName: loc?.shortName || loc?.name || c.external_location_name || null,
+        locationResolved: !!c.sf_location_id,
       };
     });
 
