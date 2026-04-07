@@ -196,10 +196,12 @@ module.exports = (supabase, logger) => {
         // LB returns { user: { id, email, ... }, token: "jwt..." }
         lbToken = loginRes.data?.token
         lbUserId = loginRes.data?.user?.id
-        if (!lbToken) return res.status(401).json({ error: 'LeadBridge login failed — no token returned' })
+        if (!lbToken) return res.status(422).json({ error: 'LeadBridge login failed — no token returned' })
       } catch (e) {
         const msg = e.response?.data?.message || e.message
-        return res.status(401).json({ error: `LeadBridge login failed: ${msg}` })
+        // Use 422 not 401 — the SF auth is valid, LB credentials are wrong
+        // 401 would trigger the frontend interceptor to redirect to SF login
+        return res.status(422).json({ error: `LeadBridge login failed: ${msg}` })
       }
 
       // 2. Fetch connected accounts
