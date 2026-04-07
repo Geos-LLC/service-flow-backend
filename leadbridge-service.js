@@ -620,15 +620,17 @@ module.exports = (supabase, logger) => {
         syncProgress[userId].phase = `syncing_${platform}`
 
         try {
-          // Fetch leads from LB — response: { count, leads: NormalizedLead[] }
-          const limit = maxLeads > 0 ? maxLeads : 50
-          const leadsPath = `/v1/${platform}/leads?limit=${limit}`
+          // Fetch leads from LB — no limit at API level (LB doesn't filter by account)
+          // Filter client-side by businessId, then apply per-account limit
+          const leadsPath = `/v1/${platform}/leads`
           const leadsRes = await lbRequest('GET', leadsPath, lbToken)
           const allLeads = leadsRes.data?.leads || []
           // Filter to this account's businessId
-          const leads = acct.external_business_id
+          let leads = acct.external_business_id
             ? allLeads.filter(l => l.businessId === acct.external_business_id)
             : allLeads
+          // Apply per-account limit for test sync
+          if (maxLeads > 0) leads = leads.slice(0, maxLeads)
 
           syncProgress[userId].total += leads.length
           logger.log(`[LB Sync] ${platform}: ${leads.length} leads for account ${acct.display_name}`)
