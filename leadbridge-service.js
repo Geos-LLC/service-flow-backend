@@ -112,13 +112,13 @@ module.exports = (supabase, logger) => {
       if (exact) {
         // Fetch location name
         const { data: loc } = await supabase
-          .from('sf_locations').select('name, short_name')
+          .from('territories').select('name')
           .eq('id', exact.sf_location_id).maybeSingle()
 
         return {
           locationId: exact.sf_location_id,
           resolution: 'exact',
-          locationName: loc?.short_name || loc?.name || exact.external_location_name || null,
+          locationName: loc?.name || exact.external_location_name || null,
         }
       }
     }
@@ -134,13 +134,13 @@ module.exports = (supabase, logger) => {
     if (accountMappings?.length === 1) {
       const mapping = accountMappings[0]
       const { data: loc } = await supabase
-        .from('sf_locations').select('name, short_name')
+        .from('territories').select('name')
         .eq('id', mapping.sf_location_id).maybeSingle()
 
       return {
         locationId: mapping.sf_location_id,
         resolution: 'account_fallback',
-        locationName: loc?.short_name || loc?.name || mapping.external_location_name || null,
+        locationName: loc?.name || mapping.external_location_name || null,
       }
     }
 

@@ -35154,38 +35154,37 @@ app.get('/api/communications/provider-accounts', authenticateToken, async (req, 
 });
 
 // ════════════════════════════════════════════════════════════════
-// LOCATIONS — lightweight operational entity for communications
+// LOCATIONS — uses existing territories table as the location entity
 // ════════════════════════════════════════════════════════════════
 
-// GET /api/locations — list locations for the user
+// GET /api/locations — list territories as locations
 app.get('/api/locations', authenticateToken, async (req, res) => {
   try {
-    const { data } = await supabase.from('sf_locations')
-      .select('*').eq('user_id', req.user.userId).eq('is_active', true)
+    const { data } = await supabase.from('territories')
+      .select('id, name, location, status, timezone')
+      .eq('user_id', req.user.userId).eq('status', 'active')
       .order('name', { ascending: true });
     res.json({ locations: (data || []).map(l => ({
-      id: l.id, name: l.name, shortName: l.short_name,
-      city: l.city, state: l.state, zipCode: l.zip_code,
-      isActive: l.is_active,
+      id: l.id, name: l.name, location: l.location,
+      timezone: l.timezone, isActive: l.status === 'active',
     })) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch locations' });
   }
 });
 
-// POST /api/locations — create a location
+// POST /api/locations — create a territory as location
 app.post('/api/locations', authenticateToken, async (req, res) => {
   try {
-    const { name, shortName, address, city, state, zipCode, timezone } = req.body;
+    const { name, location, timezone } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
 
-    const { data, error } = await supabase.from('sf_locations').insert({
+    const { data, error } = await supabase.from('territories').insert({
       user_id: req.user.userId,
       name: name.trim(),
-      short_name: shortName?.trim() || null,
-      address: address || null, city: city || null,
-      state: state || null, zip_code: zipCode || null,
+      location: location || null,
       timezone: timezone || null,
+      status: 'active',
     }).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ location: data });
@@ -35194,21 +35193,17 @@ app.post('/api/locations', authenticateToken, async (req, res) => {
   }
 });
 
-// PATCH /api/locations/:id — update a location
+// PATCH /api/locations/:id — update a territory/location
 app.patch('/api/locations/:id', authenticateToken, async (req, res) => {
   try {
-    const { name, shortName, address, city, state, zipCode, timezone, isActive } = req.body;
+    const { name, location, timezone, status } = req.body;
     const updates = {};
     if (name !== undefined) updates.name = name.trim();
-    if (shortName !== undefined) updates.short_name = shortName?.trim() || null;
-    if (address !== undefined) updates.address = address;
-    if (city !== undefined) updates.city = city;
-    if (state !== undefined) updates.state = state;
-    if (zipCode !== undefined) updates.zip_code = zipCode;
+    if (location !== undefined) updates.location = location;
     if (timezone !== undefined) updates.timezone = timezone;
-    if (isActive !== undefined) updates.is_active = isActive;
+    if (status !== undefined) updates.status = status;
 
-    const { data, error } = await supabase.from('sf_locations')
+    const { data, error } = await supabase.from('territories')
       .update(updates).eq('id', req.params.id).eq('user_id', req.user.userId)
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
@@ -35232,8 +35227,8 @@ app.get('/api/communications/location-mappings', authenticateToken, async (req, 
     // Enrich with account + location names
     const { data: accounts } = await supabase.from('communication_provider_accounts')
       .select('id, display_name, channel, external_account_id').eq('user_id', userId);
-    const { data: locations } = await supabase.from('sf_locations')
-      .select('id, name, short_name').eq('user_id', userId);
+    const { data: locations } = await supabase.from('territories')
+      .select('id, name').eq('user_id', userId);
 
     const accountMap = {};
     for (const a of (accounts || [])) accountMap[a.id] = a;
@@ -35254,7 +35249,6 @@ app.get('/api/communications/location-mappings', authenticateToken, async (req, 
         accountChannel: acct?.channel || null,
         sfLocationId: m.sf_location_id,
         locationName: loc?.name || null,
-        locationShortName: loc?.short_name || null,
         provider: m.provider,
         channel: m.channel,
         externalLocationId: m.external_location_id,
@@ -35283,7 +35277,7 @@ app.post('/api/communications/location-mappings', authenticateToken, async (req,
       .select('id').eq('id', providerAccountId).eq('user_id', req.user.userId).maybeSingle();
     if (!acct) return res.status(404).json({ error: 'Provider account not found' });
 
-    const { data: loc } = await supabase.from('sf_locations')
+    const { data: loc } = await supabase.from('territories')
       .select('id').eq('id', sfLocationId).eq('user_id', req.user.userId).maybeSingle();
     if (!loc) return res.status(404).json({ error: 'Location not found' });
 
@@ -35363,12 +35357,12 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       accountMap[pa.id] = { displayName: pa.display_name, channel: pa.channel, externalId: pa.external_account_id };
     }
 
-    // Build location lookup
-    const { data: sfLocations } = await supabase.from('sf_locations')
-      .select('id, name, short_name').eq('user_id', userId);
+    // Build location lookup (territories = locations)
+    const { data: sfLocations } = await supabase.from('territories')
+      .select('id, name').eq('user_id', userId);
     const locationMap = {};
     for (const l of (sfLocations || [])) {
-      locationMap[l.id] = { name: l.name, shortName: l.short_name };
+      locationMap[l.id] = { name: l.name };
     }
 
     // Map to frontend shape
@@ -35396,7 +35390,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         accountName: account?.displayName || null,
         // Location info (primary operational unit)
         locationId: c.sf_location_id || null,
-        locationName: loc?.shortName || loc?.name || c.external_location_name || null,
+        locationName: loc?.name || c.external_location_name || null,
         locationResolved: !!c.sf_location_id,
       };
     });
