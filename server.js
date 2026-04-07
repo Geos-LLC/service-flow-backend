@@ -35137,11 +35137,27 @@ app.post('/api/communications/relink', authenticateToken, async (req, res) => {
 
 // ── Phase 5: Conversations API ──
 
+// GET /api/communications/provider-accounts — list connected provider accounts for filter dropdown
+app.get('/api/communications/provider-accounts', authenticateToken, async (req, res) => {
+  try {
+    const { data } = await supabase.from('communication_provider_accounts')
+      .select('id, provider, channel, display_name, external_account_id, status')
+      .eq('user_id', req.user.userId).eq('status', 'active')
+      .order('channel', { ascending: true });
+    res.json({ accounts: (data || []).map(a => ({
+      id: a.id, provider: a.provider, channel: a.channel,
+      displayName: a.display_name, externalAccountId: a.external_account_id,
+    })) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch provider accounts' });
+  }
+});
+
 // GET /api/communications/conversations
 app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { filter, search, archived, channel } = req.query;
+    const { filter, search, archived, channel, accountId } = req.query;
 
     let query = supabase.from('communication_conversations').select('*')
       .eq('user_id', userId).order('last_event_at', { ascending: false, nullsFirst: false });
@@ -35149,6 +35165,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     if (archived !== 'true') query = query.eq('is_archived', false);
     if (filter === 'unread') query = query.gt('unread_count', 0);
     if (channel) query = query.eq('channel', channel);
+    if (accountId) query = query.eq('provider_account_id', parseInt(accountId));
     if (search) {
       query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,last_preview.ilike.%${search}%`);
     }
@@ -35163,22 +35180,37 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       if (pn.number) phoneSymbols[normalizePhone(pn.number)] = pn.symbol || null;
     }
 
+    // Build provider account lookup for display names
+    const { data: providerAccounts } = await supabase.from('communication_provider_accounts')
+      .select('id, display_name, channel, external_account_id').eq('user_id', userId);
+    const accountMap = {};
+    for (const pa of (providerAccounts || [])) {
+      accountMap[pa.id] = { displayName: pa.display_name, channel: pa.channel, externalId: pa.external_account_id };
+    }
+
     // Map to frontend shape
-    const conversations = (data || []).map(c => ({
-      id: c.id,
-      sigcoreConversationId: c.sigcore_conversation_id,
-      displayName: c.participant_name || '',
-      fallbackIdentifier: c.participant_phone,
-      endpointPhone: c.endpoint_phone,
-      endpointSymbol: phoneSymbols[normalizePhone(c.endpoint_phone)] || null,
-      lastPreview: c.last_preview,
-      lastEventAt: c.last_event_at,
-      unreadCount: c.unread_count || 0,
-      channels: [c.channel || 'sms'],
-      isArchived: c.is_archived,
-      customerId: c.customer_id,
-      leadId: c.lead_id,
-    }));
+    const conversations = (data || []).map(c => {
+      const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
+      return {
+        id: c.id,
+        sigcoreConversationId: c.sigcore_conversation_id,
+        provider: c.provider || 'openphone',
+        channel: c.channel || 'sms',
+        displayName: c.participant_name || '',
+        fallbackIdentifier: c.participant_phone,
+        endpointPhone: c.endpoint_phone,
+        endpointSymbol: phoneSymbols[normalizePhone(c.endpoint_phone)] || null,
+        lastPreview: c.last_preview,
+        lastEventAt: c.last_event_at,
+        unreadCount: c.unread_count || 0,
+        channels: [c.channel || 'sms'],
+        isArchived: c.is_archived,
+        customerId: c.customer_id,
+        leadId: c.lead_id,
+        providerAccountId: c.provider_account_id || null,
+        accountName: account?.displayName || null,
+      };
+    });
 
     res.json({ conversations });
   } catch (error) {
