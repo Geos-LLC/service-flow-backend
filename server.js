@@ -35593,7 +35593,16 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       };
     });
 
-    res.json({ conversations });
+    // Compute unread counts per channel for tab badges
+    const { data: unreadByChannel } = await supabase.from('communication_conversations')
+      .select('channel, provider').eq('user_id', userId).gt('unread_count', 0);
+    const channelUnread = {};
+    for (const c of (unreadByChannel || [])) {
+      const key = c.provider === 'openphone' ? 'openphone' : c.channel;
+      channelUnread[key] = (channelUnread[key] || 0) + 1;
+    }
+
+    res.json({ conversations, channelUnread });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch conversations' });
   }
