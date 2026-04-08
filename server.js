@@ -35435,6 +35435,79 @@ app.post('/api/lead-automation/seed-defaults', authenticateToken, async (req, re
   }
 });
 
+// POST /api/lead-automation/backfill — apply automation rules to existing leads based on their conversation state
+app.post('/api/lead-automation/backfill', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get all automation rules for this user
+    const { data: rules } = await supabase.from('lead_stage_automation_rules')
+      .select('*').eq('user_id', userId).eq('enabled', true);
+    if (!rules?.length) return res.json({ updated: 0, message: 'No automation rules configured' });
+
+    // Build event → stage map (use thumbtack rules, they mirror yelp)
+    const eventStageMap = {};
+    for (const r of rules) {
+      if (!eventStageMap[r.event_type]) eventStageMap[r.event_type] = r.target_stage_id;
+    }
+
+    // Get stage positions for forward-only check
+    const { data: allStages } = await supabase.from('lead_stages')
+      .select('id, position, name');
+    const stagePos = {};
+    for (const s of (allStages || [])) stagePos[s.id] = s.position;
+
+    // Get all LB leads with their conversations
+    const { data: identities } = await supabase.from('communication_participant_identities')
+      .select('id, sf_lead_id').eq('user_id', userId).not('sf_lead_id', 'is', null);
+
+    let updated = 0;
+    for (const identity of (identities || [])) {
+      // Get conversations for this identity
+      const { data: convs } = await supabase.from('communication_conversations')
+        .select('id, channel').eq('participant_identity_id', identity.id);
+
+      if (!convs?.length) continue;
+
+      // Count outbound messages across all conversations for this identity
+      const convIds = convs.map(c => c.id);
+      const { count: outboundCount } = await supabase.from('communication_messages')
+        .select('id', { count: 'exact', head: true })
+        .in('conversation_id', convIds).eq('direction', 'out');
+
+      const { count: totalCount } = await supabase.from('communication_messages')
+        .select('id', { count: 'exact', head: true })
+        .in('conversation_id', convIds);
+
+      // Determine the highest applicable event
+      let targetEvent = 'lead_received';
+      if ((outboundCount || 0) >= 1) targetEvent = 'first_reply_sent';
+      if ((outboundCount || 0) >= 2 || (totalCount || 0) >= 3) targetEvent = 'conversation_ongoing';
+
+      const targetStageId = eventStageMap[targetEvent];
+      if (!targetStageId) continue;
+
+      // Get current lead stage
+      const { data: lead } = await supabase.from('leads')
+        .select('id, stage_id').eq('id', identity.sf_lead_id).maybeSingle();
+      if (!lead) continue;
+
+      // Only advance forward
+      const currentPos = stagePos[lead.stage_id] ?? -1;
+      const targetPos = stagePos[targetStageId] ?? -1;
+      if (targetPos <= currentPos) continue;
+
+      await supabase.from('leads').update({ stage_id: targetStageId }).eq('id', lead.id);
+      updated++;
+    }
+
+    res.json({ updated, total: (identities || []).length, message: `Updated ${updated} leads` });
+  } catch (error) {
+    logger.error('Backfill error:', error.message);
+    res.status(500).json({ error: 'Failed to backfill lead stages' });
+  }
+});
+
 // GET /api/communications/conversations
 app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
   try {
