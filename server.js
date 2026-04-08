@@ -34233,7 +34233,7 @@ async function resolveEndpointRoute({ provider, providerAccountId, endpointId, p
   }
 
   // Step E: NO MATCH — do not auto-route
-  logger.warn(`[Route] Step E: no deterministic route`, { provider, endpointId, phoneNumber, channel, conversationId });
+  logger.warn(`[Route] Step E: no deterministic route — provider=${provider} endpointId=${endpointId} phone=${phoneNumber} channel=${channel} convId=${conversationId}`);
   return result;
 }
 
@@ -34578,7 +34578,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
     const payload = req.body?.data || req.body;
     if (!event || !payload) return;
 
-    logger.log(`[Webhook] Sigcore event: ${event}`, JSON.stringify(payload).substring(0, 200));
+    logger.log(`[Webhook] Sigcore event: ${event} | from=${payload.fromNumber||payload.from_number} to=${payload.toNumber||payload.to_number} phoneNumberId=${payload.phoneNumberId||payload.endpoint_id} convId=${payload.conversationId} accountId=${payload.accountId||payload.provider_account_id}`);
 
     // Extract routing inputs from webhook payload
     const fromNumber = normalizePhone(payload.fromNumber || payload.from_number);
