@@ -1055,6 +1055,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
+try { app.use('/api/integrations/whatsapp', require('./whatsapp-service')(supabase, logger, sigcoreRequest)); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
 // Test Supabase connection
@@ -34568,6 +34569,153 @@ app.put('/api/communications/settings/preferences', authenticateToken, async (re
 
 // ── Phase 3: Webhook Ingestion from Sigcore ──
 
+// ── WhatsApp webhook handler ──
+async function handleWhatsAppWebhook(event, payload) {
+  try {
+    if (event === 'whatsapp.message.inbound') {
+      // Extract from nested Sigcore payload structure
+      const conv = payload.conversation || {};
+      const msg = payload.message || payload;
+      const participantPhone = normalizePhone(conv.participantPhone || msg.fromNumber || msg.from);
+      const endpointPhone = normalizePhone(conv.endpointPhone || msg.toNumber || msg.to);
+      const body = msg.text || msg.body || '';
+      const externalMessageId = msg.externalMessageId || msg.id || `wa_${Date.now()}`;
+      const externalChatId = conv.externalChatId || null;
+      const sigcoreConvId = conv.id || payload.conversationId || null;
+      const timestamp = msg.timestamp || new Date().toISOString();
+
+      if (!participantPhone) {
+        logger.warn('[WhatsApp] Missing participant phone in inbound message');
+        return;
+      }
+
+      // Route via deterministic endpoint resolution (Step A preferred)
+      let userId = null;
+      if (endpointPhone) {
+        const routeResult = await resolveEndpointRoute({
+          provider: 'whatsapp', endpointId: `wa_${endpointPhone}`,
+          phoneNumber: endpointPhone, channel: 'whatsapp',
+        });
+        if (routeResult.routed) {
+          userId = routeResult.userId;
+          logger.log(`[WhatsApp] Routed via Step ${routeResult.step} → user ${userId}`);
+        }
+      }
+
+      // Fallback: find user with whatsapp_connected (validation check, not primary routing)
+      if (!userId) {
+        const { data: waSettings } = await supabase.from('communication_settings')
+          .select('user_id').eq('whatsapp_connected', true).limit(1).maybeSingle();
+        if (waSettings) {
+          userId = waSettings.user_id;
+          logger.log(`[WhatsApp] Fallback: whatsapp_connected user ${userId}`);
+        }
+      }
+
+      if (!userId) {
+        logger.warn('[WhatsApp] No routed user for WhatsApp message');
+        return;
+      }
+
+      // Message endpoint guard: only attach if msg involves our endpoint phone
+      if (endpointPhone) {
+        const msgFrom = normalizePhone(msg.fromNumber || msg.from);
+        const msgTo = normalizePhone(msg.toNumber || msg.to);
+        if (msgFrom !== endpointPhone && msgTo !== endpointPhone) {
+          logger.warn(`[WhatsApp] Endpoint guard: rejected message (endpoint=${endpointPhone}, from=${msgFrom}, to=${msgTo})`);
+          return;
+        }
+      }
+
+      // Find-or-create conversation — hardened identity: (user_id, provider, endpoint_phone, participant_phone)
+      let conversation;
+      const { data: existingConv } = await supabase.from('communication_conversations')
+        .select('*')
+        .eq('user_id', userId).eq('provider', 'whatsapp')
+        .eq('endpoint_phone', endpointPhone || '').eq('participant_phone', participantPhone)
+        .maybeSingle();
+
+      if (existingConv) {
+        conversation = existingConv;
+      } else {
+        const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
+          user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
+          sigcore_conversation_id: sigcoreConvId,
+          endpoint_phone: endpointPhone, participant_phone: participantPhone,
+          participant_name: null,
+          last_preview: body.substring(0, 200),
+          last_event_at: timestamp, unread_count: 1,
+          conversation_type: 'external_client',
+          metadata: { externalChatId },
+        }).select().single();
+        if (createErr) { logger.error('[WhatsApp] Create conversation error:', createErr); return; }
+        conversation = newConv;
+        logger.log(`[WhatsApp] Created conversation ${newConv.id} for ${participantPhone}`);
+
+        // Auto-link to customer/lead by phone
+        autoLinkConversation(userId, newConv.id, participantPhone);
+      }
+
+      // Insert message (dedup by external message ID)
+      const { data: existingMsg } = await supabase.from('communication_messages')
+        .select('id').eq('provider_message_id', externalMessageId).maybeSingle();
+      if (existingMsg) {
+        logger.log(`[WhatsApp] Duplicate message ${externalMessageId}, skipping`);
+        return;
+      }
+
+      await supabase.from('communication_messages').insert({
+        conversation_id: conversation.id,
+        provider_message_id: externalMessageId,
+        direction: 'in', channel: 'whatsapp', body,
+        from_number: participantPhone, to_number: endpointPhone,
+        sender_role: 'customer', status: 'delivered',
+        metadata: { externalChatId, hasMedia: msg.hasMedia, type: msg.type },
+        created_at: timestamp,
+      });
+
+      // Update conversation
+      const updates = { last_event_at: timestamp, updated_at: new Date().toISOString() };
+      if (body) updates.last_preview = body.substring(0, 200);
+      updates.unread_count = (conversation.unread_count || 0) + 1;
+      if (sigcoreConvId && !conversation.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+      await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
+
+      logger.log(`[WhatsApp] Stored inbound message for conversation ${conversation.id}`);
+
+    } else if (event === 'whatsapp.message.delivered') {
+      // Update message delivery status
+      const messageId = payload.messageId || payload.externalMessageId;
+      if (messageId) {
+        await supabase.from('communication_messages')
+          .update({ status: 'delivered', updated_at: new Date().toISOString() })
+          .eq('provider_message_id', messageId);
+      }
+
+    } else if (event === 'whatsapp.status.change') {
+      // Update connection status
+      const status = payload.status;
+      const isConnected = status === 'ready';
+      // Find user with WhatsApp connected or the target user
+      const { data: settings } = await supabase.from('communication_settings')
+        .select('user_id, whatsapp_connected')
+        .or('whatsapp_connected.eq.true,whatsapp_phone_number.neq.null')
+        .limit(1).maybeSingle();
+
+      if (settings) {
+        await supabase.from('communication_settings').update({
+          whatsapp_connected: isConnected,
+          updated_at: new Date().toISOString(),
+        }).eq('user_id', settings.user_id);
+        logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}) for user ${settings.user_id}`);
+      }
+    }
+  } catch (error) {
+    // WhatsApp failures must NOT break OpenPhone/LB webhook processing
+    logger.error('[WhatsApp] Webhook handler error:', error.message);
+  }
+}
+
 // POST /api/communications/webhooks/sigcore — receives events from Sigcore (NO auth middleware)
 app.post('/api/communications/webhooks/sigcore', async (req, res) => {
   // Return 200 immediately — process async
@@ -34578,7 +34726,13 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
     const payload = req.body?.data || req.body;
     if (!event || !payload) return;
 
-    logger.log(`[Webhook] Sigcore event: ${event} | from=${payload.fromNumber||payload.from_number} to=${payload.toNumber||payload.to_number} phoneNumberId=${payload.phoneNumberId||payload.endpoint_id} convId=${payload.conversationId} accountId=${payload.accountId||payload.provider_account_id}`);
+    logger.log(`[Webhook] Sigcore event: ${event} | from=${payload.fromNumber||payload.from_number||payload.conversation?.participantPhone} to=${payload.toNumber||payload.to_number} phoneNumberId=${payload.phoneNumberId||payload.endpoint_id} convId=${payload.conversationId||payload.conversation?.id}`);
+
+    // ── WhatsApp events — separate handling path ──
+    if (event.startsWith('whatsapp.')) {
+      await handleWhatsAppWebhook(event, payload);
+      return;
+    }
 
     // Extract routing inputs from webhook payload
     const fromNumber = normalizePhone(payload.fromNumber || payload.from_number);
@@ -35519,9 +35673,11 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
 
     if (archived !== 'true') query = query.eq('is_archived', false);
     if (filter === 'unread') query = query.gt('unread_count', 0);
-    // Channel filter: 'openphone' matches sms+call (provider=openphone), others match exact channel
+    // Channel filter: 'openphone' matches sms+call (provider=openphone), 'whatsapp' matches provider=whatsapp, others match exact channel
     if (channel === 'openphone') {
       query = query.eq('provider', 'openphone');
+    } else if (channel === 'whatsapp') {
+      query = query.eq('provider', 'whatsapp');
     } else if (channel) {
       query = query.eq('channel', channel);
     }
@@ -35849,6 +36005,47 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
       } catch (e) {
         logger.error('[LB Send] Error:', e.response?.data || e.message);
         return res.status(500).json({ error: e.response?.data?.message || 'Failed to send via LeadBridge' });
+      }
+    }
+
+    // ── WhatsApp send ──
+    if (conv.provider === 'whatsapp') {
+      try {
+        const settings = await getSigcoreSettings(userId);
+        if (!settings?.whatsapp_connected) return res.status(400).json({ error: 'WhatsApp not connected' });
+        const tenantKey = settings.sigcore_tenant_api_key;
+        if (!tenantKey) return res.status(400).json({ error: 'Sigcore tenant not configured' });
+
+        const sendResult = await sigcoreRequest('POST', '/integrations/whatsapp/send', tenantKey, {
+          to: conv.participant_phone,
+          message: text.trim()
+        });
+        const sentData = sendResult.data?.data || sendResult.data || {};
+
+        // Insert local message copy
+        const { data: localMsg } = await supabase.from('communication_messages').insert({
+          conversation_id: conv.id,
+          provider_message_id: sentData.messageId || `wa_out_${Date.now()}`,
+          direction: 'out', channel: 'whatsapp', body: text.trim(),
+          from_number: conv.endpoint_phone, to_number: conv.participant_phone,
+          sender_role: 'agent', status: 'sent',
+          created_at: new Date().toISOString(),
+        }).select().single();
+
+        // Update conversation
+        await supabase.from('communication_conversations').update({
+          last_preview: text.trim().substring(0, 200),
+          last_event_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).eq('id', conv.id);
+
+        return res.json({
+          id: localMsg?.id, conversationId: conv.id, channel: 'whatsapp',
+          text: text.trim(), status: 'sent', timestamp: new Date().toISOString(),
+        });
+      } catch (e) {
+        logger.error('[WhatsApp Send] Error:', e.response?.data || e.message);
+        return res.status(500).json({ error: e.response?.data?.message || 'Failed to send via WhatsApp' });
       }
     }
 
