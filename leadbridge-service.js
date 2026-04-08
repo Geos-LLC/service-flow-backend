@@ -194,6 +194,115 @@ module.exports = (supabase, logger) => {
     return created
   }
 
+  // ══════════════════════════════════════
+  // Lead Resolution — Phase B
+  //
+  // Given a participant identity + LB lead data, resolve to an
+  // SF lead or customer. Creates a new SF lead if no match.
+  //
+  // Resolution order:
+  //   1. Identity already linked to customer → done
+  //   2. Identity already linked to lead → done
+  //   3. Match existing customer by phone → link identity
+  //   4. Match existing lead by phone → link identity
+  //   5. No match → create SF lead + link identity
+  //
+  // Returns: { type: 'customer'|'lead'|'new_lead', id, created }
+  // ══════════════════════════════════════
+
+  async function resolveOrCreateLead(userId, identity, { channel, customerName, customerPhone, customerEmail, message, externalLeadId, locationId }) {
+    if (!identity) return null
+
+    // 1. Already linked to customer?
+    if (identity.sf_customer_id) {
+      return { type: 'customer', id: identity.sf_customer_id, created: false }
+    }
+
+    // 2. Already linked to lead?
+    if (identity.sf_lead_id) {
+      return { type: 'lead', id: identity.sf_lead_id, created: false }
+    }
+
+    const normalized = normalizePhone(customerPhone)
+    const last10 = normalized?.slice(-10)
+
+    // 3. Match existing customer by phone
+    if (last10 && last10.length >= 7) {
+      const { data: customer } = await supabase.from('customers')
+        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+
+      if (customer) {
+        // Link identity to customer
+        await supabase.from('communication_participant_identities')
+          .update({ sf_customer_id: customer.id, updated_at: new Date().toISOString() })
+          .eq('id', identity.id)
+        return { type: 'customer', id: customer.id, created: false }
+      }
+    }
+
+    // 4. Match existing lead by phone
+    if (last10 && last10.length >= 7) {
+      const { data: existingLead } = await supabase.from('leads')
+        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+
+      if (existingLead) {
+        // Link identity to existing lead
+        await supabase.from('communication_participant_identities')
+          .update({ sf_lead_id: existingLead.id, updated_at: new Date().toISOString() })
+          .eq('id', identity.id)
+        return { type: 'lead', id: existingLead.id, created: false }
+      }
+    }
+
+    // 5. No match → create new SF lead
+    // Get default pipeline + first stage
+    const { data: pipeline } = await supabase.from('lead_pipelines')
+      .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle()
+    if (!pipeline) {
+      logger.warn('[LB Lead] No default pipeline for user', userId)
+      return null
+    }
+
+    const { data: stage } = await supabase.from('lead_stages')
+      .select('id').eq('pipeline_id', pipeline.id).order('position', { ascending: true }).limit(1).maybeSingle()
+    if (!stage) {
+      logger.warn('[LB Lead] No stages in default pipeline', pipeline.id)
+      return null
+    }
+
+    // Parse name into first/last
+    const nameParts = (customerName || '').trim().split(/\s+/)
+    const firstName = nameParts[0] || null
+    const lastName = nameParts.slice(1).join(' ') || null
+
+    const source = channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack'
+
+    const { data: newLead, error } = await supabase.from('leads').insert({
+      user_id: userId,
+      pipeline_id: pipeline.id,
+      stage_id: stage.id,
+      first_name: firstName,
+      last_name: lastName,
+      phone: normalized || null,
+      email: customerEmail || null,
+      source,
+      notes: message ? message.substring(0, 500) : null,
+    }).select().single()
+
+    if (error) {
+      logger.error('[LB Lead] Create error:', error.message)
+      return null
+    }
+
+    // Link identity to new lead
+    await supabase.from('communication_participant_identities')
+      .update({ sf_lead_id: newLead.id, updated_at: new Date().toISOString() })
+      .eq('id', identity.id)
+
+    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source})`)
+    return { type: 'new_lead', id: newLead.id, created: true }
+  }
+
   // Upsert conversation from LB data
   async function upsertConversation(userId, { provider, channel, externalConvId, externalLeadId,
     participantPhone, participantName, identityId, providerAccountId, lastMessage, lastActivity,
@@ -519,6 +628,15 @@ module.exports = (supabase, logger) => {
         channel,
       })
 
+      // Phase B: resolve or create SF lead (non-blocking for webhook speed)
+      if (identity) {
+        resolveOrCreateLead(userId, identity, {
+          channel, customerName: participant.name, customerPhone: participant.phone,
+          customerEmail: participant.email, message: message.body,
+          externalLeadId: thread.external_lead_id,
+        }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
+      }
+
       // Upsert conversation
       // Resolve provider account for this event
       let resolvedAccountId = null
@@ -645,6 +763,15 @@ module.exports = (supabase, logger) => {
                 lbContactId: lead.id,
                 channel,
               })
+
+              // Phase B: resolve or create SF lead
+              if (identity) {
+                await resolveOrCreateLead(userId, identity, {
+                  channel, customerName: lead.customerName, customerPhone: lead.customerPhone,
+                  customerEmail: lead.customerEmail, message: lead.message,
+                  externalLeadId: lead.id,
+                })
+              }
 
               // Upsert conversation
               // LB NormalizedLead: { id, externalRequestId, threadId, customerName, customerPhone, message, status, ... }

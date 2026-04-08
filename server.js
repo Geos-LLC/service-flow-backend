@@ -35471,17 +35471,45 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const settings = await getSigcoreSettings(userId);
     const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
 
-    // Build lead data from customer
+    // Build lead/customer data from conversation → participant_identity → lead/customer
     let lead = null;
-    // If customer linked, fetch their data
+
+    // Check direct customer link on conversation
     if (conv.customer_id) {
       const { data: customer } = await supabase.from('customers').select('id, first_name, last_name, phone, email').eq('id', conv.customer_id).maybeSingle();
       if (customer) {
         lead = {
           id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
           phone: customer.phone, email: customer.email,
-          source: conv.provider, tags: [], status: 'Customer'
+          source: conv.provider, tags: [], status: 'Customer', entityType: 'customer'
         };
+      }
+    }
+
+    // Check via participant identity (Phase B: LB leads)
+    if (!lead && conv.participant_identity_id) {
+      const { data: identity } = await supabase.from('communication_participant_identities')
+        .select('sf_lead_id, sf_customer_id').eq('id', conv.participant_identity_id).maybeSingle();
+
+      if (identity?.sf_customer_id) {
+        const { data: customer } = await supabase.from('customers').select('id, first_name, last_name, phone, email').eq('id', identity.sf_customer_id).maybeSingle();
+        if (customer) {
+          lead = {
+            id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
+            phone: customer.phone, email: customer.email,
+            source: conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+          };
+        }
+      } else if (identity?.sf_lead_id) {
+        const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes').eq('id', identity.sf_lead_id).maybeSingle();
+        if (sfLead) {
+          lead = {
+            id: sfLead.id, name: `${sfLead.first_name || ''} ${sfLead.last_name || ''}`.trim(),
+            phone: sfLead.phone, email: sfLead.email,
+            source: sfLead.source, tags: [], status: 'Lead', entityType: 'lead',
+            notes: sfLead.notes,
+          };
+        }
       }
     }
 
