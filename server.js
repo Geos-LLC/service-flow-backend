@@ -35326,7 +35326,12 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
 
     if (archived !== 'true') query = query.eq('is_archived', false);
     if (filter === 'unread') query = query.gt('unread_count', 0);
-    if (channel) query = query.eq('channel', channel);
+    // Channel filter: 'openphone' matches sms+call (provider=openphone), others match exact channel
+    if (channel === 'openphone') {
+      query = query.eq('provider', 'openphone');
+    } else if (channel) {
+      query = query.eq('channel', channel);
+    }
     if (accountId) query = query.eq('provider_account_id', parseInt(accountId));
     // Location filter: ?locationId=123 or ?locationId=unassigned
     const locationId = req.query.locationId;
