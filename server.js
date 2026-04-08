@@ -35602,6 +35602,16 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       channelUnread[key] = (channelUnread[key] || 0) + 1;
     }
 
+    // Background: auto-link any unlinked conversations (lazy bulk relink)
+    const unlinkedConvs = (data || []).filter(c => !c.customer_id && !c.lead_id && c.participant_phone);
+    if (unlinkedConvs.length > 0) {
+      setImmediate(async () => {
+        for (const c of unlinkedConvs) {
+          try { await autoLinkConversation(userId, c.id, c.participant_phone); } catch (e) { /* skip */ }
+        }
+      });
+    }
+
     res.json({ conversations, channelUnread });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch conversations' });
@@ -35673,6 +35683,15 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const settings = await getSigcoreSettings(userId);
     const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
 
+    // Auto-link unlinked conversations on access (lazy relink)
+    if (!conv.customer_id && !conv.lead_id && conv.participant_phone) {
+      const linkResult = await autoLinkConversation(userId, conv.id, conv.participant_phone);
+      if (linkResult) {
+        if (linkResult.type === 'customer') conv.customer_id = linkResult.id;
+        else if (linkResult.type === 'lead') conv.lead_id = linkResult.id;
+      }
+    }
+
     // Build lead/customer data from conversation → participant_identity → lead/customer
     let lead = null;
 
@@ -35684,6 +35703,24 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
           id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
           phone: customer.phone, email: customer.email,
           source: conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+        };
+      }
+    }
+
+    // Check direct lead link on conversation
+    if (!lead && conv.lead_id) {
+      const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', conv.lead_id).maybeSingle();
+      if (sfLead) {
+        let stageName = 'Lead';
+        if (sfLead.stage_id) {
+          const { data: stageData } = await supabase.from('lead_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
+          if (stageData) stageName = stageData.name;
+        }
+        lead = {
+          id: sfLead.id, name: `${sfLead.first_name || ''} ${sfLead.last_name || ''}`.trim(),
+          phone: sfLead.phone, email: sfLead.email,
+          source: sfLead.source, tags: [], status: stageName, entityType: 'lead',
+          notes: sfLead.notes,
         };
       }
     }
