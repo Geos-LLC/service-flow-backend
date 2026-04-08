@@ -35315,6 +35315,126 @@ app.post('/api/communications/location-mappings', authenticateToken, async (req,
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// LEAD STAGE AUTOMATION — configurable rules for auto-progression
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/lead-automation/rules — list rules with stage names
+app.get('/api/lead-automation/rules', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: rules } = await supabase.from('lead_stage_automation_rules')
+      .select('*').eq('user_id', userId).order('channel', { ascending: true });
+
+    // Enrich with stage names
+    const { data: stages } = await supabase.from('lead_stages')
+      .select('id, name, position')
+      .in('pipeline_id', (await supabase.from('lead_pipelines').select('id').eq('user_id', userId).eq('is_default', true)).data?.map(p => p.id) || []);
+
+    const stageMap = {};
+    for (const s of (stages || [])) stageMap[s.id] = s;
+
+    res.json({
+      rules: (rules || []).map(r => ({
+        id: r.id,
+        channel: r.channel,
+        eventType: r.event_type,
+        targetStageId: r.target_stage_id,
+        targetStageName: stageMap[r.target_stage_id]?.name || null,
+        enabled: r.enabled,
+        autoConvertToCustomer: r.auto_convert_to_customer,
+      })),
+      stages: (stages || []).map(s => ({ id: s.id, name: s.name, position: s.position })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch automation rules' });
+  }
+});
+
+// POST /api/lead-automation/rules — create or update a rule
+app.post('/api/lead-automation/rules', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { channel, eventType, targetStageId, enabled, autoConvertToCustomer } = req.body;
+
+    if (!channel || !eventType || !targetStageId) {
+      return res.status(400).json({ error: 'channel, eventType, and targetStageId required' });
+    }
+
+    // Upsert: one rule per user + channel + event
+    const { data: existing } = await supabase.from('lead_stage_automation_rules')
+      .select('id').eq('user_id', userId).eq('channel', channel).eq('event_type', eventType).maybeSingle();
+
+    let rule;
+    if (existing) {
+      const { data, error } = await supabase.from('lead_stage_automation_rules')
+        .update({ target_stage_id: targetStageId, enabled: enabled !== false, auto_convert_to_customer: autoConvertToCustomer || false })
+        .eq('id', existing.id).select().single();
+      if (error) return res.status(500).json({ error: error.message });
+      rule = data;
+    } else {
+      const { data, error } = await supabase.from('lead_stage_automation_rules')
+        .insert({ user_id: userId, channel, event_type: eventType, target_stage_id: targetStageId, enabled: enabled !== false, auto_convert_to_customer: autoConvertToCustomer || false })
+        .select().single();
+      if (error) return res.status(500).json({ error: error.message });
+      rule = data;
+    }
+
+    res.json({ rule });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save automation rule' });
+  }
+});
+
+// POST /api/lead-automation/seed-defaults — create default rules for a user
+app.post('/api/lead-automation/seed-defaults', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get default pipeline stages
+    const { data: pipeline } = await supabase.from('lead_pipelines')
+      .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle();
+    if (!pipeline) return res.status(400).json({ error: 'No default pipeline' });
+
+    const { data: stages } = await supabase.from('lead_stages')
+      .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true });
+    if (!stages?.length) return res.status(400).json({ error: 'No stages' });
+
+    const stageByName = {};
+    for (const s of stages) stageByName[s.name] = s.id;
+
+    // Default mapping
+    const defaults = [
+      { event: 'lead_received', stage: stageByName['New Lead'] || stages[0].id },
+      { event: 'first_reply_sent', stage: stageByName['Contacted'] || stages[1]?.id || stages[0].id },
+      { event: 'conversation_ongoing', stage: stageByName['Negotiation'] || stageByName['Qualified'] || stages[2]?.id || stages[1]?.id },
+      { event: 'proposal_sent', stage: stageByName['Proposal Sent'] || stages[3]?.id || stages[2]?.id },
+      { event: 'job_created', stage: stageByName['Won'] || stages[stages.length - 2]?.id, convert: true },
+    ];
+
+    let created = 0;
+    for (const ch of ['thumbtack', 'yelp']) {
+      for (const d of defaults) {
+        if (!d.stage) continue;
+        const { data: existing } = await supabase.from('lead_stage_automation_rules')
+          .select('id').eq('user_id', userId).eq('channel', ch).eq('event_type', d.event).maybeSingle();
+        if (!existing) {
+          await supabase.from('lead_stage_automation_rules').insert({
+            user_id: userId, channel: ch, event_type: d.event,
+            target_stage_id: d.stage, enabled: true,
+            auto_convert_to_customer: d.convert || false,
+          });
+          created++;
+        }
+      }
+    }
+
+    res.json({ created, message: `Seeded ${created} default rules` });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to seed defaults' });
+  }
+});
+
 // GET /api/communications/conversations
 app.get('/api/communications/conversations', authenticateToken, async (req, res) => {
   try {
@@ -35570,6 +35690,41 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
           last_preview: text.trim().substring(0, 200),
           last_event_at: new Date().toISOString(),
         }).eq('id', conv.id);
+
+        // Lead stage automation: progress on outbound message
+        if (conv.participant_identity_id) {
+          const { data: identity } = await supabase.from('communication_participant_identities')
+            .select('sf_lead_id').eq('id', conv.participant_identity_id).maybeSingle();
+          if (identity?.sf_lead_id) {
+            // Check if this is the first outbound message for this conversation
+            const { count: outboundCount } = await supabase.from('communication_messages')
+              .select('id', { count: 'exact', head: true })
+              .eq('conversation_id', conv.id).eq('direction', 'out');
+            const event = (outboundCount || 0) <= 1 ? 'first_reply_sent' : 'conversation_ongoing';
+            // Import progressLeadStage from leadbridge-service (it's a module function)
+            // For now use inline rule check
+            try {
+              const { data: rule } = await supabase.from('lead_stage_automation_rules')
+                .select('target_stage_id, auto_convert_to_customer')
+                .eq('user_id', userId).eq('event_type', event).eq('enabled', true)
+                .in('channel', [conv.channel, 'all']).limit(1).maybeSingle();
+              if (rule) {
+                const { data: lead } = await supabase.from('leads')
+                  .select('stage_id').eq('id', identity.sf_lead_id).maybeSingle();
+                if (lead) {
+                  const { data: currentStage } = await supabase.from('lead_stages')
+                    .select('position').eq('id', lead.stage_id).maybeSingle();
+                  const { data: targetStage } = await supabase.from('lead_stages')
+                    .select('position, name').eq('id', rule.target_stage_id).maybeSingle();
+                  if (targetStage && (!currentStage || targetStage.position > currentStage.position)) {
+                    await supabase.from('leads').update({ stage_id: rule.target_stage_id }).eq('id', identity.sf_lead_id);
+                    logger.log(`[LB Stage] Lead ${identity.sf_lead_id}: ${event} → ${targetStage.name}`);
+                  }
+                }
+              }
+            } catch (e) { /* non-fatal */ }
+          }
+        }
 
         return res.json({ id: sentMsg.id, conversationId: id, channel: conv.channel, text: text.trim(), status: 'sent' });
       } catch (e) {

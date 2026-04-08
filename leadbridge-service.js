@@ -271,11 +271,24 @@ module.exports = (supabase, logger) => {
       return null
     }
 
-    // If there's a message, use "Contacted" stage (position 1); otherwise "New Lead" (position 0)
-    const hasMessage = !!message
-    const contactedStage = stages.find(s => s.name === 'Contacted' || s.position === 1)
-    const newLeadStage = stages.find(s => s.name === 'New Lead' || s.position === 0)
-    const stage = hasMessage && contactedStage ? contactedStage : (newLeadStage || stages[0])
+    // Use automation rules for initial stage, fall back to defaults
+    let stage = stages[0] // default: first stage
+    const eventType = message ? 'first_reply_sent' : 'lead_received'
+
+    // Check automation rules
+    const { data: rule } = await supabase.from('lead_stage_automation_rules')
+      .select('target_stage_id').eq('user_id', userId).eq('event_type', eventType)
+      .eq('enabled', true).in('channel', [channel, 'all']).limit(1).maybeSingle()
+
+    if (rule) {
+      const matchedStage = stages.find(s => s.id === rule.target_stage_id)
+      if (matchedStage) stage = matchedStage
+    } else {
+      // Fallback: contacted if message exists, new lead otherwise
+      const contactedStage = stages.find(s => s.name === 'Contacted' || s.position === 1)
+      const newLeadStage = stages.find(s => s.name === 'New Lead' || s.position === 0)
+      stage = (message && contactedStage) ? contactedStage : (newLeadStage || stages[0])
+    }
 
     // Parse name into first/last
     const nameParts = (customerName || '').trim().split(/\s+/)
@@ -308,6 +321,77 @@ module.exports = (supabase, logger) => {
 
     logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source})`)
     return { type: 'new_lead', id: newLead.id, created: true }
+  }
+
+  // ══════════════════════════════════════
+  // Lead Stage Automation Engine
+  //
+  // Checks automation rules and advances the lead to the
+  // target stage for the given event. Only advances forward
+  // (never moves a lead backwards in the pipeline).
+  //
+  // Events:
+  //   lead_received       — new lead from TT/Yelp
+  //   first_reply_sent    — agent sends first outbound message
+  //   conversation_ongoing — further messages after first reply
+  //   proposal_sent       — quote/proposal sent
+  //   job_created         — job created, optionally convert to customer
+  // ══════════════════════════════════════
+
+  async function progressLeadStage(userId, leadId, eventType, channel) {
+    if (!leadId || !eventType) return
+
+    try {
+      // Get the lead's current stage
+      const { data: lead } = await supabase.from('leads')
+        .select('id, stage_id, converted_customer_id').eq('id', leadId).eq('user_id', userId).maybeSingle()
+      if (!lead || lead.converted_customer_id) return // Already converted, skip
+
+      // Get the current stage position
+      const { data: currentStage } = await supabase.from('lead_stages')
+        .select('id, position').eq('id', lead.stage_id).maybeSingle()
+
+      // Find matching rule: try channel-specific first, then 'all'
+      let rule = null
+      const { data: channelRule } = await supabase.from('lead_stage_automation_rules')
+        .select('*').eq('user_id', userId).eq('channel', channel).eq('event_type', eventType)
+        .eq('enabled', true).maybeSingle()
+      rule = channelRule
+
+      if (!rule) {
+        const { data: allRule } = await supabase.from('lead_stage_automation_rules')
+          .select('*').eq('user_id', userId).eq('channel', 'all').eq('event_type', eventType)
+          .eq('enabled', true).maybeSingle()
+        rule = allRule
+      }
+
+      if (!rule) return // No rule for this event
+
+      // Get target stage position
+      const { data: targetStage } = await supabase.from('lead_stages')
+        .select('id, position, name').eq('id', rule.target_stage_id).maybeSingle()
+      if (!targetStage) return
+
+      // Only advance forward (never move backwards)
+      if (currentStage && targetStage.position <= currentStage.position) return
+
+      // Update lead stage
+      await supabase.from('leads').update({
+        stage_id: targetStage.id,
+        updated_at: new Date().toISOString(),
+      }).eq('id', leadId)
+
+      logger.log(`[LB Stage] Lead ${leadId}: ${eventType} → ${targetStage.name} (stage ${targetStage.position})`)
+
+      // Auto-convert to customer if rule says so
+      if (rule.auto_convert_to_customer && eventType === 'job_created') {
+        // This would trigger the existing lead→customer conversion flow
+        // For now just log — full conversion wired in Phase C
+        logger.log(`[LB Stage] Lead ${leadId}: marked for auto-conversion to customer`)
+      }
+    } catch (e) {
+      logger.warn(`[LB Stage] Error progressing lead ${leadId}: ${e.message}`)
+    }
   }
 
   // Upsert conversation from LB data
