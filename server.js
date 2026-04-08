@@ -35501,12 +35501,18 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
           };
         }
       } else if (identity?.sf_lead_id) {
-        const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes').eq('id', identity.sf_lead_id).maybeSingle();
+        const { data: sfLead } = await supabase.from('leads').select('id, first_name, last_name, phone, email, source, notes, stage_id').eq('id', identity.sf_lead_id).maybeSingle();
         if (sfLead) {
+          // Get stage name
+          let stageName = 'Lead';
+          if (sfLead.stage_id) {
+            const { data: stageData } = await supabase.from('lead_stages').select('name').eq('id', sfLead.stage_id).maybeSingle();
+            if (stageData) stageName = stageData.name;
+          }
           lead = {
             id: sfLead.id, name: `${sfLead.first_name || ''} ${sfLead.last_name || ''}`.trim(),
             phone: sfLead.phone, email: sfLead.email,
-            source: sfLead.source, tags: [], status: 'Lead', entityType: 'lead',
+            source: sfLead.source, tags: [], status: stageName, entityType: 'lead',
             notes: sfLead.notes,
           };
         }

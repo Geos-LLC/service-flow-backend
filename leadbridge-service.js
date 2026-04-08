@@ -263,12 +263,19 @@ module.exports = (supabase, logger) => {
       return null
     }
 
-    const { data: stage } = await supabase.from('lead_stages')
-      .select('id').eq('pipeline_id', pipeline.id).order('position', { ascending: true }).limit(1).maybeSingle()
-    if (!stage) {
+    // Determine stage: "Contacted" if messages exist (communication started), else "New Lead"
+    const { data: stages } = await supabase.from('lead_stages')
+      .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true })
+    if (!stages?.length) {
       logger.warn('[LB Lead] No stages in default pipeline', pipeline.id)
       return null
     }
+
+    // If there's a message, use "Contacted" stage (position 1); otherwise "New Lead" (position 0)
+    const hasMessage = !!message
+    const contactedStage = stages.find(s => s.name === 'Contacted' || s.position === 1)
+    const newLeadStage = stages.find(s => s.name === 'New Lead' || s.position === 0)
+    const stage = hasMessage && contactedStage ? contactedStage : (newLeadStage || stages[0])
 
     // Parse name into first/last
     const nameParts = (customerName || '').trim().split(/\s+/)
