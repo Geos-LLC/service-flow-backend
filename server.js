@@ -15313,24 +15313,14 @@ app.put('/api/user/availability', authenticateToken, async (req, res) => {
             const startTime = dayHours.start || '09:00';
             const endTime = dayHours.end || '17:00';
 
-            const [startH, startM] = startTime.split(':');
-            const [endH, endM] = endTime.split(':');
-            const startHour = parseInt(startH);
-            const endHour = parseInt(endH);
-
-            const startPeriod = startHour >= 12 ? 'PM' : 'AM';
-            const endPeriod = endHour >= 12 ? 'PM' : 'AM';
-            const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
-            const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
-
             workingHours[day] = {
               available: true,
-              hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+              timeSlots: [{ start: startTime, end: endTime }]
             };
           } else {
             workingHours[day] = {
               available: false,
-              hours: ""
+              timeSlots: []
             };
           }
         });
@@ -18226,52 +18216,30 @@ app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
                 sunday: businessHours.sunday || { available: false, hours: "" }
               };
               
-              // Normalize to team member format
+              // Normalize to team member format (use timeSlots, not display strings)
               Object.keys(workingHours).forEach(day => {
                 const dayHours = businessHours[day];
                 if (dayHours && dayHours.enabled !== undefined) {
-                  // Convert 24-hour format to 12-hour format
                   if (dayHours.enabled && dayHours.start && dayHours.end) {
-                    const [startH, startM] = dayHours.start.split(':');
-                    const [endH, endM] = dayHours.end.split(':');
-                    const startHour = parseInt(startH);
-                    const endHour = parseInt(endH);
-                    
-                    const startPeriod = startHour >= 12 ? 'PM' : 'AM';
-                    const endPeriod = endHour >= 12 ? 'PM' : 'AM';
-                    const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
-                    const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
-                    
                     workingHours[day] = {
                       available: true,
-                      hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+                      timeSlots: [{ start: dayHours.start, end: dayHours.end }]
                     };
                   } else {
                     workingHours[day] = {
                       available: false,
-                      hours: ""
+                      timeSlots: []
                     };
                   }
                 } else if (dayHours && dayHours.start && dayHours.end) {
-                  // Convert 24-hour format to 12-hour format
-                  const [startH, startM] = dayHours.start.split(':');
-                  const [endH, endM] = dayHours.end.split(':');
-                  const startHour = parseInt(startH);
-                  const endHour = parseInt(endH);
-                  
-                  const startPeriod = startHour >= 12 ? 'PM' : 'AM';
-                  const endPeriod = endHour >= 12 ? 'PM' : 'AM';
-                  const startHour12 = startHour > 12 ? startHour - 12 : (startHour === 0 ? 12 : startHour);
-                  const endHour12 = endHour > 12 ? endHour - 12 : (endHour === 0 ? 12 : endHour);
-                  
                   workingHours[day] = {
                     available: true,
-                    hours: `${startHour12}:${startM} ${startPeriod} - ${endHour12}:${endM} ${endPeriod}`
+                    timeSlots: [{ start: dayHours.start, end: dayHours.end }]
                   };
                 } else {
                   workingHours[day] = {
                     available: false,
-                    hours: ""
+                    timeSlots: []
                   };
                 }
               });
