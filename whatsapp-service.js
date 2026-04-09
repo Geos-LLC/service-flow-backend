@@ -12,8 +12,21 @@
 
 const express = require('express')
 
+// In-memory sync progress per user
+const waSyncProgress = {}
+
 module.exports = (supabase, logger, sigcoreRequest) => {
   const router = express.Router()
+
+  // Helper: normalize phone to E.164
+  function normalizePhone(phone) {
+    if (!phone) return null
+    const digits = phone.replace(/[^\d+]/g, '')
+    if (digits.startsWith('+')) return digits
+    if (digits.length === 10) return `+1${digits}`
+    if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
+    return digits
+  }
 
   // ══════════════════════════════════════
   // Auth middleware — reuse the app's JWT
@@ -233,6 +246,160 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       logger.error('[WhatsApp] Disconnect error:', error.message)
       res.status(500).json({ error: 'Failed to disconnect WhatsApp' })
     }
+  })
+
+  // ══════════════════════════════════════
+  // POST /sync — Backfill WhatsApp chat history
+  // ══════════════════════════════════════
+  router.post('/sync', async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const messageLimit = parseInt(req.body.messageLimit) || 50
+      const tenantKey = await getTenantKey(userId)
+      if (!tenantKey) return res.status(400).json({ error: 'Sigcore not configured' })
+
+      const { data: settings } = await supabase.from('communication_settings')
+        .select('whatsapp_connected, whatsapp_phone_number')
+        .eq('user_id', userId).maybeSingle()
+      if (!settings?.whatsapp_connected) return res.status(400).json({ error: 'WhatsApp not connected' })
+
+      const endpointPhone = normalizePhone(settings.whatsapp_phone_number)
+      if (!endpointPhone) return res.status(400).json({ error: 'WhatsApp phone number not available. Reconnect WhatsApp.' })
+
+      // Init progress
+      waSyncProgress[userId] = { phase: 'fetching', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
+      res.json({ success: true, message: 'Sync started' })
+
+      // ONE call to Sigcore — aggregated chats + messages
+      let chatsData
+      try {
+        const chatsRes = await sigcoreRequest('GET', `/integrations/whatsapp/chats?includeMessages=true&messageLimit=${messageLimit}`, tenantKey)
+        chatsData = chatsRes.data?.data?.chats || chatsRes.data?.chats || []
+      } catch (e) {
+        logger.error('[WhatsApp Sync] Failed to fetch chats:', e.response?.data || e.message)
+        waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: 'Failed to fetch chats from Sigcore' }
+        return
+      }
+
+      waSyncProgress[userId].total = chatsData.length
+      waSyncProgress[userId].phase = 'syncing'
+      logger.log(`[WhatsApp Sync] Processing ${chatsData.length} chats for user ${userId}`)
+
+      for (const chat of chatsData) {
+        try {
+          const participantPhone = normalizePhone(chat.phone)
+          if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
+
+          // Find-or-create conversation: hardened identity (user_id, provider, endpoint_phone, participant_phone)
+          let conversation
+          const { data: existingConv } = await supabase.from('communication_conversations')
+            .select('*')
+            .eq('user_id', userId).eq('provider', 'whatsapp')
+            .eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone)
+            .maybeSingle()
+
+          if (existingConv) {
+            conversation = existingConv
+          } else {
+            const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
+              user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
+              endpoint_phone: endpointPhone, participant_phone: participantPhone,
+              participant_name: chat.name || null,
+              last_preview: '', last_event_at: chat.lastMessageAt || new Date().toISOString(),
+              unread_count: chat.unreadCount || 0,
+              conversation_type: 'external_client',
+              metadata: { externalChatId: chat.id },
+            }).select().single()
+            if (createErr) { logger.error('[WhatsApp Sync] Create conversation error:', createErr); continue }
+            conversation = newConv
+          }
+
+          // Insert messages with MANDATORY endpoint guard + dedup
+          let chatMsgCount = 0
+          for (const msg of (chat.messages || [])) {
+            // MANDATORY endpoint guard: only attach if msg involves our endpoint
+            const msgFrom = normalizePhone(msg.from)
+            const msgTo = normalizePhone(msg.to)
+            if (msgFrom !== endpointPhone && msgTo !== endpointPhone) {
+              waSyncProgress[userId].skipped++
+              continue
+            }
+
+            // Dedup by WhatsApp native message ID (provider_message_id)
+            if (!msg.id) continue
+            const { data: existingMsg } = await supabase.from('communication_messages')
+              .select('id').eq('provider_message_id', msg.id).maybeSingle()
+            if (existingMsg) { continue } // Already synced
+
+            const direction = msg.fromMe ? 'out' : 'in'
+            await supabase.from('communication_messages').insert({
+              conversation_id: conversation.id,
+              provider_message_id: msg.id, // WhatsApp native _serialized ID
+              direction, channel: 'whatsapp', body: msg.body || '',
+              from_number: msgFrom, to_number: msgTo,
+              sender_role: direction === 'in' ? 'customer' : 'agent',
+              status: 'delivered',
+              metadata: { hasMedia: msg.hasMedia, type: msg.type },
+              created_at: msg.timestamp || new Date().toISOString(),
+            })
+            chatMsgCount++
+            waSyncProgress[userId].messages++
+          }
+
+          // Update conversation with latest message info
+          const lastMsg = (chat.messages || []).slice(-1)[0]
+          if (lastMsg) {
+            await supabase.from('communication_conversations').update({
+              last_preview: (lastMsg.body || '').substring(0, 200),
+              last_event_at: lastMsg.timestamp || chat.lastMessageAt || new Date().toISOString(),
+              participant_name: chat.name || conversation.participant_name || null,
+              updated_at: new Date().toISOString(),
+            }).eq('id', conversation.id)
+          }
+
+          // Auto-link to customer/lead by phone (non-blocking)
+          if (!conversation.customer_id && !conversation.lead_id) {
+            try {
+              const last10 = participantPhone.replace(/[^\d]/g, '').slice(-10)
+              if (last10.length >= 7) {
+                const { data: customer } = await supabase.from('customers')
+                  .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+                if (customer) {
+                  await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', conversation.id)
+                  waSyncProgress[userId].linked++
+                } else {
+                  const { data: lead } = await supabase.from('leads')
+                    .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+                  if (lead) {
+                    await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', conversation.id)
+                    waSyncProgress[userId].linked++
+                  }
+                }
+              }
+            } catch (e) { /* non-fatal */ }
+          }
+
+          waSyncProgress[userId].chats++
+        } catch (e) {
+          logger.warn(`[WhatsApp Sync] Error processing chat: ${e.message}`)
+          waSyncProgress[userId].skipped++
+        }
+      }
+
+      waSyncProgress[userId].phase = 'done'
+      logger.log(`[WhatsApp Sync] Done for user ${userId}: ${waSyncProgress[userId].chats} chats, ${waSyncProgress[userId].messages} messages, ${waSyncProgress[userId].linked} linked`)
+    } catch (error) {
+      logger.error('[WhatsApp Sync] Error:', error.message)
+      if (!res.headersSent) res.status(500).json({ error: 'Sync failed' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // GET /sync/progress — Sync progress
+  // ══════════════════════════════════════
+  router.get('/sync/progress', async (req, res) => {
+    const progress = waSyncProgress[req.user.userId]
+    res.json(progress || { phase: 'idle' })
   })
 
   return router
