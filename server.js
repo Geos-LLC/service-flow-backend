@@ -35104,15 +35104,24 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       // Messages + calls — fetch from Sigcore if not embedded in conversation
       let messages = conv.messages || [];
       let calls = conv.calls || [];
-      if (messages.length === 0 && sigcoreConvId && localConv) {
-        try {
-          const [msgsRes, callsRes] = await Promise.all([
-            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages?limit=50`, syncKey).then(r => r.data?.data || []).catch(() => []),
-            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || []).catch(() => []),
-          ]);
-          messages = msgsRes;
-          calls = callsRes;
-        } catch (e) { /* non-fatal — conversation synced without messages */ }
+      if (messages.length === 0 && localConv) {
+        // Fetch messages using phoneNumberId + participant (more reliable than conversation ID)
+        const pnId = phoneNumberId || conv.phoneNumberId;
+        const participant = participantPhone;
+        if (pnId && participant) {
+          try {
+            const [msgsRes, callsRes] = await Promise.all([
+              sigcoreRequest('GET', `/integrations/openphone/messages?phoneNumberId=${pnId}&participant=${encodeURIComponent(participant)}&limit=50`, syncKey)
+                .then(r => r.data?.data || r.data || []).catch(e => { logger.warn(`[Sync] Msg fetch error: ${e.message}`); return []; }),
+              sigcoreConvId
+                ? sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey)
+                    .then(r => r.data?.data || []).catch(() => [])
+                : Promise.resolve([]),
+            ]);
+            messages = msgsRes;
+            calls = callsRes;
+          } catch (e) { /* non-fatal */ }
+        }
       }
 
       for (const msg of messages) {
