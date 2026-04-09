@@ -34945,7 +34945,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
     if (isFullSync) {
       try {
-        const allRes = await sigcoreRequest('GET', '/integrations/openphone/conversations/all?includeMessages=true&messageLimit=50', syncKey);
+        // Fetch conversation LIST only (no messages) — much faster
+        const allRes = await sigcoreRequest('GET', '/integrations/openphone/conversations/all?includeMessages=false', syncKey);
         const convs = allRes.data?.data || allRes.data || [];
         for (const c of convs) {
           const phone = normalizePhone(c.participantPhone);
@@ -34954,7 +34955,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           const name = c.contactName || c.conversationName;
           if (name) contactNameMap[phone] = name;
         }
-        timer(`full_sync fetched ${allConvs.length} conversations`);
+        timer(`full_sync fetched ${allConvs.length} conversation headers`);
       } catch (e) { logger.error(`[Sync] Full sync error: ${e.message}`); }
     } else {
       const days = 7;
@@ -35117,9 +35118,19 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         autoLinkConversation(userId, localConv.id, participantPhone).catch(() => {});
       }
 
-      // Messages + calls
-      const messages = conv.messages || [];
-      const calls = conv.calls || [];
+      // Messages + calls — fetch from Sigcore if not embedded in conversation
+      let messages = conv.messages || [];
+      let calls = conv.calls || [];
+      if (messages.length === 0 && sigcoreConvId && localConv) {
+        try {
+          const [msgsRes, callsRes] = await Promise.all([
+            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/messages?limit=50`, syncKey).then(r => r.data?.data || []).catch(() => []),
+            sigcoreRequest('GET', `/conversations/${sigcoreConvId}/calls`, syncKey).then(r => r.data?.data || []).catch(() => []),
+          ]);
+          messages = msgsRes;
+          calls = callsRes;
+        } catch (e) { /* non-fatal — conversation synced without messages */ }
+      }
 
       for (const msg of messages) {
         const msgId = msg.providerMessageId || msg.id;
