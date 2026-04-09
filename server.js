@@ -35058,6 +35058,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
+    commSyncProgress[userId].syncStartedAt = Date.now();
     commSyncCancel[userId] = false; // reset cancel flag
 
     // Process a single conversation (used by parallel batch runner)
@@ -35265,6 +35266,13 @@ app.post('/api/communications/sync', authenticateToken, async (req, res) => {
 // GET /api/communications/sync/progress — poll sync progress
 app.get('/api/communications/sync/progress', authenticateToken, (req, res) => {
   const progress = commSyncProgress[req.user.userId] || { status: 'idle', total: 0, synced: 0, messages: 0 };
+  // Compute ETA
+  if (progress.syncStartedAt && progress.synced > 0 && progress.total > progress.synced) {
+    const elapsed = Date.now() - progress.syncStartedAt;
+    const rate = progress.synced / elapsed; // convs per ms
+    const remaining = progress.total - progress.synced;
+    progress.etaSeconds = Math.round(remaining / rate / 1000);
+  }
   res.json(progress);
 });
 
