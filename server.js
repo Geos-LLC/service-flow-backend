@@ -34544,8 +34544,14 @@ async function handleWhatsAppWebhook(event, payload) {
       // Extract from nested Sigcore payload structure
       const conv = payload.conversation || {};
       const msg = payload.message || payload;
-      const participantPhone = normalizePhone(conv.participantPhone || msg.fromNumber || msg.from);
-      const endpointPhone = normalizePhone(conv.endpointPhone || msg.toNumber || msg.to);
+      const isFromMe = msg.fromMe === true;
+      // When fromMe: from=our number, to=participant. Otherwise: from=participant, to=our number
+      const participantPhone = isFromMe
+        ? normalizePhone(msg.toNumber || msg.to || conv.participantPhone)
+        : normalizePhone(conv.participantPhone || msg.fromNumber || msg.from);
+      const endpointPhone = isFromMe
+        ? normalizePhone(msg.fromNumber || msg.from || conv.endpointPhone)
+        : normalizePhone(conv.endpointPhone || msg.toNumber || msg.to);
       const body = msg.text || msg.body || '';
       const externalMessageId = msg.externalMessageId || msg.id || `wa_${Date.now()}`;
       const externalChatId = conv.externalChatId || null;
@@ -34651,9 +34657,10 @@ async function handleWhatsAppWebhook(event, payload) {
       await supabase.from('communication_messages').insert({
         conversation_id: conversation.id,
         provider_message_id: externalMessageId,
-        direction: 'in', channel: 'whatsapp', body,
-        from_number: participantPhone, to_number: resolvedEndpointPhone || '',
-        sender_role: 'customer', status: 'delivered',
+        direction: isFromMe ? 'out' : 'in', channel: 'whatsapp', body,
+        from_number: isFromMe ? (resolvedEndpointPhone || '') : participantPhone,
+        to_number: isFromMe ? participantPhone : (resolvedEndpointPhone || ''),
+        sender_role: isFromMe ? 'agent' : 'customer', status: 'delivered',
         metadata: { externalChatId, hasMedia: msg.hasMedia, type: msg.type },
         created_at: timestamp,
       });
@@ -34661,7 +34668,7 @@ async function handleWhatsAppWebhook(event, payload) {
       // Update conversation
       const updates = { last_event_at: timestamp, updated_at: new Date().toISOString() };
       if (body) updates.last_preview = body.substring(0, 200);
-      updates.unread_count = (conversation.unread_count || 0) + 1;
+      if (!isFromMe) updates.unread_count = (conversation.unread_count || 0) + 1;
       if (sigcoreConvId && !conversation.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
       await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
 
