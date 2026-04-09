@@ -34914,6 +34914,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 
 // In-memory sync progress per user
 const commSyncProgress = {};
+const commSyncCancel = {}; // per-user cancel flag
 
 // Core sync function (runs in background)
 async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreSync = false) {
@@ -35054,12 +35055,13 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const totalLimit = convs.length;
     commSyncProgress[userId].total = totalLimit;
     commSyncProgress[userId].phase = 'syncing';
+    commSyncCancel[userId] = false; // reset cancel flag
 
-    for (const conv of convs) {
+    // Process a single conversation (used by parallel batch runner)
+    async function syncOneConversation(conv) {
       const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
       const endpointPhone = normalizePhone(conv.phoneNumber);
       const sigcoreConvId = conv.externalId || conv.id;
-      // Resolve name: Sigcore contact → live lookup → SF CRM → auto-detect from message content
       let contactName = conv.contactName || conv.conversationName || contactNameMap[participantPhone] || null;
       const lastMsg = conv.lastMessage;
       if (!contactName && lastMsg) {
@@ -35072,133 +35074,140 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const phoneNumberId = (conv.metadata?.phoneNumberId) || conv.phoneNumberId || null;
       const lastActivity = conv.lastMessageAt || conv.updatedAt || null;
 
-      if (!participantPhone || !endpointPhone) {
-        commSyncProgress[userId].errors++;
-        continue;
+      if (!participantPhone || !endpointPhone) return { synced: 0, messages: 0, error: true };
+
+      let msgCount = 0;
+      // Deterministic conversation identity: user + endpoint + participant
+      let localConv = null;
+      let found = null;
+      if (sigcoreConvId) {
+        const { data: bySigcore } = await supabase.from('communication_conversations')
+          .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
+        found = bySigcore;
+      }
+      if (!found) {
+        const { data: byIdentity } = await supabase.from('communication_conversations')
+          .select('*').eq('user_id', userId).eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle();
+        found = byIdentity;
       }
 
-      try {
-        // Deterministic conversation identity: user + endpoint + participant
-        // Step 1: try sigcore conversation ID (most specific)
-        // Step 2: try composite key (endpoint_phone + participant_phone)
-        // NEVER fall back to participant_phone alone — that merges conversations across business numbers
-        let localConv = null;
-        let found = null;
-        if (sigcoreConvId) {
-          const { data: bySigcore } = await supabase.from('communication_conversations')
-            .select('*').eq('user_id', userId).eq('sigcore_conversation_id', sigcoreConvId).maybeSingle();
-          found = bySigcore;
-        }
-        if (!found) {
-          const { data: byIdentity } = await supabase.from('communication_conversations')
-            .select('*').eq('user_id', userId).eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle();
-          found = byIdentity;
-        }
+      if (found) {
+        const updates = { updated_at: new Date().toISOString() };
+        if (lastActivity) updates.last_event_at = lastActivity;
+        if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
+        if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
+        if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
+        const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
+        localConv = updated || found;
+      } else {
+        const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
+          user_id: userId, sigcore_conversation_id: sigcoreConvId,
+          provider: 'openphone', channel: 'sms',
+          endpoint_phone: endpointPhone,
+          participant_phone: participantPhone, participant_name: contactName,
+          last_event_at: lastActivity, metadata: { phoneNumberId },
+        }).select().single();
+        if (convErr) return { synced: 0, messages: 0, error: true };
+        localConv = created;
+      }
+      if (!localConv) return { synced: 0, messages: 0, error: true };
 
-        if (found) {
-          const updates = { updated_at: new Date().toISOString() };
-          if (lastActivity) updates.last_event_at = lastActivity;
-          if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
-          if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
-          if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
-          const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
-          localConv = updated || found;
+      // Auto-link to SF customer/lead
+      if (!localConv.customer_id && !localConv.lead_id) {
+        autoLinkConversation(userId, localConv.id, participantPhone).catch(() => {});
+      }
+
+      // Messages + calls
+      const messages = conv.messages || [];
+      const calls = conv.calls || [];
+
+      for (const msg of messages) {
+        const msgId = msg.providerMessageId || msg.id;
+        if (!msgId) continue;
+        const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+        const msgFrom = normalizePhone(msg.fromNumber || msg.from);
+        const msgTo = normalizePhone(msg.toNumber || msg.to);
+        if (endpointPhone && msgFrom !== endpointPhone && msgTo !== endpointPhone) continue;
+        const mediaUrls = msg.metadata?.mediaUrls || [];
+        const media = msg.metadata?.media || [];
+        const body = msg.body || '';
+
+        const { data: existingMsg } = await supabase.from('communication_messages')
+          .select('id').eq('provider_message_id', msgId).maybeSingle();
+
+        if (existingMsg) {
+          await supabase.from('communication_messages').update({
+            body: body || undefined, status: msg.status || 'delivered',
+            metadata: { phoneNumberId, mediaUrls, media },
+          }).eq('id', existingMsg.id);
         } else {
-          const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
-            user_id: userId, sigcore_conversation_id: sigcoreConvId,
-            provider: 'openphone', channel: 'sms',
-            endpoint_phone: endpointPhone,
-            participant_phone: participantPhone, participant_name: contactName,
-            last_event_at: lastActivity, metadata: { phoneNumberId },
-          }).select().single();
-          if (convErr) { commSyncProgress[userId].errors++; continue; }
-          localConv = created;
+          await supabase.from('communication_messages').insert({
+            conversation_id: localConv.id, provider_message_id: msgId,
+            direction, channel: 'sms', body,
+            from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
+            sender_role: direction === 'in' ? 'customer' : 'agent',
+            status: msg.status || 'delivered',
+            metadata: { phoneNumberId, mediaUrls, media },
+            created_at: msg.createdAt || new Date().toISOString(),
+          });
         }
-        if (!localConv) { commSyncProgress[userId].errors++; continue; }
+        msgCount++;
+      }
 
-        // Auto-link to SF customer/lead
-        if (!localConv.customer_id && !localConv.lead_id) {
-          await autoLinkConversation(userId, localConv.id, participantPhone);
+      for (const call of calls) {
+        const callId = call.providerCallId || call.id;
+        if (!callId) continue;
+        const callDir = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
+        const callMeta = {
+          phoneNumberId, recordingUrl: call.recordingUrl || null,
+          voicemailUrl: call.voicemailUrl || null, transcription: call.transcription || null,
+        };
+        const { data: existingCall } = await supabase.from('communication_calls')
+          .select('id').eq('provider_call_id', callId).maybeSingle();
+        if (existingCall) {
+          await supabase.from('communication_calls').update({
+            duration_seconds: call.duration || 0, status: call.status || 'completed', metadata: callMeta,
+          }).eq('id', existingCall.id);
+        } else {
+          await supabase.from('communication_calls').insert({
+            conversation_id: localConv.id, provider_call_id: callId,
+            direction: callDir, from_number: normalizePhone(call.fromNumber),
+            to_number: normalizePhone(call.toNumber),
+            duration_seconds: call.duration || 0,
+            status: call.status || 'completed', metadata: callMeta,
+            created_at: call.createdAt || new Date().toISOString(),
+          });
         }
+      }
 
-        // Messages + calls: embedded from full sync, or empty for test sync (webhooks handle real-time)
-        const messages = conv.messages || [];
-        const calls = conv.calls || [];
-
-        for (const msg of messages) {
-          const msgId = msg.providerMessageId || msg.id;
-          if (!msgId) continue;
-          const direction = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
-
-          // Guard: only attach messages that involve our endpoint phone
-          // Prevents cross-tenant messages (e.g. LeadBridge Twilio) from leaking into SF conversations
-          const msgFrom = normalizePhone(msg.fromNumber || msg.from);
-          const msgTo = normalizePhone(msg.toNumber || msg.to);
-          if (endpointPhone && msgFrom !== endpointPhone && msgTo !== endpointPhone) {
-            continue; // This message doesn't belong to this conversation's endpoint
-          }
-          const mediaUrls = msg.metadata?.mediaUrls || [];
-          const media = msg.metadata?.media || [];
-          const body = msg.body || '';
-
-          const { data: existingMsg } = await supabase.from('communication_messages')
-            .select('id').eq('provider_message_id', msgId).maybeSingle();
-
-          if (existingMsg) {
-            await supabase.from('communication_messages').update({
-              body: body || undefined, status: msg.status || 'delivered',
-              metadata: { phoneNumberId, mediaUrls, media },
-            }).eq('id', existingMsg.id);
-          } else {
-            await supabase.from('communication_messages').insert({
-              conversation_id: localConv.id, provider_message_id: msgId,
-              direction, channel: 'sms', body,
-              from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
-              sender_role: direction === 'in' ? 'customer' : 'agent',
-              status: msg.status || 'delivered',
-              metadata: { phoneNumberId, mediaUrls, media },
-              created_at: msg.createdAt || new Date().toISOString(),
-            });
-          }
-          totalMessages++;
-        }
-
-        for (const call of calls) {
-          const callId = call.providerCallId || call.id;
-          if (!callId) continue;
-          const callDir = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
-          const callMeta = {
-            phoneNumberId,
-            recordingUrl: call.recordingUrl || null,
-            voicemailUrl: call.voicemailUrl || null,
-            transcription: call.transcription || null,
-          };
-
-          const { data: existingCall } = await supabase.from('communication_calls')
-            .select('id').eq('provider_call_id', callId).maybeSingle();
-
-          if (existingCall) {
-            await supabase.from('communication_calls').update({
-              duration_seconds: call.duration || 0, status: call.status || 'completed',
-              metadata: callMeta,
-            }).eq('id', existingCall.id);
-          } else {
-            await supabase.from('communication_calls').insert({
-              conversation_id: localConv.id, provider_call_id: callId,
-              direction: callDir, from_number: normalizePhone(call.fromNumber),
-              to_number: normalizePhone(call.toNumber),
-              duration_seconds: call.duration || 0,
-              status: call.status || 'completed', metadata: callMeta,
-              created_at: call.createdAt || new Date().toISOString(),
-            });
-          }
-        }
-
-        totalSynced++;
-        commSyncProgress[userId].synced = totalSynced;
-        commSyncProgress[userId].messages = totalMessages;
-      } catch (e) { logger.error('[Sync] Conv error:', e.message); commSyncProgress[userId].errors++; }
+      return { synced: 1, messages: msgCount, error: false };
     }
+
+    // ── Parallel batch processing (10 conversations at a time) ──
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < convs.length; i += BATCH_SIZE) {
+      // Check cancel flag between batches
+      if (commSyncCancel[userId]) {
+        logger.log(`[Sync] Cancelled by user at ${totalSynced}/${totalLimit}`);
+        commSyncProgress[userId] = { status: 'cancelled', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'cancelled' };
+        return;
+      }
+
+      const batch = convs.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(batch.map(c => syncOneConversation(c)));
+
+      for (const r of results) {
+        if (r.status === 'fulfilled' && !r.value.error) {
+          totalSynced += r.value.synced;
+          totalMessages += r.value.messages;
+        } else {
+          commSyncProgress[userId].errors++;
+        }
+      }
+      commSyncProgress[userId].synced = totalSynced;
+      commSyncProgress[userId].messages = totalMessages;
+    }
+
     timer(`upserted ${totalSynced} conversations, ${totalMessages} messages`);
     commSyncProgress[userId] = { status: 'complete', total: totalLimit, synced: totalSynced, messages: totalMessages, errors: commSyncProgress[userId].errors, phase: 'done' };
     logger.log(`[Sync] DONE in ${Date.now() - t0}ms: ${totalSynced}/${totalLimit} conversations, ${totalMessages} messages`);
@@ -35235,6 +35244,17 @@ app.post('/api/communications/sync', authenticateToken, async (req, res) => {
 app.get('/api/communications/sync/progress', authenticateToken, (req, res) => {
   const progress = commSyncProgress[req.user.userId] || { status: 'idle', total: 0, synced: 0, messages: 0 };
   res.json(progress);
+});
+
+// POST /api/communications/sync/cancel — cancel a running sync
+app.post('/api/communications/sync/cancel', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  if (commSyncProgress[userId]?.status === 'running') {
+    commSyncCancel[userId] = true;
+    res.json({ cancelled: true });
+  } else {
+    res.json({ cancelled: false, message: 'No sync in progress' });
+  }
 });
 
 // POST /api/communications/relink — re-run customer/lead matching on all unlinked conversations
