@@ -34943,46 +34943,29 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
     const isFullSync = maxConversations === 0;
     commSyncProgress[userId].phase = isFullSync ? 'full_sync' : 'fetching';
 
-    if (isFullSync) {
-      try {
-        // Fetch conversation LIST only (no messages) — much faster
-        const allRes = await sigcoreRequest('GET', '/integrations/openphone/conversations/all?includeMessages=false', syncKey);
-        const convs = allRes.data?.data || allRes.data || [];
-        for (const c of convs) {
-          const phone = normalizePhone(c.participantPhone);
+    // Fetch conversations per phone number in parallel (fast — avoids the slow /conversations/all endpoint)
+    const days = isFullSync ? 365 : 7; // full sync: 1 year of history, test: 7 days
+    const phoneResults = await Promise.allSettled(phoneNumberIds.map(async (pnId) => {
+      const t1 = Date.now();
+      const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&skipContactLookup=true`, syncKey);
+      const liveConvs = liveRes.data?.data || liveRes.data || [];
+      logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
+      return liveConvs;
+    }));
+    for (const result of phoneResults) {
+      if (result.status === 'fulfilled') {
+        for (const lc of result.value) {
+          const phone = normalizePhone(lc.participantPhone);
           if (!phone) continue;
-          allConvs.push({ ...c, participantPhoneNumber: c.participantPhone });
-          const name = c.contactName || c.conversationName;
+          allConvs.push({ ...lc, participantPhoneNumber: lc.participantPhone });
+          const name = lc.contactName || lc.conversationName;
           if (name) contactNameMap[phone] = name;
         }
-        timer(`full_sync fetched ${allConvs.length} conversation headers`);
-      } catch (e) { logger.error(`[Sync] Full sync error: ${e.message}`); }
-    } else {
-      const days = 7;
-      // Test sync: conversations only (no includeMessages) — messages come from webhooks
-      // Fetch both phones in parallel
-      const phoneResults = await Promise.allSettled(phoneNumberIds.map(async (pnId) => {
-        const t1 = Date.now();
-        const liveRes = await sigcoreRequest('GET', `/integrations/openphone/conversations?days=${days}&phoneNumberId=${pnId}&skipContactLookup=true`, syncKey);
-        const liveConvs = liveRes.data?.data || liveRes.data || [];
-        logger.log(`[Sync] ⏱ phone ${pnId}: ${liveConvs.length} convs in ${Date.now() - t1}ms`);
-        return liveConvs;
-      }));
-      for (const result of phoneResults) {
-        if (result.status === 'fulfilled') {
-          for (const lc of result.value) {
-            const phone = normalizePhone(lc.participantPhone);
-            if (!phone) continue;
-            allConvs.push({ ...lc, participantPhoneNumber: lc.participantPhone });
-            const name = lc.contactName || lc.conversationName;
-            if (name) contactNameMap[phone] = name;
-          }
-        } else {
-          logger.warn(`[Sync] Phone fetch failed: ${result.reason?.message}`);
-        }
+      } else {
+        logger.warn(`[Sync] Phone fetch failed: ${result.reason?.message}`);
       }
-      timer(`test_sync fetched ${allConvs.length} conversations`);
     }
+    timer(`fetched ${allConvs.length} conversations (${days}d, ${phoneNumberIds.length} phones)`);
 
     // Filter to only our phone numbers
     if (ourPhoneNumbers.length > 0) {
