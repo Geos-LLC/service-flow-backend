@@ -34557,6 +34557,22 @@ async function handleWhatsAppWebhook(event, payload) {
         return;
       }
 
+      // Filter out group chats and invalid numbers
+      // WhatsApp group IDs are 18+ digits, real phone numbers are 10-15 digits
+      const rawDigits = participantPhone.replace(/[^\d]/g, '');
+      if (rawDigits.length > 15 || rawDigits.length < 7) {
+        logger.log(`[WhatsApp] Skipping non-individual chat: ${participantPhone} (${rawDigits.length} digits)`);
+        return;
+      }
+
+      // Resolve endpoint phone from settings if not in payload
+      let resolvedEndpointPhone = endpointPhone;
+      if (!resolvedEndpointPhone) {
+        const { data: waSettings } = await supabase.from('communication_settings')
+          .select('whatsapp_phone_number').eq('whatsapp_connected', true).limit(1).maybeSingle();
+        if (waSettings?.whatsapp_phone_number) resolvedEndpointPhone = normalizePhone(waSettings.whatsapp_phone_number);
+      }
+
       // Route via deterministic endpoint resolution (Step A preferred)
       let userId = null;
       if (endpointPhone) {
@@ -34586,11 +34602,11 @@ async function handleWhatsAppWebhook(event, payload) {
       }
 
       // Message endpoint guard: only attach if msg involves our endpoint phone
-      if (endpointPhone) {
+      if (resolvedEndpointPhone) {
         const msgFrom = normalizePhone(msg.fromNumber || msg.from);
         const msgTo = normalizePhone(msg.toNumber || msg.to);
-        if (msgFrom !== endpointPhone && msgTo !== endpointPhone) {
-          logger.warn(`[WhatsApp] Endpoint guard: rejected message (endpoint=${endpointPhone}, from=${msgFrom}, to=${msgTo})`);
+        if (msgFrom !== resolvedEndpointPhone && msgTo !== resolvedEndpointPhone) {
+          logger.warn(`[WhatsApp] Endpoint guard: rejected message (endpoint=${resolvedEndpointPhone}, from=${msgFrom}, to=${msgTo})`);
           return;
         }
       }
@@ -34600,7 +34616,7 @@ async function handleWhatsAppWebhook(event, payload) {
       const { data: existingConv } = await supabase.from('communication_conversations')
         .select('*')
         .eq('user_id', userId).eq('provider', 'whatsapp')
-        .eq('endpoint_phone', endpointPhone || '').eq('participant_phone', participantPhone)
+        .eq('endpoint_phone', resolvedEndpointPhone || '').eq('participant_phone', participantPhone)
         .maybeSingle();
 
       if (existingConv) {
@@ -34609,7 +34625,7 @@ async function handleWhatsAppWebhook(event, payload) {
         const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
           user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
           sigcore_conversation_id: sigcoreConvId,
-          endpoint_phone: endpointPhone, participant_phone: participantPhone,
+          endpoint_phone: resolvedEndpointPhone || '', participant_phone: participantPhone,
           participant_name: null,
           last_preview: body.substring(0, 200),
           last_event_at: timestamp, unread_count: 1,
@@ -34636,7 +34652,7 @@ async function handleWhatsAppWebhook(event, payload) {
         conversation_id: conversation.id,
         provider_message_id: externalMessageId,
         direction: 'in', channel: 'whatsapp', body,
-        from_number: participantPhone, to_number: endpointPhone,
+        from_number: participantPhone, to_number: resolvedEndpointPhone || '',
         sender_role: 'customer', status: 'delivered',
         metadata: { externalChatId, hasMedia: msg.hasMedia, type: msg.type },
         created_at: timestamp,
