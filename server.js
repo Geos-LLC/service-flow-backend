@@ -34553,6 +34553,7 @@ async function handleWhatsAppWebhook(event, payload) {
         ? normalizePhone(msg.fromNumber || msg.from || conv.endpointPhone)
         : normalizePhone(conv.endpointPhone || msg.toNumber || msg.to);
       const body = msg.text || msg.body || '';
+      const contactName = msg.contactName || conv.contactName || null;
       const externalMessageId = msg.externalMessageId || msg.id || `wa_${Date.now()}`;
       const externalChatId = conv.externalChatId || null;
       const sigcoreConvId = conv.id || payload.conversationId || null;
@@ -34632,7 +34633,7 @@ async function handleWhatsAppWebhook(event, payload) {
           user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
           sigcore_conversation_id: sigcoreConvId,
           endpoint_phone: resolvedEndpointPhone || '', participant_phone: participantPhone,
-          participant_name: null,
+          participant_name: contactName,
           last_preview: body.substring(0, 200),
           last_event_at: timestamp, unread_count: 1,
           conversation_type: 'external_client',
@@ -34670,6 +34671,7 @@ async function handleWhatsAppWebhook(event, payload) {
       if (body) updates.last_preview = body.substring(0, 200);
       if (!isFromMe) updates.unread_count = (conversation.unread_count || 0) + 1;
       if (sigcoreConvId && !conversation.sigcore_conversation_id) updates.sigcore_conversation_id = sigcoreConvId;
+      if (contactName && !conversation.participant_name) updates.participant_name = contactName;
       await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
 
       logger.log(`[WhatsApp] Stored inbound message for conversation ${conversation.id}`);
