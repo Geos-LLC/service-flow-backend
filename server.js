@@ -22227,22 +22227,22 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
     if (!teamMember) {
         return res.status(404).json({ error: 'Team member not found' });
       }
-      
-      // Allow resending invite for both 'invited' and 'pending' status
-      if (teamMember.status !== 'invited' && teamMember.status !== 'pending') {
-        return res.status(400).json({ error: 'Team member is not in invited or pending status' });
+
+      if (!teamMember.email) {
+        return res.status(400).json({ error: 'Team member has no email address' });
       }
-      
+
       // Generate new invitation token
       const invitationToken = crypto.randomBytes(32).toString('hex');
       const invitationExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-      
-    // Update invitation token in Supabase
+
+    // Update invitation token and set status to 'invited' so the signup flow works
     const { error: updateError } = await supabase
       .from('team_members')
       .update({
         invitation_token: invitationToken,
-        invitation_expires: invitationExpires.toISOString()
+        invitation_expires: invitationExpires.toISOString(),
+        status: 'invited'
       })
       .eq('id', id);
     
