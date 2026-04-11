@@ -74,6 +74,7 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
       tips: 0,
       incentives: 0,
       adjustments: 0,
+      reimbursements: 0,
       cashCollected: 0,
       netPayout: 0,
     }
@@ -90,6 +91,7 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
       else if (type === 'tip') totals.tips += amt
       else if (type === 'incentive') totals.incentives += amt
       else if (type === 'adjustment') totals.adjustments += amt
+      else if (type === 'reimbursement') totals.reimbursements += amt
       else if (type === 'cash_collected') totals.cashCollected += amt
       else if (type === 'cash_to_company') totals.cashCollected += amt
 
@@ -107,6 +109,7 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
             earning: 0,
             tip: 0,
             incentive: 0,
+            reimbursement: 0,
             cashCollected: 0,
           })
         }
@@ -114,11 +117,12 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
         if (type === 'earning') item.earning += amt
         else if (type === 'tip') item.tip += amt
         else if (type === 'incentive') item.incentive += amt
+        else if (type === 'reimbursement') item.reimbursement += amt
         else if (type === 'cash_collected' || type === 'cash_to_company') item.cashCollected += amt
       }
     }
 
-    totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.cashCollected
+    totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.reimbursements + totals.cashCollected
 
     // Round all totals to 2 decimal places for clean display
     for (const k of Object.keys(totals)) {
@@ -202,6 +206,7 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;">Earnings</td><td style="padding:10px 14px;font-size:13px;text-align:right;">${fmt(totals.earnings)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Tips</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.tips)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Incentives</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.incentives)}</td></tr>
+        <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Reimbursements</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.reimbursements)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Adjustments</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.adjustments)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Cash collected</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.cashCollected)}</td></tr>
         <tr><td style="padding:14px;font-size:15px;font-weight:700;color:#111;border-top:2px solid #111;">Net Paid</td><td style="padding:14px;font-size:15px;font-weight:700;text-align:right;border-top:2px solid #111;">${fmt(totals.netPayout)}</td></tr>
@@ -227,12 +232,13 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
       `Paystub for ${name}`,
       `Period: ${formatDate(period.start)} - ${formatDate(period.end)}`,
       '',
-      `Earnings:      ${fmt(totals.earnings)}`,
-      `Tips:          ${fmt(totals.tips)}`,
-      `Incentives:    ${fmt(totals.incentives)}`,
-      `Adjustments:   ${fmt(totals.adjustments)}`,
+      `Earnings:       ${fmt(totals.earnings)}`,
+      `Tips:           ${fmt(totals.tips)}`,
+      `Incentives:     ${fmt(totals.incentives)}`,
+      `Reimbursements: ${fmt(totals.reimbursements)}`,
+      `Adjustments:    ${fmt(totals.adjustments)}`,
       `Cash collected: ${fmt(totals.cashCollected)}`,
-      `Net Paid:      ${fmt(totals.netPayout)}`,
+      `Net Paid:       ${fmt(totals.netPayout)}`,
     ].join('\n')
   }
 
@@ -552,7 +558,7 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
 // Export helpers statically too for pure-function testing
 module.exports.aggregateLedgerEntries = function aggregateLedgerEntries(entries, jobLookup = {}) {
   const totals = {
-    earnings: 0, tips: 0, incentives: 0, adjustments: 0, cashCollected: 0, netPayout: 0,
+    earnings: 0, tips: 0, incentives: 0, adjustments: 0, reimbursements: 0, cashCollected: 0, netPayout: 0,
   }
   const lineItemsByJob = new Map()
   const toNum = (v) => { const n = parseFloat(v); return isNaN(n) ? 0 : n }
@@ -565,6 +571,7 @@ module.exports.aggregateLedgerEntries = function aggregateLedgerEntries(entries,
     else if (type === 'tip') totals.tips += amt
     else if (type === 'incentive') totals.incentives += amt
     else if (type === 'adjustment') totals.adjustments += amt
+    else if (type === 'reimbursement') totals.reimbursements += amt
     else if (type === 'cash_collected' || type === 'cash_to_company') totals.cashCollected += amt
 
     if (entry.job_id) {
@@ -574,18 +581,19 @@ module.exports.aggregateLedgerEntries = function aggregateLedgerEntries(entries,
         lineItemsByJob.set(key, {
           jobId: key, date: job.scheduled_date || null, service: job.service_name || '',
           customerName: job.customer_name || '', hours: toNum(job.hours),
-          earning: 0, tip: 0, incentive: 0, cashCollected: 0,
+          earning: 0, tip: 0, incentive: 0, reimbursement: 0, cashCollected: 0,
         })
       }
       const item = lineItemsByJob.get(key)
       if (type === 'earning') item.earning += amt
       else if (type === 'tip') item.tip += amt
       else if (type === 'incentive') item.incentive += amt
+      else if (type === 'reimbursement') item.reimbursement += amt
       else if (type === 'cash_collected' || type === 'cash_to_company') item.cashCollected += amt
     }
   }
 
-  totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.cashCollected
+  totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.reimbursements + totals.cashCollected
   for (const k of Object.keys(totals)) totals[k] = parseFloat(totals[k].toFixed(2))
   const lineItems = Array.from(lineItemsByJob.values()).sort((a, b) => {
     const da = a.date ? new Date(a.date).getTime() : 0

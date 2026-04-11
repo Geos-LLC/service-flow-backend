@@ -1057,6 +1057,7 @@ try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, cr
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 try { app.use('/api/integrations/whatsapp', require('./whatsapp-service')(supabase, logger, sigcoreRequest)); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
+try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
 // Test Supabase connection
@@ -20639,9 +20640,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       let totalTips = 0;
       let totalIncentives = 0;
       let totalCashCollected = 0;
+      let totalReimbursements = 0;
       let totalHours = 0;
       const jobIdSet = new Set();
-      const jobEntriesMap = {}; // job_id -> { earning, tip, incentive }
+      const jobEntriesMap = {}; // job_id -> { earning, tip, incentive, reimbursement }
 
       for (const entry of memberEntries) {
         const amount = parseFloat(entry.amount) || 0;
@@ -20686,6 +20688,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalIncentives += amount;
         } else if (entry.type === 'cash_collected') {
           totalCashCollected += amount; // negative value — offsets balance
+        } else if (entry.type === 'reimbursement') {
+          totalReimbursements += amount; // positive value — company owes cleaner
         }
 
         // Track jobs
@@ -20713,7 +20717,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       // Managers/schedulers: payroll reads from ledger entries (is_manager_salary, is_manager_commission)
       // No override — ledger is the single source of truth for all members including managers
 
-      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives + totalCashCollected;
+      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives + totalCashCollected + totalReimbursements;
 
       // Build job details for expandable rows
       const jobDetails = Object.entries(jobEntriesMap).map(([jobId, entries]) => {
@@ -20747,7 +20751,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           commission: parseFloat(jobCommission.toFixed(2)),
           tip: parseFloat((parseFloat(entries.tip?.amount) || 0).toFixed(2)),
           incentive: parseFloat((parseFloat(entries.incentive?.amount) || 0).toFixed(2)),
-          cashCollected: parseFloat((parseFloat(entries.cash_collected?.amount) || 0).toFixed(2))
+          cashCollected: parseFloat((parseFloat(entries.cash_collected?.amount) || 0).toFixed(2)),
+          reimbursement: parseFloat((parseFloat(entries.reimbursement?.amount) || 0).toFixed(2))
         };
       }).sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
@@ -20786,6 +20791,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalIncentives: parseFloat(totalIncentives.toFixed(2)),
         totalCashCollected: parseFloat(totalCashCollected.toFixed(2)),
         priorCashCollected: parseFloat((priorCashByMember[member.id] || 0).toFixed(2)),
+        totalReimbursements: parseFloat(totalReimbursements.toFixed(2)),
         totalSalary: parseFloat(totalSalary.toFixed(2)),
         hasHourlyRate: !!member.hourly_rate,
         hasCommission: !!member.commission_percentage,
@@ -20821,6 +20827,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalTips = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalTips || 0), 0);
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
     const grandTotalCashCollected = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalCashCollected || 0), 0);
+    const grandTotalReimbursements = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalReimbursements || 0), 0);
     const grandTotalJobRevenue = totalBusinessRevenue;
     const allUniqueJobIds = new Set();
     sortedTeamMembers.forEach(item => { (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id)); });
@@ -20840,6 +20847,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalTips: parseFloat(grandTotalTips.toFixed(2)),
         totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
         totalCashCollected: parseFloat(grandTotalCashCollected.toFixed(2)),
+        totalReimbursements: parseFloat(grandTotalReimbursements.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2)),
         totalJobCount: grandTotalJobCount,
         totalJobRevenue: parseFloat(grandTotalJobRevenue.toFixed(2))
@@ -32630,6 +32638,7 @@ app.get('/api/ledger/balance/:teamMemberId', authenticateToken, async (req, res)
       unpaid_incentives: 0,
       unpaid_cash_offsets: 0,
       unpaid_adjustments: 0,
+      unpaid_reimbursements: 0,
       total_paid_out: 0
     };
 
@@ -32645,6 +32654,7 @@ app.get('/api/ledger/balance/:teamMemberId', authenticateToken, async (req, res)
           case 'incentive': summary.unpaid_incentives += amount; break;
           case 'cash_collected': summary.unpaid_cash_offsets += amount; break;
           case 'adjustment': summary.unpaid_adjustments += amount; break;
+          case 'reimbursement': summary.unpaid_reimbursements += amount; break;
         }
       }
       if (entry.type === 'payout') {
@@ -32732,6 +32742,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
         unpaid_incentives: 0,
         unpaid_cash_offsets: 0,
         unpaid_adjustments: 0,
+        unpaid_reimbursements: 0,
         job_count: 0,
         _jobIds: new Set()
       };
@@ -32761,6 +32772,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
           case 'incentive': memberMap[mid].unpaid_incentives += amount; break;
           case 'cash_collected': memberMap[mid].unpaid_cash_offsets += amount; break;
           case 'adjustment': memberMap[mid].unpaid_adjustments += amount; break;
+          case 'reimbursement': memberMap[mid].unpaid_reimbursements = (memberMap[mid].unpaid_reimbursements || 0) + amount; break;
         }
       }
     }
@@ -33198,7 +33210,8 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
       tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
       incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
       cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
-      adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0)
+      adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0),
+      reimbursements: unpaidEntries.filter(e => e.type === 'reimbursement').reduce((s, e) => s + parseFloat(e.amount), 0)
     }
   };
 }

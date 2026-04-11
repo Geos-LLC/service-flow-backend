@@ -151,6 +151,71 @@ describe('Paystubs — aggregateLedgerEntries', () => {
   })
 })
 
+describe('Paystubs — reimbursements integration', () => {
+  test('reimbursement entries sum into totals.reimbursements', () => {
+    const entries = [
+      { type: 'earning', amount: '100', job_id: 1 },
+      { type: 'reimbursement', amount: '5', job_id: 1 },
+      { type: 'reimbursement', amount: '3.50', job_id: 2 },
+    ]
+    const { totals } = aggregateLedgerEntries(entries)
+    expect(totals.reimbursements).toBe(8.5)
+  })
+
+  test('reimbursements included in netPayout', () => {
+    const entries = [
+      { type: 'earning', amount: '100', job_id: 1 },
+      { type: 'reimbursement', amount: '10', job_id: 1 },
+    ]
+    const { totals } = aggregateLedgerEntries(entries)
+    expect(totals.netPayout).toBe(110)
+  })
+
+  test('reimbursements + cash collected + earnings combine correctly', () => {
+    const entries = [
+      { type: 'earning', amount: '100', job_id: 1 },
+      { type: 'reimbursement', amount: '5', job_id: 1 },
+      { type: 'cash_collected', amount: '-80', job_id: 1 },
+    ]
+    const { totals } = aggregateLedgerEntries(entries)
+    expect(totals.earnings).toBe(100)
+    expect(totals.reimbursements).toBe(5)
+    expect(totals.cashCollected).toBe(-80)
+    expect(totals.netPayout).toBe(25) // 100 + 5 - 80
+  })
+
+  test('per-job line item captures reimbursement separately', () => {
+    const entries = [
+      { type: 'earning', amount: '60', job_id: 1 },
+      { type: 'reimbursement', amount: '5', job_id: 1 },
+    ]
+    const jobLookup = { 1: { service_name: 'Regular', customer_name: 'Alice', scheduled_date: '2026-04-11' } }
+    const { lineItems } = aggregateLedgerEntries(entries, jobLookup)
+    expect(lineItems).toHaveLength(1)
+    expect(lineItems[0].earning).toBe(60)
+    expect(lineItems[0].reimbursement).toBe(5)
+  })
+
+  test('reimbursement without earning still creates line item', () => {
+    const entries = [
+      { type: 'reimbursement', amount: '5', job_id: 1 },
+    ]
+    const jobLookup = { 1: { service_name: 'Regular' } }
+    const { lineItems } = aggregateLedgerEntries(entries, jobLookup)
+    expect(lineItems).toHaveLength(1)
+    expect(lineItems[0].reimbursement).toBe(5)
+    expect(lineItems[0].earning).toBe(0)
+  })
+
+  test('totals.reimbursements defaults to 0 when no reimbursement entries', () => {
+    const entries = [
+      { type: 'earning', amount: '100', job_id: 1 },
+    ]
+    const { totals } = aggregateLedgerEntries(entries)
+    expect(totals.reimbursements).toBe(0)
+  })
+})
+
 describe('Paystubs — escapeHtml (XSS safety)', () => {
   test('escapes angle brackets', () => {
     expect(escapeHtml('<script>alert(1)</script>')).toBe('&lt;script&gt;alert(1)&lt;/script&gt;')
@@ -225,7 +290,7 @@ describe('Paystubs — status state machine invariants', () => {
       { type: 'earning', amount: '100', job_id: 1 },
     ])
     expect(Object.keys(totals).sort()).toEqual(
-      ['adjustments', 'cashCollected', 'earnings', 'incentives', 'netPayout', 'tips'].sort()
+      ['adjustments', 'cashCollected', 'earnings', 'incentives', 'netPayout', 'reimbursements', 'tips'].sort()
     )
     expect(Array.isArray(lineItems)).toBe(true)
   })
