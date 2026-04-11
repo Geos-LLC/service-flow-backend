@@ -327,6 +327,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     const zbTransactions = await zbFetchAll(apiKey, '/transactions')
     logger.log(`[Zenbooker] Fetched ${zbTransactions.length} transactions`)
 
+    // Track jobs that got new cash transactions — they need ledger rebuild
+    const jobsNeedingLedgerRebuild = new Set()
+
     // Build lookup: ZB invoice_id → SF job (via jobs.zenbooker_id matching the ZB job that owns the invoice)
     // ZB transactions have invoice_id, ZB invoices belong to jobs
     // We need to map ZB invoice_id → ZB job_id → SF job_id
@@ -386,9 +389,37 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
       const { error } = await supabase.from('transactions').insert(txData)
       if (error) { logger.error(`[Zenbooker] Transaction insert error ${zbt.id}: ${JSON.stringify(error)}`); errors++ }
-      else created++
+      else {
+        created++
+        // New transaction — mark job for ledger rebuild (important for cash payments)
+        if (sfJob?.id) jobsNeedingLedgerRebuild.add(sfJob.id)
+        // Also update the job's payment_method + payment_status
+        if (sfJob?.id && (zbt.payment_method || zbt.custom_payment_method_name)) {
+          await supabase.from('jobs').update({
+            payment_method: zbt.custom_payment_method_name || zbt.payment_method,
+            payment_status: 'paid',
+          }).eq('id', sfJob.id).catch(() => {})
+        }
+      }
     }
-    return { total: zbTransactions.length, created, updated, skipped, errors }
+
+    // Rebuild ledger for jobs that got new transactions
+    // (cash payments need cash_collected entries to be created)
+    let ledgerRebuilt = 0
+    if (createLedgerEntriesForCompletedJob) {
+      for (const jobId of jobsNeedingLedgerRebuild) {
+        try {
+          await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+          await createLedgerEntriesForCompletedJob(jobId, userId)
+          ledgerRebuilt++
+        } catch (e) {
+          logger.error(`[Zenbooker] Ledger rebuild after tx sync failed for job ${jobId}: ${e.message}`)
+        }
+      }
+      logger.log(`[Zenbooker] Rebuilt ledger for ${ledgerRebuilt} jobs with new transactions`)
+    }
+
+    return { total: zbTransactions.length, created, updated, skipped, errors, ledgerRebuilt }
   }
 
   async function syncJobs(userId, apiKey, params = {}, maxJobs = 0) {
@@ -580,7 +611,46 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         await supabase.from('job_team_assignments').delete().eq('job_id', jobId)
       }
 
+      // Fallback: ZB doesn't reliably send invoice_payment webhooks.
+      // When a job is completed or paid, proactively fetch the invoice and
+      // create missing transaction records so cash_collected entries get created.
+      if ((mapped.status === 'completed' || mapped.status === 'paid') && zbJob.invoice?.id && apiKey) {
+        try {
+          const invoiceData = await zbFetch(apiKey, `/invoices/${zbJob.invoice.id}`)
+          const zbTxs = invoiceData?.transactions || []
+          for (const zbt of zbTxs) {
+            if (zbt.status !== 'succeeded') continue
+            // Dedup by zenbooker transaction ID
+            const { data: existing } = await supabase.from('transactions')
+              .select('id').eq('zenbooker_id', zbt.id).maybeSingle()
+            if (existing) continue
+            await supabase.from('transactions').insert({
+              user_id: userId,
+              job_id: jobId,
+              customer_id: mapped.customer_id || null,
+              amount: parseFloat(zbt.amount) || 0,
+              payment_method: zbt.custom_payment_method_name || zbt.payment_method || 'other',
+              payment_intent_id: zbt.stripe_transaction_id || `zb_${zbt.id}`,
+              status: 'completed',
+              notes: zbt.memo || 'Synced from Zenbooker on job completion',
+              zenbooker_id: zbt.id,
+              created_at: zbt.payment_date || zbt.created,
+            }).catch(err => logger.warn(`[Zenbooker] Fallback tx insert error: ${err.message}`))
+            // Update job payment method
+            await supabase.from('jobs').update({
+              payment_method: zbt.custom_payment_method_name || zbt.payment_method,
+              payment_status: 'paid',
+            }).eq('id', jobId).catch(() => {})
+            logger.log(`[Zenbooker] Fallback tx created for job ${jobId}: ${zbt.payment_method} $${zbt.amount}`)
+          }
+        } catch (invErr) {
+          // Non-fatal — invoice fetch might fail or not exist yet
+          logger.debug(`[Zenbooker] Invoice fetch for job ${jobId} failed: ${invErr.message}`)
+        }
+      }
+
       // Create/rebuild ledger entries when job is completed or paid
+      // (runs AFTER fallback tx creation so cash_collected entries get included)
       if ((mapped.status === 'completed' || mapped.status === 'paid') && createLedgerEntriesForCompletedJob) {
         try {
           await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
