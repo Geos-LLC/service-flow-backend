@@ -20437,7 +20437,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
       // Only count completed/paid jobs in revenue (unless includeScheduled)
-      if (!includeScheduled && s !== 'completed') return;
+      if (!includeScheduled && s !== 'completed' && s !== 'paid') return;
       // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
       const rev = svcP > 0
@@ -20514,7 +20514,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     jobsWithAnyEntry.forEach(jobId => {
       if (!jobsWithEarning.has(jobId)) {
         const job = allJobsById[jobId];
-        if (job && (job.status || '').toLowerCase() === 'completed') {
+        const jobStatus = (job?.status || '').toLowerCase();
+        if (job && (jobStatus === 'completed' || jobStatus === 'paid')) {
           staleJobIds.add(jobId);
         }
       }
