@@ -6462,7 +6462,9 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     }
 
     // === LEDGER INTEGRATION: Create ledger entries when job is completed or paid ===
-    if (status === 'completed' && previousStatus !== 'completed') {
+    // 'paid' means invoice settled — the work was still done, so earnings apply
+    const earningsStatuses = ['completed', 'complete', 'paid'];
+    if (earningsStatuses.includes(status) && !earningsStatuses.includes(previousStatus)) {
       try {
         await createLedgerEntriesForCompletedJob(id, userId);
       } catch (ledgerError) {
@@ -6470,10 +6472,9 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // === LEDGER CLEANUP: Remove ledger entries when job leaves completed status ===
-    // Covers: cancel, reschedule, reset to pending, or any status change FROM completed
-    const completedStatuses = ['completed', 'complete'];
-    if (completedStatuses.includes(previousStatus) && !completedStatuses.includes(status)) {
+    // === LEDGER CLEANUP: Remove ledger entries when job leaves earnings status ===
+    // Covers: cancel, reschedule, reset to pending
+    if (earningsStatuses.includes(previousStatus) && !earningsStatuses.includes(status)) {
       try {
         const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).select('id');
         if (delErr) console.error(`⚠️ Error removing ledger entries for ${status} job:`, delErr);
@@ -6482,8 +6483,8 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
         console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
       }
     }
-    // Also clean up if directly set to cancelled/rescheduled from non-completed status (e.g. pending→cancelled)
-    if ((status === 'cancelled' || status === 'rescheduled') && !completedStatuses.includes(previousStatus)) {
+    // Also clean up if directly set to cancelled/rescheduled from non-earnings status (e.g. pending→cancelled)
+    if ((status === 'cancelled' || status === 'rescheduled') && !earningsStatuses.includes(previousStatus)) {
       try {
         await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id));
       } catch (ledgerError) {
@@ -6969,6 +6970,20 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       } catch (assignmentError) {
         console.error('Error updating team assignments:', assignmentError);
         // Don't fail the job update if team assignment fails
+      }
+
+      // === LEDGER REBUILD: assignments changed — rebuild ledger if job is in earnings state ===
+      try {
+        const { data: currentJob } = await supabase.from('jobs').select('status').eq('id', id).single();
+        const earningsJobStatuses = ['completed', 'complete', 'paid'];
+        if (currentJob && earningsJobStatuses.includes((currentJob.status || '').toLowerCase())) {
+          // Delete existing ledger entries and rebuild with new assignments
+          await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id));
+          await createLedgerEntriesForCompletedJob(id, userId);
+          console.log(`[Ledger] Rebuilt for job ${id} after team assignment change`);
+        }
+      } catch (rebuildErr) {
+        console.error('⚠️ Error rebuilding ledger after assignment change:', rebuildErr);
       }
     }
 
@@ -32347,9 +32362,10 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Only create ledger entries for completed/paid jobs
+  // Only create ledger entries for completed or paid jobs
+  // (paid = invoice settled, still a completed job from payroll perspective)
   const jobStatus = (job.status || '').toLowerCase();
-  if (jobStatus !== 'completed') {
+  if (jobStatus !== 'completed' && jobStatus !== 'paid') {
     return;
   }
 
