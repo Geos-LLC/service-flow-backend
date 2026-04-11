@@ -20507,9 +20507,10 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         if (e.type === 'earning') jobsWithEarning.add(e.job_id);
       }
     });
-    // Also check completed jobs with NO ledger entries at all
+    // Also check completed/paid jobs with NO ledger entries at all
     (allJobs || []).forEach(job => {
-      if ((job.status || '').toLowerCase() === 'completed' && !jobsWithAnyEntry.has(job.id)) {
+      const s = (job.status || '').toLowerCase();
+      if ((s === 'completed' || s === 'paid') && !jobsWithAnyEntry.has(job.id)) {
         staleJobIds.add(job.id);
       }
     });
