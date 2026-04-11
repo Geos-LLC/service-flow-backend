@@ -20865,7 +20865,7 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { hoursWorked, tipAmount, incentiveAmount, totalDue } = req.body;
+    const { hoursWorked, tipAmount, incentiveAmount, totalDue, teamMemberId } = req.body;
 
     // Verify job belongs to user and fetch old values for audit
     const { data: job, error: jobErr } = await supabase
@@ -20893,9 +20893,31 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     }
     if (incentiveAmount !== undefined) {
       const newVal = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
-      const oldVal = parseFloat(job.incentive_amount) || 0;
-      update.incentive_amount = newVal;
-      if (newVal !== oldVal) edits.push({ field: 'incentive_amount', old_value: String(oldVal), new_value: String(newVal) });
+
+      if (teamMemberId) {
+        // Per-member incentive: update this member's assignment, then sync job total
+        const { error: assignErr } = await supabase
+          .from('job_team_assignments')
+          .update({ incentive_amount: newVal })
+          .eq('job_id', id)
+          .eq('team_member_id', teamMemberId);
+        if (assignErr) console.error(`[Payroll PATCH] Assignment incentive update error:`, assignErr);
+
+        // Recalculate job total from all assignments
+        const { data: allAssignments } = await supabase
+          .from('job_team_assignments')
+          .select('incentive_amount')
+          .eq('job_id', id);
+        const jobTotal = (allAssignments || []).reduce((sum, a) => sum + (parseFloat(a.incentive_amount) || 0), 0);
+        const oldVal = parseFloat(job.incentive_amount) || 0;
+        update.incentive_amount = jobTotal;
+        if (jobTotal !== oldVal) edits.push({ field: 'incentive_amount', old_value: String(oldVal), new_value: String(jobTotal) });
+      } else {
+        // Legacy: set job total directly (no per-member tracking)
+        const oldVal = parseFloat(job.incentive_amount) || 0;
+        update.incentive_amount = newVal;
+        if (newVal !== oldVal) edits.push({ field: 'incentive_amount', old_value: String(oldVal), new_value: String(newVal) });
+      }
     }
     if (req.body.servicePrice !== undefined) {
       const newVal = parseFloat(req.body.servicePrice) || 0;
@@ -20917,16 +20939,21 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     }
 
     // Recalculate ledger entries for this job
-    await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
+    const { error: deleteErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
+    if (deleteErr) {
+      console.error(`[Payroll PATCH] Ledger delete failed for job ${id}:`, deleteErr);
+      return res.status(500).json({ error: 'Failed to clear ledger entries for recalculation' });
+    }
     try {
       await createLedgerEntriesForCompletedJob(parseInt(id), userId);
     } catch (e) {
-      console.error('Ledger rebuild after payroll edit:', e);
+      console.error(`[Payroll PATCH] Ledger rebuild failed for job ${id}:`, e);
+      return res.status(500).json({ error: 'Failed to rebuild ledger entries' });
     }
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Update payroll error:', error);
+    console.error('[Payroll PATCH] Unexpected error:', error);
     res.status(500).json({ error: 'Failed to update job payroll data' });
   }
 });
@@ -32394,10 +32421,10 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Fetch all team member assignments for this job
+  // Fetch all team member assignments for this job (include per-member incentive)
   const { data: assignments } = await supabase
     .from('job_team_assignments')
-    .select('team_member_id, is_primary')
+    .select('team_member_id, is_primary, incentive_amount')
     .eq('job_id', jobId);
 
   // Build list of team members assigned to this job
@@ -32529,22 +32556,25 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       });
     }
 
-    // Incentives: job-level split only (same as Payroll — no assignment-level check)
+    // Incentives: use per-assignment value if set, otherwise split job total equally
+    const assignmentRow = (assignments || []).find(a => a.team_member_id === member.id);
+    const assignmentIncentive = assignmentRow ? parseFloat(assignmentRow.incentive_amount) || 0 : 0;
     const jobIncentive = parseFloat(job.incentive_amount) || 0;
-    if (jobIncentive > 0) {
-      const memberIncentive = parseFloat((jobIncentive / Math.max(1, memberCount)).toFixed(2));
-      if (memberIncentive > 0) {
-        ledgerEntries.push({
-          user_id: userId,
-          team_member_id: member.id,
-          job_id: jobId,
-          type: 'incentive',
-          amount: memberIncentive,
-          effective_date: effectiveDate,
-          note: `Incentive for job #${jobId}`,
-          created_by: userId
-        });
-      }
+    const hasPerAssignmentIncentives = (assignments || []).some(a => parseFloat(a.incentive_amount) > 0);
+    const memberIncentive = hasPerAssignmentIncentives
+      ? assignmentIncentive
+      : (jobIncentive > 0 ? parseFloat((jobIncentive / Math.max(1, memberCount)).toFixed(2)) : 0);
+    if (memberIncentive > 0) {
+      ledgerEntries.push({
+        user_id: userId,
+        team_member_id: member.id,
+        job_id: jobId,
+        type: 'incentive',
+        amount: memberIncentive,
+        effective_date: effectiveDate,
+        note: `Incentive for job #${jobId}`,
+        created_by: userId
+      });
     }
 
   }
@@ -32593,8 +32623,15 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   // Batch insert all ledger entries (delete first to prevent duplicates from race conditions)
   if (ledgerEntries.length > 0) {
-    // Re-check right before insert to handle concurrent webhook calls
-    const { data: raceCheck } = await supabase.from('cleaner_ledger').select('id').eq('job_id', jobId).limit(1);
+    // Re-check right before insert to handle concurrent webhook calls.
+    // Only check earning/tip/incentive — the rebuild path deletes those and leaves
+    // cash_collected/adjustment/reimbursement/payout alone, so those must NOT block reinsert.
+    const { data: raceCheck } = await supabase
+      .from('cleaner_ledger')
+      .select('id')
+      .eq('job_id', jobId)
+      .in('type', ['earning', 'tip', 'incentive'])
+      .limit(1);
     if (raceCheck && raceCheck.length > 0) {
       console.log(`Ledger: Entries already exist for job ${jobId} (race condition avoided), skipping`);
       return;
