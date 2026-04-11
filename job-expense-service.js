@@ -43,7 +43,8 @@ module.exports = (supabase, logger) => {
       return res.status(401).json({ error: 'Invalid token' })
     }
   }
-  router.use(authenticateToken)
+  // Auth is applied per-route below (NOT router.use) to avoid intercepting
+  // other /api/* routes like /api/auth/signin and /api/health.
 
   // ══════════════════════════════════════════════════════════════
   // Validation helpers
@@ -147,7 +148,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // GET /api/jobs/:jobId/expenses — list
   // ══════════════════════════════════════
-  router.get('/jobs/:jobId/expenses', async (req, res) => {
+  router.get('/jobs/:jobId/expenses', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const jobId = parseInt(req.params.jobId)
@@ -170,7 +171,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // POST /api/jobs/:jobId/expenses — create
   // ══════════════════════════════════════
-  router.post('/jobs/:jobId/expenses', async (req, res) => {
+  router.post('/jobs/:jobId/expenses', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const jobId = parseInt(req.params.jobId)
@@ -210,7 +211,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // PATCH /api/job-expenses/:id — edit
   // ══════════════════════════════════════
-  router.patch('/job-expenses/:id', async (req, res) => {
+  router.patch('/job-expenses/:id', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const id = parseInt(req.params.id)
@@ -267,7 +268,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // POST /api/job-expenses/:id/approve
   // ══════════════════════════════════════
-  router.post('/job-expenses/:id/approve', async (req, res) => {
+  router.post('/job-expenses/:id/approve', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const id = parseInt(req.params.id)
@@ -310,7 +311,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // POST /api/job-expenses/:id/reject
   // ══════════════════════════════════════
-  router.post('/job-expenses/:id/reject', async (req, res) => {
+  router.post('/job-expenses/:id/reject', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const id = parseInt(req.params.id)
@@ -350,7 +351,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // DELETE /api/job-expenses/:id
   // ══════════════════════════════════════
-  router.delete('/job-expenses/:id', async (req, res) => {
+  router.delete('/job-expenses/:id', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const id = parseInt(req.params.id)
