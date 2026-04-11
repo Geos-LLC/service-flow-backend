@@ -1056,6 +1056,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 try { app.use('/api/integrations/whatsapp', require('./whatsapp-service')(supabase, logger, sigcoreRequest)); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
+try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
 // Test Supabase connection
