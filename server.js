@@ -20223,7 +20223,7 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     const pageSize = 1000;
     while (true) {
       const { data: page } = await supabase.from('cleaner_ledger')
-        .select('effective_date, metadata')
+        .select('id, effective_date, amount, metadata, payout_batch_id')
         .eq('user_id', userId).eq('team_member_id', mgr.id)
         .is('job_id', null).eq('type', 'earning')
         .gte('effective_date', effectiveStart).lte('effective_date', effectiveEnd)
@@ -20234,11 +20234,11 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     }
 
     const existingSalaryDates = new Set();
-    const existingCommDates = new Set();
+    const existingCommByDate = {}; // date → { id, day_revenue, amount }
     existingEntries.forEach(e => {
       const meta = e.metadata || {};
       if (meta.is_manager_salary) existingSalaryDates.add(e.effective_date);
-      if (meta.is_manager_commission) existingCommDates.add(e.effective_date);
+      if (meta.is_manager_commission) existingCommByDate[e.effective_date] = { id: e.id, day_revenue: meta.day_revenue || 0, amount: parseFloat(e.amount) || 0, payout_batch_id: e.payout_batch_id };
     });
 
     const newEntries = [];
@@ -20280,8 +20280,11 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
           : (parseFloat(job.total) || parseFloat(job.total_amount) || 0);
         dailyRevenue[jd] = (dailyRevenue[jd] || 0) + rev;
       });
+      const staleUpdates = [];
       for (const [dayStr, dayRev] of Object.entries(dailyRevenue)) {
-        if (dayRev > 0 && !existingCommDates.has(dayStr)) {
+        const existing = existingCommByDate[dayStr];
+        if (dayRev > 0 && !existing) {
+          // Missing: create new entry
           newEntries.push({
             user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
             amount: parseFloat((dayRev * commPct / 100).toFixed(2)),
@@ -20290,7 +20293,38 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
             metadata: { commission_pct: commPct, day_revenue: dayRev, is_manager_commission: true },
             created_by: userId
           });
+        } else if (existing && (
+          // Stale if: stored day_revenue differs from current, OR day_revenue was never stored (old entries)
+          !existing.day_revenue || Math.abs(dayRev - existing.day_revenue) > 0.01
+        )) {
+          // Stale: revenue changed since entry was created — update if unbatched
+          if (!existing.payout_batch_id) {
+            staleUpdates.push({
+              id: existing.id,
+              amount: parseFloat((dayRev * commPct / 100).toFixed(2)),
+              note: `Commission: $${dayRev.toFixed(2)} × ${commPct}% (${dayStr})`,
+              metadata: { commission_pct: commPct, day_revenue: dayRev, is_manager_commission: true },
+            });
+          }
         }
+      }
+      // Also check for dates that had revenue before but now have 0 (jobs rescheduled away)
+      for (const [dayStr, existing] of Object.entries(existingCommByDate)) {
+        if (!dailyRevenue[dayStr] && !existing.payout_batch_id) {
+          // No revenue on this day anymore — delete the stale commission entry
+          staleUpdates.push({ id: existing.id, _delete: true });
+        }
+      }
+      // Apply stale updates
+      for (const upd of staleUpdates) {
+        if (upd._delete) {
+          await supabase.from('cleaner_ledger').delete().eq('id', upd.id);
+        } else {
+          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id);
+        }
+      }
+      if (staleUpdates.length > 0) {
+        console.log(`[Payroll] Updated ${staleUpdates.length} stale commission entries for ${mgr.first_name} ${mgr.last_name}`);
       }
     }
 
@@ -34723,12 +34757,15 @@ async function handleWhatsAppWebhook(event, payload) {
         return;
       }
 
-      // Filter out group chats and invalid numbers
-      // WhatsApp group IDs are 18+ digits, real phone numbers are 10-15 digits
-      const rawDigits = participantPhone.replace(/[^\d]/g, '');
-      if (rawDigits.length > 15 || rawDigits.length < 7) {
-        logger.log(`[WhatsApp] Skipping non-individual chat: ${participantPhone} (${rawDigits.length} digits)`);
-        return;
+      // Detect group chats — group IDs contain @g.us or are 18+ digits
+      const isGroup = participantPhone.includes('@g.us') || participantPhone.includes('@') || participantPhone.replace(/[^\d]/g, '').length > 15;
+      // For individual chats, validate phone length
+      if (!isGroup) {
+        const rawDigits = participantPhone.replace(/[^\d]/g, '');
+        if (rawDigits.length < 7) {
+          logger.log(`[WhatsApp] Skipping invalid phone: ${participantPhone} (${rawDigits.length} digits)`);
+          return;
+        }
       }
 
       // Resolve endpoint phone from settings if not in payload
@@ -34796,8 +34833,8 @@ async function handleWhatsAppWebhook(event, payload) {
           participant_name: contactName,
           last_preview: body.substring(0, 200),
           last_event_at: timestamp, unread_count: 1,
-          conversation_type: 'external_client',
-          metadata: { externalChatId },
+          conversation_type: isGroup ? 'group' : 'external_client',
+          metadata: { externalChatId, ...(isGroup && { isGroup: true }) },
         }).select().single();
         if (createErr) { logger.error('[WhatsApp] Create conversation error:', createErr); return; }
         conversation = newConv;
