@@ -99,6 +99,7 @@ function markBatchPaid(entries, batch) {
  * Calculate prior period debt — two sources:
  * A) Unpaid entries before period (no batch)
  * B) Negative paid batch amounts from prior periods (carry-forward)
+ *    — excludes batches already recovered by a subsequent batch
  */
 function calculatePriorDebt(entries, batches, teamMemberId, periodStart) {
   // A) Unpaid entries before period
@@ -111,17 +112,73 @@ function calculatePriorDebt(entries, batches, teamMemberId, periodStart) {
     )
     .reduce((sum, e) => sum + e.amount, 0);
 
-  // B) Negative paid batches from prior periods
+  // B) Negative paid batches from prior periods (not yet recovered)
   (batches || []).forEach(b => {
     if (b.team_member_id === teamMemberId &&
         b.status === 'paid' &&
         b.total_amount < 0 &&
+        !b.recovered_by_batch_id &&
         b.period_end < periodStart) {
       debt += b.total_amount;
     }
   });
 
   return debt < -0.01 ? parseFloat(debt.toFixed(2)) : 0;
+}
+
+/**
+ * Simulate createPayoutBatch with prior debt recovery.
+ * Matches updated server.js: finds unrecovered negative batches,
+ * deducts from total, marks them as recovered.
+ */
+function createPayoutBatchWithRecovery(entries, batches, teamMemberId, periodStart, periodEnd) {
+  const unpaid = entries.filter(e =>
+    e.team_member_id === teamMemberId &&
+    !e.payout_batch_id &&
+    e.effective_date >= periodStart &&
+    e.effective_date <= periodEnd &&
+    e.type !== 'payout'
+  );
+
+  if (unpaid.length === 0) {
+    return { skipped: true, reason: 'No unpaid entries found' };
+  }
+
+  const periodTotal = unpaid.reduce((sum, e) => sum + e.amount, 0);
+
+  // Find unrecovered negative batches from prior periods
+  const negativeBatches = (batches || []).filter(b =>
+    b.team_member_id === teamMemberId &&
+    b.status === 'paid' &&
+    b.total_amount < 0 &&
+    !b.recovered_by_batch_id &&
+    b.period_end < periodStart
+  );
+
+  const priorDebt = negativeBatches.reduce((sum, b) => sum + b.total_amount, 0);
+  const totalAmount = parseFloat((periodTotal + priorDebt).toFixed(2));
+  const batchId = Math.floor(Math.random() * 10000) + 50000;
+
+  // Mark consumed negative batches as recovered
+  negativeBatches.forEach(b => { b.recovered_by_batch_id = batchId; });
+
+  // Attach entries
+  unpaid.forEach(e => { e.payout_batch_id = batchId; });
+
+  return {
+    skipped: false,
+    batch: {
+      id: batchId,
+      team_member_id: teamMemberId,
+      period_start: periodStart,
+      period_end: periodEnd,
+      status: 'pending',
+      total_amount: totalAmount
+    },
+    entry_count: unpaid.length,
+    prior_debt: priorDebt,
+    recovered_batches: negativeBatches.map(b => b.id)
+  };
 }
 
 /**
@@ -689,6 +746,101 @@ describe('Negative Batch — Payout Entry and Debt Carry-Forward', () => {
     // Only the batch amount (-66.60) shows as prior debt
     const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
     expect(priorDebt).toBe(-66.60); // NOT -133.20 (no double counting)
+  });
+});
+
+describe('Negative Batch Recovery — recovered_by_batch_id', () => {
+  test('recovered negative batch no longer carries forward as debt', () => {
+    // Period 1: cleaner collects more cash than earned → negative batch
+    const entries = [
+      makeEntry(1, 100, 'earning', 113.40, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const batch1Result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, batch1Result.batch);
+    const batches = [batch1Result.batch];
+
+    // Period 2: new earnings, prior debt should be deducted and batch marked recovered
+    entries.push(makeEntry(3, 100, 'earning', 200, '2026-03-30'));
+    const batch2Result = createPayoutBatchWithRecovery(entries, batches, 100, '2026-03-29', '2026-04-04');
+
+    expect(batch2Result.skipped).toBe(false);
+    // Total: 200 + (-66.60) = 133.40
+    expect(batch2Result.batch.total_amount).toBe(133.40);
+    expect(batch2Result.prior_debt).toBe(-66.60);
+
+    // Negative batch is now marked as recovered
+    expect(batch1Result.batch.recovered_by_batch_id).toBe(batch2Result.batch.id);
+
+    // Period 3: debt should NOT carry forward anymore
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-04-05');
+    expect(priorDebt).toBe(0); // recovered — no more carry-forward
+  });
+
+  test('unrecovered negative batch still carries forward', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 113.40, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const batch1Result = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, batch1Result.batch);
+    const batches = [batch1Result.batch];
+
+    // No subsequent batch created — debt is NOT recovered
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
+    expect(priorDebt).toBe(-66.60); // still carries
+  });
+
+  test('multiple negative batches recovered in single new batch', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 50, '2026-03-20'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-20'),
+      makeEntry(3, 100, 'earning', 60, '2026-03-27'),
+      makeEntry(4, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    // Two negative batches in two periods
+    const batch1 = createPayoutBatch([entries[0], entries[1]], 100, '2026-03-15', '2026-03-21');
+    markBatchPaid([entries[0], entries[1]], batch1.batch);
+    const batch2 = createPayoutBatch([entries[2], entries[3]], 100, '2026-03-22', '2026-03-28');
+    markBatchPaid([entries[2], entries[3]], batch2.batch);
+    const batches = [batch1.batch, batch2.batch];
+
+    expect(batch1.batch.total_amount).toBe(-130);
+    expect(batch2.batch.total_amount).toBe(-120);
+
+    // Period 3: big earning covers both debts
+    entries.push(makeEntry(5, 100, 'earning', 500, '2026-03-30'));
+    const batch3 = createPayoutBatchWithRecovery(entries, batches, 100, '2026-03-29', '2026-04-04');
+
+    // Total: 500 + (-130) + (-120) = 250
+    expect(batch3.batch.total_amount).toBe(250);
+    expect(batch3.recovered_batches.length).toBe(2);
+
+    // Both are recovered — no more debt
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-04-05');
+    expect(priorDebt).toBe(0);
+  });
+
+  test('recovery only applies to same team member', () => {
+    const entries = [
+      makeEntry(1, 100, 'earning', 50, '2026-03-27'),
+      makeEntry(2, 100, 'cash_collected', -180, '2026-03-27'),
+    ];
+    const batch1 = createPayoutBatch(entries, 100, '2026-03-22', '2026-03-28');
+    markBatchPaid(entries, batch1.batch);
+    const batches = [batch1.batch];
+
+    // Different member's earnings should not recover member 100's debt
+    entries.push(makeEntry(3, 200, 'earning', 500, '2026-03-30'));
+    const batch2 = createPayoutBatchWithRecovery(entries, batches, 200, '2026-03-29', '2026-04-04');
+
+    // Member 200: no prior debt, full 500
+    expect(batch2.batch.total_amount).toBe(500);
+    expect(batch2.recovered_batches.length).toBe(0);
+
+    // Member 100's debt still carries
+    const priorDebt = calculatePriorDebt(entries, batches, 100, '2026-03-29');
+    expect(priorDebt).toBe(-130);
   });
 });
 

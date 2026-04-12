@@ -589,3 +589,107 @@ describe('Payroll edit audit trail', () => {
     expect(edit.field).toBe('service_price');
   });
 });
+
+describe('Per-member incentive tracking', () => {
+  test('per-assignment incentive: editing one member does not affect others', () => {
+    const assignments = [
+      { team_member_id: 100, incentive_amount: 15 },
+      { team_member_id: 200, incentive_amount: 15 },
+    ];
+    // Edit member 100's incentive to 0
+    assignments.find(a => a.team_member_id === 100).incentive_amount = 0;
+    // Job total = sum of all assignments
+    const jobTotal = assignments.reduce((sum, a) => sum + (a.incentive_amount || 0), 0);
+    expect(jobTotal).toBe(15); // member 200 still has $15
+    expect(assignments.find(a => a.team_member_id === 200).incentive_amount).toBe(15);
+  });
+
+  test('legacy path: when no per-assignment incentives, split job total equally', () => {
+    const assignments = [
+      { team_member_id: 100, incentive_amount: 0 },
+      { team_member_id: 200, incentive_amount: 0 },
+    ];
+    const jobIncentive = 30;
+    const memberCount = assignments.length;
+    const hasPerAssignment = assignments.some(a => a.incentive_amount > 0);
+
+    const member100incentive = hasPerAssignment
+      ? assignments.find(a => a.team_member_id === 100).incentive_amount
+      : jobIncentive / memberCount;
+
+    expect(hasPerAssignment).toBe(false);
+    expect(member100incentive).toBe(15); // 30 / 2
+  });
+
+  test('per-assignment path: uses assignment values when any are > 0', () => {
+    const assignments = [
+      { team_member_id: 100, incentive_amount: 20 },
+      { team_member_id: 200, incentive_amount: 10 },
+    ];
+    const jobIncentive = 30;
+    const hasPerAssignment = assignments.some(a => a.incentive_amount > 0);
+
+    const member100 = hasPerAssignment
+      ? assignments.find(a => a.team_member_id === 100).incentive_amount
+      : jobIncentive / assignments.length;
+    const member200 = hasPerAssignment
+      ? assignments.find(a => a.team_member_id === 200).incentive_amount
+      : jobIncentive / assignments.length;
+
+    expect(hasPerAssignment).toBe(true);
+    expect(member100).toBe(20); // per-assignment, not split
+    expect(member200).toBe(10);
+  });
+
+  test('job total recalculated as sum of assignments after edit', () => {
+    const assignments = [
+      { team_member_id: 100, incentive_amount: 20 },
+      { team_member_id: 200, incentive_amount: 10 },
+    ];
+    // Edit member 100 from 20 to 5
+    assignments.find(a => a.team_member_id === 100).incentive_amount = 5;
+    const jobTotal = assignments.reduce((sum, a) => sum + a.incentive_amount, 0);
+    expect(jobTotal).toBe(15); // 5 + 10
+  });
+});
+
+describe('Ledger race check — type-scoped', () => {
+  test('race check should only consider earning/tip/incentive types', () => {
+    // Simulate: after deleting earning/tip/incentive, cash_collected still exists
+    const remainingEntries = [
+      { id: 1, job_id: 100, type: 'cash_collected', amount: -180 },
+    ];
+    // Old (buggy) check: any entry blocks rebuild
+    const oldCheck = remainingEntries.length > 0;
+    // New (fixed) check: only earning/tip/incentive block rebuild
+    const newCheck = remainingEntries.filter(e =>
+      ['earning', 'tip', 'incentive'].includes(e.type)
+    ).length > 0;
+
+    expect(oldCheck).toBe(true);   // old: would skip rebuild (BUG)
+    expect(newCheck).toBe(false);  // new: allows rebuild (CORRECT)
+  });
+
+  test('race check blocks when earning entries exist', () => {
+    const entries = [
+      { id: 1, job_id: 100, type: 'earning', amount: 150 },
+      { id: 2, job_id: 100, type: 'cash_collected', amount: -180 },
+    ];
+    const raceCheck = entries.filter(e =>
+      ['earning', 'tip', 'incentive'].includes(e.type)
+    ).length > 0;
+    expect(raceCheck).toBe(true); // correctly blocks — earnings still exist
+  });
+
+  test('race check allows rebuild when only reimbursement/cash remain', () => {
+    const entries = [
+      { id: 1, job_id: 100, type: 'cash_collected', amount: -180 },
+      { id: 2, job_id: 100, type: 'reimbursement', amount: 5 },
+      { id: 3, job_id: 100, type: 'adjustment', amount: 10 },
+    ];
+    const raceCheck = entries.filter(e =>
+      ['earning', 'tip', 'incentive'].includes(e.type)
+    ).length > 0;
+    expect(raceCheck).toBe(false); // correctly allows rebuild
+  });
+});

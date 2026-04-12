@@ -173,6 +173,53 @@ describe('Job Expenses — validateExpensePayload', () => {
   })
 })
 
+describe('Job Expenses — buildReimbursementLedgerRow with jobScheduledDate', () => {
+  const expense = {
+    id: 42,
+    user_id: 2,
+    team_member_id: 100,
+    job_id: 999,
+    expense_type: 'parking',
+    description: 'downtown meter',
+    amount: '5.00',
+    approved_at: '2026-04-12T00:23:00Z',
+  }
+
+  test('uses jobScheduledDate when provided (not approved_at)', () => {
+    const row = buildReimbursementLedgerRow(expense, 2, '2026-04-07 10:00:00')
+    expect(row.effective_date).toBe('2026-04-07')
+  })
+
+  test('uses jobScheduledDate with ISO format', () => {
+    const row = buildReimbursementLedgerRow(expense, 2, '2026-04-07T10:00:00Z')
+    expect(row.effective_date).toBe('2026-04-07')
+  })
+
+  test('falls back to approved_at when jobScheduledDate is null', () => {
+    const row = buildReimbursementLedgerRow(expense, 2, null)
+    expect(row.effective_date).toBe('2026-04-12')
+  })
+
+  test('falls back to approved_at when jobScheduledDate is undefined', () => {
+    const row = buildReimbursementLedgerRow(expense, 2, undefined)
+    expect(row.effective_date).toBe('2026-04-12')
+  })
+
+  test('falls back to today when both jobScheduledDate and approved_at are null', () => {
+    const row = buildReimbursementLedgerRow({ ...expense, approved_at: null }, 2, null)
+    expect(row.effective_date).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  test('all other fields unchanged when jobScheduledDate provided', () => {
+    const row = buildReimbursementLedgerRow(expense, 2, '2026-04-07')
+    expect(row.type).toBe('reimbursement')
+    expect(row.team_member_id).toBe(100)
+    expect(row.job_id).toBe(999)
+    expect(row.amount).toBe(5)
+    expect(row.metadata.source_id).toBe('42')
+  })
+})
+
 describe('Job Expenses — state machine invariants', () => {
   // Document the allowed status transitions via test assertions.
   test('valid statuses', () => {
