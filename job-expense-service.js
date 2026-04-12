@@ -85,6 +85,13 @@ module.exports = (supabase, logger) => {
     if (expense.status !== 'approved') return { action: 'skipped', reason: 'not_approved' }
     if (!expense.team_member_id) return { action: 'skipped', reason: 'no_team_member' }
 
+    // Use the job's scheduled_date so the reimbursement falls in the same payroll period
+    let effectiveDate = (expense.approved_at || new Date().toISOString()).split('T')[0]
+    if (expense.job_id) {
+      const { data: job } = await supabase.from('jobs').select('scheduled_date').eq('id', expense.job_id).maybeSingle()
+      if (job?.scheduled_date) effectiveDate = String(job.scheduled_date).split('T')[0].split(' ')[0]
+    }
+
     // Check for existing ledger row by metadata.source_id (idempotency key)
     const { data: existing } = await supabase.from('cleaner_ledger')
       .select('id, payout_batch_id, amount')
@@ -99,7 +106,7 @@ module.exports = (supabase, logger) => {
       job_id: expense.job_id,
       type: 'reimbursement',
       amount: parseFloat(expense.amount),
-      effective_date: (expense.approved_at || new Date().toISOString()).split('T')[0],
+      effective_date: effectiveDate,
       note: `Reimbursement: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
       metadata: { source_type: 'job_expense', source_id: String(expense.id), expense_type: expense.expense_type },
       created_by: userId,
@@ -409,14 +416,17 @@ module.exports.shouldCreateReimbursement = function shouldCreateReimbursement(ex
 /**
  * Build the ledger row for an expense. Pure function.
  */
-module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRow(expense, userId) {
+module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRow(expense, userId, jobScheduledDate) {
+  const effectiveDate = jobScheduledDate
+    ? String(jobScheduledDate).split('T')[0].split(' ')[0]
+    : (expense.approved_at || new Date().toISOString()).split('T')[0]
   return {
     user_id: userId,
     team_member_id: expense.team_member_id,
     job_id: expense.job_id,
     type: 'reimbursement',
     amount: parseFloat(expense.amount),
-    effective_date: (expense.approved_at || new Date().toISOString()).split('T')[0],
+    effective_date: effectiveDate,
     note: `Reimbursement: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
     metadata: {
       source_type: 'job_expense',
