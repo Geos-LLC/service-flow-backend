@@ -20940,17 +20940,65 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
       await supabase.from('payroll_edits').insert(editRows).catch(err => console.error('Audit log error:', err));
     }
 
-    // Recalculate ledger entries for this job
-    const { error: deleteErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
-    if (deleteErr) {
-      console.error(`[Payroll PATCH] Ledger delete failed for job ${id}:`, deleteErr);
-      return res.status(500).json({ error: 'Failed to clear ledger entries for recalculation' });
-    }
-    try {
-      await createLedgerEntriesForCompletedJob(parseInt(id), userId);
-    } catch (e) {
-      console.error(`[Payroll PATCH] Ledger rebuild failed for job ${id}:`, e);
-      return res.status(500).json({ error: 'Failed to rebuild ledger entries' });
+    // === Ledger sync strategy ===
+    // Incentive-only edits with teamMemberId: directly upsert the incentive ledger entry
+    // (avoids fragile full delete+rebuild that loses entries during deploy restarts or races).
+    // All other edits (hours, tips, servicePrice): full rebuild needed since earnings change.
+    const incentiveOnlyEdit = incentiveAmount !== undefined && teamMemberId &&
+      hoursWorked === undefined && tipAmount === undefined && req.body.servicePrice === undefined;
+
+    if (incentiveOnlyEdit) {
+      // Direct upsert: update or create incentive ledger entry for this specific member
+      const newInc = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
+      const effectiveDate = job.scheduled_date
+        ? String(job.scheduled_date).split('T')[0].split(' ')[0]
+        : new Date().toISOString().split('T')[0];
+
+      // Find existing incentive entry for this member+job
+      const { data: existingInc } = await supabase.from('cleaner_ledger')
+        .select('id, payout_batch_id')
+        .eq('job_id', parseInt(id))
+        .eq('team_member_id', parseInt(teamMemberId))
+        .eq('type', 'incentive')
+        .maybeSingle();
+
+      if (newInc > 0) {
+        const incRow = {
+          user_id: userId,
+          team_member_id: parseInt(teamMemberId),
+          job_id: parseInt(id),
+          type: 'incentive',
+          amount: newInc,
+          effective_date: effectiveDate,
+          note: `Incentive for job #${id}`,
+          created_by: userId,
+        };
+        if (existingInc) {
+          if (existingInc.payout_batch_id) {
+            console.log(`[Payroll PATCH] Incentive for job ${id} member ${teamMemberId} already in payout batch — skipping`);
+          } else {
+            await supabase.from('cleaner_ledger').update(incRow).eq('id', existingInc.id);
+          }
+        } else {
+          await supabase.from('cleaner_ledger').insert(incRow);
+        }
+      } else if (existingInc && !existingInc.payout_batch_id) {
+        // Incentive set to 0: delete the ledger entry (if unbatched)
+        await supabase.from('cleaner_ledger').delete().eq('id', existingInc.id);
+      }
+    } else {
+      // Full rebuild for hours/tips/servicePrice changes
+      const { error: deleteErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
+      if (deleteErr) {
+        console.error(`[Payroll PATCH] Ledger delete failed for job ${id}:`, deleteErr);
+        return res.status(500).json({ error: 'Failed to clear ledger entries for recalculation' });
+      }
+      try {
+        await createLedgerEntriesForCompletedJob(parseInt(id), userId);
+      } catch (e) {
+        console.error(`[Payroll PATCH] Ledger rebuild failed for job ${id}:`, e);
+        return res.status(500).json({ error: 'Failed to rebuild ledger entries' });
+      }
     }
 
     res.json({ success: true });
