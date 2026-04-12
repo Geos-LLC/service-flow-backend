@@ -147,9 +147,26 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       const qrRes = await sigcoreRequest('GET', '/integrations/whatsapp/qr', tenantKey)
       const qrData = qrRes.data?.data || qrRes.data || {}
 
-      // If connected (QR was scanned), update local settings
+      // If connected (QR was scanned), clear old data + update settings
       if (qrData.connected) {
         const phoneNumber = qrData.phoneNumber || null
+
+        // ── Clear old WhatsApp data (synchronous, before anything else) ──
+        // Conversations + messages will be re-created by webhook delivery
+        try {
+          const { data: oldConvs } = await supabase.from('communication_conversations')
+            .select('id').eq('user_id', userId).eq('provider', 'whatsapp')
+          if (oldConvs && oldConvs.length > 0) {
+            const oldIds = oldConvs.map(c => c.id)
+            await supabase.from('communication_messages').delete().in('conversation_id', oldIds)
+            await supabase.from('communication_conversations').delete().in('id', oldIds)
+            logger.log(`[WhatsApp] Cleared ${oldConvs.length} old conversations for user ${userId}`)
+          }
+        } catch (e) {
+          logger.warn('[WhatsApp] Failed to clear old data:', e.message)
+        }
+
+        // ── Update connection settings ──
         await supabase.from('communication_settings').update({
           whatsapp_connected: true,
           whatsapp_phone_number: phoneNumber,
@@ -157,22 +174,13 @@ module.exports = (supabase, logger, sigcoreRequest) => {
           updated_at: new Date().toISOString(),
         }).eq('user_id', userId)
 
-        // Register endpoint route for deterministic routing (Step A)
+        // ── Register endpoint route for deterministic routing (Step A) ──
         if (phoneNumber) {
-          const normalizePhone = (p) => {
-            if (!p) return null
-            const digits = p.replace(/[^\d+]/g, '')
-            if (digits.startsWith('+')) return digits
-            if (digits.length === 10) return `+1${digits}`
-            if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
-            return digits
-          }
           const normalized = normalizePhone(phoneNumber)
           if (normalized) {
             const { data: wsUser } = await supabase.from('sf_workspace_users')
               .select('workspace_id').eq('user_id', userId).eq('status', 'active').maybeSingle()
             if (wsUser?.workspace_id) {
-              // Upsert endpoint route for WhatsApp
               const { data: existing } = await supabase.from('communication_endpoint_routes')
                 .select('id').eq('provider', 'whatsapp').eq('phone_number', normalized).eq('channel', 'whatsapp').eq('is_active', true).maybeSingle()
               if (existing) {
@@ -193,104 +201,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         }
 
         logger.log(`[WhatsApp] Connected for user ${userId}, phone: ${phoneNumber}`)
-
-        // Auto-trigger sync after Sigcore's auto-sync has time to populate messages
-        // The microservice needs ~15s startup + ~2min to sync messages via Puppeteer fallback
-        if (!waSyncProgress[userId] || waSyncProgress[userId].phase === 'done' || waSyncProgress[userId].phase === 'idle') {
-          waSyncProgress[userId] = { phase: 'waiting', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
-          logger.log(`[WhatsApp] Scheduling auto-sync for user ${userId} in 45s (waiting for Sigcore auto-sync)`)
-          setTimeout(async () => {
-            try {
-              // Trigger internal sync by calling our own sync logic
-              const endpointPhone = normalizePhone(phoneNumber)
-              if (!endpointPhone || !tenantKey) return
-
-              waSyncProgress[userId] = { phase: 'fetching', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
-
-              let allConversations = []
-              let page = 1
-              const pageSize = 50
-              while (true) {
-                const convRes = await sigcoreRequest('GET', `/conversations?provider=whatsapp&page=${page}&limit=${pageSize}`, tenantKey)
-                const convData = convRes.data?.data || []
-                const meta = convRes.data?.meta || {}
-                allConversations.push(...convData)
-                if (page >= (meta.totalPages || 1)) break
-                page++
-              }
-
-              waSyncProgress[userId].total = allConversations.length
-              waSyncProgress[userId].phase = 'syncing'
-              logger.log(`[WhatsApp AutoSync] Processing ${allConversations.length} conversations`)
-
-              for (const sigConv of allConversations) {
-                try {
-                  const participantPhone = normalizePhone(sigConv.participantPhoneNumber)
-                  if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
-                  const rawDigits = participantPhone.replace(/[^\d]/g, '')
-                  if (participantPhone.includes('@') || rawDigits.length > 15 || rawDigits.length < 7) {
-                    waSyncProgress[userId].skipped++; continue
-                  }
-
-                  // Find-or-create conversation
-                  let conversation
-                  const { data: existingConv } = await supabase.from('communication_conversations')
-                    .select('*').eq('user_id', userId).eq('provider', 'whatsapp')
-                    .eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle()
-
-                  if (existingConv) {
-                    conversation = existingConv
-                  } else {
-                    const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
-                      user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
-                      sigcore_conversation_id: sigConv.id,
-                      endpoint_phone: endpointPhone, participant_phone: participantPhone,
-                      participant_name: sigConv.contactName || null,
-                      last_preview: (sigConv.lastMessage || '').substring(0, 200),
-                      last_event_at: sigConv.lastMessageAt || new Date().toISOString(),
-                      unread_count: sigConv.unreadCount || 0,
-                      conversation_type: 'external_client',
-                      metadata: { externalChatId: sigConv.externalId, sigcoreConversationId: sigConv.id, ...(sigConv.avatarUrl && { avatarUrl: sigConv.avatarUrl }) },
-                    }).select().single()
-                    if (createErr) continue
-                    conversation = newConv
-                  }
-
-                  // Fetch + insert messages
-                  try {
-                    const msgRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=50`, tenantKey)
-                    const sigMessages = msgRes.data?.data || []
-                    for (const msg of sigMessages) {
-                      const providerMsgId = msg.providerMessageId || msg.id
-                      if (!providerMsgId) continue
-                      const { data: existingMsg } = await supabase.from('communication_messages')
-                        .select('id').eq('provider_message_id', providerMsgId).maybeSingle()
-                      if (existingMsg) continue
-                      const direction = msg.direction === 'out' ? 'out' : 'in'
-                      await supabase.from('communication_messages').insert({
-                        conversation_id: conversation.id, provider_message_id: providerMsgId,
-                        direction, channel: 'whatsapp', body: msg.body || '',
-                        from_number: normalizePhone(msg.fromNumber) || (direction === 'out' ? endpointPhone : participantPhone),
-                        to_number: normalizePhone(msg.toNumber) || (direction === 'out' ? participantPhone : endpointPhone),
-                        sender_role: direction === 'in' ? 'customer' : 'agent', status: msg.status || 'delivered',
-                        metadata: msg.metadata || {}, created_at: msg.createdAt || new Date().toISOString(),
-                      })
-                      waSyncProgress[userId].messages++
-                    }
-                  } catch (e) { /* messages fetch failed — non-fatal */ }
-
-                  waSyncProgress[userId].chats++
-                } catch (e) { waSyncProgress[userId].skipped++ }
-              }
-
-              waSyncProgress[userId].phase = 'done'
-              logger.log(`[WhatsApp AutoSync] Done: ${waSyncProgress[userId].chats} chats, ${waSyncProgress[userId].messages} messages`)
-            } catch (e) {
-              logger.error('[WhatsApp AutoSync] Error:', e.message)
-              waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: e.message }
-            }
-          }, 45000) // 45s delay for Sigcore auto-sync to run
-        }
+        // Messages will arrive via whatsapp.message.inbound webhooks as Sigcore auto-sync runs (~2 min)
       }
 
       res.json({
@@ -298,7 +209,6 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         status: qrData.status || 'unknown',
         qrCode: qrData.qrCode || null,
         phoneNumber: qrData.phoneNumber || null,
-        autoSyncScheduled: qrData.connected || false,
       })
     } catch (error) {
       logger.error('[WhatsApp] QR error:', error.response?.data || error.message)
