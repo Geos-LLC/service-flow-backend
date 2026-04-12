@@ -20397,11 +20397,13 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       // B) Negative paid batches from prior periods — debt carry-forward
       // When a batch is negative (cleaner owes), marking it paid acknowledges
       // the debt but doesn't recover the money. It carries to the next period.
+      // Exclude batches already recovered by a subsequent batch.
       const { data: negativeBatches } = await supabase.from('cleaner_payout_batch')
         .select('team_member_id, total_amount')
         .eq('user_id', userId)
         .eq('status', 'paid')
         .lt('total_amount', 0)
+        .is('recovered_by_batch_id', null)
         .lt('period_end', startDate);
       (negativeBatches || []).forEach(b => {
         const mid = b.team_member_id;
@@ -33194,12 +33196,14 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
   const periodTotal = unpaidEntries.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
 
   // Include prior period negative batch debt (carry-forward)
+  // Only include negative batches not yet recovered by a subsequent batch
   const { data: negativeBatches } = await supabase.from('cleaner_payout_batch')
-    .select('total_amount')
+    .select('id, total_amount')
     .eq('user_id', userId)
     .eq('team_member_id', parseInt(teamMemberId))
     .eq('status', 'paid')
     .lt('total_amount', 0)
+    .is('recovered_by_batch_id', null)
     .lt('period_end', periodStart);
   const priorDebt = (negativeBatches || []).reduce((sum, b) => sum + parseFloat(b.total_amount), 0);
   const totalAmount = periodTotal + priorDebt;
@@ -33224,6 +33228,14 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
 
   if (batchError) {
     throw new Error(`Failed to create payout batch: ${batchError.message}`);
+  }
+
+  // Mark consumed negative batches as recovered by this new batch
+  if (negativeBatches && negativeBatches.length > 0) {
+    const negativeIds = negativeBatches.map(b => b.id);
+    await supabase.from('cleaner_payout_batch')
+      .update({ recovered_by_batch_id: batch.id })
+      .in('id', negativeIds);
   }
 
   // Attach ledger entries to this batch
