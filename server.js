@@ -20956,7 +20956,7 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
 
       // Find existing incentive entry for this member+job
       const { data: existingInc } = await supabase.from('cleaner_ledger')
-        .select('id, payout_batch_id')
+        .select('id, amount, payout_batch_id')
         .eq('job_id', parseInt(id))
         .eq('team_member_id', parseInt(teamMemberId))
         .eq('type', 'incentive')
@@ -20975,16 +20975,49 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
         };
         if (existingInc) {
           if (existingInc.payout_batch_id) {
-            console.log(`[Payroll PATCH] Incentive for job ${id} member ${teamMemberId} already in payout batch — skipping`);
+            // Already settled — create a correction adjustment for the difference
+            const oldAmount = parseFloat(existingInc.amount) || 0;
+            const diff = parseFloat((newInc - oldAmount).toFixed(2));
+            if (Math.abs(diff) >= 0.01) {
+              await supabase.from('cleaner_ledger').insert({
+                user_id: userId,
+                team_member_id: parseInt(teamMemberId),
+                job_id: parseInt(id),
+                type: 'adjustment',
+                amount: diff,
+                effective_date: new Date().toISOString().split('T')[0],
+                note: `Incentive correction for job #${id} (was ${oldAmount}, now ${newInc})`,
+                metadata: { adjustment_reason: 'incentive_correction', original_ledger_id: existingInc.id, original_amount: oldAmount, new_amount: newInc },
+                created_by: userId,
+              });
+            }
           } else {
             await supabase.from('cleaner_ledger').update(incRow).eq('id', existingInc.id);
           }
         } else {
           await supabase.from('cleaner_ledger').insert(incRow);
         }
-      } else if (existingInc && !existingInc.payout_batch_id) {
-        // Incentive set to 0: delete the ledger entry (if unbatched)
-        await supabase.from('cleaner_ledger').delete().eq('id', existingInc.id);
+      } else if (newInc === 0 && existingInc) {
+        if (!existingInc.payout_batch_id) {
+          // Unbatched: delete the ledger entry
+          await supabase.from('cleaner_ledger').delete().eq('id', existingInc.id);
+        } else {
+          // Batched: create a negative correction to zero it out in next payout
+          const oldAmount = parseFloat(existingInc.amount) || 0;
+          if (oldAmount > 0) {
+            await supabase.from('cleaner_ledger').insert({
+              user_id: userId,
+              team_member_id: parseInt(teamMemberId),
+              job_id: parseInt(id),
+              type: 'adjustment',
+              amount: -oldAmount,
+              effective_date: new Date().toISOString().split('T')[0],
+              note: `Incentive removed for job #${id} (was ${oldAmount})`,
+              metadata: { adjustment_reason: 'incentive_correction', original_ledger_id: existingInc.id, original_amount: oldAmount, new_amount: 0 },
+              created_by: userId,
+            });
+          }
+        }
       }
     } else {
       // Full rebuild for hours/tips/servicePrice changes
