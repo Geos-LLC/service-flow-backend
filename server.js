@@ -1055,7 +1055,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
-try { app.use('/api/integrations/whatsapp', require('./whatsapp-service')(supabase, logger, sigcoreRequest)); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
+let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
@@ -34872,6 +34872,18 @@ async function handleWhatsAppWebhook(event, payload) {
       await supabase.from('communication_conversations').update(updates).eq('id', conversation.id);
 
       logger.log(`[WhatsApp] Stored inbound message for conversation ${conversation.id}`);
+
+      // Track webhook-delivered messages in sync progress (for progress bar)
+      if (waRouter?.waSyncProgress) {
+        const p = waRouter.waSyncProgress[userId];
+        if (p && (p.phase === 'receiving' || p.phase === 'syncing')) {
+          p.messages = (p.messages || 0) + 1;
+          // Count unique conversations
+          if (!p._convSet) p._convSet = new Set();
+          p._convSet.add(conversation.id);
+          p.chats = p._convSet.size;
+        }
+      }
 
     } else if (event === 'whatsapp.message.delivered') {
       // Update message delivery status

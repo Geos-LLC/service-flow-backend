@@ -12,11 +12,13 @@
 
 const express = require('express')
 
-// In-memory sync progress per user
+// In-memory sync progress per user — shared with server.js for webhook progress tracking
 const waSyncProgress = {}
 
 module.exports = (supabase, logger, sigcoreRequest) => {
   const router = express.Router()
+  // Expose progress object so webhook handler can track message delivery
+  router.waSyncProgress = waSyncProgress
 
   // Helper: normalize phone to E.164
   function normalizePhone(phone) {
@@ -201,7 +203,8 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         }
 
         logger.log(`[WhatsApp] Connected for user ${userId}, phone: ${phoneNumber}`)
-        // Messages will arrive via whatsapp.message.inbound webhooks as Sigcore auto-sync runs (~2 min)
+        // Set progress to 'receiving' — webhook handler will track incoming messages
+        waSyncProgress[userId] = { phase: 'receiving', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
       }
 
       res.json({
@@ -313,13 +316,17 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
       for (const sigConv of allConversations) {
         try {
-          const participantPhone = normalizePhone(sigConv.participantPhoneNumber)
+          // Groups use the raw ID (e.g. 120363862176675@g.us), individuals get normalized
+          const isGroup = sigConv.isGroup || sigConv.participantPhoneNumber?.includes('@')
+          const participantPhone = isGroup
+            ? sigConv.participantPhoneNumber
+            : normalizePhone(sigConv.participantPhoneNumber)
           if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
 
-          // Skip group chats (group IDs contain @g.us or are 18+ digits)
-          const rawDigits = participantPhone.replace(/[^\d]/g, '')
-          if (participantPhone.includes('@') || rawDigits.length > 15 || rawDigits.length < 7) {
-            waSyncProgress[userId].skipped++; continue
+          // Validate individual phone numbers (skip invalid, allow groups)
+          if (!isGroup) {
+            const rawDigits = participantPhone.replace(/[^\d]/g, '')
+            if (rawDigits.length < 7) { waSyncProgress[userId].skipped++; continue }
           }
 
           // Find-or-create conversation: hardened identity (user_id, provider, endpoint_phone, participant_phone)
@@ -357,11 +364,12 @@ module.exports = (supabase, logger, sigcoreRequest) => {
               last_preview: (sigConv.lastMessage || '').substring(0, 200),
               last_event_at: sigConv.lastMessageAt || new Date().toISOString(),
               unread_count: sigConv.unreadCount || 0,
-              conversation_type: 'external_client',
+              conversation_type: isGroup ? 'group' : 'external_client',
               metadata: {
                 externalChatId: sigConv.externalId,
                 sigcoreConversationId: sigConv.id,
                 ...(sigConv.avatarUrl && { avatarUrl: sigConv.avatarUrl }),
+                ...(isGroup && { isGroup: true }),
               },
             }).select().single()
             if (createErr) { logger.error('[WhatsApp Sync] Create conversation error:', createErr); continue }
