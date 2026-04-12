@@ -20271,7 +20271,8 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     if (commPct > 0) {
       const dailyRevenue = {};
       (completedJobs || []).forEach(job => {
-        if ((job.status || '').toLowerCase() !== 'completed') return;
+        const js = (job.status || '').toLowerCase();
+        if (js !== 'completed' && js !== 'paid') return;
         const jd = String(job.scheduled_date || '').split('T')[0].split(' ')[0];
         if (jd < effectiveStart || jd > effectiveEnd) return;
         const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
