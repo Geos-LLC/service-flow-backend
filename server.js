@@ -34622,17 +34622,14 @@ app.put('/api/communications/settings/preferences', authenticateToken, async (re
 async function handleWhatsAppWebhook(event, payload) {
   try {
     if (event === 'whatsapp.message.inbound') {
-      // Extract from nested Sigcore payload structure
+      // Extract from Sigcore webhook payload structure
       const conv = payload.conversation || {};
       const msg = payload.message || payload;
-      const isFromMe = msg.fromMe === true;
-      // When fromMe: from=our number, to=participant. Otherwise: from=participant, to=our number
-      const participantPhone = isFromMe
-        ? normalizePhone(msg.toNumber || msg.to || conv.participantPhone)
-        : normalizePhone(conv.participantPhone || msg.fromNumber || msg.from);
-      const endpointPhone = isFromMe
-        ? normalizePhone(msg.fromNumber || msg.from || conv.endpointPhone)
-        : normalizePhone(conv.endpointPhone || msg.toNumber || msg.to);
+      const isFromMe = msg.fromMe === true || msg.direction === 'out';
+      // Sigcore sends: conv.participantPhone (the contact), conv.endpointPhone (our number)
+      // Also msg.fromNumber/msg.toNumber for the raw message direction
+      const participantPhone = normalizePhone(conv.participantPhone || (isFromMe ? (msg.toNumber || msg.to) : (msg.fromNumber || msg.from)));
+      const endpointPhone = normalizePhone(conv.endpointPhone || (isFromMe ? (msg.fromNumber || msg.from) : (msg.toNumber || msg.to)));
       const body = msg.text || msg.body || '';
       const contactName = msg.contactName || conv.contactName || null;
       const externalMessageId = msg.externalMessageId || msg.id || `wa_${Date.now()}`;
@@ -34663,10 +34660,10 @@ async function handleWhatsAppWebhook(event, payload) {
 
       // Route via deterministic endpoint resolution (Step A preferred)
       let userId = null;
-      if (endpointPhone) {
+      if (resolvedEndpointPhone) {
         const routeResult = await resolveEndpointRoute({
-          provider: 'whatsapp', endpointId: `wa_${endpointPhone}`,
-          phoneNumber: endpointPhone, channel: 'whatsapp',
+          provider: 'whatsapp', endpointId: `wa_${resolvedEndpointPhone}`,
+          phoneNumber: resolvedEndpointPhone, channel: 'whatsapp',
         });
         if (routeResult.routed) {
           userId = routeResult.userId;
@@ -34690,10 +34687,11 @@ async function handleWhatsAppWebhook(event, payload) {
       }
 
       // Message endpoint guard: only attach if msg involves our endpoint phone
-      if (resolvedEndpointPhone) {
+      // Skip guard if Sigcore didn't send phone numbers (backwards compat)
+      if (resolvedEndpointPhone && (msg.fromNumber || msg.toNumber)) {
         const msgFrom = normalizePhone(msg.fromNumber || msg.from);
         const msgTo = normalizePhone(msg.toNumber || msg.to);
-        if (msgFrom !== resolvedEndpointPhone && msgTo !== resolvedEndpointPhone) {
+        if (msgFrom && msgTo && msgFrom !== resolvedEndpointPhone && msgTo !== resolvedEndpointPhone) {
           logger.warn(`[WhatsApp] Endpoint guard: rejected message (endpoint=${resolvedEndpointPhone}, from=${msgFrom}, to=${msgTo})`);
           return;
         }
@@ -34770,6 +34768,7 @@ async function handleWhatsAppWebhook(event, payload) {
       // Update connection status
       const status = payload.status;
       const isConnected = status === 'ready';
+      const phoneNumber = payload.phoneNumber ? normalizePhone(payload.phoneNumber) : null;
       // Find user with WhatsApp connected or the target user
       const { data: settings } = await supabase.from('communication_settings')
         .select('user_id, whatsapp_connected')
@@ -34777,11 +34776,38 @@ async function handleWhatsAppWebhook(event, payload) {
         .limit(1).maybeSingle();
 
       if (settings) {
-        await supabase.from('communication_settings').update({
+        const updateFields = {
           whatsapp_connected: isConnected,
           updated_at: new Date().toISOString(),
-        }).eq('user_id', settings.user_id);
-        logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}) for user ${settings.user_id}`);
+        };
+        // Save phone number on reconnect, clear on disconnect
+        if (isConnected && phoneNumber) {
+          updateFields.whatsapp_phone_number = phoneNumber;
+          updateFields.whatsapp_connected_at = new Date().toISOString();
+        } else if (!isConnected) {
+          updateFields.whatsapp_phone_number = null;
+          updateFields.whatsapp_connected_at = null;
+        }
+        await supabase.from('communication_settings').update(updateFields).eq('user_id', settings.user_id);
+        logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}, phone=${phoneNumber}) for user ${settings.user_id}`);
+
+        // On reconnect: clear old WhatsApp conversations + messages so fresh sync replaces them
+        // Mirrors Sigcore's clearWhatsAppData() behavior
+        if (isConnected) {
+          try {
+            const { data: oldConvs } = await supabase.from('communication_conversations')
+              .select('id').eq('user_id', settings.user_id).eq('provider', 'whatsapp');
+            if (oldConvs && oldConvs.length > 0) {
+              const oldIds = oldConvs.map(c => c.id);
+              // Delete messages first (FK constraint)
+              await supabase.from('communication_messages').delete().in('conversation_id', oldIds);
+              await supabase.from('communication_conversations').delete().in('id', oldIds);
+              logger.log(`[WhatsApp] Cleared ${oldConvs.length} old conversations + messages for user ${settings.user_id}`);
+            }
+          } catch (e) {
+            logger.warn('[WhatsApp] Failed to clear old data:', e.message);
+          }
+        }
       }
     }
   } catch (error) {
@@ -35870,6 +35896,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         locationId: c.sf_location_id || null,
         locationName: loc?.name || c.external_location_name || null,
         locationResolved: !!c.sf_location_id,
+        // Avatar URL from WhatsApp sync (stored in metadata)
+        avatarUrl: c.metadata?.avatarUrl || null,
       };
     });
 

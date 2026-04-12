@@ -193,6 +193,104 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         }
 
         logger.log(`[WhatsApp] Connected for user ${userId}, phone: ${phoneNumber}`)
+
+        // Auto-trigger sync after Sigcore's auto-sync has time to populate messages
+        // The microservice needs ~15s startup + ~2min to sync messages via Puppeteer fallback
+        if (!waSyncProgress[userId] || waSyncProgress[userId].phase === 'done' || waSyncProgress[userId].phase === 'idle') {
+          waSyncProgress[userId] = { phase: 'waiting', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
+          logger.log(`[WhatsApp] Scheduling auto-sync for user ${userId} in 45s (waiting for Sigcore auto-sync)`)
+          setTimeout(async () => {
+            try {
+              // Trigger internal sync by calling our own sync logic
+              const endpointPhone = normalizePhone(phoneNumber)
+              if (!endpointPhone || !tenantKey) return
+
+              waSyncProgress[userId] = { phase: 'fetching', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
+
+              let allConversations = []
+              let page = 1
+              const pageSize = 50
+              while (true) {
+                const convRes = await sigcoreRequest('GET', `/conversations?provider=whatsapp&page=${page}&limit=${pageSize}`, tenantKey)
+                const convData = convRes.data?.data || []
+                const meta = convRes.data?.meta || {}
+                allConversations.push(...convData)
+                if (page >= (meta.totalPages || 1)) break
+                page++
+              }
+
+              waSyncProgress[userId].total = allConversations.length
+              waSyncProgress[userId].phase = 'syncing'
+              logger.log(`[WhatsApp AutoSync] Processing ${allConversations.length} conversations`)
+
+              for (const sigConv of allConversations) {
+                try {
+                  const participantPhone = normalizePhone(sigConv.participantPhoneNumber)
+                  if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
+                  const rawDigits = participantPhone.replace(/[^\d]/g, '')
+                  if (participantPhone.includes('@') || rawDigits.length > 15 || rawDigits.length < 7) {
+                    waSyncProgress[userId].skipped++; continue
+                  }
+
+                  // Find-or-create conversation
+                  let conversation
+                  const { data: existingConv } = await supabase.from('communication_conversations')
+                    .select('*').eq('user_id', userId).eq('provider', 'whatsapp')
+                    .eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone).maybeSingle()
+
+                  if (existingConv) {
+                    conversation = existingConv
+                  } else {
+                    const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
+                      user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
+                      sigcore_conversation_id: sigConv.id,
+                      endpoint_phone: endpointPhone, participant_phone: participantPhone,
+                      participant_name: sigConv.contactName || null,
+                      last_preview: (sigConv.lastMessage || '').substring(0, 200),
+                      last_event_at: sigConv.lastMessageAt || new Date().toISOString(),
+                      unread_count: sigConv.unreadCount || 0,
+                      conversation_type: 'external_client',
+                      metadata: { externalChatId: sigConv.externalId, sigcoreConversationId: sigConv.id, ...(sigConv.avatarUrl && { avatarUrl: sigConv.avatarUrl }) },
+                    }).select().single()
+                    if (createErr) continue
+                    conversation = newConv
+                  }
+
+                  // Fetch + insert messages
+                  try {
+                    const msgRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=50`, tenantKey)
+                    const sigMessages = msgRes.data?.data || []
+                    for (const msg of sigMessages) {
+                      const providerMsgId = msg.providerMessageId || msg.id
+                      if (!providerMsgId) continue
+                      const { data: existingMsg } = await supabase.from('communication_messages')
+                        .select('id').eq('provider_message_id', providerMsgId).maybeSingle()
+                      if (existingMsg) continue
+                      const direction = msg.direction === 'out' ? 'out' : 'in'
+                      await supabase.from('communication_messages').insert({
+                        conversation_id: conversation.id, provider_message_id: providerMsgId,
+                        direction, channel: 'whatsapp', body: msg.body || '',
+                        from_number: normalizePhone(msg.fromNumber) || (direction === 'out' ? endpointPhone : participantPhone),
+                        to_number: normalizePhone(msg.toNumber) || (direction === 'out' ? participantPhone : endpointPhone),
+                        sender_role: direction === 'in' ? 'customer' : 'agent', status: msg.status || 'delivered',
+                        metadata: msg.metadata || {}, created_at: msg.createdAt || new Date().toISOString(),
+                      })
+                      waSyncProgress[userId].messages++
+                    }
+                  } catch (e) { /* messages fetch failed — non-fatal */ }
+
+                  waSyncProgress[userId].chats++
+                } catch (e) { waSyncProgress[userId].skipped++ }
+              }
+
+              waSyncProgress[userId].phase = 'done'
+              logger.log(`[WhatsApp AutoSync] Done: ${waSyncProgress[userId].chats} chats, ${waSyncProgress[userId].messages} messages`)
+            } catch (e) {
+              logger.error('[WhatsApp AutoSync] Error:', e.message)
+              waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: e.message }
+            }
+          }, 45000) // 45s delay for Sigcore auto-sync to run
+        }
       }
 
       res.json({
@@ -200,6 +298,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         status: qrData.status || 'unknown',
         qrCode: qrData.qrCode || null,
         phoneNumber: qrData.phoneNumber || null,
+        autoSyncScheduled: qrData.connected || false,
       })
     } catch (error) {
       logger.error('[WhatsApp] QR error:', error.response?.data || error.message)
@@ -251,6 +350,9 @@ module.exports = (supabase, logger, sigcoreRequest) => {
   // ══════════════════════════════════════
   // POST /sync — Backfill WhatsApp chat history
   // ══════════════════════════════════════
+  // Pulls conversations + messages from Sigcore's database (populated by auto-sync).
+  // The microservice's direct chat API doesn't return messages for LID chats,
+  // but Sigcore's auto-sync uses Puppeteer fallback and stores everything in DB.
   router.post('/sync', async (req, res) => {
     try {
       const userId = req.user.userId
@@ -270,25 +372,45 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       waSyncProgress[userId] = { phase: 'fetching', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
       res.json({ success: true, message: 'Sync started' })
 
-      // ONE call to Sigcore — aggregated chats + messages
-      let chatsData
+      // Fetch WhatsApp conversations from Sigcore's database (auto-sync stores them with full data)
+      let allConversations = []
       try {
-        const chatsRes = await sigcoreRequest('GET', `/integrations/whatsapp/chats?includeMessages=true&messageLimit=${messageLimit}`, tenantKey)
-        chatsData = chatsRes.data?.data?.chats || chatsRes.data?.chats || []
+        let page = 1
+        const pageSize = 50
+        while (true) {
+          const convRes = await sigcoreRequest('GET', `/conversations?provider=whatsapp&page=${page}&limit=${pageSize}`, tenantKey)
+          const convData = convRes.data?.data || []
+          const meta = convRes.data?.meta || {}
+          allConversations.push(...convData)
+          if (page >= (meta.totalPages || 1)) break
+          page++
+        }
       } catch (e) {
-        logger.error('[WhatsApp Sync] Failed to fetch chats:', e.response?.data || e.message)
-        waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: 'Failed to fetch chats from Sigcore' }
+        logger.error('[WhatsApp Sync] Failed to fetch conversations:', e.response?.data || e.message)
+        waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: 'Failed to fetch conversations from Sigcore' }
         return
       }
 
-      waSyncProgress[userId].total = chatsData.length
+      waSyncProgress[userId].total = allConversations.length
       waSyncProgress[userId].phase = 'syncing'
-      logger.log(`[WhatsApp Sync] Processing ${chatsData.length} chats for user ${userId}`)
+      // Log sample conversation for debugging
+      if (allConversations.length > 0) {
+        const sample = allConversations[0]
+        logger.log(`[WhatsApp Sync] Processing ${allConversations.length} conversations from Sigcore DB. Sample: id=${sample.id}, name=${sample.contactName}, phone=${sample.participantPhoneNumber}, provider=${sample.provider}, hasAvatar=${!!sample.avatarUrl}`)
+      } else {
+        logger.log(`[WhatsApp Sync] 0 conversations from Sigcore DB — auto-sync may not have finished yet`)
+      }
 
-      for (const chat of chatsData) {
+      for (const sigConv of allConversations) {
         try {
-          const participantPhone = normalizePhone(chat.phone)
+          const participantPhone = normalizePhone(sigConv.participantPhoneNumber)
           if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
+
+          // Skip group chats (group IDs contain @g.us or are 18+ digits)
+          const rawDigits = participantPhone.replace(/[^\d]/g, '')
+          if (participantPhone.includes('@') || rawDigits.length > 15 || rawDigits.length < 7) {
+            waSyncProgress[userId].skipped++; continue
+          }
 
           // Find-or-create conversation: hardened identity (user_id, provider, endpoint_phone, participant_phone)
           let conversation
@@ -300,59 +422,89 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
           if (existingConv) {
             conversation = existingConv
+            // Update name and avatar if Sigcore has better data
+            const updates = {}
+            if (sigConv.contactName && !conversation.participant_name) updates.participant_name = sigConv.contactName
+            if (sigConv.lastMessage && !conversation.last_preview) updates.last_preview = sigConv.lastMessage.substring(0, 200)
+            if (sigConv.lastMessageAt) updates.last_event_at = sigConv.lastMessageAt
+            // Store avatar in metadata
+            if (sigConv.avatarUrl) {
+              const existingMeta = conversation.metadata || {}
+              if (existingMeta.avatarUrl !== sigConv.avatarUrl) {
+                updates.metadata = { ...existingMeta, avatarUrl: sigConv.avatarUrl }
+              }
+            }
+            if (Object.keys(updates).length > 0) {
+              updates.updated_at = new Date().toISOString()
+              await supabase.from('communication_conversations').update(updates).eq('id', conversation.id)
+            }
           } else {
             const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
               user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
+              sigcore_conversation_id: sigConv.id,
               endpoint_phone: endpointPhone, participant_phone: participantPhone,
-              participant_name: chat.name || null,
-              last_preview: '', last_event_at: chat.lastMessageAt || new Date().toISOString(),
-              unread_count: chat.unreadCount || 0,
+              participant_name: sigConv.contactName || null,
+              last_preview: (sigConv.lastMessage || '').substring(0, 200),
+              last_event_at: sigConv.lastMessageAt || new Date().toISOString(),
+              unread_count: sigConv.unreadCount || 0,
               conversation_type: 'external_client',
-              metadata: { externalChatId: chat.id },
+              metadata: {
+                externalChatId: sigConv.externalId,
+                sigcoreConversationId: sigConv.id,
+                ...(sigConv.avatarUrl && { avatarUrl: sigConv.avatarUrl }),
+              },
             }).select().single()
             if (createErr) { logger.error('[WhatsApp Sync] Create conversation error:', createErr); continue }
             conversation = newConv
           }
 
-          // Insert messages with MANDATORY endpoint guard + dedup
-          let chatMsgCount = 0
-          for (const msg of (chat.messages || [])) {
-            // MANDATORY endpoint guard: only attach if msg involves our endpoint
-            const msgFrom = normalizePhone(msg.from)
-            const msgTo = normalizePhone(msg.to)
-            if (msgFrom !== endpointPhone && msgTo !== endpointPhone) {
-              waSyncProgress[userId].skipped++
-              continue
+          // Fetch messages from Sigcore's database for this conversation
+          let sigMessages = []
+          try {
+            const msgRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=${messageLimit}`, tenantKey)
+            sigMessages = msgRes.data?.data || []
+            if (waSyncProgress[userId].chats < 3) {
+              // Log first few conversations for debugging
+              logger.log(`[WhatsApp Sync] Conv ${sigConv.id} (${sigConv.contactName || sigConv.participantPhoneNumber}): ${sigMessages.length} messages from Sigcore`)
             }
+          } catch (e) {
+            logger.warn(`[WhatsApp Sync] Failed to fetch messages for conv ${sigConv.id}: ${e.response?.status || ''} ${e.message}`)
+          }
 
-            // Dedup by WhatsApp native message ID (provider_message_id)
-            if (!msg.id) continue
+          // Insert messages with dedup
+          for (const msg of sigMessages) {
+            const providerMsgId = msg.providerMessageId || msg.id
+            if (!providerMsgId) continue
+
+            // Dedup by provider message ID
             const { data: existingMsg } = await supabase.from('communication_messages')
-              .select('id').eq('provider_message_id', msg.id).maybeSingle()
-            if (existingMsg) { continue } // Already synced
+              .select('id').eq('provider_message_id', providerMsgId).maybeSingle()
+            if (existingMsg) continue
 
-            const direction = msg.fromMe ? 'out' : 'in'
+            const direction = msg.direction === 'out' ? 'out' : 'in'
+            const fromNumber = normalizePhone(msg.fromNumber) || (direction === 'out' ? endpointPhone : participantPhone)
+            const toNumber = normalizePhone(msg.toNumber) || (direction === 'out' ? participantPhone : endpointPhone)
+
             await supabase.from('communication_messages').insert({
               conversation_id: conversation.id,
-              provider_message_id: msg.id, // WhatsApp native _serialized ID
+              provider_message_id: providerMsgId,
               direction, channel: 'whatsapp', body: msg.body || '',
-              from_number: msgFrom, to_number: msgTo,
+              from_number: fromNumber, to_number: toNumber,
               sender_role: direction === 'in' ? 'customer' : 'agent',
-              status: 'delivered',
-              metadata: { hasMedia: msg.hasMedia, type: msg.type },
-              created_at: msg.timestamp || new Date().toISOString(),
+              status: msg.status || 'delivered',
+              metadata: msg.metadata || {},
+              created_at: msg.createdAt || new Date().toISOString(),
             })
-            chatMsgCount++
             waSyncProgress[userId].messages++
           }
 
-          // Update conversation with latest message info
-          const lastMsg = (chat.messages || []).slice(-1)[0]
-          if (lastMsg) {
+          // Update conversation with latest message info from fetched messages
+          if (sigMessages.length > 0) {
+            const latestMsg = sigMessages[0] // Messages come sorted by createdAt DESC
             await supabase.from('communication_conversations').update({
-              last_preview: (lastMsg.body || '').substring(0, 200),
-              last_event_at: lastMsg.timestamp || chat.lastMessageAt || new Date().toISOString(),
-              participant_name: chat.name || conversation.participant_name || null,
+              last_preview: (latestMsg.body || '').substring(0, 200),
+              last_event_at: latestMsg.createdAt || sigConv.lastMessageAt || new Date().toISOString(),
+              participant_name: sigConv.contactName || conversation.participant_name || null,
               updated_at: new Date().toISOString(),
             }).eq('id', conversation.id)
           }
@@ -381,7 +533,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
           waSyncProgress[userId].chats++
         } catch (e) {
-          logger.warn(`[WhatsApp Sync] Error processing chat: ${e.message}`)
+          logger.warn(`[WhatsApp Sync] Error processing conversation: ${e.message}`)
           waSyncProgress[userId].skipped++
         }
       }
