@@ -288,42 +288,27 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       waSyncProgress[userId] = { phase: 'fetching', chats: webhookChats, messages: webhookMessages, skipped: 0, linked: 0, total: 0 }
       res.json({ success: true, message: 'Sync started' })
 
-      // Fetch WhatsApp conversations from Sigcore's database (auto-sync stores them with full data)
-      let allConversations = []
+      // Fetch chat list from WhatsApp microservice (via Sigcore proxy)
+      // This is the source of truth for contact names + group status
+      // Sigcore's conversations DB may be empty due to clearWhatsAppData timing
+      let chatsData = []
       try {
-        let page = 1
-        const pageSize = 50
-        while (true) {
-          const convRes = await sigcoreRequest('GET', `/conversations?provider=whatsapp&page=${page}&limit=${pageSize}`, tenantKey)
-          const convData = convRes.data?.data || []
-          const meta = convRes.data?.meta || {}
-          allConversations.push(...convData)
-          if (page >= (meta.totalPages || 1)) break
-          page++
-        }
+        const chatsRes = await sigcoreRequest('GET', `/integrations/whatsapp/chats?includeMessages=false`, tenantKey)
+        chatsData = chatsRes.data?.data?.chats || chatsRes.data?.chats || []
       } catch (e) {
-        logger.error('[WhatsApp Sync] Failed to fetch conversations:', e.response?.data || e.message)
-        waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: 'Failed to fetch conversations from Sigcore' }
+        logger.error('[WhatsApp Sync] Failed to fetch chats:', e.response?.data || e.message)
+        waSyncProgress[userId] = { ...waSyncProgress[userId], phase: 'error', error: 'Failed to fetch chats from WhatsApp' }
         return
       }
 
-      waSyncProgress[userId].total = allConversations.length
+      waSyncProgress[userId].total = chatsData.length
       waSyncProgress[userId].phase = 'syncing'
-      // Log sample conversation for debugging
-      if (allConversations.length > 0) {
-        const sample = allConversations[0]
-        logger.log(`[WhatsApp Sync] Processing ${allConversations.length} conversations from Sigcore DB. Sample: id=${sample.id}, name=${sample.contactName}, phone=${sample.participantPhoneNumber}, provider=${sample.provider}, hasAvatar=${!!sample.avatarUrl}`)
-      } else {
-        logger.log(`[WhatsApp Sync] 0 conversations from Sigcore DB — auto-sync may not have finished yet`)
-      }
+      logger.log(`[WhatsApp Sync] Processing ${chatsData.length} chats from microservice for user ${userId}`)
 
-      for (const sigConv of allConversations) {
+      for (const chat of chatsData) {
         try {
-          // Groups use the raw ID (e.g. 120363862176675@g.us), individuals get normalized
-          const isGroup = sigConv.isGroup || sigConv.participantPhoneNumber?.includes('@')
-          const participantPhone = isGroup
-            ? sigConv.participantPhoneNumber
-            : normalizePhone(sigConv.participantPhoneNumber)
+          const isGroup = !!chat.isGroup || chat.phone?.includes('@')
+          const participantPhone = isGroup ? chat.phone : normalizePhone(chat.phone)
           if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
 
           // Validate individual phone numbers (skip invalid, allow groups)
@@ -332,8 +317,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
             if (rawDigits.length < 7) { waSyncProgress[userId].skipped++; continue }
           }
 
-          // Find-or-create conversation: hardened identity (user_id, provider, endpoint_phone, participant_phone)
-          let conversation
+          // Find existing conversation (created by webhook handler) and update metadata
           const { data: existingConv } = await supabase.from('communication_conversations')
             .select('*')
             .eq('user_id', userId).eq('provider', 'whatsapp')
@@ -341,110 +325,56 @@ module.exports = (supabase, logger, sigcoreRequest) => {
             .maybeSingle()
 
           if (existingConv) {
-            conversation = existingConv
-            // Update name and avatar if Sigcore has better data
+            // Update name from microservice (contact resolution)
             const updates = {}
-            if (sigConv.contactName && !conversation.participant_name) updates.participant_name = sigConv.contactName
-            if (sigConv.lastMessage && !conversation.last_preview) updates.last_preview = sigConv.lastMessage.substring(0, 200)
-            if (sigConv.lastMessageAt) updates.last_event_at = sigConv.lastMessageAt
-            // Store avatar in metadata
-            if (sigConv.avatarUrl) {
-              const existingMeta = conversation.metadata || {}
-              if (existingMeta.avatarUrl !== sigConv.avatarUrl) {
-                updates.metadata = { ...existingMeta, avatarUrl: sigConv.avatarUrl }
-              }
+            if (chat.name && !existingConv.participant_name) updates.participant_name = chat.name
+            if (chat.name && existingConv.participant_name !== chat.name) updates.participant_name = chat.name
+            if (chat.avatarUrl) {
+              const meta = existingConv.metadata || {}
+              if (meta.avatarUrl !== chat.avatarUrl) updates.metadata = { ...meta, avatarUrl: chat.avatarUrl }
+            }
+            if (isGroup && !(existingConv.metadata || {}).isGroup) {
+              updates.metadata = { ...(existingConv.metadata || {}), ...(updates.metadata || {}), isGroup: true }
+              updates.conversation_type = 'group'
             }
             if (Object.keys(updates).length > 0) {
               updates.updated_at = new Date().toISOString()
-              await supabase.from('communication_conversations').update(updates).eq('id', conversation.id)
+              await supabase.from('communication_conversations').update(updates).eq('id', existingConv.id)
             }
           } else {
-            const { data: newConv, error: createErr } = await supabase.from('communication_conversations').insert({
+            // Create conversation stub (messages will arrive via webhooks or already have)
+            const { error: createErr } = await supabase.from('communication_conversations').insert({
               user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
-              sigcore_conversation_id: sigConv.id,
               endpoint_phone: endpointPhone, participant_phone: participantPhone,
-              participant_name: sigConv.contactName || null,
-              last_preview: (sigConv.lastMessage || '').substring(0, 200),
-              last_event_at: sigConv.lastMessageAt || new Date().toISOString(),
-              unread_count: sigConv.unreadCount || 0,
+              participant_name: chat.name || null,
+              last_preview: chat.lastMessageAt ? '' : '',
+              last_event_at: chat.lastMessageAt || new Date().toISOString(),
+              unread_count: chat.unreadCount || 0,
               conversation_type: isGroup ? 'group' : 'external_client',
               metadata: {
-                externalChatId: sigConv.externalId,
-                sigcoreConversationId: sigConv.id,
-                ...(sigConv.avatarUrl && { avatarUrl: sigConv.avatarUrl }),
+                externalChatId: chat.id,
+                ...(chat.avatarUrl && { avatarUrl: chat.avatarUrl }),
                 ...(isGroup && { isGroup: true }),
               },
             }).select().single()
             if (createErr) { logger.error('[WhatsApp Sync] Create conversation error:', createErr); continue }
-            conversation = newConv
           }
 
-          // Fetch messages from Sigcore's database for this conversation
-          let sigMessages = []
-          try {
-            const msgRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=${messageLimit}`, tenantKey)
-            sigMessages = msgRes.data?.data || []
-            if (waSyncProgress[userId].chats < 3) {
-              // Log first few conversations for debugging
-              logger.log(`[WhatsApp Sync] Conv ${sigConv.id} (${sigConv.contactName || sigConv.participantPhoneNumber}): ${sigMessages.length} messages from Sigcore`)
-            }
-          } catch (e) {
-            logger.warn(`[WhatsApp Sync] Failed to fetch messages for conv ${sigConv.id}: ${e.response?.status || ''} ${e.message}`)
-          }
-
-          // Insert messages with dedup
-          for (const msg of sigMessages) {
-            const providerMsgId = msg.providerMessageId || msg.id
-            if (!providerMsgId) continue
-
-            // Dedup by provider message ID
-            const { data: existingMsg } = await supabase.from('communication_messages')
-              .select('id').eq('provider_message_id', providerMsgId).maybeSingle()
-            if (existingMsg) continue
-
-            const direction = msg.direction === 'out' ? 'out' : 'in'
-            const fromNumber = normalizePhone(msg.fromNumber) || (direction === 'out' ? endpointPhone : participantPhone)
-            const toNumber = normalizePhone(msg.toNumber) || (direction === 'out' ? participantPhone : endpointPhone)
-
-            await supabase.from('communication_messages').insert({
-              conversation_id: conversation.id,
-              provider_message_id: providerMsgId,
-              direction, channel: 'whatsapp', body: msg.body || '',
-              from_number: fromNumber, to_number: toNumber,
-              sender_role: direction === 'in' ? 'customer' : 'agent',
-              status: msg.status || 'delivered',
-              metadata: msg.metadata || {},
-              created_at: msg.createdAt || new Date().toISOString(),
-            })
-            waSyncProgress[userId].messages++
-          }
-
-          // Update conversation with latest message info from fetched messages
-          if (sigMessages.length > 0) {
-            const latestMsg = sigMessages[0] // Messages come sorted by createdAt DESC
-            await supabase.from('communication_conversations').update({
-              last_preview: (latestMsg.body || '').substring(0, 200),
-              last_event_at: latestMsg.createdAt || sigConv.lastMessageAt || new Date().toISOString(),
-              participant_name: sigConv.contactName || conversation.participant_name || null,
-              updated_at: new Date().toISOString(),
-            }).eq('id', conversation.id)
-          }
-
-          // Auto-link to customer/lead by phone (non-blocking)
-          if (!conversation.customer_id && !conversation.lead_id) {
+          // Auto-link to customer/lead by phone (non-blocking, skip groups)
+          if (existingConv && !existingConv.customer_id && !existingConv.lead_id && !isGroup) {
             try {
               const last10 = participantPhone.replace(/[^\d]/g, '').slice(-10)
               if (last10.length >= 7) {
                 const { data: customer } = await supabase.from('customers')
                   .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
                 if (customer) {
-                  await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', conversation.id)
+                  await supabase.from('communication_conversations').update({ customer_id: customer.id }).eq('id', existingConv.id)
                   waSyncProgress[userId].linked++
                 } else {
                   const { data: lead } = await supabase.from('leads')
                     .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
                   if (lead) {
-                    await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', conversation.id)
+                    await supabase.from('communication_conversations').update({ lead_id: lead.id }).eq('id', existingConv.id)
                     waSyncProgress[userId].linked++
                   }
                 }
@@ -454,7 +384,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
           waSyncProgress[userId].chats++
         } catch (e) {
-          logger.warn(`[WhatsApp Sync] Error processing conversation: ${e.message}`)
+          logger.warn(`[WhatsApp Sync] Error processing chat: ${e.message}`)
           waSyncProgress[userId].skipped++
         }
       }
