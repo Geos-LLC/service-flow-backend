@@ -36036,6 +36036,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         locationResolved: !!c.sf_location_id,
         // Avatar URL from WhatsApp sync (stored in metadata)
         avatarUrl: c.metadata?.avatarUrl || null,
+        isGroup: c.metadata?.isGroup || c.conversation_type === 'group' || false,
       };
     });
 
