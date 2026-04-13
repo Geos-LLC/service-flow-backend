@@ -1,7 +1,7 @@
 /**
  * Paystubs Module (Loosely Coupled)
  *
- * Mount: app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail))
+ * Mount: app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail))
  * Remove: delete this file + remove the line above = zero breakage
  *
  * Paystubs are immutable document records. They do NOT recalculate finances —
@@ -13,7 +13,7 @@
 
 const express = require('express')
 
-module.exports = (supabase, logger, sendTeamMemberEmail) => {
+module.exports = (supabase, logger, notificationEmail) => {
   const router = express.Router()
 
   // ══════════════════════════════════════
@@ -469,10 +469,8 @@ module.exports = (supabase, logger, sendTeamMemberEmail) => {
       const subject = `Your paystub for ${formatDate(period.start)} – ${formatDate(period.end)}`
 
       try {
-        const sgResult = await sendTeamMemberEmail({ to: email, subject, html, text })
-        const messageId = Array.isArray(sgResult) && sgResult[0]?.headers?.['x-message-id']
-          ? sgResult[0].headers['x-message-id']
-          : null
+        const sgResult = await notificationEmail.sendInternalEmail(userId, { to: email, subject, html, text, emailType: 'paystub' })
+        const messageId = sgResult?.messageId || null
 
         // Track send count in metadata
         const prevMeta = paystub.metadata || {}

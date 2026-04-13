@@ -453,8 +453,8 @@ cron.schedule('0 9 * * *', async () => {
       
       // Send email notification
         try {
-      await sendEmail({
-        to: job.customers.email,
+      await notificationEmail.sendCustomerEmail(job.user_id, {
+        to: job.customers.email, emailType: 'recurring_scheduled',
         subject: 'Recurring Service Scheduled',
         html: `
           <h2>Your recurring service has been scheduled</h2>
@@ -1056,8 +1056,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
-let emailRouter = null; try { emailRouter = require('./email-service')(supabase, logger); app.use('/api/integrations/email', emailRouter); } catch (e) { console.log('Email module not loaded:', e.message); }
-try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
+let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
+try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
 // Supabase connection is handled in supabase.js
@@ -13435,8 +13435,8 @@ app.post('/api/estimates/:id/send', async (req, res) => {
           </div>
         `;
 
-        await sendEmail({
-          to: estimate.customers.email,
+        await notificationEmail.sendCustomerEmail(estimate.user_id, {
+          to: estimate.customers.email, emailType: 'estimate',
           subject: `Your Estimate #${estimate.id} is Ready - ${estimate.users?.business_name || 'Service-flow'}`,
           html: emailHtml,
           text: `
@@ -18641,8 +18641,8 @@ app.post('/api/team-members', async (req, res) => {
     
     // Send invitation email in background without waiting
     // Note: Email sending failure will not prevent team member creation
-    sendTeamMemberEmail({
-      to: email,
+    notificationEmail.sendInternalEmail(userId, {
+      to: email, emailType: 'team_invite',
       subject: 'You\'ve been invited to join Service Flow',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -22079,8 +22079,8 @@ app.post('/api/team-members/register', async (req, res) => {
       const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
       
     // Send email in background without waiting using SendGrid
-    sendTeamMemberEmail({
-        to: email,
+    notificationEmail.sendInternalEmail(userId, {
+        to: email, emailType: 'team_invite',
         subject: 'You\'ve been invited to join Service Flow',
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -22299,8 +22299,8 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
     
     // Send activation confirmation email to team member (use new email if changed)
     try {
-      await sendTeamMemberEmail({
-        to: email, // Use the new email address
+      await notificationEmail.sendInternalEmail(teamMember.user_id, {
+        to: email, emailType: 'team_welcome',
         subject: 'Welcome to Service Flow - Account Activated!',
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -22343,8 +22343,8 @@ app.post('/api/team-members/complete-signup', async (req, res) => {
         .single();
       
       if (!adminError && adminData) {
-        await sendTeamMemberEmail({
-          to: adminData.email,
+        await notificationEmail.sendInternalEmail(teamMember.user_id, {
+          to: adminData.email, emailType: 'admin_new_member',
           subject: 'Team Member Activated - Service Flow',
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -22433,8 +22433,8 @@ app.post('/api/team-members/:id/resend-invite', async (req, res) => {
       const invitationLink = `${process.env.FRONTEND_URL || 'https://service-flow.pro'}/team-member/signup?token=${invitationToken}`;
         
       // Send email in background - don't fail the request if email fails
-      sendTeamMemberEmail({
-          to: teamMember.email,
+      notificationEmail.sendInternalEmail(teamMember.user_id, {
+          to: teamMember.email, emailType: 'team_invite',
         subject: 'You\'ve been invited to join Service Flow',
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -23471,8 +23471,8 @@ app.post('/api/payments/confirm-payment', authenticateToken, async (req, res) =>
         const invoice = invoices[0];
         
         // Send payment confirmation email
-        await sendEmail({
-          to: invoice.customers.email,
+        await notificationEmail.sendCustomerEmail(req.user.userId, {
+          to: invoice.customers.email, emailType: 'payment_confirmation',
           subject: 'Payment Confirmation',
           html: `
             <h2>Payment Confirmation</h2>
@@ -23563,16 +23563,16 @@ app.post('/api/notifications/send-email', authenticateToken, async (req, res) =>
   try {
     const { to, subject, html, text } = req.body;
     
-    const result = await sendEmail({ to, subject, html, text });
-    
-    res.json({ 
-      success: true, 
+    const result = await notificationEmail.sendCustomerEmail(req.user.userId, { to, subject, html, text, emailType: 'custom' });
+
+    res.json({
+      success: true,
       messageId: result.messageId,
-      message: 'Email sent successfully' 
+      message: 'Email sent successfully'
     });
   } catch (error) {
     console.error('Email sending error:', error);
-    res.status(500).json({ error: 'Failed to send email' });
+    res.status(500).json({ error: error.message || 'Failed to send email' });
   }
 });
 
@@ -35966,8 +35966,6 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       query = query.eq('provider', 'openphone');
     } else if (channel === 'whatsapp') {
       query = query.eq('provider', 'whatsapp');
-    } else if (channel === 'email') {
-      query = query.eq('provider', 'sendgrid');
     } else if (channel) {
       query = query.eq('channel', channel);
     }
@@ -36108,13 +36106,6 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
         mediaUrls: m.metadata?.mediaUrls || [],
         media: m.metadata?.media || [],
-        // Email-specific fields (only present for email channel)
-        ...(m.channel === 'email' ? {
-          email_subject: m.email_subject || null,
-          from_email: m.from_email || null,
-          to_email: m.to_email || null,
-          body_html: m.body_html || null,
-        } : {}),
       })),
       ...(calls || []).map(c => ({
         id: `call-${c.id}`, conversationId: id, channel: 'call',
@@ -36137,7 +36128,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     // Get available send channels from phone numbers
     const settings = await getSigcoreSettings(userId);
     const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
-    if (settings?.email_connected) availableSendChannels.push('email');
+    // Email channel de-scoped from communications inbox (use Notification Email settings instead)
 
     // Auto-link unlinked conversations on access (lazy relink)
     if (!conv.customer_id && !conv.lead_id && conv.participant_phone) {
@@ -36235,18 +36226,6 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
 
     const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-
-    // ── Email (SendGrid) send — NOT through Sigcore ──
-    if (conv.provider === 'sendgrid') {
-      if (!emailRouter?.sendEmail) return res.status(500).json({ error: 'Email module not loaded' });
-      try {
-        const result = await emailRouter.sendEmail(userId, conv, text.trim(), subject);
-        return res.json(result);
-      } catch (e) {
-        logger.error('[Email Send] Error:', e.response?.body || e.message);
-        return res.status(500).json({ error: e.message || 'Failed to send email' });
-      }
-    }
 
     // Route to LeadBridge for thumbtack/yelp conversations
     if (conv.provider === 'leadbridge' && (conv.channel === 'thumbtack' || conv.channel === 'yelp')) {

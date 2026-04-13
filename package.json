@@ -24,7 +24,7 @@
     "dependencies": {
         "@ffmpeg-installer/ffmpeg": "^1.1.0",
         "@geos/loghub-client": "github:goscha01/geos-loghub-client",
-        "@sendgrid/mail": "^8.1.5",
+        "@sendgrid/mail": "^8.1.6",
         "@supabase/supabase-js": "^2.56.0",
         "axios": "^1.11.0",
         "bcryptjs": "^2.4.3",
