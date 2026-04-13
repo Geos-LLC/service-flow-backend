@@ -38,15 +38,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
   async function zbFetch(apiKey, path, params = {}) {
     const url = new URL(`${ZB_BASE}${path}`)
     Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null) url.searchParams.set(k, v) })
-    const res = await fetch(url.toString(), {
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      timeout: 30000
-    })
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      throw new Error(`Zenbooker API ${res.status}: ${body}`)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 30000)
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        signal: controller.signal
+      })
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        throw new Error(`Zenbooker API ${res.status}: ${body}`)
+      }
+      return res.json()
+    } finally {
+      clearTimeout(timer)
     }
-    return res.json()
   }
 
   async function zbFetchAll(apiKey, path, params = {}) {
@@ -56,7 +62,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     while (true) {
       page++
       logger.log(`[Zenbooker] Fetching ${path} page ${page} (cursor=${cursor})`)
-      const data = await zbFetch(apiKey, path, { ...params, cursor, limit: 100 })
+      let data
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          data = await zbFetch(apiKey, path, { ...params, cursor, limit: 100 })
+          break
+        } catch (e) {
+          logger.error(`[Zenbooker] Fetch ${path} page ${page} attempt ${attempt} failed: ${e.message}`)
+          if (attempt === 3) throw e
+          await new Promise(r => setTimeout(r, 2000))
+        }
+      }
       if (data.results && data.results.length > 0) all.push(...data.results)
       logger.log(`[Zenbooker] Got ${data.results?.length || 0} results, has_more=${data.has_more}`)
       if (!data.has_more || !data.next_cursor) break
