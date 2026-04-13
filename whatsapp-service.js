@@ -389,6 +389,52 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         }
       }
 
+      // ── Step 2: Pull avatars from Sigcore conversations API ──
+      // The microservice has names/phones but Sigcore DB has avatars (from contacts_sync)
+      try {
+        let avatarConvs = []
+        let page = 1
+        while (true) {
+          const convRes = await sigcoreRequest('GET', `/conversations?provider=whatsapp&page=${page}&limit=50`, tenantKey)
+          const convData = convRes.data?.data || []
+          const meta = convRes.data?.meta || {}
+          avatarConvs.push(...convData)
+          if (page >= (meta.totalPages || 1)) break
+          page++
+        }
+
+        let avatarsUpdated = 0
+        for (const sigConv of avatarConvs) {
+          if (!sigConv.avatarUrl) continue
+          const phone = sigConv.participantPhoneNumber
+          if (!phone) continue
+
+          // Find matching SF conversation and update avatar
+          const { data: sfConv } = await supabase.from('communication_conversations')
+            .select('id, metadata')
+            .eq('user_id', userId).eq('provider', 'whatsapp').eq('participant_phone', phone)
+            .maybeSingle()
+
+          if (sfConv) {
+            const meta = sfConv.metadata || {}
+            if (meta.avatarUrl !== sigConv.avatarUrl) {
+              await supabase.from('communication_conversations').update({
+                metadata: { ...meta, avatarUrl: sigConv.avatarUrl },
+                // Also update name + last message from Sigcore if available
+                ...(sigConv.contactName && { participant_name: sigConv.contactName }),
+                ...(sigConv.lastMessage && { last_preview: sigConv.lastMessage.substring(0, 200) }),
+                updated_at: new Date().toISOString(),
+              }).eq('id', sfConv.id)
+              avatarsUpdated++
+            }
+          }
+        }
+        if (avatarsUpdated > 0) logger.log(`[WhatsApp Sync] Updated ${avatarsUpdated} avatars from Sigcore API`)
+      } catch (e) {
+        // Sigcore conversations API may return 0 — non-fatal, avatars are supplementary
+        logger.warn(`[WhatsApp Sync] Avatar fetch from Sigcore API: ${e.response?.status || ''} ${e.message || 'failed'}`)
+      }
+
       waSyncProgress[userId].phase = 'done'
       logger.log(`[WhatsApp Sync] Done for user ${userId}: ${waSyncProgress[userId].chats} chats, ${waSyncProgress[userId].messages} messages, ${waSyncProgress[userId].linked} linked`)
     } catch (error) {
