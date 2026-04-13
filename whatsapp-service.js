@@ -281,8 +281,11 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       const endpointPhone = normalizePhone(settings.whatsapp_phone_number)
       if (!endpointPhone) return res.status(400).json({ error: 'WhatsApp phone number not available. Reconnect WhatsApp.' })
 
-      // Init progress
-      waSyncProgress[userId] = { phase: 'fetching', chats: 0, messages: 0, skipped: 0, linked: 0, total: 0 }
+      // Init progress — preserve webhook-delivered counts if receiving phase was active
+      const existing = waSyncProgress[userId]
+      const webhookChats = (existing?.phase === 'receiving' && existing?.chats) || 0
+      const webhookMessages = (existing?.phase === 'receiving' && existing?.messages) || 0
+      waSyncProgress[userId] = { phase: 'fetching', chats: webhookChats, messages: webhookMessages, skipped: 0, linked: 0, total: 0 }
       res.json({ success: true, message: 'Sync started' })
 
       // Fetch WhatsApp conversations from Sigcore's database (auto-sync stores them with full data)
