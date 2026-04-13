@@ -36542,27 +36542,54 @@ app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/sendgrid — get SendGrid config
+// Load platform setting from DB (with env fallback)
+async function getPlatformSetting(key, envFallback) {
+  try {
+    const { data } = await supabase.from('platform_settings').select('value').eq('key', key).maybeSingle();
+    return data?.value || process.env[envFallback] || null;
+  } catch (e) {
+    return process.env[envFallback] || null;
+  }
+}
+
+// Save platform setting to DB
+async function setPlatformSetting(key, value) {
+  const { error } = await supabase.from('platform_settings').upsert({
+    key, value, updated_at: new Date().toISOString(),
+  }, { onConflict: 'key' });
+  if (error) throw error;
+}
+
+// GET /api/admin/sendgrid — get SendGrid config (from DB, with env fallback)
 app.get('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
-  res.json({
-    apiKey: SENDGRID_API_KEY ? '••••••••' + SENDGRID_API_KEY.slice(-8) : '',
-    fromEmail: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
-    hasKey: !!SENDGRID_API_KEY,
-  });
+  try {
+    const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
+    const fromEmail = await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL') || 'info@spotless.homes';
+    res.json({
+      apiKey: apiKey ? '••••••••' + apiKey.slice(-8) : '',
+      fromEmail,
+      hasKey: !!apiKey,
+    });
+  } catch (error) {
+    logger.error('Admin SendGrid get error:', error);
+    res.status(500).json({ error: 'Failed to load SendGrid settings' });
+  }
 });
 
-// PUT /api/admin/sendgrid — save SendGrid API key + from email to env (in-memory)
+// PUT /api/admin/sendgrid — save SendGrid API key + from email to DB
 app.put('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
   try {
     const { apiKey, fromEmail } = req.body;
     if (apiKey?.trim()) {
+      await setPlatformSetting('sendgrid_api_key', apiKey.trim());
       process.env.SENDGRID_API_KEY = apiKey.trim();
       sgMail.setApiKey(apiKey.trim());
-      logger.log('[Admin] SendGrid API key updated in-memory');
+      logger.log('[Admin] SendGrid API key saved to DB');
     }
     if (fromEmail?.trim()) {
+      await setPlatformSetting('sendgrid_from_email', fromEmail.trim());
       process.env.SENDGRID_FROM_EMAIL = fromEmail.trim();
-      logger.log(`[Admin] SendGrid from email set to: ${fromEmail.trim()}`);
+      logger.log(`[Admin] SendGrid from email saved: ${fromEmail.trim()}`);
     }
     res.json({ success: true });
   } catch (error) {
@@ -36571,29 +36598,35 @@ app.put('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
   }
 });
 
-// POST /api/admin/test-sendgrid — test SendGrid connectivity
+// POST /api/admin/test-sendgrid — test SendGrid connectivity (uses DB-stored config)
 app.post('/api/admin/test-sendgrid', authenticateAdmin, async (req, res) => {
   try {
     const { testEmail } = req.body;
     if (!testEmail) return res.status(400).json({ error: 'Test email required' });
-    if (!SENDGRID_API_KEY && !process.env.SENDGRID_API_KEY) {
-      return res.status(400).json({ error: 'SendGrid API key not configured' });
-    }
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY || SENDGRID_API_KEY);
+
+    const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
+    const fromEmail = await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL') || 'info@spotless.homes';
+
+    if (!apiKey) return res.status(400).json({ error: 'SendGrid API key not configured. Save it first.' });
+
+    sgMail.setApiKey(apiKey);
+    logger.log(`[Admin Test] Sending test to ${testEmail} from ${fromEmail}`);
+
     const result = await sgMail.send({
       to: testEmail,
-      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      from: fromEmail,
       subject: 'SendGrid Test — Service Flow Admin',
-      html: '<h2>SendGrid is working</h2><p>This test email confirms your SendGrid configuration is correct.</p>',
-      text: 'SendGrid is working. This test email confirms your SendGrid configuration is correct.',
+      html: `<h2>SendGrid is working</h2><p>This test email confirms your SendGrid configuration is correct.</p><p><strong>From:</strong> ${fromEmail}</p>`,
+      text: `SendGrid is working. This test email confirms your SendGrid configuration is correct. From: ${fromEmail}`,
     });
-    res.json({ success: true, messageId: result?.[0]?.headers?.['x-message-id'] || null });
+    logger.log(`[Admin Test] Sent successfully, message ID: ${result?.[0]?.headers?.['x-message-id']}`);
+    res.json({ success: true, fromEmail, messageId: result?.[0]?.headers?.['x-message-id'] || null });
   } catch (error) {
-    logger.error('Admin SendGrid test error:', error.message);
+    logger.error('Admin SendGrid test error:', error.message, error.response?.body);
     const code = error.code || error.response?.statusCode;
     if (code === 401) return res.status(400).json({ error: 'Invalid API key (401 Unauthorized)' });
-    if (code === 403) return res.status(400).json({ error: 'API key lacks permissions or sender not verified (403 Forbidden)' });
-    res.status(500).json({ error: error.message || 'Test failed' });
+    if (code === 403) return res.status(400).json({ error: 'API key lacks permissions or sender not verified in SendGrid (403 Forbidden). Verify the FROM address in SendGrid > Settings > Sender Authentication.' });
+    res.status(500).json({ error: error.response?.body?.errors?.[0]?.message || error.message || 'Test failed' });
   }
 });
 

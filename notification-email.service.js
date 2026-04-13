@@ -52,21 +52,33 @@ module.exports = (supabase, logger) => {
   }
 
   /** Resolve SendGrid config: tenant settings → env fallback */
-  function resolveConfig(settings) {
-    // API key is ALWAYS from env var (application-level, not per-tenant)
-    const apiKey = process.env.SENDGRID_API_KEY
+  /** Load platform-level setting from DB (with env fallback) */
+  async function getPlatformSetting(key, envFallback) {
+    try {
+      const { data } = await supabase.from('platform_settings').select('value').eq('key', key).maybeSingle()
+      return data?.value || process.env[envFallback] || null
+    } catch (e) {
+      return process.env[envFallback] || null
+    }
+  }
+
+  async function resolveConfig(settings) {
+    // API key from DB first, env fallback (application-level, not per-tenant)
+    const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY')
     if (!apiKey) {
-      throw new Error('Email not configured: SENDGRID_API_KEY environment variable is not set.')
+      throw new Error('Email not configured: SendGrid API key is not set in admin settings.')
     }
 
     if (settings && !settings.is_enabled) {
       throw new Error('Notification email is disabled in settings.')
     }
 
+    const platformFromEmail = await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL')
+
     // Tenant settings override from/name/reply-to only
     return {
       apiKey,
-      fromEmail: settings?.from_email || process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      fromEmail: settings?.from_email || platformFromEmail || 'info@spotless.homes',
       fromName: settings?.from_name || undefined,
       replyToEmail: settings?.reply_to_email || undefined,
       replyToName: settings?.reply_to_name || undefined,
@@ -144,7 +156,7 @@ module.exports = (supabase, logger) => {
     if (!to) throw new Error('Recipient email (to) is required')
 
     const settings = await getSettings(userId)
-    const config = resolveConfig(settings)
+    const config = await resolveConfig(settings)
 
     // Check tenant toggle
     if (settings && !settings.use_for_customer_notifications) {
@@ -199,7 +211,7 @@ module.exports = (supabase, logger) => {
     if (!to) throw new Error('Recipient email (to) is required')
 
     const settings = await getSettings(userId)
-    const config = resolveConfig(settings)
+    const config = await resolveConfig(settings)
 
     // Check tenant toggle
     if (settings && !settings.use_for_internal_notifications) {
@@ -250,7 +262,7 @@ module.exports = (supabase, logger) => {
     if (!testEmail) throw new Error('Test email address is required')
 
     const settings = await getSettings(userId)
-    const config = resolveConfig(settings)
+    const config = await resolveConfig(settings)
 
     sgMail.setApiKey(config.apiKey)
 
