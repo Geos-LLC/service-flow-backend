@@ -36542,6 +36542,61 @@ app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/sendgrid — get SendGrid config
+app.get('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
+  res.json({
+    apiKey: SENDGRID_API_KEY ? '••••••••' + SENDGRID_API_KEY.slice(-8) : '',
+    fromEmail: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+    hasKey: !!SENDGRID_API_KEY,
+  });
+});
+
+// PUT /api/admin/sendgrid — save SendGrid API key + from email to env (in-memory)
+app.put('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
+  try {
+    const { apiKey, fromEmail } = req.body;
+    if (apiKey?.trim()) {
+      process.env.SENDGRID_API_KEY = apiKey.trim();
+      sgMail.setApiKey(apiKey.trim());
+      logger.log('[Admin] SendGrid API key updated in-memory');
+    }
+    if (fromEmail?.trim()) {
+      process.env.SENDGRID_FROM_EMAIL = fromEmail.trim();
+      logger.log(`[Admin] SendGrid from email set to: ${fromEmail.trim()}`);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Admin SendGrid save error:', error);
+    res.status(500).json({ error: 'Failed to save SendGrid settings' });
+  }
+});
+
+// POST /api/admin/test-sendgrid — test SendGrid connectivity
+app.post('/api/admin/test-sendgrid', authenticateAdmin, async (req, res) => {
+  try {
+    const { testEmail } = req.body;
+    if (!testEmail) return res.status(400).json({ error: 'Test email required' });
+    if (!SENDGRID_API_KEY && !process.env.SENDGRID_API_KEY) {
+      return res.status(400).json({ error: 'SendGrid API key not configured' });
+    }
+    sgMail.setApiKey(process.env.SENDGRID_API_KEY || SENDGRID_API_KEY);
+    const result = await sgMail.send({
+      to: testEmail,
+      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      subject: 'SendGrid Test — Service Flow Admin',
+      html: '<h2>SendGrid is working</h2><p>This test email confirms your SendGrid configuration is correct.</p>',
+      text: 'SendGrid is working. This test email confirms your SendGrid configuration is correct.',
+    });
+    res.json({ success: true, messageId: result?.[0]?.headers?.['x-message-id'] || null });
+  } catch (error) {
+    logger.error('Admin SendGrid test error:', error.message);
+    const code = error.code || error.response?.statusCode;
+    if (code === 401) return res.status(400).json({ error: 'Invalid API key (401 Unauthorized)' });
+    if (code === 403) return res.status(400).json({ error: 'API key lacks permissions or sender not verified (403 Forbidden)' });
+    res.status(500).json({ error: error.message || 'Test failed' });
+  }
+});
+
 // GET /api/admin/users — list all users with subscription + comms status
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {
