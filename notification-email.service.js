@@ -53,34 +53,23 @@ module.exports = (supabase, logger) => {
 
   /** Resolve SendGrid config: tenant settings → env fallback */
   function resolveConfig(settings) {
-    // If tenant settings row exists, use it (no fallback on missing key = misconfigured)
-    if (settings) {
-      if (!settings.sendgrid_api_key) {
-        throw new Error('Email not configured: SendGrid API key is missing in your Notification Email settings.')
-      }
-      if (!settings.is_enabled) {
-        throw new Error('Notification email is disabled in settings.')
-      }
-      return {
-        apiKey: settings.sendgrid_api_key,
-        fromEmail: settings.from_email || process.env.SENDGRID_FROM_EMAIL || 'noreply@serviceflow.app',
-        fromName: settings.from_name || undefined,
-        replyToEmail: settings.reply_to_email || undefined,
-        replyToName: settings.reply_to_name || undefined,
-      }
+    // API key is ALWAYS from env var (application-level, not per-tenant)
+    const apiKey = process.env.SENDGRID_API_KEY
+    if (!apiKey) {
+      throw new Error('Email not configured: SENDGRID_API_KEY environment variable is not set.')
     }
 
-    // No settings row → fall back to env vars
-    const envKey = process.env.SENDGRID_API_KEY
-    if (!envKey) {
-      throw new Error('Email not configured: No SendGrid API key found (no tenant settings and no SENDGRID_API_KEY env var).')
+    if (settings && !settings.is_enabled) {
+      throw new Error('Notification email is disabled in settings.')
     }
+
+    // Tenant settings override from/name/reply-to only
     return {
-      apiKey: envKey,
-      fromEmail: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
-      fromName: undefined,
-      replyToEmail: undefined,
-      replyToName: undefined,
+      apiKey,
+      fromEmail: settings?.from_email || process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      fromName: settings?.from_name || undefined,
+      replyToEmail: settings?.reply_to_email || undefined,
+      replyToName: settings?.reply_to_name || undefined,
     }
   }
 
@@ -318,37 +307,24 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
 
   // GET /settings — current notification email config (never expose API key)
+  // GET /settings — tenant email sender config (API key is app-level, not exposed)
   router.get('/settings', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const settings = await getSettings(userId)
 
-      if (!settings) {
-        // Check if env fallback is available
-        const envConfigured = !!process.env.SENDGRID_API_KEY
-        return res.json({
-          configured: envConfigured,
-          source: envConfigured ? 'environment' : 'none',
-          settings: null,
-        })
-      }
-
       return res.json({
-        configured: !!settings.sendgrid_api_key,
-        source: 'tenant',
-        settings: {
+        configured: !!settings,
+        settings: settings ? {
           isEnabled: settings.is_enabled,
           fromEmail: settings.from_email,
           fromName: settings.from_name,
           replyToEmail: settings.reply_to_email,
           replyToName: settings.reply_to_name,
-          useForCustomerNotifications: settings.use_for_customer_notifications,
-          useForInternalNotifications: settings.use_for_internal_notifications,
           lastTestedAt: settings.last_tested_at,
           lastTestStatus: settings.last_test_status,
           lastTestError: settings.last_test_error,
-          hasApiKey: !!settings.sendgrid_api_key,
-        },
+        } : null,
       })
     } catch (error) {
       logger.error('[NotificationEmail] Settings error:', error.message)
@@ -356,41 +332,33 @@ module.exports = (supabase, logger) => {
     }
   })
 
-  // PUT /settings — save notification email config
+  // PUT /settings — save tenant sender config (no API key — that's app-level)
   router.put('/settings', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
-      const { apiKey, fromEmail, fromName, replyToEmail, replyToName, useForCustomerNotifications, useForInternalNotifications, isEnabled } = req.body
+      const { fromEmail, fromName, replyToEmail, replyToName } = req.body
+
+      if (!fromEmail?.trim()) {
+        return res.status(400).json({ error: 'From email is required' })
+      }
 
       const existing = await getSettings(userId)
       const updates = {
-        is_enabled: isEnabled !== undefined ? isEnabled : true,
-        from_email: fromEmail?.trim() || null,
+        from_email: fromEmail.trim(),
         from_name: fromName?.trim() || null,
         reply_to_email: replyToEmail?.trim() || null,
         reply_to_name: replyToName?.trim() || null,
-        use_for_customer_notifications: useForCustomerNotifications !== undefined ? useForCustomerNotifications : true,
-        use_for_internal_notifications: useForInternalNotifications !== undefined ? useForInternalNotifications : true,
         updated_at: new Date().toISOString(),
-      }
-
-      // Only update API key if provided (don't wipe on save without key)
-      if (apiKey?.trim()) {
-        updates.sendgrid_api_key = apiKey.trim()
       }
 
       if (existing) {
         await supabase.from('notification_email_settings').update(updates).eq('user_id', userId)
       } else {
         updates.user_id = userId
-        if (!apiKey?.trim()) {
-          return res.status(400).json({ error: 'SendGrid API key is required for initial setup' })
-        }
-        updates.sendgrid_api_key = apiKey.trim()
         await supabase.from('notification_email_settings').insert(updates)
       }
 
-      logger.log(`[NotificationEmail] Settings saved for user ${userId}`)
+      logger.log(`[NotificationEmail] Settings saved for user ${userId}: from=${fromEmail.trim()}`)
       return res.json({ success: true })
     } catch (error) {
       logger.error('[NotificationEmail] Save settings error:', error.message)
