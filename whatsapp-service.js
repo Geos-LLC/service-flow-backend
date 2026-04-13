@@ -20,6 +20,19 @@ module.exports = (supabase, logger, sigcoreRequest) => {
   // Expose progress object so webhook handler can track message delivery
   router.waSyncProgress = waSyncProgress
 
+  // Helper: normalize avatar URL — base64 data needs data URI prefix, URLs pass through
+  function normalizeAvatarUrl(url) {
+    if (!url) return null
+    if (url.startsWith('http') || url.startsWith('data:')) return url
+    // Raw base64 — detect image type and add data URI prefix
+    if (url.startsWith('/9j/') || url.startsWith('/9J/')) return `data:image/jpeg;base64,${url}`
+    if (url.startsWith('iVBOR')) return `data:image/png;base64,${url}`
+    if (url.startsWith('UklGR')) return `data:image/webp;base64,${url}`
+    // Unknown base64 — assume JPEG
+    if (url.length > 100 && !url.includes('/')) return `data:image/jpeg;base64,${url}`
+    return url
+  }
+
   // Helper: normalize phone to E.164
   function normalizePhone(phone) {
     if (!phone) return null
@@ -329,9 +342,9 @@ module.exports = (supabase, logger, sigcoreRequest) => {
             const updates = {}
             if (chat.name && !existingConv.participant_name) updates.participant_name = chat.name
             if (chat.name && existingConv.participant_name !== chat.name) updates.participant_name = chat.name
-            if (chat.avatarUrl) {
+            if (normalizeAvatarUrl(chat.avatarUrl)) {
               const meta = existingConv.metadata || {}
-              if (meta.avatarUrl !== chat.avatarUrl) updates.metadata = { ...meta, avatarUrl: chat.avatarUrl }
+              if (meta.avatarUrl !== normalizeAvatarUrl(chat.avatarUrl)) updates.metadata = { ...meta, avatarUrl: normalizeAvatarUrl(chat.avatarUrl) }
             }
             if (isGroup && !(existingConv.metadata || {}).isGroup) {
               updates.metadata = { ...(existingConv.metadata || {}), ...(updates.metadata || {}), isGroup: true }
@@ -353,7 +366,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
               conversation_type: isGroup ? 'group' : 'external_client',
               metadata: {
                 externalChatId: chat.id,
-                ...(chat.avatarUrl && { avatarUrl: chat.avatarUrl }),
+                ...(normalizeAvatarUrl(chat.avatarUrl) && { avatarUrl: normalizeAvatarUrl(chat.avatarUrl) }),
                 ...(isGroup && { isGroup: true }),
               },
             }).select().single()
@@ -405,7 +418,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
         let avatarsUpdated = 0
         for (const sigConv of avatarConvs) {
-          if (!sigConv.avatarUrl) continue
+          if (!normalizeAvatarUrl(sigConv.avatarUrl)) continue
           const phone = sigConv.participantPhoneNumber
           if (!phone) continue
 
@@ -417,9 +430,9 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
           if (sfConv) {
             const meta = sfConv.metadata || {}
-            if (meta.avatarUrl !== sigConv.avatarUrl) {
+            if (meta.avatarUrl !== normalizeAvatarUrl(sigConv.avatarUrl)) {
               await supabase.from('communication_conversations').update({
-                metadata: { ...meta, avatarUrl: sigConv.avatarUrl },
+                metadata: { ...meta, avatarUrl: normalizeAvatarUrl(sigConv.avatarUrl) },
                 // Also update name + last message from Sigcore if available
                 ...(sigConv.contactName && { participant_name: sigConv.contactName }),
                 ...(sigConv.lastMessage && { last_preview: sigConv.lastMessage.substring(0, 200) }),
