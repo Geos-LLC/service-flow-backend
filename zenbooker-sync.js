@@ -1024,6 +1024,26 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               if (zb.started_at) update.start_time = zb.started_at
               if (zb.completed_at) update.end_time = zb.completed_at
 
+              // Bedrooms, bathrooms, add-ons from service_fields
+              const serviceFields = zb.service_fields || []
+              if (Array.isArray(serviceFields) && serviceFields.length > 0) {
+                update.zenbooker_intake = serviceFields
+                const addons = []
+                for (const field of serviceFields) {
+                  const fname = (field.field_name || '').toLowerCase()
+                  const sel = (field.selected_options || [])[0]
+                  if (!sel) continue
+                  const optionText = sel.text || sel.display_label || ''
+                  const num = parseInt(optionText) || null
+                  if (fname.includes('bedroom')) update.bedroom_count = num
+                  else if (fname.includes('bathroom')) update.bathroom_count = num
+                  else if (field.field_type === 'service_modifier' && !fname.includes('bedroom') && !fname.includes('bathroom')) {
+                    addons.push({ name: field.field_name, value: optionText, price: parseFloat(sel.total_price || sel.price || 0), quantity: parseInt(sel.quantity) || 1 })
+                  }
+                }
+                if (addons.length > 0) update.addons = addons
+              }
+
               const { error } = await supabase.from('jobs').update(update).eq('id', sfJob.id)
               if (error) { logger.error(`[Zenbooker] Reconcile error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
               else { updated++ }
