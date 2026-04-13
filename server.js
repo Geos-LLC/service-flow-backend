@@ -1056,6 +1056,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
+let emailRouter = null; try { emailRouter = require('./email-service')(supabase, logger); app.use('/api/integrations/email', emailRouter); } catch (e) { console.log('Email module not loaded:', e.message); }
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, sendTeamMemberEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
@@ -20471,10 +20472,16 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const allJobsById = {};
     let totalBusinessRevenue = 0;
     const revenueJobsList = [];
+    const todayStr = (() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); })();
     (allJobs || []).forEach(job => {
       allJobsById[job.id] = job;
       const s = (job.status || '').toLowerCase();
       if (s === 'cancelled' || s === 'canceled' || s === 'cancel') return;
+      // Skip past-date scheduled/pending jobs — they didn't happen (likely cancelled in ZB but not synced)
+      if (s !== 'completed' && s !== 'paid') {
+        const jobDate = String(job.scheduled_date || '').split('T')[0].split(' ')[0];
+        if (jobDate && jobDate < todayStr) return;
+      }
       // Only count completed/paid jobs in revenue (unless includeScheduled)
       if (!includeScheduled && s !== 'completed' && s !== 'paid') return;
       // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
@@ -35959,6 +35966,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       query = query.eq('provider', 'openphone');
     } else if (channel === 'whatsapp') {
       query = query.eq('provider', 'whatsapp');
+    } else if (channel === 'email') {
+      query = query.eq('provider', 'sendgrid');
     } else if (channel) {
       query = query.eq('channel', channel);
     }
@@ -35971,7 +35980,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       query = query.eq('sf_location_id', parseInt(locationId));
     }
     if (search) {
-      query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,last_preview.ilike.%${search}%`);
+      query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,participant_email.ilike.%${search}%,last_preview.ilike.%${search}%`);
     }
 
     const { data, error } = await query.limit(100);
@@ -36010,7 +36019,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         provider: c.provider || 'openphone',
         channel: c.channel || 'sms',
         displayName: c.participant_name || '',
-        fallbackIdentifier: c.participant_phone,
+        fallbackIdentifier: c.participant_phone || c.participant_email || '',
         endpointPhone: c.endpoint_phone,
         endpointSymbol: phoneSymbols[normalizePhone(c.endpoint_phone)] || null,
         lastPreview: c.last_preview,
@@ -36037,7 +36046,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       .select('channel, provider').eq('user_id', userId).gt('unread_count', 0);
     const channelUnread = {};
     for (const c of (unreadByChannel || [])) {
-      const key = c.provider === 'openphone' ? 'openphone' : c.channel;
+      const key = c.provider === 'openphone' ? 'openphone' : c.provider === 'sendgrid' ? 'email' : c.channel;
       channelUnread[key] = (channelUnread[key] || 0) + 1;
     }
 
@@ -36099,6 +36108,13 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
         mediaUrls: m.metadata?.mediaUrls || [],
         media: m.metadata?.media || [],
+        // Email-specific fields (only present for email channel)
+        ...(m.channel === 'email' ? {
+          email_subject: m.email_subject || null,
+          from_email: m.from_email || null,
+          to_email: m.to_email || null,
+          body_html: m.body_html || null,
+        } : {}),
       })),
       ...(calls || []).map(c => ({
         id: `call-${c.id}`, conversationId: id, channel: 'call',
@@ -36121,6 +36137,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     // Get available send channels from phone numbers
     const settings = await getSigcoreSettings(userId);
     const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
+    if (settings?.email_connected) availableSendChannels.push('email');
 
     // Auto-link unlinked conversations on access (lazy relink)
     if (!conv.customer_id && !conv.lead_id && conv.participant_phone) {
@@ -36213,11 +36230,23 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { text, channel } = req.body;
+    const { text, channel, subject } = req.body;
     if (!text?.trim()) return res.status(400).json({ error: 'Message text is required' });
 
     const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+    // ── Email (SendGrid) send — NOT through Sigcore ──
+    if (conv.provider === 'sendgrid') {
+      if (!emailRouter?.sendEmail) return res.status(500).json({ error: 'Email module not loaded' });
+      try {
+        const result = await emailRouter.sendEmail(userId, conv, text.trim(), subject);
+        return res.json(result);
+      } catch (e) {
+        logger.error('[Email Send] Error:', e.response?.body || e.message);
+        return res.status(500).json({ error: e.message || 'Failed to send email' });
+      }
+    }
 
     // Route to LeadBridge for thumbtack/yelp conversations
     if (conv.provider === 'leadbridge' && (conv.channel === 'thumbtack' || conv.channel === 'yelp')) {
