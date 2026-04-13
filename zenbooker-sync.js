@@ -200,6 +200,46 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     // Real timestamps from Zenbooker (started_at, completed_at)
     if (zb.started_at) mapped.start_time = zb.started_at
     if (zb.completed_at) mapped.end_time = zb.completed_at
+
+    // Bedrooms, bathrooms, and add-ons from ZB intake form answers
+    const intakeAnswers = zb.intake_form_answers || zb.custom_fields || zb.booking_answers || []
+    if (Array.isArray(intakeAnswers) && intakeAnswers.length > 0) {
+      mapped.zenbooker_intake = intakeAnswers
+      for (const qa of intakeAnswers) {
+        const q = (qa.question || qa.label || qa.field_name || '').toLowerCase()
+        const a = qa.answer || qa.value || ''
+        if (q.includes('bedroom')) mapped.bedroom_count = parseInt(a) || null
+        if (q.includes('bathroom')) mapped.bathroom_count = parseInt(a) || null
+      }
+    }
+    // Direct fields (some ZB setups use top-level fields)
+    if (zb.number_of_bedrooms) mapped.bedroom_count = parseInt(zb.number_of_bedrooms) || null
+    if (zb.number_of_bathrooms) mapped.bathroom_count = parseInt(zb.number_of_bathrooms) || null
+    if (zb.bedrooms) mapped.bedroom_count = parseInt(zb.bedrooms) || null
+    if (zb.bathrooms) mapped.bathroom_count = parseInt(zb.bathrooms) || null
+
+    // Add-ons / line items
+    const zbAddons = zb.addons || zb.service_addons || zb.extras || []
+    if (Array.isArray(zbAddons) && zbAddons.length > 0) {
+      mapped.addons = zbAddons.map(a => ({
+        name: a.name || a.addon_name || a.title || 'Add-on',
+        price: parseFloat(a.price || a.amount || 0),
+        quantity: parseInt(a.quantity) || 1,
+      }))
+    }
+    // Line items that are add-ons (from invoice)
+    const lineItems = inv.line_items || zb.line_items || []
+    if (Array.isArray(lineItems) && lineItems.length > 0 && !mapped.addons) {
+      const addons = lineItems.filter(li => li.type === 'addon' || li.is_addon || li.category === 'addon')
+      if (addons.length > 0) {
+        mapped.addons = addons.map(a => ({
+          name: a.name || a.description || 'Add-on',
+          price: parseFloat(a.amount || a.price || 0),
+          quantity: parseInt(a.quantity) || 1,
+        }))
+      }
+    }
+
     return mapped
   }
 
