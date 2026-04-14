@@ -37,7 +37,9 @@ module.exports = function buildConnectedEmail(supabase, logger) {
     const token = hdr && hdr.split(' ')[1]
     if (!token) return res.status(401).json({ error: 'No token provided' })
     try {
-      req.user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
+      // Normalize: the app's JWTs carry userId; our code reads .id. Support both.
+      req.user = { ...decoded, id: decoded.id || decoded.userId }
       next()
     } catch {
       res.status(401).json({ error: 'Invalid token' })
