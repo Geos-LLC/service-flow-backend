@@ -242,6 +242,23 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   })
 
   // ══════════════════════════════════════════════════════════════
+  // GET /api/connected-email/accounts/:id/sync-progress
+  //   Returns { phase, scanned, synced, total, startedAt, error }
+  //   phase: 'starting' | 'initial_list' | 'incremental_list' | 'fetching' | 'done' | 'error'
+  //   null when no sync has run recently.
+  // ══════════════════════════════════════════════════════════════
+  router.get('/accounts/:id/sync-progress', auth, async (req, res) => {
+    try {
+      const safe = await store.getSafeById(supabase, req.user.id, req.params.id)
+      if (!safe) return res.status(404).json({ error: 'not found' })
+      const progress = syncEngine.getProgress(req.params.id)
+      res.json({ progress })
+    } catch (e) {
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
   // POST /api/connected-email/accounts/:id/test-sync
   //   Body: { days?: number, maxMessages?: number }
   //   Runs synchronously so the UI can show exact counts.
