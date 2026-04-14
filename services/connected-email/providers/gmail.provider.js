@@ -16,11 +16,9 @@ const SCOPES = [
 ]
 
 function makeOAuth2(redirectUri) {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_OAUTH_CLIENT_ID,
-    process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-    redirectUri
-  )
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.GOOGLE_CLIENT_ID
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri)
 }
 
 function buildAuthUrl({ redirectUri, state }) {

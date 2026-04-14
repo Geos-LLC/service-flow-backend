@@ -45,10 +45,16 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   }
 
   // Feature-flag-aware fail soft.
+  // Reuses existing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET when the
+  // connected-email-specific ones aren't set.
+  function hasGoogle() {
+    return !!(process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.GOOGLE_CLIENT_ID)
+  }
+  function hasMicrosoft() {
+    return !!process.env.MS_OAUTH_CLIENT_ID
+  }
   function featureConfigured() {
-    return tokenCrypto.isConfigured() && (
-      process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.MS_OAUTH_CLIENT_ID
-    )
+    return tokenCrypto.isConfigured() && (hasGoogle() || hasMicrosoft())
   }
 
   function redirectUriFor(provider, req) {
@@ -63,7 +69,11 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   router.get('/accounts', auth, async (req, res) => {
     try {
       const rows = await store.listSafe(supabase, req.user.id)
-      res.json({ accounts: rows, configured: featureConfigured() })
+      res.json({
+        accounts: rows,
+        configured: featureConfigured(),
+        providers: { gmail: hasGoogle(), outlook: hasMicrosoft() },
+      })
     } catch (e) {
       log.error?.(`[connected-email] list accounts: ${e.message}`)
       res.status(500).json({ error: e.message })
