@@ -1,0 +1,264 @@
+/**
+ * Connected Email — Express router + poller.
+ *
+ * Mount:
+ *   const connectedEmail = require('./services/connected-email')(supabase, logger)
+ *   app.use('/api/connected-email', connectedEmail.router)
+ *   connectedEmail.startPoller()
+ *
+ * LOOSE COUPLING:
+ *   - All code lives under services/connected-email/
+ *   - Tables live under connected_email_* namespace
+ *   - Reuses communication_conversations / communication_messages only for data
+ *   - Does NOT import from server.js, notification-email.service, sigcore, etc.
+ *   - Removing the mount line removes the feature with zero side effects
+ */
+
+const express = require('express')
+const jwt = require('jsonwebtoken')
+const crypto = require('crypto')
+
+const { getProvider } = require('./providers')
+const store = require('./account-store')
+const syncEngine = require('./sync-engine')
+const sender = require('./send')
+const tokenCrypto = require('./token-crypto')
+
+const OAUTH_STATE_TTL_MS = 5 * 60 * 1000
+const POLL_INTERVAL_MS = parseInt(process.env.CONNECTED_EMAIL_POLL_INTERVAL_MS || '120000', 10)
+
+module.exports = function buildConnectedEmail(supabase, logger) {
+  const router = express.Router()
+  const log = logger || console
+
+  // ── Auth middleware (per-route — NEVER router.use) ──
+  async function auth(req, res, next) {
+    const hdr = req.headers['authorization']
+    const token = hdr && hdr.split(' ')[1]
+    if (!token) return res.status(401).json({ error: 'No token provided' })
+    try {
+      req.user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
+      next()
+    } catch {
+      res.status(401).json({ error: 'Invalid token' })
+    }
+  }
+
+  // Feature-flag-aware fail soft.
+  function featureConfigured() {
+    return tokenCrypto.isConfigured() && (
+      process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.MS_OAUTH_CLIENT_ID
+    )
+  }
+
+  function redirectUriFor(provider, req) {
+    const base = process.env.CONNECTED_EMAIL_REDIRECT_BASE
+      || `${req.protocol}://${req.get('host')}`
+    return `${base}/api/connected-email/oauth/${provider}/callback`
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // GET /api/connected-email/accounts
+  // ══════════════════════════════════════════════════════════════
+  router.get('/accounts', auth, async (req, res) => {
+    try {
+      const rows = await store.listSafe(supabase, req.user.id)
+      res.json({ accounts: rows, configured: featureConfigured() })
+    } catch (e) {
+      log.error?.(`[connected-email] list accounts: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/oauth/:provider/start
+  // ══════════════════════════════════════════════════════════════
+  router.post('/oauth/:provider/start', auth, async (req, res) => {
+    try {
+      const provider = req.params.provider
+      if (!['gmail', 'outlook'].includes(provider)) {
+        return res.status(400).json({ error: 'unknown provider' })
+      }
+      if (!featureConfigured()) {
+        return res.status(503).json({ error: 'connected email not configured on this server' })
+      }
+      const p = getProvider(provider)
+      const nonce = crypto.randomBytes(16).toString('hex')
+      const stateToken = crypto.randomBytes(24).toString('hex')
+      await supabase.from('connected_email_oauth_states').insert({
+        state_token: stateToken,
+        user_id: req.user.id,
+        provider,
+        nonce,
+        expires_at: new Date(Date.now() + OAUTH_STATE_TTL_MS).toISOString(),
+      })
+      const url = p.buildAuthUrl({
+        redirectUri: redirectUriFor(provider, req),
+        state: stateToken,
+      })
+      res.json({ authorization_url: url })
+    } catch (e) {
+      log.error?.(`[connected-email] oauth start: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // GET /api/connected-email/oauth/:provider/callback
+  // Browser-redirected, no auth header — state token validates.
+  // ══════════════════════════════════════════════════════════════
+  router.get('/oauth/:provider/callback', async (req, res) => {
+    const provider = req.params.provider
+    const { code, state, error: oauthErr } = req.query
+    try {
+      if (oauthErr) throw new Error(`OAuth error: ${oauthErr}`)
+      if (!code || !state) throw new Error('missing code or state')
+
+      // Single-use state — claim in a read-update cycle.
+      const { data: stateRow } = await supabase
+        .from('connected_email_oauth_states')
+        .select('*')
+        .eq('state_token', state)
+        .maybeSingle()
+      if (!stateRow) throw new Error('invalid state')
+      if (stateRow.consumed_at) throw new Error('state already used')
+      if (new Date(stateRow.expires_at).getTime() < Date.now()) throw new Error('state expired')
+      if (stateRow.provider !== provider) throw new Error('state/provider mismatch')
+
+      const { error: consumeErr } = await supabase
+        .from('connected_email_oauth_states')
+        .update({ consumed_at: new Date().toISOString() })
+        .eq('state_token', state)
+        .is('consumed_at', null)
+      if (consumeErr) throw consumeErr
+
+      const p = getProvider(provider)
+      const tokens = await p.exchangeCode({
+        redirectUri: redirectUriFor(provider, req),
+        code,
+      })
+      const profile = await p.getProfile({
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+      })
+
+      await store.upsertAccount(supabase, {
+        userId: stateRow.user_id,
+        provider,
+        emailAddress: profile.emailAddress,
+        displayName: profile.displayName,
+        tokens,
+        scopes: tokens.scopes,
+      })
+
+      // Kick sync asynchronously — don't block redirect.
+      const { data: acct } = await supabase
+        .from('connected_email_accounts')
+        .select('id')
+        .eq('user_id', stateRow.user_id)
+        .eq('provider', provider)
+        .eq('email_address', String(profile.emailAddress).toLowerCase())
+        .maybeSingle()
+      if (acct?.id) {
+        setImmediate(() => syncEngine.syncAccount(supabase, log, acct.id).catch(() => {}))
+      }
+
+      const frontendBase = process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://service-flow.pro'
+      res.redirect(`${frontendBase}/settings/connected-inboxes?connected=${provider}`)
+    } catch (e) {
+      log.error?.(`[connected-email] callback ${provider}: ${e.message}`)
+      const frontendBase = process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://service-flow.pro'
+      res.redirect(`${frontendBase}/settings/connected-inboxes?error=${encodeURIComponent(e.message)}`)
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/accounts/:id/disconnect
+  // ══════════════════════════════════════════════════════════════
+  router.post('/accounts/:id/disconnect', auth, async (req, res) => {
+    try {
+      const account = await store.getWithTokens(supabase, req.params.id)
+      if (!account || account.user_id !== req.user.id) {
+        return res.status(404).json({ error: 'not found' })
+      }
+      try {
+        const p = getProvider(account.provider)
+        await p.revoke({ accessToken: account.accessToken, refreshToken: account.refreshToken })
+      } catch (e) {
+        log.warn?.(`[connected-email] revoke failed (non-fatal): ${e.message}`)
+      }
+      await store.markDisconnected(supabase, req.params.id, req.body?.reason || 'user_disconnect')
+      res.json({ ok: true })
+    } catch (e) {
+      log.error?.(`[connected-email] disconnect: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/accounts/:id/resync
+  // ══════════════════════════════════════════════════════════════
+  router.post('/accounts/:id/resync', auth, async (req, res) => {
+    try {
+      const acct = await store.getSafeById(supabase, req.user.id, req.params.id)
+      if (!acct) return res.status(404).json({ error: 'not found' })
+      setImmediate(() => syncEngine.syncAccount(supabase, log, req.params.id).catch(() => {}))
+      res.json({ ok: true, queued: true })
+    } catch (e) {
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/conversations/:id/send
+  //   Alternative entry point for sending from a connected email thread.
+  //   (communications.jsx primary path uses /api/communications/conversations/:id/send
+  //    which delegates into sender.sendFromConversation — see server.js integration.)
+  // ══════════════════════════════════════════════════════════════
+  router.post('/conversations/:id/send', auth, async (req, res) => {
+    try {
+      const { text, html, subject } = req.body || {}
+      if (!text && !html) return res.status(400).json({ error: 'text or html required' })
+      const out = await sender.sendFromConversation(supabase, log, {
+        conversationId: req.params.id,
+        userId: req.user.id,
+        text,
+        html,
+        subject,
+      })
+      res.json({ message: out })
+    } catch (e) {
+      log.error?.(`[connected-email] send: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // Poller
+  // ══════════════════════════════════════════════════════════════
+  let pollerHandle = null
+  function startPoller() {
+    if (pollerHandle) return
+    if (!featureConfigured()) {
+      log.info?.('[connected-email] poller not started (feature not configured)')
+      return
+    }
+    pollerHandle = setInterval(() => {
+      syncEngine.syncAllDue(supabase, log).catch(e =>
+        log.error?.(`[connected-email] poller: ${e.message}`)
+      )
+    }, POLL_INTERVAL_MS)
+    log.info?.(`[connected-email] poller started (interval=${POLL_INTERVAL_MS}ms)`)
+  }
+  function stopPoller() { if (pollerHandle) { clearInterval(pollerHandle); pollerHandle = null } }
+
+  return {
+    router,
+    startPoller,
+    stopPoller,
+    // Direct programmatic send — used by /api/communications send endpoint to
+    // delegate when channel === 'email'. Keeps the feature loosely coupled.
+    sendFromConversation: (args) => sender.sendFromConversation(supabase, log, args),
+    syncAccount: (id) => syncEngine.syncAccount(supabase, log, id),
+  }
+}
