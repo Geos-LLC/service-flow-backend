@@ -25,9 +25,10 @@ function buildAuthUrl({ redirectUri, state }) {
   const oauth = makeOAuth2(redirectUri)
   return oauth.generateAuthUrl({
     access_type: 'offline',
-    prompt: 'consent',     // force refresh_token on every consent
+    prompt: 'select_account consent', // force account chooser + refresh_token
     scope: SCOPES,
     state,
+    include_granted_scopes: false,
   })
 }
 
