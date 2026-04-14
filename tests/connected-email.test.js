@@ -20,13 +20,25 @@ const gmail = require('../services/connected-email/providers/gmail.provider')
 // token-crypto
 // ──────────────────────────────────────────────
 describe('token-crypto', () => {
-  test('round-trip encrypt/decrypt', () => {
+  test('round-trip encrypt/decrypt (base64 strings)', () => {
     const { ciphertext, iv, authTag } = tokenCrypto.encrypt('super-secret-token-value')
-    expect(ciphertext).toBeInstanceOf(Buffer)
-    expect(iv.length).toBe(12)
-    expect(authTag.length).toBe(16)
+    expect(typeof ciphertext).toBe('string')
+    expect(typeof iv).toBe('string')
+    expect(typeof authTag).toBe('string')
+    expect(Buffer.from(iv, 'base64').length).toBe(12)
+    expect(Buffer.from(authTag, 'base64').length).toBe(16)
     const back = tokenCrypto.decrypt(ciphertext, iv, authTag)
     expect(back).toBe('super-secret-token-value')
+  })
+
+  test('decrypt also accepts legacy Buffer inputs', () => {
+    const { ciphertext, iv, authTag } = tokenCrypto.encrypt('abc')
+    const back = tokenCrypto.decrypt(
+      Buffer.from(ciphertext, 'base64'),
+      Buffer.from(iv, 'base64'),
+      Buffer.from(authTag, 'base64'),
+    )
+    expect(back).toBe('abc')
   })
 
   test('null plaintext yields null outputs', () => {
@@ -38,9 +50,10 @@ describe('token-crypto', () => {
 
   test('tampered ciphertext fails auth tag', () => {
     const { ciphertext, iv, authTag } = tokenCrypto.encrypt('abc')
-    const bad = Buffer.from(ciphertext)
-    bad[0] = bad[0] ^ 0xff
-    expect(() => tokenCrypto.decrypt(bad, iv, authTag)).toThrow()
+    const buf = Buffer.from(ciphertext, 'base64')
+    buf[0] = buf[0] ^ 0xff
+    const tampered = buf.toString('base64')
+    expect(() => tokenCrypto.decrypt(tampered, iv, authTag)).toThrow()
   })
 
   test('isConfigured returns true when key set', () => {

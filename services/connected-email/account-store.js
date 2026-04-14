@@ -56,8 +56,13 @@ async function getWithTokens(supabase, accountId) {
     .maybeSingle()
   if (error) throw error
   if (!data) return null
-  const accessToken = decrypt(data.access_token_ciphertext, data.access_token_iv, data.access_token_auth_tag)
-  const refreshToken = decrypt(data.refresh_token_ciphertext, data.refresh_token_iv, data.refresh_token_auth_tag)
+  let accessToken = null, refreshToken = null
+  try {
+    accessToken = decrypt(data.access_token_ciphertext, data.access_token_iv, data.access_token_auth_tag)
+  } catch (e) { /* legacy/corrupt blob — fall through as null */ }
+  try {
+    refreshToken = decrypt(data.refresh_token_ciphertext, data.refresh_token_iv, data.refresh_token_auth_tag)
+  } catch (e) { /* legacy/corrupt blob — fall through as null */ }
   return { ...stripTokens(data), accessToken, refreshToken }
 }
 
