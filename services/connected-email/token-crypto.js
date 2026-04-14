@@ -27,25 +27,49 @@ function getKey() {
   return buf
 }
 
+/**
+ * Encrypt a plaintext string. Returns base64 strings — safe to store in
+ * text columns via supabase-js (which JSON-serializes Buffer values in a
+ * way that breaks bytea columns).
+ */
 function encrypt(plaintext) {
   if (plaintext == null || plaintext === '') {
     return { ciphertext: null, iv: null, authTag: null }
   }
   const iv = crypto.randomBytes(IV_LEN)
   const cipher = crypto.createCipheriv(ALGO, getKey(), iv)
-  const ciphertext = Buffer.concat([
+  const ct = Buffer.concat([
     cipher.update(String(plaintext), 'utf8'),
     cipher.final(),
   ])
   const authTag = cipher.getAuthTag()
-  return { ciphertext, iv, authTag }
+  return {
+    ciphertext: ct.toString('base64'),
+    iv: iv.toString('base64'),
+    authTag: authTag.toString('base64'),
+  }
+}
+
+/**
+ * Decrypt. Accepts base64 strings (current) OR Buffers (legacy bytea reads)
+ * OR the broken {type:'Buffer',data:[...]} shape for defense-in-depth.
+ */
+function toBuffer(v) {
+  if (v == null) return null
+  if (Buffer.isBuffer(v)) return v
+  if (typeof v === 'string') return Buffer.from(v, 'base64')
+  if (v.type === 'Buffer' && Array.isArray(v.data)) return Buffer.from(v.data)
+  return null
 }
 
 function decrypt(ciphertext, iv, authTag) {
-  if (!ciphertext || !iv || !authTag) return null
-  const cbuf = Buffer.isBuffer(ciphertext) ? ciphertext : Buffer.from(ciphertext)
-  const ivbuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv)
-  const tagbuf = Buffer.isBuffer(authTag) ? authTag : Buffer.from(authTag)
+  const cbuf = toBuffer(ciphertext)
+  const ivbuf = toBuffer(iv)
+  const tagbuf = toBuffer(authTag)
+  if (!cbuf || !ivbuf || !tagbuf) return null
+  if (ivbuf.length !== IV_LEN || tagbuf.length !== TAG_LEN) {
+    throw new Error('token crypto: iv/authTag length mismatch (stored format invalid)')
+  }
   const decipher = crypto.createDecipheriv(ALGO, getKey(), ivbuf)
   decipher.setAuthTag(tagbuf)
   const out = Buffer.concat([decipher.update(cbuf), decipher.final()])

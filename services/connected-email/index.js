@@ -189,20 +189,40 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   // ══════════════════════════════════════════════════════════════
   router.post('/accounts/:id/disconnect', auth, async (req, res) => {
     try {
-      const account = await store.getWithTokens(supabase, req.params.id)
-      if (!account || account.user_id !== req.user.id) {
-        return res.status(404).json({ error: 'not found' })
-      }
+      // Ownership check via safe select — never decrypts tokens.
+      const safe = await store.getSafeById(supabase, req.user.id, req.params.id)
+      if (!safe) return res.status(404).json({ error: 'not found' })
+
+      // Best-effort provider revoke — if tokens are corrupt or key changed,
+      // skip revocation and still disconnect locally.
       try {
-        const p = getProvider(account.provider)
-        await p.revoke({ accessToken: account.accessToken, refreshToken: account.refreshToken })
+        const account = await store.getWithTokens(supabase, req.params.id)
+        if (account?.accessToken || account?.refreshToken) {
+          const p = getProvider(account.provider)
+          await p.revoke({ accessToken: account.accessToken, refreshToken: account.refreshToken })
+        }
       } catch (e) {
-        log.warn?.(`[connected-email] revoke failed (non-fatal): ${e.message}`)
+        log.warn?.(`[connected-email] revoke skipped (${e.message})`)
       }
+
       await store.markDisconnected(supabase, req.params.id, req.body?.reason || 'user_disconnect')
       res.json({ ok: true })
     } catch (e) {
       log.error?.(`[connected-email] disconnect: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // Hard delete — removes the row entirely. Use for broken/orphan records
+  // that can't be re-used (e.g. after token encryption scheme changes).
+  router.delete('/accounts/:id', auth, async (req, res) => {
+    try {
+      const safe = await store.getSafeById(supabase, req.user.id, req.params.id)
+      if (!safe) return res.status(404).json({ error: 'not found' })
+      await supabase.from('connected_email_sync_state').delete().eq('account_id', req.params.id)
+      await supabase.from('connected_email_accounts').delete().eq('id', req.params.id).eq('user_id', req.user.id)
+      res.json({ ok: true, deleted: true })
+    } catch (e) {
       res.status(500).json({ error: e.message })
     }
   })
