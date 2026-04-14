@@ -308,6 +308,20 @@ async function syncAccount(supabase, logger, accountId) {
 }
 
 async function persistMessage(supabase, { account, providerName, ownerEmail, providerMsg, logger }) {
+  // Folder / label filter — skip anything that isn't inbox-bound.
+  // Gmail: labelIds carry INBOX / SPAM / TRASH / DRAFT / CATEGORY_*.
+  if (providerName === 'gmail') {
+    const labels = providerMsg.labelIds || []
+    const blocked = ['SPAM', 'TRASH', 'DRAFT', 'CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL']
+    if (blocked.some(b => labels.includes(b))) {
+      logger?.info?.(`[connected-email] skip ${providerMsg.id} (label ${labels.find(l => blocked.includes(l))})`)
+      return false
+    }
+    // Accept if INBOX label present OR it's a SENT message (outbound replies also need storing).
+    const keep = labels.includes('INBOX') || labels.includes('SENT')
+    if (!keep) return false
+  }
+
   // Dedupe at app level before DB unique catches it.
   if (providerMsg.messageId) {
     const { data: existing } = await supabase

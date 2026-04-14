@@ -72,7 +72,9 @@ async function getProfile(tokens) {
 
 async function listRecentMessages(tokens, { maxResults = 200, afterEpoch } = {}) {
   const gmail = client(tokens)
-  const q = afterEpoch ? `after:${afterEpoch}` : ''
+  // Only sync the main inbox — ignore spam, trash, drafts, promotions, social.
+  const baseFilter = 'in:inbox -in:spam -in:trash -in:drafts -category:promotions -category:social'
+  const q = afterEpoch ? `${baseFilter} after:${afterEpoch}` : baseFilter
   const ids = []
   let pageToken
   do {
