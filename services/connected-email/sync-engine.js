@@ -26,6 +26,26 @@ function backoffDelay(consecutiveFailures) {
   return exp
 }
 
+// ───────────────────────────────────────────────────────────────
+// In-memory progress tracker (per process) — polled by the UI.
+// Survives per-request; clears 60s after completion so UI can show final state.
+// ───────────────────────────────────────────────────────────────
+const progressMap = new Map()
+
+function setProgress(accountId, patch) {
+  const prev = progressMap.get(accountId) || {}
+  progressMap.set(accountId, { ...prev, ...patch, updatedAt: Date.now() })
+}
+function getProgress(accountId) {
+  const p = progressMap.get(accountId) || null
+  if (p && p.phase === 'done' && Date.now() - p.updatedAt > 60 * 1000) {
+    progressMap.delete(accountId)
+    return null
+  }
+  return p
+}
+function clearProgress(accountId) { progressMap.delete(accountId) }
+
 async function claimLock(supabase, accountId) {
   // Release stuck locks first.
   await supabase.rpc('noop').catch(() => {}) // no-op just to warm
@@ -129,7 +149,9 @@ async function syncBoundedWindow(supabase, logger, accountId, { days = 7, maxMes
   }
 
   messageIds = messageIds.slice(0, cap)
+  setProgress(accountId, { phase: 'fetching', total: messageIds.length, scanned: 0, synced: 0, isTest: true, startedAt: Date.now() })
   let synced = 0
+  let scanned = 0
   for (const mid of messageIds) {
     try {
       const full = await provider.getMessage(
@@ -143,7 +165,10 @@ async function syncBoundedWindow(supabase, logger, accountId, { days = 7, maxMes
     } catch (e) {
       logger?.warn?.(`[connected-email] test-sync msg ${mid}: ${e.message}`)
     }
+    scanned++
+    setProgress(accountId, { scanned, synced })
   }
+  setProgress(accountId, { phase: 'done', scanned, synced })
   await supabase.from('connected_email_accounts')
     .update({ last_sync_at: new Date().toISOString(), updated_at: new Date().toISOString() })
     .eq('id', accountId)
@@ -159,9 +184,11 @@ async function syncAccount(supabase, logger, accountId) {
 
   let messagesSynced = 0
   try {
+    setProgress(accountId, { phase: 'starting', scanned: 0, synced: 0, total: null, startedAt: Date.now() })
     let account = await store.getWithTokens(supabase, accountId)
     if (!account || account.status === 'disconnected') {
       await releaseLock(supabase, accountId, { success: true, messagesSynced: 0 })
+      setProgress(accountId, { phase: 'done', error: 'disconnected' })
       return { skipped: true, reason: 'disconnected' }
     }
 
@@ -169,6 +196,7 @@ async function syncAccount(supabase, logger, accountId) {
     account = await ensureFreshToken(supabase, account, provider)
 
     const isInitial = !account.initial_sync_completed_at
+    setProgress(accountId, { phase: isInitial ? 'initial_list' : 'incremental_list', isInitial })
     const ownerEmail = account.email_address
 
     let messageIds = []
@@ -227,7 +255,9 @@ async function syncAccount(supabase, logger, accountId) {
     }
 
     messageIds = messageIds.slice(0, PER_CYCLE_MAX)
+    setProgress(accountId, { phase: 'fetching', total: messageIds.length, scanned: 0, synced: 0 })
 
+    let scannedLocal = 0
     for (const mid of messageIds) {
       try {
         const full = await provider.getMessage(
@@ -241,6 +271,9 @@ async function syncAccount(supabase, logger, accountId) {
       } catch (e) {
         logger?.warn?.(`[connected-email] message ${mid} failed: ${e.message}`)
       }
+      scannedLocal++
+      // Update every message for real-time feel (cheap — in-memory only).
+      setProgress(accountId, { scanned: scannedLocal, synced: messagesSynced })
     }
 
     // Advance cursor (use profile historyId for gmail if we were on initial).
@@ -263,11 +296,13 @@ async function syncAccount(supabase, logger, accountId) {
     await supabase.from('connected_email_accounts').update(patch).eq('id', accountId)
 
     await releaseLock(supabase, accountId, { success: true, messagesSynced })
+    setProgress(accountId, { phase: 'done', scanned: messageIds.length, synced: messagesSynced })
     return { synced: messagesSynced, initial: isInitial }
   } catch (e) {
     logger?.error?.(`[connected-email] sync ${accountId} failed: ${e.message}`)
     await store.markError(supabase, accountId, e.message)
     await releaseLock(supabase, accountId, { success: false, errorMessage: e.message, messagesSynced })
+    setProgress(accountId, { phase: 'error', error: e.message })
     return { error: e.message, synced: messagesSynced }
   }
 }
@@ -371,6 +406,8 @@ module.exports = {
   syncAllDue,
   syncBoundedWindow,
   persistMessage,
+  getProgress,
+  clearProgress,
   // for tests
   backoffDelay,
 }
