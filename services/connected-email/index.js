@@ -119,9 +119,9 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   // ══════════════════════════════════════════════════════════════
   router.get('/oauth/:provider/callback', async (req, res) => {
     const provider = req.params.provider
-    const { code, state, error: oauthErr } = req.query
+    const { code, state, error: oauthErr, error_description: oauthErrDesc } = req.query
     try {
-      if (oauthErr) throw new Error(`OAuth error: ${oauthErr}`)
+      if (oauthErr) throw new Error(`OAuth error: ${oauthErr}${oauthErrDesc ? ' - ' + oauthErrDesc : ''}`)
       if (!code || !state) throw new Error('missing code or state')
 
       // Single-use state — claim in a read-update cycle.
