@@ -1060,6 +1060,15 @@ let notificationEmail = null; try { notificationEmail = require('./notification-
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
+// Connected Email (Gmail/Outlook OAuth) — System 2 for Communications Hub.
+// Loosely coupled: removing this block + services/connected-email/ = feature gone, zero side effects.
+let connectedEmail = null;
+try {
+  connectedEmail = require('./services/connected-email')(supabase, logger);
+  app.use('/api/connected-email', connectedEmail.router);
+  if (process.env.CONNECTED_EMAIL_POLLER_DISABLED !== '1') connectedEmail.startPoller();
+} catch (e) { console.log('Connected email module not loaded:', e.message); }
+
 // Supabase connection is handled in supabase.js
 // Test Supabase connection
 async function testSupabaseConnection() {
@@ -36227,6 +36236,31 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
 
     const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+
+    // Route connected-email conversations through the Gmail/Outlook provider.
+    if (conv.channel === 'email' && (conv.provider === 'gmail' || conv.provider === 'outlook')) {
+      if (!connectedEmail) return res.status(503).json({ error: 'Connected email not available' });
+      try {
+        const sentRow = await connectedEmail.sendFromConversation({
+          conversationId: id,
+          userId,
+          text: text?.trim() || null,
+          html: req.body?.html || null,
+          subject: subject || null,
+        });
+        return res.json({
+          id: sentRow.id,
+          conversationId: id,
+          channel: 'email',
+          text: sentRow.body_text || text,
+          subject: sentRow.email_subject,
+          status: 'sent',
+        });
+      } catch (e) {
+        logger.error('[Connected Email Send] Error:', e.message);
+        return res.status(500).json({ error: e.message || 'Failed to send email' });
+      }
+    }
 
     // Route to LeadBridge for thumbtack/yelp conversations
     if (conv.provider === 'leadbridge' && (conv.channel === 'thumbtack' || conv.channel === 'yelp')) {
