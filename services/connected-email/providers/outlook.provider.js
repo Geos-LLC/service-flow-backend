@@ -26,6 +26,7 @@ function buildAuthUrl({ redirectUri, state }) {
     response_mode: 'query',
     scope: SCOPES.join(' '),
     state,
+    prompt: 'select_account', // force account chooser
   })
   return `${AUTHORITY}/oauth2/v2.0/authorize?${params.toString()}`
 }
