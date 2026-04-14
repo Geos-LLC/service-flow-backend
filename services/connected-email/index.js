@@ -222,6 +222,26 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   })
 
   // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/accounts/:id/test-sync
+  //   Body: { days?: number, maxMessages?: number }
+  //   Runs synchronously so the UI can show exact counts.
+  // ══════════════════════════════════════════════════════════════
+  router.post('/accounts/:id/test-sync', auth, async (req, res) => {
+    try {
+      const acct = await store.getSafeById(supabase, req.user.id, req.params.id)
+      if (!acct) return res.status(404).json({ error: 'not found' })
+      const days = Math.max(1, Math.min(90, parseInt(req.body?.days || 7, 10)))
+      const maxMessages = Math.max(1, Math.min(200, parseInt(req.body?.maxMessages || 50, 10)))
+      const result = await syncEngine.syncBoundedWindow(supabase, log, req.params.id, { days, maxMessages })
+      if (result.error) return res.status(500).json({ error: result.error })
+      res.json(result)
+    } catch (e) {
+      log.error?.(`[connected-email] test-sync: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
   // POST /api/connected-email/conversations/:id/send
   //   Alternative entry point for sending from a connected email thread.
   //   (communications.jsx primary path uses /api/communications/conversations/:id/send

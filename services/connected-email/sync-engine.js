@@ -96,6 +96,60 @@ async function ensureFreshToken(supabase, account, provider) {
   }
 }
 
+/**
+ * One-shot bounded sync — used for "Test Sync (N days)" from the UI.
+ * Does NOT advance the history cursor and does NOT mark initial complete.
+ * Idempotent: uses normal dedupe path.
+ */
+async function syncBoundedWindow(supabase, logger, accountId, { days = 7, maxMessages = 50 } = {}) {
+  let account = await store.getWithTokens(supabase, accountId)
+  if (!account) return { error: 'account not found' }
+  if (account.status === 'disconnected') return { error: 'disconnected' }
+
+  const provider = getProvider(account.provider)
+  account = await ensureFreshToken(supabase, account, provider)
+
+  const afterEpoch = Math.floor((Date.now() - days * 86400 * 1000) / 1000)
+  const afterDate = new Date(Date.now() - days * 86400 * 1000)
+  const cap = Math.min(maxMessages, PER_CYCLE_MAX)
+
+  let messageIds
+  try {
+    messageIds = account.provider === 'gmail'
+      ? await provider.listRecentMessages(
+          { accessToken: account.accessToken, refreshToken: account.refreshToken },
+          { maxResults: cap, afterEpoch }
+        )
+      : await provider.listRecentMessages(
+          { accessToken: account.accessToken },
+          { maxResults: cap, afterDate }
+        )
+  } catch (e) {
+    return { error: `list failed: ${e.message}` }
+  }
+
+  messageIds = messageIds.slice(0, cap)
+  let synced = 0
+  for (const mid of messageIds) {
+    try {
+      const full = await provider.getMessage(
+        { accessToken: account.accessToken, refreshToken: account.refreshToken },
+        mid
+      )
+      const ok = await persistMessage(supabase, {
+        account, providerName: account.provider, ownerEmail: account.email_address, providerMsg: full, logger,
+      })
+      if (ok) synced++
+    } catch (e) {
+      logger?.warn?.(`[connected-email] test-sync msg ${mid}: ${e.message}`)
+    }
+  }
+  await supabase.from('connected_email_accounts')
+    .update({ last_sync_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq('id', accountId)
+  return { synced, scanned: messageIds.length, days, cap }
+}
+
 async function syncAccount(supabase, logger, accountId) {
   const acquired = await claimLock(supabase, accountId)
   if (!acquired) {
@@ -315,6 +369,7 @@ async function syncAllDue(supabase, logger) {
 module.exports = {
   syncAccount,
   syncAllDue,
+  syncBoundedWindow,
   persistMessage,
   // for tests
   backoffDelay,
