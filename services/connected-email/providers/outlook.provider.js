@@ -102,9 +102,10 @@ async function listRecentMessages(tokens, { maxResults = 200, afterDate } = {}) 
     ? `&$filter=receivedDateTime ge ${new Date(afterDate).toISOString()}`
     : ''
   const top = Math.min(maxResults, 200)
+  // Scope to Inbox folder — ignores Junk Email, Deleted Items, Drafts, etc.
   const data = await graphGet(
     tokens,
-    `/me/messages?$top=${top}&$select=id${filter}`
+    `/me/mailFolders/Inbox/messages?$top=${top}&$select=id${filter}&$orderby=receivedDateTime desc`
   )
   return (data.value || []).map(m => m.id)
 }
