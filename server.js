@@ -29558,7 +29558,8 @@ app.get('/api/user/business-details', async (req, res) => {
         email,
         first_name,
         last_name,
-        business_slug
+        business_slug,
+        time_format
       `)
       .eq('id', userId)
       .limit(1);
@@ -29576,7 +29577,8 @@ app.get('/api/user/business-details', async (req, res) => {
         email: userData[0].email || '',
         firstName: userData[0].first_name || '',
         lastName: userData[0].last_name || '',
-        businessSlug: userData[0].business_slug || ''
+        businessSlug: userData[0].business_slug || '',
+        timeFormat: userData[0].time_format || '12h'
       });
     } else {
       res.status(404).json({ error: 'User not found' });
@@ -29589,43 +29591,47 @@ app.get('/api/user/business-details', async (req, res) => {
 
 app.put('/api/user/business-details', async (req, res) => {
   try {
-    const { userId, businessName, businessEmail, phone, email, firstName, lastName } = req.body;
-    
+    const { userId, businessName, businessEmail, phone, email, firstName, lastName, timeFormat } = req.body;
+
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Update business details in users table
-      await connection.query(`
-        UPDATE users 
-        SET 
-          business_name = ?,
-          business_email = ?,
-          phone = ?,
-          email = ?,
-          first_name = ?,
-          last_name = ?,
-          updated_at = NOW()
-        WHERE id = ?
-      `, [businessName, businessEmail, phone, email, firstName, lastName, userId]);
+    const normalizedTimeFormat = timeFormat === '24h' ? '24h' : (timeFormat === '12h' ? '12h' : null);
 
-      res.json({ 
-        message: 'Business details updated successfully',
-        businessDetails: {
-          businessName,
-          businessEmail,
-          phone,
-          email,
-          firstName,
-          lastName
-        }
-      });
-    } finally {
-      connection.release();
+    const updateData = {
+      business_name: businessName,
+      business_email: businessEmail,
+      phone,
+      email,
+      first_name: firstName,
+      last_name: lastName,
+      updated_at: new Date().toISOString(),
+      ...(normalizedTimeFormat ? { time_format: normalizedTimeFormat } : {})
+    };
+
+    const { error: updateError } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error updating business details:', updateError);
+      return res.status(500).json({ error: 'Failed to update business details', details: updateError.message });
     }
+
+    res.json({
+      message: 'Business details updated successfully',
+      businessDetails: {
+        businessName,
+        businessEmail,
+        phone,
+        email,
+        firstName,
+        lastName,
+        ...(normalizedTimeFormat ? { timeFormat: normalizedTimeFormat } : {})
+      }
+    });
   } catch (error) {
     console.error('Error updating business details:', error);
     res.status(500).json({ error: 'Failed to update business details' });
