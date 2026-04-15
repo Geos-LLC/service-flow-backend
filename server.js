@@ -34976,24 +34976,8 @@ async function handleWhatsAppWebhook(event, payload) {
         }
         await supabase.from('communication_settings').update(updateFields).eq('user_id', settings.user_id);
         logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}, phone=${phoneNumber}) for user ${settings.user_id}`);
-
-        // On reconnect: clear old WhatsApp conversations + messages so fresh sync replaces them
-        // Mirrors Sigcore's clearWhatsAppData() behavior
-        if (isConnected) {
-          try {
-            const { data: oldConvs } = await supabase.from('communication_conversations')
-              .select('id').eq('user_id', settings.user_id).eq('provider', 'whatsapp');
-            if (oldConvs && oldConvs.length > 0) {
-              const oldIds = oldConvs.map(c => c.id);
-              // Delete messages first (FK constraint)
-              await supabase.from('communication_messages').delete().in('conversation_id', oldIds);
-              await supabase.from('communication_conversations').delete().in('id', oldIds);
-              logger.log(`[WhatsApp] Cleared ${oldConvs.length} old conversations + messages for user ${settings.user_id}`);
-            }
-          } catch (e) {
-            logger.warn('[WhatsApp] Failed to clear old data:', e.message);
-          }
-        }
+        // Note: Sigcore no longer wipes on reconnect — it upserts by providerMessageId.
+        // SF must not wipe either, otherwise we lose history Sigcore won't re-send.
       }
     }
   } catch (error) {
