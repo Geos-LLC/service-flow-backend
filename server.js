@@ -6531,12 +6531,12 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { frequency, endDate } = req.body;
-    
+    const { frequency, endDate, time } = req.body;
+
     if (!frequency) {
       return res.status(400).json({ error: 'Recurring frequency is required' });
     }
-    
+
     // Check if job exists and belongs to user
     const { data: existingJob, error: checkError } = await supabase
       .from('jobs')
@@ -6544,27 +6544,38 @@ app.post('/api/jobs/:id/convert-to-recurring', authenticateToken, async (req, re
       .eq('id', id)
       .eq('user_id', userId)
       .single();
-    
+
     if (checkError || !existingJob) {
       return res.status(404).json({ error: 'Job not found' });
     }
-    
+
     // Check if already recurring (only check boolean true, not truthy strings)
     if (existingJob.is_recurring === true) {
       return res.status(400).json({ error: 'Job is already set as recurring' });
     }
-    
+
+    // Apply new time-of-day to scheduled_date (if provided + valid)
+    let newScheduledDate = existingJob.scheduled_date;
+    if (typeof time === 'string' && /^\d{2}:\d{2}$/.test(time) && existingJob.scheduled_date) {
+      const raw = String(existingJob.scheduled_date);
+      const datePart = raw.split(/[ T]/)[0];
+      if (/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+        newScheduledDate = `${datePart} ${time}:00`;
+      }
+    }
+
     // Calculate next billing date based on frequency
-    const scheduledDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
-    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
-    
+    const scheduledDateObj = newScheduledDate ? new Date(String(newScheduledDate).replace(' ', 'T')) : new Date();
+    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDateObj);
+
     // Update job to be recurring
     // Note: Only update fields that exist in the database schema
     const updateData = {
         is_recurring: true,
         recurring_frequency: frequency,
         recurring_end_date: endDate || null,
-      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : null
+      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : null,
+      ...(newScheduledDate !== existingJob.scheduled_date ? { scheduled_date: newScheduledDate } : {})
     };
     
     console.log(`🔄 Converting job ${id} to recurring with frequency: ${frequency}, endDate: ${endDate || 'none'}, nextBillingDate: ${updateData.next_billing_date}`);
@@ -6602,7 +6613,7 @@ app.put('/api/jobs/:id/recurring-frequency', authenticateToken, async (req, res)
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    const { frequency, endDate } = req.body;
+    const { frequency, endDate, time } = req.body;
 
     if (!frequency) {
       return res.status(400).json({ error: 'Recurring frequency is required' });
@@ -6624,14 +6635,25 @@ app.put('/api/jobs/:id/recurring-frequency', authenticateToken, async (req, res)
       return res.status(400).json({ error: 'Job is not recurring. Use convert-to-recurring instead.' });
     }
 
+    // Apply new time-of-day to the job's scheduled_date (if provided + valid)
+    let newScheduledDate = existingJob.scheduled_date;
+    if (typeof time === 'string' && /^\d{2}:\d{2}$/.test(time) && existingJob.scheduled_date) {
+      const raw = String(existingJob.scheduled_date);
+      const datePart = raw.split(/[ T]/)[0]; // "YYYY-MM-DD"
+      if (/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+        newScheduledDate = `${datePart} ${time}:00`;
+      }
+    }
+
     // Recalculate next billing date based on new frequency
-    const scheduledDate = existingJob.scheduled_date ? new Date(existingJob.scheduled_date) : new Date();
-    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDate);
+    const scheduledDateObj = newScheduledDate ? new Date(newScheduledDate.replace(' ', 'T')) : new Date();
+    const nextBillingDate = calculateNextRecurringDate(frequency, scheduledDateObj);
 
     const updateData = {
       recurring_frequency: frequency,
       recurring_end_date: endDate !== undefined ? (endDate || null) : existingJob.recurring_end_date,
-      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : existingJob.next_billing_date
+      next_billing_date: nextBillingDate ? nextBillingDate.toISOString().split('T')[0] : existingJob.next_billing_date,
+      ...(newScheduledDate !== existingJob.scheduled_date ? { scheduled_date: newScheduledDate } : {})
     };
 
     console.log(`🔄 Updating recurring frequency for job ${id}: ${existingJob.recurring_frequency} -> ${frequency}`);
