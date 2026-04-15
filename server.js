@@ -35124,13 +35124,34 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
               const { data: ex } = await supabase.from('communication_messages').select('id').eq('provider_message_id', msgId).maybeSingle();
               if (ex) continue;
               const dir = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out';
+
+              // WhatsApp media contract (top-level on Sigcore responses)
+              const mediaMeta = msg.hasMedia ? {
+                hasMedia: true,
+                mediaType: msg.mediaType || null,
+                mediaMimetype: msg.mediaMimetype || null,
+                mediaFilename: msg.mediaFilename || null,
+                mediaStatus: msg.mediaStatus || null,
+                sigcoreMediaUrl: msg.mediaUrl || null,
+              } : null;
+              if (mediaMeta && !msg.id) {
+                logger.warn('[Backfill] Message has media but no sigcore id — media will not be retrievable');
+              }
+
               await supabase.from('communication_messages').insert({
-                conversation_id: conversation.id, provider_message_id: msgId,
+                conversation_id: conversation.id,
+                sigcore_message_id: msg.id || null,
+                provider_message_id: msgId,
                 direction: dir, channel: 'sms', body: msg.body || '',
                 from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
                 sender_role: dir === 'in' ? 'customer' : 'agent',
                 status: msg.status || 'delivered',
-                metadata: { mediaUrls: msg.metadata?.mediaUrls || [], media: msg.metadata?.media || [] },
+                metadata: {
+                  // legacy OpenPhone MMS shape (preserved for back-compat)
+                  mediaUrls: msg.metadata?.mediaUrls || [],
+                  // new WhatsApp media contract
+                  ...(mediaMeta && { media: mediaMeta }),
+                },
                 created_at: msg.createdAt || new Date().toISOString(),
               });
             }
@@ -35167,6 +35188,20 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
           return;
         }
       }
+
+      // Extract WhatsApp media contract (Sigcore-normalized)
+      const mediaMeta = payload.hasMedia ? {
+        hasMedia: true,
+        mediaType: payload.mediaType || null,
+        mediaMimetype: payload.mediaMimetype || null,
+        mediaFilename: payload.mediaFilename || null,
+        mediaStatus: payload.mediaStatus || null,
+        sigcoreMediaUrl: payload.mediaUrl || null,
+      } : null;
+      if (mediaMeta && !sigcoreMessageId) {
+        logger.warn('[Webhook] Message has media but no sigcore_message_id — media will not be retrievable', { event });
+      }
+
       await supabase.from('communication_messages').insert({
         conversation_id: conversation.id,
         sigcore_message_id: sigcoreMessageId,
@@ -35178,7 +35213,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         to_number: toNumber,
         sender_role: isInbound ? 'customer' : 'agent',
         status: payload.status || 'delivered',
-        metadata: { event, sigcoreConvId },
+        metadata: { event, sigcoreConvId, ...(mediaMeta && { media: mediaMeta }) },
         created_at: payload.createdAt || new Date().toISOString()
       });
 
@@ -36113,6 +36148,69 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
   }
 });
 
+// GET /api/communications/media/:sigcoreMessageId — authed proxy for WhatsApp media
+// Browsers can't send x-api-key for <img>/<video>, so SF proxies Sigcore with the tenant key.
+app.get('/api/communications/media/:sigcoreMessageId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { sigcoreMessageId } = req.params;
+    if (!sigcoreMessageId) return res.status(404).json({ error: 'Not found' });
+
+    // Ownership check: message must belong to a conversation owned by this user
+    const { data: msg } = await supabase.from('communication_messages')
+      .select('id, conversation_id, metadata')
+      .eq('sigcore_message_id', sigcoreMessageId)
+      .maybeSingle();
+    if (!msg) return res.status(404).json({ error: 'Not found' });
+
+    const { data: conv } = await supabase.from('communication_conversations')
+      .select('id, user_id')
+      .eq('id', msg.conversation_id)
+      .maybeSingle();
+    if (!conv || conv.user_id !== userId) return res.status(404).json({ error: 'Not found' });
+
+    // Resolve tenant key
+    const settings = await getSigcoreSettings(userId);
+    const tenantKey = settings?.sigcore_tenant_api_key;
+    if (!tenantKey || !SIGCORE_URL) return res.status(404).json({ error: 'Not found' });
+
+    // Stream from Sigcore
+    let upstream;
+    try {
+      upstream = await axios({
+        method: 'GET',
+        url: `${SIGCORE_URL}/conversations/messages/${encodeURIComponent(sigcoreMessageId)}/media`,
+        headers: { 'x-api-key': tenantKey },
+        responseType: 'stream',
+        validateStatus: () => true,
+      });
+    } catch (e) {
+      logger.warn(`[Media] Sigcore request failed: ${e.message}`);
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    if (upstream.status === 404) return res.status(404).json({ error: 'Not found' });
+    if (upstream.status !== 200) {
+      logger.warn(`[Media] Sigcore returned ${upstream.status} for ${sigcoreMessageId}`);
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const contentType = upstream.headers['content-type'] || msg.metadata?.media?.mediaMimetype || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+    upstream.data.pipe(res);
+    upstream.data.on('error', (err) => {
+      logger.warn(`[Media] Stream error: ${err.message}`);
+      if (!res.headersSent) res.status(502).end();
+      else res.end();
+    });
+  } catch (error) {
+    logger.error('[Media] Proxy error:', error);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to fetch media' });
+  }
+});
+
 // GET /api/communications/conversations/:id?limit=20&before=2026-04-01T00:00:00Z
 app.get('/api/communications/conversations/:id', authenticateToken, async (req, res) => {
   try {
@@ -36148,14 +36246,29 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
 
     // Merge into unified timeline
     const events = [
-      ...(messages || []).map(m => ({
-        id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
-        type: m.direction === 'in' ? 'message_in' : 'message_out',
-        senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
-        sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
-        mediaUrls: m.metadata?.mediaUrls || [],
-        media: m.metadata?.media || [],
-      })),
+      ...(messages || []).map(m => {
+        const mMedia = m.metadata?.media || null;
+        // New WhatsApp media contract — mediaUrl is SF-relative, never exposes Sigcore path
+        const hasMedia = !!(mMedia && mMedia.hasMedia);
+        const mediaUrl = (hasMedia && m.sigcore_message_id)
+          ? `/api/communications/media/${m.sigcore_message_id}`
+          : null;
+        return {
+          id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
+          type: m.direction === 'in' ? 'message_in' : 'message_out',
+          senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
+          sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
+          // Legacy OpenPhone MMS (kept for back-compat; ignored when hasMedia is true)
+          mediaUrls: Array.isArray(m.metadata?.mediaUrls) ? m.metadata.mediaUrls : [],
+          // New WhatsApp media contract
+          hasMedia,
+          mediaType: hasMedia ? (mMedia.mediaType || null) : null,
+          mediaMimetype: hasMedia ? (mMedia.mediaMimetype || null) : null,
+          mediaFilename: hasMedia ? (mMedia.mediaFilename || null) : null,
+          mediaStatus: hasMedia ? (mMedia.mediaStatus || null) : null,
+          mediaUrl,
+        };
+      }),
       ...(calls || []).map(c => ({
         id: `call-${c.id}`, conversationId: id, channel: 'call',
         type: c.direction === 'in' ? 'call_in' : 'call_out',
