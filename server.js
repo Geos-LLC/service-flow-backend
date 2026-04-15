@@ -1036,6 +1036,17 @@ app.options('/api/team-members', (req, res) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Normalize search query params: trim leading/trailing whitespace and collapse
+// internal whitespace so "  Wasserman  " matches "Wasserman" and " John  Doe "
+// matches "John Doe". Applied globally so every search endpoint benefits.
+app.use((req, _res, next) => {
+  if (req.query && typeof req.query.search === 'string') {
+    const normalized = req.query.search.trim().replace(/\s+/g, ' ');
+    req.query.search = normalized;
+  }
+  next();
+});
+
 // Apply rate limiting
 // Note: More specific paths must come first. The generalLimiter skips paths
 // that already have their own limiter to avoid double-counting.
