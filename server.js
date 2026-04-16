@@ -36310,7 +36310,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         lead = {
           id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
           phone: customer.phone, email: customer.email,
-          source: conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+          source: conv.company || conv.provider, tags: [], status: 'Customer', entityType: 'customer'
         };
       }
     }
@@ -36344,7 +36344,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
           lead = {
             id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
             phone: customer.phone, email: customer.email,
-            source: conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+            source: conv.company || conv.provider, tags: [], status: 'Customer', entityType: 'customer'
           };
         }
       } else if (identity?.sf_lead_id) {
