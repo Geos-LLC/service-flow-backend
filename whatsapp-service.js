@@ -309,7 +309,11 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       for (const chat of chatsData) {
         try {
           const isGroup = !!chat.isGroup || chat.phone?.includes('@')
-          const participantPhone = isGroup ? chat.phone : normalizePhone(chat.phone)
+          // Normalize group IDs: ensure @g.us suffix so it matches Sigcore's format
+          let participantPhone = isGroup ? chat.phone : normalizePhone(chat.phone)
+          if (isGroup && participantPhone && !participantPhone.includes('@')) {
+            participantPhone = participantPhone + '@g.us'
+          }
           if (!participantPhone) { waSyncProgress[userId].skipped++; continue }
 
           // Validate individual phone numbers (skip invalid, allow groups)
@@ -319,11 +323,27 @@ module.exports = (supabase, logger, sigcoreRequest) => {
           }
 
           // Find existing conversation (created by webhook handler) and update metadata
-          const { data: existingConv } = await supabase.from('communication_conversations')
+          // Try both with and without @g.us for groups (legacy stubs may lack the suffix)
+          let existingConv = null
+          const { data: found } = await supabase.from('communication_conversations')
             .select('*')
             .eq('user_id', userId).eq('provider', 'whatsapp')
             .eq('endpoint_phone', endpointPhone).eq('participant_phone', participantPhone)
             .maybeSingle()
+          existingConv = found
+          if (!existingConv && isGroup) {
+            const altPhone = participantPhone.replace('@g.us', '')
+            const { data: altFound } = await supabase.from('communication_conversations')
+              .select('*')
+              .eq('user_id', userId).eq('provider', 'whatsapp')
+              .eq('endpoint_phone', endpointPhone).eq('participant_phone', altPhone)
+              .maybeSingle()
+            if (altFound) {
+              // Fix the phone to canonical format
+              await supabase.from('communication_conversations').update({ participant_phone: participantPhone }).eq('id', altFound.id)
+              existingConv = { ...altFound, participant_phone: participantPhone }
+            }
+          }
 
           if (existingConv) {
             // Update name from microservice (contact resolution)
@@ -405,31 +425,41 @@ module.exports = (supabase, logger, sigcoreRequest) => {
         }
 
         let avatarsUpdated = 0
+        let msgsFetched = 0
         for (const sigConv of avatarConvs) {
-          if (!normalizeAvatarUrl(sigConv.avatarUrl)) continue
           const phone = sigConv.participantPhoneNumber
           if (!phone) continue
 
-          // Find matching SF conversation and update avatar
-          const { data: sfConv } = await supabase.from('communication_conversations')
-            .select('id, metadata')
+          // Find matching SF conversation — try exact phone, then without @g.us (legacy stubs)
+          let sfConv = null
+          const { data: found } = await supabase.from('communication_conversations')
+            .select('id, metadata, sigcore_conversation_id, participant_phone')
             .eq('user_id', userId).eq('provider', 'whatsapp').eq('participant_phone', phone)
             .maybeSingle()
+          sfConv = found
+          if (!sfConv && phone.includes('@g.us')) {
+            const altPhone = phone.replace('@g.us', '')
+            const { data: altFound } = await supabase.from('communication_conversations')
+              .select('id, metadata, sigcore_conversation_id, participant_phone')
+              .eq('user_id', userId).eq('provider', 'whatsapp').eq('participant_phone', altPhone)
+              .maybeSingle()
+            if (altFound) {
+              // Fix phone to canonical format
+              await supabase.from('communication_conversations').update({ participant_phone: phone }).eq('id', altFound.id)
+              sfConv = { ...altFound, participant_phone: phone }
+            }
+          }
 
           if (sfConv) {
             const meta = sfConv.metadata || {}
             const updates = { updated_at: new Date().toISOString() }
-            if (meta.avatarUrl !== normalizeAvatarUrl(sigConv.avatarUrl)) {
+            if (normalizeAvatarUrl(sigConv.avatarUrl) && meta.avatarUrl !== normalizeAvatarUrl(sigConv.avatarUrl)) {
               updates.metadata = { ...meta, avatarUrl: normalizeAvatarUrl(sigConv.avatarUrl) }
-              if (sigConv.contactName) updates.participant_name = sigConv.contactName
-              if (sigConv.lastMessage) updates.last_preview = sigConv.lastMessage.substring(0, 200)
               avatarsUpdated++
             }
+            if (sigConv.contactName) updates.participant_name = sigConv.contactName
             if (!sfConv.sigcore_conversation_id && sigConv.id) {
               updates.sigcore_conversation_id = sigConv.id
-            }
-            if (Object.keys(updates).length > 1) {
-              await supabase.from('communication_conversations').update(updates).eq('id', sfConv.id)
             }
 
             // Fetch messages from Sigcore for this conversation
@@ -438,6 +468,8 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                 const msgsRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=50`, tenantKey)
                 const msgs = msgsRes.data?.data || []
                 let inserted = 0
+                let latestBody = null
+                let latestAt = null
                 for (const msg of msgs) {
                   const sigMsgId = msg.id
                   if (!sigMsgId) continue
@@ -453,6 +485,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                     mediaStatus: msg.mediaStatus || null,
                     sigcoreMediaUrl: msg.mediaUrl || null,
                   } : null
+                  const msgCreatedAt = msg.createdAt || new Date().toISOString()
                   await supabase.from('communication_messages').insert({
                     conversation_id: sfConv.id,
                     sigcore_message_id: sigMsgId,
@@ -463,20 +496,38 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                     sender_role: dir === 'in' ? 'customer' : 'agent',
                     status: msg.status || 'delivered',
                     metadata: { ...(mediaMeta && { media: mediaMeta }) },
-                    created_at: msg.createdAt || new Date().toISOString(),
+                    created_at: msgCreatedAt,
                   })
                   inserted++
+                  // Track latest message for preview
+                  if (!latestAt || msgCreatedAt > latestAt) {
+                    latestAt = msgCreatedAt
+                    latestBody = msg.body || ''
+                  }
                 }
                 if (inserted > 0) {
+                  msgsFetched += inserted
                   waSyncProgress[userId].messages += inserted
+                }
+                // Update last_preview from newest message
+                if (latestBody) {
+                  updates.last_preview = latestBody.substring(0, 200)
+                  updates.last_event_at = latestAt
+                } else if (sigConv.lastMessage) {
+                  updates.last_preview = sigConv.lastMessage.substring(0, 200)
                 }
               } catch (e) {
                 logger.warn(`[WhatsApp Sync] Msg fetch failed for conv ${sigConv.id}: ${e.response?.status || ''} ${e.message}`)
               }
             }
+
+            if (Object.keys(updates).length > 1) {
+              await supabase.from('communication_conversations').update(updates).eq('id', sfConv.id)
+            }
           }
         }
         if (avatarsUpdated > 0) logger.log(`[WhatsApp Sync] Updated ${avatarsUpdated} avatars from Sigcore API`)
+        if (msgsFetched > 0) logger.log(`[WhatsApp Sync] Fetched ${msgsFetched} messages across ${avatarConvs.length} Sigcore conversations`)
       } catch (e) {
         // Sigcore conversations API may return 0 — non-fatal, avatars are supplementary
         logger.warn(`[WhatsApp Sync] Avatar fetch from Sigcore API: ${e.response?.status || ''} ${e.message || 'failed'}`)
