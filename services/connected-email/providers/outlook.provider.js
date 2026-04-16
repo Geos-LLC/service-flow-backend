@@ -16,8 +16,6 @@ const AUTHORITY = process.env.MS_OAUTH_AUTHORITY || 'https://login.microsoftonli
 const SCOPES = [
   'https://graph.microsoft.com/Mail.Read',
   'https://graph.microsoft.com/Mail.Send',
-  'https://graph.microsoft.com/Mail.ReadShared',
-  'https://graph.microsoft.com/Mail.Send.Shared',
   'offline_access',
   'openid',
   'email',
