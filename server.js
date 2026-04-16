@@ -34996,24 +34996,42 @@ async function handleWhatsAppWebhook(event, payload) {
         autoLinkConversation(userId, newConv.id, participantPhone);
       }
 
-      // Insert message (dedup by external message ID)
+      // Upsert message: update if exists (by provider_message_id or sigcore conv+body+timestamp), insert if new
+      const sigcoreMessageId = msg.sigcoreMessageId || msg.messageId || null;
       const { data: existingMsg } = await supabase.from('communication_messages')
         .select('id').eq('provider_message_id', externalMessageId).maybeSingle();
-      if (existingMsg) {
-        logger.log(`[WhatsApp] Duplicate message ${externalMessageId}, skipping`);
-        return;
-      }
 
-      await supabase.from('communication_messages').insert({
+      // Build media contract
+      const mediaMeta = msg.hasMedia ? {
+        hasMedia: true,
+        mediaType: msg.mediaType || null,
+        mediaMimetype: msg.mediaMimetype || null,
+        mediaFilename: msg.mediaFilename || null,
+        mediaStatus: msg.mediaStatus || null,
+        sigcoreMediaUrl: msg.mediaUrl || null,
+      } : null;
+
+      const msgData = {
         conversation_id: conversation.id,
         provider_message_id: externalMessageId,
+        sigcore_message_id: sigcoreMessageId,
         direction: isFromMe ? 'out' : 'in', channel: 'whatsapp', body,
         from_number: isFromMe ? (resolvedEndpointPhone || '') : participantPhone,
         to_number: isFromMe ? participantPhone : (resolvedEndpointPhone || ''),
         sender_role: isFromMe ? 'agent' : 'customer', status: 'delivered',
-        metadata: { externalChatId, hasMedia: msg.hasMedia, type: msg.type },
+        metadata: { externalChatId, ...(mediaMeta && { media: mediaMeta }) },
         created_at: timestamp,
-      });
+      };
+
+      if (existingMsg) {
+        // Update existing — rewrite, don't duplicate
+        await supabase.from('communication_messages').update({
+          body: msgData.body, status: msgData.status, metadata: msgData.metadata,
+          ...(sigcoreMessageId && { sigcore_message_id: sigcoreMessageId }),
+        }).eq('id', existingMsg.id);
+      } else {
+        await supabase.from('communication_messages').insert(msgData);
+      }
 
       // Update conversation
       const updates = { last_event_at: timestamp, updated_at: new Date().toISOString() };

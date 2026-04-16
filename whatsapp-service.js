@@ -473,9 +473,6 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                 for (const msg of msgs) {
                   const sigMsgId = msg.id
                   if (!sigMsgId) continue
-                  const { data: existing } = await supabase.from('communication_messages')
-                    .select('id').eq('sigcore_message_id', sigMsgId).maybeSingle()
-                  if (existing) continue
                   const dir = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out'
                   const mediaMeta = msg.hasMedia ? {
                     hasMedia: true,
@@ -486,19 +483,42 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                     sigcoreMediaUrl: msg.mediaUrl || null,
                   } : null
                   const msgCreatedAt = msg.createdAt || new Date().toISOString()
-                  await supabase.from('communication_messages').insert({
-                    conversation_id: sfConv.id,
-                    sigcore_message_id: sigMsgId,
-                    provider_message_id: msg.providerMessageId || null,
-                    direction: dir, channel: 'whatsapp', body: msg.body || '',
-                    from_number: normalizePhone(msg.fromNumber),
-                    to_number: normalizePhone(msg.toNumber),
-                    sender_role: dir === 'in' ? 'customer' : 'agent',
-                    status: msg.status || 'delivered',
-                    metadata: { ...(mediaMeta && { media: mediaMeta }) },
-                    created_at: msgCreatedAt,
-                  })
-                  inserted++
+                  const provMsgId = msg.providerMessageId || null
+
+                  // Upsert: check by sigcore_message_id OR provider_message_id
+                  let existingId = null
+                  const { data: bySigcore } = await supabase.from('communication_messages')
+                    .select('id').eq('sigcore_message_id', sigMsgId).maybeSingle()
+                  existingId = bySigcore?.id
+                  if (!existingId && provMsgId) {
+                    const { data: byProvider } = await supabase.from('communication_messages')
+                      .select('id').eq('provider_message_id', provMsgId).maybeSingle()
+                    existingId = byProvider?.id
+                  }
+
+                  if (existingId) {
+                    // Update existing — rewrite body, media, sigcore_message_id
+                    await supabase.from('communication_messages').update({
+                      body: msg.body || '', status: msg.status || 'delivered',
+                      sigcore_message_id: sigMsgId,
+                      ...(provMsgId && { provider_message_id: provMsgId }),
+                      metadata: { ...(mediaMeta && { media: mediaMeta }) },
+                    }).eq('id', existingId)
+                  } else {
+                    await supabase.from('communication_messages').insert({
+                      conversation_id: sfConv.id,
+                      sigcore_message_id: sigMsgId,
+                      provider_message_id: provMsgId,
+                      direction: dir, channel: 'whatsapp', body: msg.body || '',
+                      from_number: normalizePhone(msg.fromNumber),
+                      to_number: normalizePhone(msg.toNumber),
+                      sender_role: dir === 'in' ? 'customer' : 'agent',
+                      status: msg.status || 'delivered',
+                      metadata: { ...(mediaMeta && { media: mediaMeta }) },
+                      created_at: msgCreatedAt,
+                    })
+                    inserted++
+                  }
                   // Track latest message for preview
                   if (!latestAt || msgCreatedAt > latestAt) {
                     latestAt = msgCreatedAt
