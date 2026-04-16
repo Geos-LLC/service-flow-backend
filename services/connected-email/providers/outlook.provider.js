@@ -122,11 +122,21 @@ async function validateMailboxAccess(tokens, targetMailboxEmail) {
     const status = e.response?.status
     const code = e.response?.data?.error?.code
     const msg = e.response?.data?.error?.message || e.message
+    const isAccessDenied = status === 403 || status === 401 || code === 'ErrorAccessDenied' || code === 'ErrorItemNotFound'
     return {
       accessible: false,
-      error: status === 403 || status === 401 || code === 'ErrorAccessDenied'
-        ? `Access denied to ${targetMailboxEmail}. The signed-in user needs "Full Access" permission on this shared mailbox in Exchange admin.`
+      error: isAccessDenied
+        ? `Access denied to ${targetMailboxEmail}. The signed-in user needs "Full Access" permission on this shared mailbox.`
         : `Cannot access ${targetMailboxEmail}: ${msg}`,
+      helpUrl: isAccessDenied ? 'https://admin.exchange.microsoft.com/#/mailboxes' : null,
+      helpSteps: isAccessDenied ? [
+        `Open Exchange Admin Center: https://admin.exchange.microsoft.com`,
+        `Go to Recipients → Mailboxes → find and click "${targetMailboxEmail}"`,
+        `Click the Delegation tab`,
+        `Under "Read and manage (Full Access)", click Edit`,
+        `Add the signed-in user's account and Save`,
+        `Wait 5–15 minutes for the permission to propagate, then try again`,
+      ] : null,
     }
   }
 }
