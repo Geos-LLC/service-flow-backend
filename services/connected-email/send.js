@@ -55,10 +55,14 @@ async function sendFromConversation(supabase, logger, { conversationId, userId, 
   })
   const finalSubject = subject || makeReplySubject(lastMsg?.email_subject || conv.email_subject)
 
+  // Delegated: target_mailbox_email is the actual mailbox we send from.
+  const sendFrom = (account.target_mailbox_email || account.email_address).toLowerCase()
+  const targetMailbox = account.mailbox_type === 'shared' ? sendFrom : null
+
   const sent = await provider.sendMessage(
     { accessToken: account.accessToken, refreshToken: account.refreshToken },
     {
-      from: account.email_address,
+      from: sendFrom,
       to: participantEmail,
       subject: finalSubject,
       bodyText: text || null,
@@ -66,6 +70,7 @@ async function sendFromConversation(supabase, logger, { conversationId, userId, 
       inReplyTo,
       references,
       threadId: conv.email_thread_id || null,
+      targetMailbox,
     }
   )
 
@@ -75,7 +80,7 @@ async function sendFromConversation(supabase, logger, { conversationId, userId, 
     provider: account.provider,
     channel: 'email',
     direction: 'outbound',
-    from_email: account.email_address,
+    from_email: sendFrom,
     to_email: participantEmail,
     email_subject: finalSubject,
     body: text || '',

@@ -17,6 +17,8 @@ const SAFE_COLUMNS = [
   'id', 'user_id', 'provider', 'email_address', 'display_name', 'status',
   'token_expires_at', 'initial_sync_completed_at', 'last_sync_at', 'scopes',
   'disconnect_reason', 'created_at', 'updated_at',
+  'auth_email_address', 'auth_display_name',
+  'target_mailbox_email', 'target_mailbox_display_name', 'mailbox_type',
 ].join(', ')
 
 function stripTokens(row) {
@@ -66,7 +68,7 @@ async function getWithTokens(supabase, accountId) {
   return { ...stripTokens(data), accessToken, refreshToken }
 }
 
-async function upsertAccount(supabase, { userId, provider, emailAddress, displayName, tokens, scopes }) {
+async function upsertAccount(supabase, { userId, provider, emailAddress, displayName, tokens, scopes, authEmailAddress, authDisplayName, targetMailboxEmail, mailboxType }) {
   const accessEnc = encrypt(tokens.accessToken)
   const refreshEnc = encrypt(tokens.refreshToken)
   const row = {
@@ -74,6 +76,11 @@ async function upsertAccount(supabase, { userId, provider, emailAddress, display
     provider,
     email_address: String(emailAddress).toLowerCase(),
     display_name: displayName || null,
+    auth_email_address: authEmailAddress ? String(authEmailAddress).toLowerCase() : String(emailAddress).toLowerCase(),
+    auth_display_name: authDisplayName || displayName || null,
+    target_mailbox_email: targetMailboxEmail ? String(targetMailboxEmail).toLowerCase() : String(emailAddress).toLowerCase(),
+    target_mailbox_display_name: null,
+    mailbox_type: mailboxType || 'primary',
     status: 'connected',
     access_token_ciphertext: accessEnc.ciphertext,
     access_token_iv: accessEnc.iv,
