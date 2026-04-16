@@ -2,18 +2,111 @@
  * Job Expenses / Reimbursements Unit Tests
  *
  * Tests the pure-function helpers exported from job-expense-service.js:
- *   - shouldCreateReimbursement: decides whether an expense produces a ledger row
+ *   - getLedgerIntent: decides what ledger effect an expense produces
+ *   - shouldCreateReimbursement: backwards-compat boolean wrapper
  *   - buildReimbursementLedgerRow: builds the ledger row shape
  *   - validateExpensePayload: request validation
  */
 
 const {
+  getLedgerIntent,
   shouldCreateReimbursement,
   buildReimbursementLedgerRow,
   validateExpensePayload,
 } = require('../job-expense-service')
 
-describe('Job Expenses — shouldCreateReimbursement', () => {
+describe('Job Expenses — getLedgerIntent', () => {
+  const base = {
+    id: 1,
+    status: 'approved',
+    paid_by: 'team_member',
+    reimbursable_to_team_member: true,
+    team_member_id: 42,
+    amount: '5.00',
+    expense_type: 'parking',
+  }
+
+  test('team_member + reimbursable → positive reimbursement', () => {
+    const intent = getLedgerIntent(base)
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('reimbursement')
+    expect(intent.amount).toBe(5)
+    expect(intent.notePrefix).toBe('Reimbursement')
+  })
+
+  test('team_member + not reimbursable → null (own cost)', () => {
+    expect(getLedgerIntent({ ...base, reimbursable_to_team_member: false })).toBeNull()
+  })
+
+  test('customer → positive reimbursement (customer paid, cleaner keeps it)', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'customer' })
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('reimbursement')
+    expect(intent.amount).toBe(5)
+    expect(intent.notePrefix).toContain('Customer')
+  })
+
+  test('company → positive reimbursement (company bears cost)', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'company' })
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('reimbursement')
+    expect(intent.amount).toBe(5)
+    expect(intent.notePrefix).toContain('Company')
+  })
+
+  test('deduction → negative expense_deduction', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'deduction' })
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('expense_deduction')
+    expect(intent.amount).toBe(-5)
+    expect(intent.notePrefix).toContain('Deduction')
+  })
+
+  test('deduction amount is always negative (even if already negative)', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'deduction', amount: '10.50' })
+    expect(intent.amount).toBe(-10.5)
+  })
+
+  test('pending → null', () => {
+    expect(getLedgerIntent({ ...base, status: 'pending' })).toBeNull()
+  })
+
+  test('rejected → null', () => {
+    expect(getLedgerIntent({ ...base, status: 'rejected' })).toBeNull()
+  })
+
+  test('missing team_member_id → null', () => {
+    expect(getLedgerIntent({ ...base, team_member_id: null })).toBeNull()
+  })
+
+  test('negative amount → null', () => {
+    expect(getLedgerIntent({ ...base, amount: '-5.00' })).toBeNull()
+  })
+
+  test('null expense → null', () => {
+    expect(getLedgerIntent(null)).toBeNull()
+  })
+
+  test('zero amount → valid (edge: $0 approved expense)', () => {
+    const intent = getLedgerIntent({ ...base, amount: '0' })
+    expect(intent).not.toBeNull()
+    expect(intent.amount).toBe(0)
+  })
+
+  test('customer-paid ignores reimbursable_to_team_member flag', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'customer', reimbursable_to_team_member: false })
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('reimbursement')
+  })
+
+  test('company-paid ignores reimbursable_to_team_member flag', () => {
+    const intent = getLedgerIntent({ ...base, paid_by: 'company', reimbursable_to_team_member: false })
+    expect(intent).not.toBeNull()
+    expect(intent.type).toBe('reimbursement')
+  })
+})
+
+describe('Job Expenses — shouldCreateReimbursement (backwards-compat)', () => {
   const base = {
     id: 1,
     status: 'approved',
@@ -32,36 +125,24 @@ describe('Job Expenses — shouldCreateReimbursement', () => {
     expect(shouldCreateReimbursement({ ...base, status: 'pending' })).toBe(false)
   })
 
-  test('rejected → false', () => {
-    expect(shouldCreateReimbursement({ ...base, status: 'rejected' })).toBe(false)
+  test('customer-paid → true (now creates ledger entry)', () => {
+    expect(shouldCreateReimbursement({ ...base, paid_by: 'customer' })).toBe(true)
   })
 
-  test('paid_by=company → false (company already covered it)', () => {
-    expect(shouldCreateReimbursement({ ...base, paid_by: 'company' })).toBe(false)
+  test('company-paid → true (now creates ledger entry)', () => {
+    expect(shouldCreateReimbursement({ ...base, paid_by: 'company' })).toBe(true)
   })
 
-  test('paid_by=customer → false', () => {
-    expect(shouldCreateReimbursement({ ...base, paid_by: 'customer' })).toBe(false)
+  test('deduction → true (creates negative ledger entry)', () => {
+    expect(shouldCreateReimbursement({ ...base, paid_by: 'deduction' })).toBe(true)
   })
 
-  test('not reimbursable → false', () => {
+  test('team_member + not reimbursable → false', () => {
     expect(shouldCreateReimbursement({ ...base, reimbursable_to_team_member: false })).toBe(false)
-  })
-
-  test('missing team_member_id → false', () => {
-    expect(shouldCreateReimbursement({ ...base, team_member_id: null })).toBe(false)
-  })
-
-  test('negative amount → false', () => {
-    expect(shouldCreateReimbursement({ ...base, amount: '-5.00' })).toBe(false)
   })
 
   test('null expense → false', () => {
     expect(shouldCreateReimbursement(null)).toBe(false)
-  })
-
-  test('zero amount → true (edge: $0 approved expense still valid)', () => {
-    expect(shouldCreateReimbursement({ ...base, amount: '0' })).toBe(true)
   })
 })
 
@@ -75,9 +156,12 @@ describe('Job Expenses — buildReimbursementLedgerRow', () => {
     description: 'downtown meter',
     amount: '5.00',
     approved_at: '2026-04-11T15:30:00Z',
+    status: 'approved',
+    paid_by: 'team_member',
+    reimbursable_to_team_member: true,
   }
 
-  test('builds correct ledger row shape', () => {
+  test('builds correct ledger row shape for reimbursement', () => {
     const row = buildReimbursementLedgerRow(expense, 2)
     expect(row.type).toBe('reimbursement')
     expect(row.team_member_id).toBe(100)
@@ -87,14 +171,44 @@ describe('Job Expenses — buildReimbursementLedgerRow', () => {
     expect(row.created_by).toBe(2)
   })
 
-  test('metadata contains source_type and source_id for idempotency', () => {
-    const row = buildReimbursementLedgerRow(expense, 2)
-    expect(row.metadata.source_type).toBe('job_expense')
-    expect(row.metadata.source_id).toBe('42') // stored as string
-    expect(row.metadata.expense_type).toBe('parking')
+  test('builds correct row for customer-paid expense', () => {
+    const row = buildReimbursementLedgerRow({ ...expense, paid_by: 'customer' }, 2)
+    expect(row.type).toBe('reimbursement')
+    expect(row.amount).toBe(5)
+    expect(row.note).toContain('Customer-paid')
+    expect(row.metadata.paid_by).toBe('customer')
   })
 
-  test('source_id is always a string (avoids type comparison issues)', () => {
+  test('builds correct row for company-paid expense', () => {
+    const row = buildReimbursementLedgerRow({ ...expense, paid_by: 'company' }, 2)
+    expect(row.type).toBe('reimbursement')
+    expect(row.amount).toBe(5)
+    expect(row.note).toContain('Company-paid')
+    expect(row.metadata.paid_by).toBe('company')
+  })
+
+  test('builds correct row for deduction (negative amount)', () => {
+    const row = buildReimbursementLedgerRow({ ...expense, paid_by: 'deduction' }, 2)
+    expect(row.type).toBe('expense_deduction')
+    expect(row.amount).toBe(-5)
+    expect(row.note).toContain('Deduction')
+    expect(row.metadata.paid_by).toBe('deduction')
+  })
+
+  test('returns null for non-reimbursable team_member expense', () => {
+    const row = buildReimbursementLedgerRow({ ...expense, reimbursable_to_team_member: false }, 2)
+    expect(row).toBeNull()
+  })
+
+  test('metadata contains source_type, source_id, and paid_by', () => {
+    const row = buildReimbursementLedgerRow(expense, 2)
+    expect(row.metadata.source_type).toBe('job_expense')
+    expect(row.metadata.source_id).toBe('42')
+    expect(row.metadata.expense_type).toBe('parking')
+    expect(row.metadata.paid_by).toBe('team_member')
+  })
+
+  test('source_id is always a string', () => {
     const row = buildReimbursementLedgerRow({ ...expense, id: 99 }, 2)
     expect(typeof row.metadata.source_id).toBe('string')
     expect(row.metadata.source_id).toBe('99')
@@ -162,6 +276,10 @@ describe('Job Expenses — validateExpensePayload', () => {
     expect(errors.some(e => e.includes('paid_by'))).toBe(true)
   })
 
+  test('deduction paid_by → accepted', () => {
+    expect(validateExpensePayload({ expense_type: 'other', amount: '10', paid_by: 'deduction' })).toEqual([])
+  })
+
   test('missing paid_by → accepted (defaults to team_member server-side)', () => {
     expect(validateExpensePayload({ expense_type: 'parking', amount: '5' })).toEqual([])
   })
@@ -169,6 +287,12 @@ describe('Job Expenses — validateExpensePayload', () => {
   test('all four expense types accepted', () => {
     for (const t of ['parking', 'toll', 'supplies', 'other']) {
       expect(validateExpensePayload({ expense_type: t, amount: '5' })).toEqual([])
+    }
+  })
+
+  test('all four paid_by options accepted', () => {
+    for (const p of ['company', 'team_member', 'customer', 'deduction']) {
+      expect(validateExpensePayload({ expense_type: 'parking', amount: '5', paid_by: p })).toEqual([])
     }
   })
 })
@@ -183,6 +307,9 @@ describe('Job Expenses — buildReimbursementLedgerRow with jobScheduledDate', (
     description: 'downtown meter',
     amount: '5.00',
     approved_at: '2026-04-12T00:23:00Z',
+    status: 'approved',
+    paid_by: 'team_member',
+    reimbursable_to_team_member: true,
   }
 
   test('uses jobScheduledDate when provided (not approved_at)', () => {
@@ -221,7 +348,6 @@ describe('Job Expenses — buildReimbursementLedgerRow with jobScheduledDate', (
 })
 
 describe('Job Expenses — state machine invariants', () => {
-  // Document the allowed status transitions via test assertions.
   test('valid statuses', () => {
     const valid = ['pending', 'approved', 'rejected']
     for (const s of valid) {
@@ -230,8 +356,6 @@ describe('Job Expenses — state machine invariants', () => {
   })
 
   test('approved expense with ledger → cannot modify amount if batched', () => {
-    // This is enforced in the endpoint layer, not a pure function.
-    // Documented here as a contract invariant.
     const expense = { status: 'approved', amount: '5.00' }
     const ledgerSettled = { payout_batch_id: 42 }
     const shouldBlockEdit = expense.status === 'approved' && !!ledgerSettled.payout_batch_id

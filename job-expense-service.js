@@ -50,7 +50,7 @@ module.exports = (supabase, logger) => {
   // Validation helpers
   // ══════════════════════════════════════════════════════════════
   const VALID_EXPENSE_TYPES = ['parking', 'toll', 'supplies', 'other']
-  const VALID_PAID_BY = ['company', 'team_member', 'customer']
+  const VALID_PAID_BY = ['company', 'team_member', 'customer', 'deduction']
 
   function validateExpensePayload(body) {
     const errors = []
@@ -72,20 +72,48 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════════════════════════════
 
   /**
-   * Sync the reimbursement ledger entry for an expense.
+   * Decide whether this expense should create a ledger entry, and if so, what kind.
+   *
+   * Returns null (no ledger entry) or { type, amount, notePrefix } describing what to create.
+   *
+   * Business rules:
+   *   paid_by=customer  → +amount to cleaner (customer already paid, company unaffected)
+   *   paid_by=company   → +amount to cleaner (company bears cost)
+   *   paid_by=team_member + reimbursable → +amount to cleaner (reimbursement)
+   *   paid_by=team_member + !reimbursable → no entry (cleaner's own cost, e.g. parking)
+   *   paid_by=deduction  → −amount from cleaner (damage, breakage charge)
+   */
+  function ledgerIntent(expense) {
+    if (expense.status !== 'approved') return null
+    if (!expense.team_member_id) return null
+
+    switch (expense.paid_by) {
+      case 'customer':
+        return { type: 'reimbursement', amount: parseFloat(expense.amount), notePrefix: 'Customer-paid expense' }
+      case 'company':
+        return { type: 'reimbursement', amount: parseFloat(expense.amount), notePrefix: 'Company-paid expense' }
+      case 'team_member':
+        if (!expense.reimbursable_to_team_member) return null
+        return { type: 'reimbursement', amount: parseFloat(expense.amount), notePrefix: 'Reimbursement' }
+      case 'deduction':
+        return { type: 'expense_deduction', amount: -Math.abs(parseFloat(expense.amount)), notePrefix: 'Deduction' }
+      default:
+        return null
+    }
+  }
+
+  /**
+   * Sync the ledger entry for an expense.
    * Pure idempotent: calling this multiple times with the same approved expense
    * results in exactly one ledger row. Matches by metadata.source_id.
    *
    * Returns { action: 'created'|'updated'|'skipped'|'locked', ledgerId?, reason? }
    */
   async function syncReimbursementLedger(expense, userId) {
-    // Only reimbursable team-member expenses in approved state create ledger entries
-    if (!expense.reimbursable_to_team_member) return { action: 'skipped', reason: 'not_reimbursable' }
-    if (expense.paid_by !== 'team_member') return { action: 'skipped', reason: 'paid_by_not_team_member' }
-    if (expense.status !== 'approved') return { action: 'skipped', reason: 'not_approved' }
-    if (!expense.team_member_id) return { action: 'skipped', reason: 'no_team_member' }
+    const intent = ledgerIntent(expense)
+    if (!intent) return { action: 'skipped', reason: 'no_ledger_needed' }
 
-    // Use the job's scheduled_date so the reimbursement falls in the same payroll period
+    // Use the job's scheduled_date so the entry falls in the same payroll period
     let effectiveDate = (expense.approved_at || new Date().toISOString()).split('T')[0]
     if (expense.job_id) {
       const { data: job } = await supabase.from('jobs').select('scheduled_date').eq('id', expense.job_id).maybeSingle()
@@ -93,9 +121,9 @@ module.exports = (supabase, logger) => {
     }
 
     // Check for existing ledger row by metadata.source_id (idempotency key)
+    // Search across both reimbursement and expense_deduction types
     const { data: existing } = await supabase.from('cleaner_ledger')
-      .select('id, payout_batch_id, amount')
-      .eq('type', 'reimbursement')
+      .select('id, payout_batch_id, amount, type')
       .eq('metadata->>source_type', 'job_expense')
       .eq('metadata->>source_id', String(expense.id))
       .maybeSingle()
@@ -104,11 +132,11 @@ module.exports = (supabase, logger) => {
       user_id: userId,
       team_member_id: expense.team_member_id,
       job_id: expense.job_id,
-      type: 'reimbursement',
-      amount: parseFloat(expense.amount),
+      type: intent.type,
+      amount: intent.amount,
       effective_date: effectiveDate,
-      note: `Reimbursement: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
-      metadata: { source_type: 'job_expense', source_id: String(expense.id), expense_type: expense.expense_type },
+      note: `${intent.notePrefix}: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
+      metadata: { source_type: 'job_expense', source_id: String(expense.id), expense_type: expense.expense_type, paid_by: expense.paid_by },
       created_by: userId,
     }
 
@@ -133,13 +161,12 @@ module.exports = (supabase, logger) => {
   }
 
   /**
-   * Remove the reimbursement ledger entry for an expense.
+   * Remove the ledger entry for an expense (reimbursement or deduction).
    * Only deletes if not yet included in a settled payout batch.
    */
   async function removeReimbursementLedger(expenseId) {
     const { data: existing } = await supabase.from('cleaner_ledger')
       .select('id, payout_batch_id')
-      .eq('type', 'reimbursement')
       .eq('metadata->>source_type', 'job_expense')
       .eq('metadata->>source_id', String(expenseId))
       .maybeSingle()
@@ -191,10 +218,17 @@ module.exports = (supabase, logger) => {
       const { data: job } = await supabase.from('jobs').select('id').eq('id', jobId).eq('user_id', userId).maybeSingle()
       if (!job) return res.status(404).json({ error: 'Job not found' })
 
+      // Validate team_member_id exists in team_members (prevent FK violation)
+      const parsedMemberId = req.body.team_member_id ? parseInt(req.body.team_member_id) : null
+      if (parsedMemberId) {
+        const { data: member } = await supabase.from('team_members').select('id').eq('id', parsedMemberId).maybeSingle()
+        if (!member) return res.status(400).json({ error: 'Selected team member not found. They may be a virtual account owner entry — please ensure they have a team member record.' })
+      }
+
       const row = {
         user_id: userId,
         job_id: jobId,
-        team_member_id: req.body.team_member_id ? parseInt(req.body.team_member_id) : null,
+        team_member_id: parsedMemberId,
         expense_type: req.body.expense_type,
         description: req.body.description || null,
         amount: parseFloat(req.body.amount),
@@ -232,7 +266,6 @@ module.exports = (supabase, logger) => {
       if (existing.status === 'approved') {
         const { data: ledgerRow } = await supabase.from('cleaner_ledger')
           .select('payout_batch_id')
-          .eq('type', 'reimbursement')
           .eq('metadata->>source_type', 'job_expense')
           .eq('metadata->>source_id', String(id))
           .maybeSingle()
@@ -248,7 +281,11 @@ module.exports = (supabase, logger) => {
         if (req.body[k] !== undefined) update[k] = req.body[k]
       }
       if (update.amount !== undefined) update.amount = parseFloat(update.amount)
-      if (update.team_member_id !== undefined && update.team_member_id !== null) update.team_member_id = parseInt(update.team_member_id)
+      if (update.team_member_id !== undefined && update.team_member_id !== null) {
+        update.team_member_id = parseInt(update.team_member_id)
+        const { data: member } = await supabase.from('team_members').select('id').eq('id', update.team_member_id).maybeSingle()
+        if (!member) return res.status(400).json({ error: 'Selected team member not found.' })
+      }
 
       // Validate partial
       const merged = { ...existing, ...update }
@@ -399,24 +436,52 @@ module.exports = (supabase, logger) => {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * Decide whether a given expense should produce a reimbursement ledger row.
+ * Decide what ledger effect (if any) an expense should have.
  * Pure function — no DB. Used by tests and by the service module.
+ *
+ * Returns null (no ledger entry) or { type, amount, notePrefix }.
+ *
+ * Business rules:
+ *   customer pays  → +amount to cleaner (customer already paid, company unaffected)
+ *   company pays   → +amount to cleaner (company bears cost)
+ *   team_member + reimbursable → +amount to cleaner (reimbursement)
+ *   team_member + !reimbursable → no entry (own cost, e.g. parking)
+ *   deduction → −amount from cleaner payroll (damage, breakage)
  */
-module.exports.shouldCreateReimbursement = function shouldCreateReimbursement(expense) {
-  if (!expense) return false
-  if (!expense.reimbursable_to_team_member) return false
-  if (expense.paid_by !== 'team_member') return false
-  if (expense.status !== 'approved') return false
-  if (!expense.team_member_id) return false
+module.exports.getLedgerIntent = function getLedgerIntent(expense) {
+  if (!expense) return null
+  if (expense.status !== 'approved') return null
+  if (!expense.team_member_id) return null
   const amt = parseFloat(expense.amount)
-  if (isNaN(amt) || amt < 0) return false
-  return true
+  if (isNaN(amt) || amt < 0) return null
+
+  switch (expense.paid_by) {
+    case 'customer':
+      return { type: 'reimbursement', amount: amt, notePrefix: 'Customer-paid expense' }
+    case 'company':
+      return { type: 'reimbursement', amount: amt, notePrefix: 'Company-paid expense' }
+    case 'team_member':
+      if (!expense.reimbursable_to_team_member) return null
+      return { type: 'reimbursement', amount: amt, notePrefix: 'Reimbursement' }
+    case 'deduction':
+      return { type: 'expense_deduction', amount: -Math.abs(amt), notePrefix: 'Deduction' }
+    default:
+      return null
+  }
+}
+
+// Backwards-compat alias
+module.exports.shouldCreateReimbursement = function shouldCreateReimbursement(expense) {
+  return module.exports.getLedgerIntent(expense) !== null
 }
 
 /**
  * Build the ledger row for an expense. Pure function.
  */
 module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRow(expense, userId, jobScheduledDate) {
+  const intent = module.exports.getLedgerIntent(expense)
+  if (!intent) return null
+
   const effectiveDate = jobScheduledDate
     ? String(jobScheduledDate).split('T')[0].split(' ')[0]
     : (expense.approved_at || new Date().toISOString()).split('T')[0]
@@ -424,14 +489,15 @@ module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRo
     user_id: userId,
     team_member_id: expense.team_member_id,
     job_id: expense.job_id,
-    type: 'reimbursement',
-    amount: parseFloat(expense.amount),
+    type: intent.type,
+    amount: intent.amount,
     effective_date: effectiveDate,
-    note: `Reimbursement: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
+    note: `${intent.notePrefix}: ${expense.expense_type}${expense.description ? ' — ' + expense.description : ''}`,
     metadata: {
       source_type: 'job_expense',
       source_id: String(expense.id),
       expense_type: expense.expense_type,
+      paid_by: expense.paid_by,
     },
     created_by: userId,
   }
@@ -443,7 +509,7 @@ module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRo
 module.exports.validateExpensePayload = function validateExpensePayload(body) {
   const errors = []
   const types = ['parking', 'toll', 'supplies', 'other']
-  const paidByOptions = ['company', 'team_member', 'customer']
+  const paidByOptions = ['company', 'team_member', 'customer', 'deduction']
   if (!body.expense_type || !types.includes(body.expense_type)) {
     errors.push(`expense_type must be one of: ${types.join(', ')}`)
   }

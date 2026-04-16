@@ -20777,6 +20777,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalCashCollected += amount; // negative value — offsets balance
         } else if (entry.type === 'reimbursement') {
           totalReimbursements += amount; // positive value — company owes cleaner
+        } else if (entry.type === 'expense_deduction') {
+          totalReimbursements += amount; // negative value — deducted from cleaner payroll
         }
 
         // Track jobs
@@ -33432,7 +33434,8 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
       incentives: unpaidEntries.filter(e => e.type === 'incentive').reduce((s, e) => s + parseFloat(e.amount), 0),
       cash_offsets: unpaidEntries.filter(e => e.type === 'cash_collected').reduce((s, e) => s + parseFloat(e.amount), 0),
       adjustments: unpaidEntries.filter(e => e.type === 'adjustment').reduce((s, e) => s + parseFloat(e.amount), 0),
-      reimbursements: unpaidEntries.filter(e => e.type === 'reimbursement').reduce((s, e) => s + parseFloat(e.amount), 0)
+      reimbursements: unpaidEntries.filter(e => e.type === 'reimbursement').reduce((s, e) => s + parseFloat(e.amount), 0),
+      expense_deductions: unpaidEntries.filter(e => e.type === 'expense_deduction').reduce((s, e) => s + parseFloat(e.amount), 0)
     }
   };
 }
