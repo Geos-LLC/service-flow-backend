@@ -35087,6 +35087,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         endpoint_phone: ourEndpointPhone,
         participant_phone: participantPhone,
         participant_name: contactName,
+        company: payload.company || payload.conversation?.company || null,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
         last_event_at: payload.createdAt || new Date().toISOString(),
         unread_count: isInbound ? 1 : 0,
@@ -35406,7 +35407,13 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
       const endpointPhone = normalizePhone(conv.phoneNumber);
       const sigcoreConvId = conv.externalId || conv.id;
-      let contactName = conv.contactName || conv.conversationName || contactNameMap[participantPhone] || null;
+      // Use firstName/lastName from Sigcore (sourced from OpenPhone contact defaultFields) for better name
+      const sigcoreFirstName = conv.firstName || null;
+      const sigcoreLastName = conv.lastName || null;
+      const sigcoreFullName = [sigcoreFirstName, sigcoreLastName].filter(Boolean).join(' ') || null;
+      let contactName = conv.contactName || sigcoreFullName || conv.conversationName || contactNameMap[participantPhone] || null;
+      // company = OpenPhone contact "company" field — represents the lead source
+      const sigcoreCompany = conv.company || null;
       const lastMsg = conv.lastMessage;
       if (!contactName && lastMsg) {
         const msg = lastMsg.toLowerCase();
@@ -35441,6 +35448,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
         if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
         if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
+        // Persist company from OpenPhone (lead source) — always update if Sigcore provides it
+        if (sigcoreCompany && sigcoreCompany !== found.company) updates.company = sigcoreCompany;
         const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
         localConv = updated || found;
       } else {
@@ -35449,6 +35458,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           provider: 'openphone', channel: 'sms',
           endpoint_phone: endpointPhone,
           participant_phone: participantPhone, participant_name: contactName,
+          company: sigcoreCompany,
           last_event_at: lastActivity, metadata: { phoneNumberId },
         }).select().single();
         if (convErr) return { synced: 0, messages: 0, error: true };
@@ -36048,7 +36058,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       query = query.eq('sf_location_id', parseInt(locationId));
     }
     if (search) {
-      query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,participant_email.ilike.%${search}%,last_preview.ilike.%${search}%`);
+      query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,participant_email.ilike.%${search}%,last_preview.ilike.%${search}%,company.ilike.%${search}%`);
     }
 
     const { data, error } = await query.limit(100);
@@ -36104,6 +36114,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         locationId: c.sf_location_id || null,
         locationName: loc?.name || c.external_location_name || null,
         locationResolved: !!c.sf_location_id,
+        // Company / lead source from OpenPhone contact
+        company: c.company || null,
         // Avatar URL from WhatsApp sync (stored in metadata)
         avatarUrl: c.metadata?.avatarUrl || null,
         isGroup: c.metadata?.isGroup || c.conversation_type === 'group' || false,
@@ -36358,7 +36370,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const hasMore = events.length < totalEvents;
     const oldestTimestamp = events.length > 0 ? events[0].timestamp : null;
 
-    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone } });
+    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: conv.company || null } });
   } catch (error) {
     logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
