@@ -218,17 +218,49 @@ module.exports = (supabase, logger) => {
       const { data: job } = await supabase.from('jobs').select('id').eq('id', jobId).eq('user_id', userId).maybeSingle()
       if (!job) return res.status(404).json({ error: 'Job not found' })
 
-      // Validate team_member_id exists in team_members (prevent FK violation)
-      const parsedMemberId = req.body.team_member_id ? parseInt(req.body.team_member_id) : null
-      if (parsedMemberId) {
-        const { data: member } = await supabase.from('team_members').select('id').eq('id', parsedMemberId).maybeSingle()
-        if (!member) return res.status(400).json({ error: 'Selected team member not found. They may be a virtual account owner entry — please ensure they have a team member record.' })
+      // Validate team_member_id exists in team_members (prevent FK violation).
+      // If the selected ID is the account owner's users.id (virtual entry from /api/team-members),
+      // resolve it to their real team_members.id — or auto-create one if missing.
+      let resolvedMemberId = req.body.team_member_id ? parseInt(req.body.team_member_id) : null
+      if (resolvedMemberId) {
+        const { data: member } = await supabase.from('team_members').select('id').eq('id', resolvedMemberId).maybeSingle()
+        if (!member) {
+          // Might be the account owner's users.id — check if it matches and resolve
+          const { data: owner } = await supabase.from('users').select('id, email, first_name, last_name, phone').eq('id', resolvedMemberId).maybeSingle()
+          if (owner && parseInt(owner.id) === parseInt(userId)) {
+            // Account owner selected via virtual entry — find or create their team_members record
+            const { data: existingTm } = await supabase.from('team_members')
+              .select('id').eq('user_id', userId).eq('role', 'account owner').maybeSingle()
+            if (existingTm) {
+              resolvedMemberId = existingTm.id
+            } else {
+              const { data: newTm, error: tmErr } = await supabase.from('team_members').insert({
+                user_id: userId,
+                email: owner.email,
+                first_name: owner.first_name,
+                last_name: owner.last_name,
+                phone: owner.phone,
+                role: 'account owner',
+                status: 'active',
+                is_service_provider: true,
+              }).select('id').single()
+              if (tmErr) {
+                logger.error('[JobExpenses] Failed to auto-create team_members record for owner:', tmErr.message)
+                return res.status(400).json({ error: 'Could not resolve team member. Please refresh and try again.' })
+              }
+              resolvedMemberId = newTm.id
+              logger.log(`[JobExpenses] Auto-created team_members record ${newTm.id} for account owner ${userId}`)
+            }
+          } else {
+            return res.status(400).json({ error: 'Selected team member not found.' })
+          }
+        }
       }
 
       const row = {
         user_id: userId,
         job_id: jobId,
-        team_member_id: parsedMemberId,
+        team_member_id: resolvedMemberId,
         expense_type: req.body.expense_type,
         description: req.body.description || null,
         amount: parseFloat(req.body.amount),
@@ -284,7 +316,21 @@ module.exports = (supabase, logger) => {
       if (update.team_member_id !== undefined && update.team_member_id !== null) {
         update.team_member_id = parseInt(update.team_member_id)
         const { data: member } = await supabase.from('team_members').select('id').eq('id', update.team_member_id).maybeSingle()
-        if (!member) return res.status(400).json({ error: 'Selected team member not found.' })
+        if (!member) {
+          // Same virtual account owner resolution as create endpoint
+          const { data: owner } = await supabase.from('users').select('id').eq('id', update.team_member_id).maybeSingle()
+          if (owner && parseInt(owner.id) === parseInt(userId)) {
+            const { data: existingTm } = await supabase.from('team_members')
+              .select('id').eq('user_id', userId).eq('role', 'account owner').maybeSingle()
+            if (existingTm) {
+              update.team_member_id = existingTm.id
+            } else {
+              return res.status(400).json({ error: 'Account owner team member record not found. Please add an expense first to auto-create it.' })
+            }
+          } else {
+            return res.status(400).json({ error: 'Selected team member not found.' })
+          }
+        }
       }
 
       // Validate partial
