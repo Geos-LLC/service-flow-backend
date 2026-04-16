@@ -8935,6 +8935,99 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// Lead Sources CRUD
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/lead-sources', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data, error } = await supabase.from('lead_sources')
+      .select('*').eq('user_id', userId).order('sort_order').order('name');
+    if (error) return res.status(500).json({ error: 'Failed to fetch lead sources' });
+    res.json({ sources: data || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to fetch lead sources' }); }
+});
+
+app.post('/api/lead-sources', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required' });
+    const { data, error } = await supabase.from('lead_sources')
+      .upsert({ user_id: userId, name: name.trim(), is_active: true }, { onConflict: 'user_id,name' })
+      .select().single();
+    if (error) return res.status(500).json({ error: 'Failed to create lead source' });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to create lead source' }); }
+});
+
+app.put('/api/lead-sources/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { name, is_active, sort_order } = req.body;
+    const updates = {};
+    if (name !== undefined) updates.name = name.trim();
+    if (is_active !== undefined) updates.is_active = is_active;
+    if (sort_order !== undefined) updates.sort_order = sort_order;
+    const { data, error } = await supabase.from('lead_sources')
+      .update(updates).eq('id', id).eq('user_id', userId).select().single();
+    if (error) return res.status(500).json({ error: 'Failed to update lead source' });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to update lead source' }); }
+});
+
+app.delete('/api/lead-sources/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { error } = await supabase.from('lead_sources')
+      .delete().eq('id', id).eq('user_id', userId);
+    if (error) return res.status(500).json({ error: 'Failed to delete lead source' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to delete lead source' }); }
+});
+
+// Seed default sources for a user (called on first load if empty)
+app.post('/api/lead-sources/seed', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { count } = await supabase.from('lead_sources')
+      .select('id', { count: 'exact', head: true }).eq('user_id', userId);
+    if (count > 0) return res.json({ seeded: false, message: 'Sources already exist' });
+    const defaults = ['Website', 'Referral', 'Cold Call', 'Social Media', 'Google', 'Thumbtack', 'Yelp', 'Facebook', 'Other'];
+    const rows = defaults.map((name, i) => ({ user_id: userId, name, sort_order: i, is_active: true }));
+    await supabase.from('lead_sources').insert(rows);
+    const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
+    res.json({ seeded: true, sources: data || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to seed lead sources' }); }
+});
+
+// Import sources from OpenPhone company tags (bulk upsert)
+app.post('/api/lead-sources/import-from-openphone', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: convs } = await supabase.from('communication_conversations')
+      .select('company').eq('user_id', userId).not('company', 'is', null);
+    const unique = [...new Set((convs || []).map(c => c.company).filter(Boolean))];
+    if (!unique.length) return res.json({ imported: 0, sources: [] });
+    // Get existing to find max sort_order
+    const { data: existing } = await supabase.from('lead_sources')
+      .select('name, sort_order').eq('user_id', userId);
+    const existingNames = new Set((existing || []).map(s => s.name));
+    const maxOrder = Math.max(0, ...(existing || []).map(s => s.sort_order || 0));
+    const newSources = unique.filter(n => !existingNames.has(n));
+    if (newSources.length > 0) {
+      const rows = newSources.map((name, i) => ({ user_id: userId, name, sort_order: maxOrder + i + 1, is_active: true }));
+      await supabase.from('lead_sources').insert(rows);
+    }
+    const { data: all } = await supabase.from('lead_sources')
+      .select('*').eq('user_id', userId).order('sort_order');
+    res.json({ imported: newSources.length, sources: all || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to import sources' }); }
+});
+
 // Find and merge duplicate customers endpoint
 app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) => {
   try {
