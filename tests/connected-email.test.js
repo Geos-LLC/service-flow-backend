@@ -339,3 +339,68 @@ describe('conversation-identity — multi-mailbox isolation', () => {
     expect(r.conversationId).toBe('existing-1')
   })
 })
+
+// ──────────────────────────────────────────────
+// Outlook delegated mailbox — mailboxPrefix
+// ──────────────────────────────────────────────
+describe('outlook.mailboxPrefix', () => {
+  const { mailboxPrefix } = require('../services/connected-email/providers/outlook.provider')
+
+  test('null → /me (primary mailbox)', () => {
+    expect(mailboxPrefix(null)).toBe('/me')
+    expect(mailboxPrefix(undefined)).toBe('/me')
+    expect(mailboxPrefix('')).toBe('/me')
+  })
+
+  test('email → /users/{email} (delegated)', () => {
+    expect(mailboxPrefix('sales@spotless.homes')).toBe('/users/sales%40spotless.homes')
+  })
+})
+
+// ──────────────────────────────────────────────
+// Guard with shared mailbox: ownerEmail = target, not auth
+// ──────────────────────────────────────────────
+describe('message-normalizer — delegated mailbox guard', () => {
+  test('inbound to shared mailbox (not auth user) → ok', () => {
+    const r = normalizer.normalize({
+      mailboxOwnerEmail: 'sales@spotless.homes', // target (shared)
+      providerMsg: {
+        from: 'customer@outside.com',
+        to: 'sales@spotless.homes',
+        subject: 'Quote', date: new Date(), id: 'x', threadId: 't',
+        messageId: '<f@x>', bodyText: 'hi', isSent: false,
+      }
+    })
+    expect(r.ok).toBe(true)
+    expect(r.direction).toBe('inbound')
+    expect(r.participantEmail).toBe('customer@outside.com')
+  })
+
+  test('guard rejects when auth user (kate@) is recipient but target (sales@) is not', () => {
+    const r = normalizer.normalize({
+      mailboxOwnerEmail: 'sales@spotless.homes', // target
+      providerMsg: {
+        from: 'customer@outside.com',
+        to: 'kate@spotless.homes', // auth user, NOT target
+        subject: 'Hi', date: new Date(), id: 'x', threadId: 't',
+        messageId: '<g@x>', bodyText: 'hi', isSent: false,
+      }
+    })
+    expect(r.ok).toBe(false)
+  })
+
+  test('outbound from shared mailbox → sender must be target', () => {
+    const r = normalizer.normalize({
+      mailboxOwnerEmail: 'sales@spotless.homes',
+      providerMsg: {
+        from: 'sales@spotless.homes',
+        to: 'customer@outside.com',
+        subject: 'Reply', date: new Date(), id: 'x', threadId: 't',
+        messageId: '<h@x>', bodyText: 'thanks', isSent: true,
+      }
+    })
+    expect(r.ok).toBe(true)
+    expect(r.direction).toBe('outbound')
+    expect(r.participantEmail).toBe('customer@outside.com')
+  })
+})

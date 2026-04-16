@@ -197,7 +197,15 @@ async function syncAccount(supabase, logger, accountId) {
 
     const isInitial = !account.initial_sync_completed_at
     setProgress(accountId, { phase: isInitial ? 'initial_list' : 'incremental_list', isInitial })
-    const ownerEmail = account.email_address
+
+    // Delegated mailbox: ownerEmail = target mailbox (what SF syncs/sends from).
+    // For Outlook shared mailbox, targetMailbox is passed to provider calls to
+    // swap /me → /users/{target}. For Gmail/primary, it's null.
+    const ownerEmail = (account.target_mailbox_email || account.email_address).toLowerCase()
+    const targetMailbox = (account.mailbox_type === 'shared' && account.target_mailbox_email)
+      ? account.target_mailbox_email.toLowerCase()
+      : null
+    const tokens = { accessToken: account.accessToken, refreshToken: account.refreshToken }
 
     let messageIds = []
     let newCursor = null
@@ -207,51 +215,34 @@ async function syncAccount(supabase, logger, accountId) {
       const afterDate = new Date(Date.now() - INITIAL_DAYS * 86400 * 1000)
       if (account.provider === 'gmail') {
         messageIds = await provider.listRecentMessages(
-          { accessToken: account.accessToken, refreshToken: account.refreshToken },
+          tokens,
           { maxResults: Math.min(INITIAL_MAX_MESSAGES, PER_CYCLE_MAX * 5), afterEpoch }
         )
       } else {
         messageIds = await provider.listRecentMessages(
-          { accessToken: account.accessToken },
-          { maxResults: Math.min(INITIAL_MAX_MESSAGES, PER_CYCLE_MAX * 5), afterDate }
+          tokens,
+          { maxResults: Math.min(INITIAL_MAX_MESSAGES, PER_CYCLE_MAX * 5), afterDate, targetMailbox }
         )
       }
     } else if (account.history_cursor) {
       try {
-        const res = await provider.listHistory(
-          { accessToken: account.accessToken, refreshToken: account.refreshToken },
-          account.history_cursor
-        )
+        const res = await provider.listHistory(tokens, account.history_cursor, { targetMailbox })
         messageIds = res.messageIds
         newCursor = res.historyId
       } catch (e) {
-        // Cursor expired — fall back to time-window resync.
         logger?.warn?.(`[connected-email] cursor expired for ${accountId}, fallback window`)
         const afterEpoch = Math.floor((Date.now() - 2 * 86400 * 1000) / 1000)
         const afterDate = new Date(Date.now() - 2 * 86400 * 1000)
         messageIds = account.provider === 'gmail'
-          ? await provider.listRecentMessages(
-              { accessToken: account.accessToken, refreshToken: account.refreshToken },
-              { maxResults: PER_CYCLE_MAX, afterEpoch }
-            )
-          : await provider.listRecentMessages(
-              { accessToken: account.accessToken },
-              { maxResults: PER_CYCLE_MAX, afterDate }
-            )
+          ? await provider.listRecentMessages(tokens, { maxResults: PER_CYCLE_MAX, afterEpoch })
+          : await provider.listRecentMessages(tokens, { maxResults: PER_CYCLE_MAX, afterDate, targetMailbox })
       }
     } else {
-      // No cursor, no initial completion — shouldn't happen, treat as initial.
       const afterEpoch = Math.floor((Date.now() - INITIAL_DAYS * 86400 * 1000) / 1000)
       const afterDate = new Date(Date.now() - INITIAL_DAYS * 86400 * 1000)
       messageIds = account.provider === 'gmail'
-        ? await provider.listRecentMessages(
-            { accessToken: account.accessToken, refreshToken: account.refreshToken },
-            { maxResults: PER_CYCLE_MAX, afterEpoch }
-          )
-        : await provider.listRecentMessages(
-            { accessToken: account.accessToken },
-            { maxResults: PER_CYCLE_MAX, afterDate }
-          )
+        ? await provider.listRecentMessages(tokens, { maxResults: PER_CYCLE_MAX, afterEpoch })
+        : await provider.listRecentMessages(tokens, { maxResults: PER_CYCLE_MAX, afterDate, targetMailbox })
     }
 
     messageIds = messageIds.slice(0, PER_CYCLE_MAX)
@@ -260,10 +251,7 @@ async function syncAccount(supabase, logger, accountId) {
     let scannedLocal = 0
     for (const mid of messageIds) {
       try {
-        const full = await provider.getMessage(
-          { accessToken: account.accessToken, refreshToken: account.refreshToken },
-          mid
-        )
+        const full = await provider.getMessage(tokens, mid, { targetMailbox })
         const processed = await persistMessage(supabase, {
           account, providerName: account.provider, ownerEmail, providerMsg: full, logger,
         })

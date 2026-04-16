@@ -1,9 +1,13 @@
 /**
  * Outlook / Microsoft 365 provider adapter — Microsoft Graph over direct HTTPS.
  *
- * Why plain axios instead of @microsoft/microsoft-graph-client: avoids an extra
- * dependency tree for what is fundamentally a few REST calls. Keeps the module
- * loosely coupled and easier to mock in tests.
+ * Supports both:
+ *   - Primary mailbox: /me/... (signed-in user's own mailbox)
+ *   - Delegated shared mailbox: /users/{target@email}/... (the user has Full Access)
+ *
+ * All mailbox-specific functions accept an optional `targetMailbox` param.
+ * When null/undefined → /me (backward compatible, primary mailbox).
+ * When a string email → /users/{email} (delegated shared mailbox).
  */
 
 const axios = require('axios')
@@ -12,11 +16,19 @@ const AUTHORITY = process.env.MS_OAUTH_AUTHORITY || 'https://login.microsoftonli
 const SCOPES = [
   'https://graph.microsoft.com/Mail.Read',
   'https://graph.microsoft.com/Mail.Send',
+  'https://graph.microsoft.com/Mail.ReadShared',
+  'https://graph.microsoft.com/Mail.Send.Shared',
   'offline_access',
   'openid',
   'email',
   'profile',
 ]
+
+/** Build the Graph path prefix. Primary → /me, delegated → /users/{email} */
+function mailboxPrefix(targetMailbox) {
+  if (!targetMailbox) return '/me'
+  return `/users/${encodeURIComponent(targetMailbox)}`
+}
 
 function buildAuthUrl({ redirectUri, state }) {
   const params = new URLSearchParams({
@@ -26,7 +38,7 @@ function buildAuthUrl({ redirectUri, state }) {
     response_mode: 'query',
     scope: SCOPES.join(' '),
     state,
-    prompt: 'select_account', // force account chooser
+    prompt: 'select_account',
   })
   return `${AUTHORITY}/oauth2/v2.0/authorize?${params.toString()}`
 }
@@ -88,6 +100,7 @@ function graphPost(tokens, path, body) {
   }).then(r => r.data)
 }
 
+/** Get the signed-in user's identity (always /me). */
 async function getProfile(tokens) {
   const me = await graphGet(tokens, '/me')
   return {
@@ -97,21 +110,45 @@ async function getProfile(tokens) {
   }
 }
 
-async function listRecentMessages(tokens, { maxResults = 200, afterDate } = {}) {
+/**
+ * Validate that the auth user can access a target shared mailbox.
+ * Attempts a lightweight read (1 message) against the target.
+ * Returns { accessible: true, displayName } on success, { accessible: false, error } on failure.
+ */
+async function validateMailboxAccess(tokens, targetMailboxEmail) {
+  try {
+    const prefix = mailboxPrefix(targetMailboxEmail)
+    const data = await graphGet(tokens, `${prefix}/mailFolders/Inbox/messages?$top=1&$select=id`)
+    return { accessible: true, messageCount: (data.value || []).length }
+  } catch (e) {
+    const status = e.response?.status
+    const code = e.response?.data?.error?.code
+    const msg = e.response?.data?.error?.message || e.message
+    return {
+      accessible: false,
+      error: status === 403 || status === 401 || code === 'ErrorAccessDenied'
+        ? `Access denied to ${targetMailboxEmail}. The signed-in user needs "Full Access" permission on this shared mailbox in Exchange admin.`
+        : `Cannot access ${targetMailboxEmail}: ${msg}`,
+    }
+  }
+}
+
+async function listRecentMessages(tokens, { maxResults = 200, afterDate, targetMailbox } = {}) {
   const filter = afterDate
     ? `&$filter=receivedDateTime ge ${new Date(afterDate).toISOString()}`
     : ''
   const top = Math.min(maxResults, 200)
-  // Scope to Inbox folder — ignores Junk Email, Deleted Items, Drafts, etc.
+  const prefix = mailboxPrefix(targetMailbox)
   const data = await graphGet(
     tokens,
-    `/me/mailFolders/Inbox/messages?$top=${top}&$select=id${filter}&$orderby=receivedDateTime desc`
+    `${prefix}/mailFolders/Inbox/messages?$top=${top}&$select=id${filter}&$orderby=receivedDateTime desc`
   )
   return (data.value || []).map(m => m.id)
 }
 
-async function listHistory(tokens, deltaLink) {
-  const url = deltaLink || '/me/mailFolders/Inbox/messages/delta?$select=id'
+async function listHistory(tokens, deltaLink, { targetMailbox } = {}) {
+  const prefix = mailboxPrefix(targetMailbox)
+  const url = deltaLink || `${prefix}/mailFolders/Inbox/messages/delta?$select=id`
   const path = url.startsWith('http') ? null : url
   let data
   if (path) {
@@ -128,8 +165,9 @@ async function listHistory(tokens, deltaLink) {
   }
 }
 
-async function getMessage(tokens, id) {
-  const m = await graphGet(tokens, `/me/messages/${id}`)
+async function getMessage(tokens, id, { targetMailbox } = {}) {
+  const prefix = mailboxPrefix(targetMailbox)
+  const m = await graphGet(tokens, `${prefix}/messages/${id}`)
   return parseMessage(m)
 }
 
@@ -160,7 +198,7 @@ function parseMessage(m) {
   }
 }
 
-async function sendMessage(tokens, { from, to, subject, bodyText, bodyHtml, inReplyTo, references, threadId }) {
+async function sendMessage(tokens, { from, to, subject, bodyText, bodyHtml, inReplyTo, references, threadId, targetMailbox }) {
   const message = {
     subject: subject || '',
     body: {
@@ -175,14 +213,14 @@ async function sendMessage(tokens, { from, to, subject, bodyText, bodyHtml, inRe
       ...(references ? [{ name: 'References', value: references }] : []),
     ]
   }
-  await graphPost(tokens, '/me/sendMail', { message, saveToSentItems: true })
-  // Graph sendMail doesn't return the created message — surface a stub.
+  const prefix = mailboxPrefix(targetMailbox)
+  await graphPost(tokens, `${prefix}/sendMail`, { message, saveToSentItems: true })
   return {
     id: null,
     threadId: threadId || null,
     messageId: null,
     subject,
-    from,
+    from: targetMailbox || from,
     to,
     date: new Date(),
     bodyHtml,
@@ -192,18 +230,18 @@ async function sendMessage(tokens, { from, to, subject, bodyText, bodyHtml, inRe
 }
 
 async function revoke(tokens) {
-  // Microsoft does not expose a client-side token revoke for confidential apps.
-  // We clear local state in the caller. Sign-out URL exists but requires user interaction.
   return
 }
 
 module.exports = {
   name: 'outlook',
   SCOPES,
+  mailboxPrefix,
   buildAuthUrl,
   exchangeCode,
   refreshToken,
   getProfile,
+  validateMailboxAccess,
   listRecentMessages,
   listHistory,
   getMessage,

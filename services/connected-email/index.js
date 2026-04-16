@@ -154,6 +154,9 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         refreshToken: tokens.refreshToken,
       })
 
+      // Store with auth identity. For Outlook, target_mailbox defaults to
+      // auth email (primary); user can select a shared mailbox via the UI after.
+      // For Gmail, auth = target always (no shared mailbox concept).
       await store.upsertAccount(supabase, {
         userId: stateRow.user_id,
         provider,
@@ -161,6 +164,10 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         displayName: profile.displayName,
         tokens,
         scopes: tokens.scopes,
+        authEmailAddress: profile.emailAddress,
+        authDisplayName: profile.displayName,
+        targetMailboxEmail: profile.emailAddress,
+        mailboxType: 'primary',
       })
 
       // Kick sync asynchronously — don't block redirect.
@@ -175,8 +182,12 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         setImmediate(() => syncEngine.syncAccount(supabase, log, acct.id).catch(() => {}))
       }
 
+      // For Outlook, redirect includes accountId so the UI can prompt mailbox selection.
       const frontendBase = process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://service-flow.pro'
-      res.redirect(`${frontendBase}/settings/connected-inboxes?connected=${provider}`)
+      const qp = provider === 'outlook' && acct?.id
+        ? `connected=${provider}&accountId=${acct.id}&selectMailbox=1`
+        : `connected=${provider}`
+      res.redirect(`${frontendBase}/settings/connected-inboxes?${qp}`)
     } catch (e) {
       log.error?.(`[connected-email] callback ${provider}: ${e.message}`)
       const frontendBase = process.env.FRONTEND_URL || process.env.CLIENT_URL || 'https://service-flow.pro'
@@ -274,6 +285,95 @@ module.exports = function buildConnectedEmail(supabase, logger) {
       res.json(result)
     } catch (e) {
       log.error?.(`[connected-email] test-sync: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/accounts/:id/validate-mailbox
+  //   Body: { mailboxEmail: "sales@spotless.homes" }
+  //   Tests if auth user can access the specified shared mailbox.
+  // ══════════════════════════════════════════════════════════════
+  router.post('/accounts/:id/validate-mailbox', auth, async (req, res) => {
+    try {
+      const acct = await store.getWithTokens(supabase, req.params.id)
+      if (!acct || acct.user_id !== req.user.id) return res.status(404).json({ error: 'not found' })
+      if (acct.provider !== 'outlook') return res.status(400).json({ error: 'shared mailbox only supported for Outlook' })
+      const { mailboxEmail } = req.body || {}
+      if (!mailboxEmail?.trim()) return res.status(400).json({ error: 'mailboxEmail required' })
+      const outlook = getProvider('outlook')
+      const result = await outlook.validateMailboxAccess(
+        { accessToken: acct.accessToken, refreshToken: acct.refreshToken },
+        mailboxEmail.trim().toLowerCase()
+      )
+      res.json(result)
+    } catch (e) {
+      log.error?.(`[connected-email] validate-mailbox: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
+  // POST /api/connected-email/accounts/:id/select-mailbox
+  //   Body: { mailboxEmail: "sales@spotless.homes" } or { mailboxEmail: null } for primary
+  //   Validates access if shared, then sets target_mailbox_email + resets sync cursor.
+  // ══════════════════════════════════════════════════════════════
+  router.post('/accounts/:id/select-mailbox', auth, async (req, res) => {
+    try {
+      const acct = await store.getWithTokens(supabase, req.params.id)
+      if (!acct || acct.user_id !== req.user.id) return res.status(404).json({ error: 'not found' })
+      if (acct.provider !== 'outlook') return res.status(400).json({ error: 'mailbox selection only for Outlook' })
+
+      const { mailboxEmail } = req.body || {}
+      const target = mailboxEmail?.trim()?.toLowerCase() || null
+      const authEmail = (acct.auth_email_address || acct.email_address).toLowerCase()
+      const isPrimary = !target || target === authEmail
+      const mailboxType = isPrimary ? 'primary' : 'shared'
+      const finalTarget = isPrimary ? authEmail : target
+
+      // Validate access for shared mailbox.
+      if (!isPrimary) {
+        const outlook = getProvider('outlook')
+        const check = await outlook.validateMailboxAccess(
+          { accessToken: acct.accessToken, refreshToken: acct.refreshToken },
+          finalTarget
+        )
+        if (!check.accessible) return res.status(403).json({ error: check.error })
+      }
+
+      // Update account — set target + reset sync cursor (different mailbox = different delta).
+      await supabase.from('connected_email_accounts').update({
+        target_mailbox_email: finalTarget,
+        target_mailbox_display_name: null,
+        mailbox_type: mailboxType,
+        email_address: finalTarget, // email_address = operative mailbox
+        history_cursor: null, // reset — new mailbox needs fresh delta
+        initial_sync_completed_at: null, // force initial sync for new mailbox
+        last_sync_at: null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', req.params.id)
+
+      // Also reset sync state so poller picks it up immediately.
+      await supabase.from('connected_email_sync_state').upsert({
+        account_id: req.params.id,
+        is_running: false,
+        consecutive_failures: 0,
+        next_run_at: new Date().toISOString(),
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'account_id' })
+
+      // Kick sync immediately.
+      setImmediate(() => syncEngine.syncAccount(supabase, log, req.params.id).catch(() => {}))
+
+      res.json({
+        ok: true,
+        mailboxType,
+        targetMailboxEmail: finalTarget,
+        authEmail,
+      })
+    } catch (e) {
+      log.error?.(`[connected-email] select-mailbox: ${e.message}`)
       res.status(500).json({ error: e.message })
     }
   })
