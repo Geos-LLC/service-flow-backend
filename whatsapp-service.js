@@ -162,24 +162,12 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       const qrRes = await sigcoreRequest('GET', '/integrations/whatsapp/qr', tenantKey)
       const qrData = qrRes.data?.data || qrRes.data || {}
 
-      // If connected (QR was scanned), clear old data + update settings
+      // If connected (QR was scanned), update settings
       if (qrData.connected) {
         const phoneNumber = qrData.phoneNumber || null
 
-        // ── Clear old WhatsApp data (synchronous, before anything else) ──
-        // Conversations + messages will be re-created by webhook delivery
-        try {
-          const { data: oldConvs } = await supabase.from('communication_conversations')
-            .select('id').eq('user_id', userId).eq('provider', 'whatsapp')
-          if (oldConvs && oldConvs.length > 0) {
-            const oldIds = oldConvs.map(c => c.id)
-            await supabase.from('communication_messages').delete().in('conversation_id', oldIds)
-            await supabase.from('communication_conversations').delete().in('id', oldIds)
-            logger.log(`[WhatsApp] Cleared ${oldConvs.length} old conversations for user ${userId}`)
-          }
-        } catch (e) {
-          logger.warn('[WhatsApp] Failed to clear old data:', e.message)
-        }
+        // Note: Sigcore now upserts by providerMessageId on reconnect instead of wiping.
+        // SF must not wipe either — doing so loses history Sigcore won't re-send.
 
         // ── Update connection settings ──
         await supabase.from('communication_settings').update({
