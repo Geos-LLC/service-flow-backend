@@ -9028,6 +9028,157 @@ app.post('/api/lead-sources/import-from-openphone', authenticateToken, async (re
   } catch (e) { res.status(500).json({ error: 'Failed to import sources' }); }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// Lead Source Mappings (raw value → canonical source)
+// ═══════════════════════════════════════════════════════════════
+
+// GET unmapped raw values with counts + existing mappings
+app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get existing mappings
+    const { data: mappings } = await supabase.from('lead_source_mappings')
+      .select('*').eq('user_id', userId).order('raw_value');
+
+    // Get all distinct raw values from OpenPhone conversations
+    const { data: opConvs } = await supabase.from('communication_conversations')
+      .select('company').eq('user_id', userId).not('company', 'is', null);
+    const opCounts = {};
+    for (const c of (opConvs || [])) {
+      if (c.company) opCounts[c.company] = (opCounts[c.company] || 0) + 1;
+    }
+
+    // Get all distinct raw values from LeadBridge conversations
+    const { data: lbConvs } = await supabase.from('communication_conversations')
+      .select('channel').eq('user_id', userId).eq('provider', 'leadbridge');
+    const lbCounts = {};
+    for (const c of (lbConvs || [])) {
+      if (c.channel) lbCounts[c.channel] = (lbCounts[c.channel] || 0) + 1;
+    }
+
+    // Build mapped set for quick lookup
+    const mappedSet = new Set((mappings || []).map(m => `${m.provider}:${m.raw_value}`));
+
+    // Build unmapped list
+    const unmapped = [];
+    for (const [raw, count] of Object.entries(opCounts)) {
+      if (!mappedSet.has(`openphone:${raw}`)) {
+        unmapped.push({ raw_value: raw, provider: 'openphone', count });
+      }
+    }
+    for (const [raw, count] of Object.entries(lbCounts)) {
+      if (!mappedSet.has(`leadbridge:${raw}`)) {
+        unmapped.push({ raw_value: raw, provider: 'leadbridge', count });
+      }
+    }
+    unmapped.sort((a, b) => b.count - a.count);
+
+    res.json({ mappings: mappings || [], unmapped });
+  } catch (e) {
+    logger.error('Lead source mappings error:', e);
+    res.status(500).json({ error: 'Failed to fetch mappings' });
+  }
+});
+
+// Save a single mapping (upsert)
+app.post('/api/lead-source-mappings', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { raw_value, source_name, provider } = req.body;
+    if (!raw_value || !source_name) return res.status(400).json({ error: 'raw_value and source_name are required' });
+    const { data, error } = await supabase.from('lead_source_mappings')
+      .upsert({ user_id: userId, raw_value, source_name, provider: provider || 'openphone' },
+        { onConflict: 'user_id,raw_value,provider' })
+      .select().single();
+    if (error) return res.status(500).json({ error: 'Failed to save mapping' });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to save mapping' }); }
+});
+
+// Bulk save mappings
+app.post('/api/lead-source-mappings/bulk', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { mappings } = req.body;
+    if (!Array.isArray(mappings) || !mappings.length) return res.status(400).json({ error: 'mappings array required' });
+    const rows = mappings.map(m => ({
+      user_id: userId,
+      raw_value: m.raw_value,
+      source_name: m.source_name,
+      provider: m.provider || 'openphone',
+    }));
+    const { error } = await supabase.from('lead_source_mappings')
+      .upsert(rows, { onConflict: 'user_id,raw_value,provider' });
+    if (error) return res.status(500).json({ error: 'Failed to save mappings' });
+    res.json({ saved: rows.length });
+  } catch (e) { res.status(500).json({ error: 'Failed to save mappings' }); }
+});
+
+// Delete a mapping
+app.delete('/api/lead-source-mappings/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { error } = await supabase.from('lead_source_mappings')
+      .delete().eq('id', req.params.id).eq('user_id', userId);
+    if (error) return res.status(500).json({ error: 'Failed to delete mapping' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to delete mapping' }); }
+});
+
+// Auto-suggest mappings based on prefix matching
+app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Get user's canonical sources
+    const { data: sources } = await supabase.from('lead_sources')
+      .select('name').eq('user_id', userId).eq('is_active', true);
+    const sourceNames = (sources || []).map(s => s.name);
+
+    // Get existing mappings to skip
+    const { data: existing } = await supabase.from('lead_source_mappings')
+      .select('raw_value, provider').eq('user_id', userId);
+    const mappedSet = new Set((existing || []).map(m => `${m.provider}:${m.raw_value}`));
+
+    // Get unmapped OpenPhone company values
+    const { data: opConvs } = await supabase.from('communication_conversations')
+      .select('company').eq('user_id', userId).not('company', 'is', null);
+    const opRaw = [...new Set((opConvs || []).map(c => c.company).filter(Boolean))];
+
+    // Get unmapped LB channel values
+    const { data: lbConvs } = await supabase.from('communication_conversations')
+      .select('channel').eq('user_id', userId).eq('provider', 'leadbridge');
+    const lbRaw = [...new Set((lbConvs || []).map(c => c.channel).filter(Boolean))];
+
+    const suggestions = [];
+
+    for (const raw of opRaw) {
+      if (mappedSet.has(`openphone:${raw}`)) continue;
+      const exact = sourceNames.find(s => s.toLowerCase() === raw.toLowerCase());
+      if (exact) { suggestions.push({ raw_value: raw, source_name: exact, provider: 'openphone', confidence: 'exact' }); continue; }
+      const prefix = sourceNames.find(s => raw.toLowerCase().startsWith(s.toLowerCase()));
+      if (prefix) { suggestions.push({ raw_value: raw, source_name: prefix, provider: 'openphone', confidence: 'prefix' }); continue; }
+      const reverse = sourceNames.find(s => s.toLowerCase().startsWith(raw.toLowerCase()));
+      if (reverse) { suggestions.push({ raw_value: raw, source_name: reverse, provider: 'openphone', confidence: 'prefix' }); continue; }
+    }
+
+    for (const raw of lbRaw) {
+      if (mappedSet.has(`leadbridge:${raw}`)) continue;
+      const match = sourceNames.find(s => s.toLowerCase() === raw.toLowerCase());
+      if (match) { suggestions.push({ raw_value: raw, source_name: match, provider: 'leadbridge', confidence: 'exact' }); continue; }
+      const capitalized = raw.charAt(0).toUpperCase() + raw.slice(1);
+      const capMatch = sourceNames.find(s => s === capitalized);
+      if (capMatch) { suggestions.push({ raw_value: raw, source_name: capMatch, provider: 'leadbridge', confidence: 'exact' }); continue; }
+    }
+
+    res.json({ suggestions });
+  } catch (e) {
+    logger.error('Auto-suggest error:', e);
+    res.status(500).json({ error: 'Failed to generate suggestions' });
+  }
+});
+
 // Find and merge duplicate customers endpoint
 app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) => {
   try {
@@ -36198,14 +36349,28 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       locationMap[l.id] = { name: l.name };
     }
 
+    // Build source mapping lookup (raw → canonical)
+    const { data: sourceMappings } = await supabase.from('lead_source_mappings')
+      .select('raw_value, source_name, provider').eq('user_id', userId);
+    const sourceMap = {};
+    for (const m of (sourceMappings || [])) {
+      sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
+    }
+
     // Map to frontend shape
     const conversations = (data || []).map(c => {
       const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
       const loc = c.sf_location_id ? locationMap[c.sf_location_id] : null;
+      // Resolve source: company mapping → LB channel mapping → raw company
+      const rawSource = c.company || null;
+      const provider = c.provider || 'openphone';
+      const resolvedSource = sourceMap[`${provider}:${rawSource}`]
+        || sourceMap[`${provider}:${c.channel}`]
+        || rawSource;
       return {
         id: c.id,
         sigcoreConversationId: c.sigcore_conversation_id,
-        provider: c.provider || 'openphone',
+        provider: provider,
         channel: c.channel || 'sms',
         displayName: c.participant_name || '',
         fallbackIdentifier: c.participant_phone || c.participant_email || '',
@@ -36225,8 +36390,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         locationId: c.sf_location_id || null,
         locationName: loc?.name || c.external_location_name || null,
         locationResolved: !!c.sf_location_id,
-        // Company / lead source from OpenPhone contact
-        company: c.company || null,
+        // Company / lead source — resolved through mappings
+        company: resolvedSource,
         // Avatar URL from WhatsApp sync (stored in metadata)
         avatarUrl: c.metadata?.avatarUrl || null,
         isGroup: c.metadata?.isGroup || c.conversation_type === 'group' || false,
@@ -36411,6 +36576,18 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
       }
     }
 
+    // Resolve source through mappings
+    const { data: detailMappings } = await supabase.from('lead_source_mappings')
+      .select('raw_value, source_name, provider').eq('user_id', userId);
+    const detailSourceMap = {};
+    for (const m of (detailMappings || [])) {
+      detailSourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
+    }
+    const convProvider = conv.provider || 'openphone';
+    const resolvedConvSource = detailSourceMap[`${convProvider}:${conv.company}`]
+      || detailSourceMap[`${convProvider}:${conv.channel}`]
+      || conv.company || conv.provider;
+
     // Build lead/customer data from conversation → participant_identity → lead/customer
     let lead = null;
 
@@ -36421,7 +36598,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         lead = {
           id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
           phone: customer.phone, email: customer.email,
-          source: conv.company || conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+          source: resolvedConvSource, tags: [], status: 'Customer', entityType: 'customer'
         };
       }
     }
@@ -36455,7 +36632,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
           lead = {
             id: customer.id, name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
             phone: customer.phone, email: customer.email,
-            source: conv.company || conv.provider, tags: [], status: 'Customer', entityType: 'customer'
+            source: resolvedConvSource, tags: [], status: 'Customer', entityType: 'customer'
           };
         }
       } else if (identity?.sf_lead_id) {
@@ -36481,7 +36658,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const hasMore = events.length < totalEvents;
     const oldestTimestamp = events.length > 0 ? events[0].timestamp : null;
 
-    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: conv.company || null } });
+    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: resolvedConvSource !== conv.provider ? resolvedConvSource : (conv.company || null) } });
   } catch (error) {
     logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
