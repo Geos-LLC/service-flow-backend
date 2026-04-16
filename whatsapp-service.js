@@ -430,15 +430,61 @@ module.exports = (supabase, logger, sigcoreRequest) => {
 
           if (sfConv) {
             const meta = sfConv.metadata || {}
+            const updates = { updated_at: new Date().toISOString() }
             if (meta.avatarUrl !== normalizeAvatarUrl(sigConv.avatarUrl)) {
-              await supabase.from('communication_conversations').update({
-                metadata: { ...meta, avatarUrl: normalizeAvatarUrl(sigConv.avatarUrl) },
-                // Also update name + last message from Sigcore if available
-                ...(sigConv.contactName && { participant_name: sigConv.contactName }),
-                ...(sigConv.lastMessage && { last_preview: sigConv.lastMessage.substring(0, 200) }),
-                updated_at: new Date().toISOString(),
-              }).eq('id', sfConv.id)
+              updates.metadata = { ...meta, avatarUrl: normalizeAvatarUrl(sigConv.avatarUrl) }
+              if (sigConv.contactName) updates.participant_name = sigConv.contactName
+              if (sigConv.lastMessage) updates.last_preview = sigConv.lastMessage.substring(0, 200)
               avatarsUpdated++
+            }
+            if (!sfConv.sigcore_conversation_id && sigConv.id) {
+              updates.sigcore_conversation_id = sigConv.id
+            }
+            if (Object.keys(updates).length > 1) {
+              await supabase.from('communication_conversations').update(updates).eq('id', sfConv.id)
+            }
+
+            // Fetch messages from Sigcore for this conversation
+            if (sigConv.id) {
+              try {
+                const msgsRes = await sigcoreRequest('GET', `/conversations/${sigConv.id}/messages?limit=50`, tenantKey)
+                const msgs = msgsRes.data?.data || []
+                let inserted = 0
+                for (const msg of msgs) {
+                  const sigMsgId = msg.id
+                  if (!sigMsgId) continue
+                  const { data: existing } = await supabase.from('communication_messages')
+                    .select('id').eq('sigcore_message_id', sigMsgId).maybeSingle()
+                  if (existing) continue
+                  const dir = (msg.direction === 'incoming' || msg.direction === 'in') ? 'in' : 'out'
+                  const mediaMeta = msg.hasMedia ? {
+                    hasMedia: true,
+                    mediaType: msg.mediaType || null,
+                    mediaMimetype: msg.mediaMimetype || null,
+                    mediaFilename: msg.mediaFilename || null,
+                    mediaStatus: msg.mediaStatus || null,
+                    sigcoreMediaUrl: msg.mediaUrl || null,
+                  } : null
+                  await supabase.from('communication_messages').insert({
+                    conversation_id: sfConv.id,
+                    sigcore_message_id: sigMsgId,
+                    provider_message_id: msg.providerMessageId || null,
+                    direction: dir, channel: 'whatsapp', body: msg.body || '',
+                    from_number: normalizePhone(msg.fromNumber),
+                    to_number: normalizePhone(msg.toNumber),
+                    sender_role: dir === 'in' ? 'customer' : 'agent',
+                    status: msg.status || 'delivered',
+                    metadata: { ...(mediaMeta && { media: mediaMeta }) },
+                    created_at: msg.createdAt || new Date().toISOString(),
+                  })
+                  inserted++
+                }
+                if (inserted > 0) {
+                  waSyncProgress[userId].messages += inserted
+                }
+              } catch (e) {
+                logger.warn(`[WhatsApp Sync] Msg fetch failed for conv ${sigConv.id}: ${e.response?.status || ''} ${e.message}`)
+              }
             }
           }
         }
