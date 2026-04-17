@@ -170,7 +170,9 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         mailboxType: 'primary',
       })
 
-      // Kick sync asynchronously — don't block redirect.
+      // For Gmail: kick sync asynchronously (no mailbox picker).
+      // For Outlook: DEFER sync until user picks mailbox (primary vs shared).
+      //   Otherwise auto-mapped shared mailboxes leak into the primary sync.
       const { data: acct } = await supabase
         .from('connected_email_accounts')
         .select('id')
@@ -178,7 +180,7 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         .eq('provider', provider)
         .eq('email_address', String(profile.emailAddress).toLowerCase())
         .maybeSingle()
-      if (acct?.id) {
+      if (acct?.id && provider === 'gmail') {
         setImmediate(() => syncEngine.syncAccount(supabase, log, acct.id).catch(() => {}))
       }
 
@@ -349,6 +351,28 @@ module.exports = function buildConnectedEmail(supabase, logger) {
           finalTarget
         )
         if (!check.accessible) return res.status(403).json({ error: check.error })
+      }
+
+      // Wipe any conversations/messages that were synced BEFORE mailbox selection
+      // (e.g. leaked from auto-mapped shared mailboxes during pre-selection sync).
+      // Scope: user + provider=outlook, not yet linked to the chosen target.
+      try {
+        const { data: staleConvs } = await supabase
+          .from('communication_conversations')
+          .select('id, endpoint_email')
+          .eq('user_id', req.user.id)
+          .eq('provider', 'outlook')
+          .eq('channel', 'email')
+        const staleIds = (staleConvs || [])
+          .filter(c => (c.endpoint_email || '').toLowerCase() !== finalTarget)
+          .map(c => c.id)
+        if (staleIds.length > 0) {
+          await supabase.from('communication_messages').delete().in('conversation_id', staleIds)
+          await supabase.from('communication_conversations').delete().in('id', staleIds)
+          log.info?.(`[connected-email] select-mailbox: cleared ${staleIds.length} stale conversations from other endpoints`)
+        }
+      } catch (e) {
+        log.warn?.(`[connected-email] select-mailbox cleanup: ${e.message}`)
       }
 
       // Update account — set target + reset sync cursor (different mailbox = different delta).
