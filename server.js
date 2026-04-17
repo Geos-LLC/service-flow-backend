@@ -9049,12 +9049,21 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
       if (c.company) opCounts[c.company] = (opCounts[c.company] || 0) + 1;
     }
 
-    // Get all distinct raw values from LeadBridge conversations
+    // Get LeadBridge conversations grouped by provider_account_id + channel
     const { data: lbConvs } = await supabase.from('communication_conversations')
-      .select('channel').eq('user_id', userId).eq('provider', 'leadbridge');
+      .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge');
+    // Get provider account names for display
+    const { data: provAccounts } = await supabase.from('communication_provider_accounts')
+      .select('id, display_name, channel').eq('user_id', userId);
+    const accountMap = {};
+    for (const pa of (provAccounts || [])) accountMap[pa.id] = pa;
+
+    // Build LB raw values as "AccountName (channel)" — e.g. "Spotless Homes Tampa (yelp)"
     const lbCounts = {};
     for (const c of (lbConvs || [])) {
-      if (c.channel) lbCounts[c.channel] = (lbCounts[c.channel] || 0) + 1;
+      const acct = c.provider_account_id ? accountMap[c.provider_account_id] : null;
+      const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
+      if (raw) lbCounts[raw] = (lbCounts[raw] || 0) + 1;
     }
 
     // Build mapped set for quick lookup
@@ -9146,10 +9155,20 @@ app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req
       .select('company').eq('user_id', userId).not('company', 'is', null);
     const opRaw = [...new Set((opConvs || []).map(c => c.company).filter(Boolean))];
 
-    // Get unmapped LB channel values
+    // Get unmapped LB values with account names
     const { data: lbConvs } = await supabase.from('communication_conversations')
-      .select('channel').eq('user_id', userId).eq('provider', 'leadbridge');
-    const lbRaw = [...new Set((lbConvs || []).map(c => c.channel).filter(Boolean))];
+      .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge');
+    const { data: suggestAccounts } = await supabase.from('communication_provider_accounts')
+      .select('id, display_name, channel').eq('user_id', userId);
+    const suggestAcctMap = {};
+    for (const pa of (suggestAccounts || [])) suggestAcctMap[pa.id] = pa;
+    const lbRawSet = new Set();
+    for (const c of (lbConvs || [])) {
+      const acct = c.provider_account_id ? suggestAcctMap[c.provider_account_id] : null;
+      const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
+      if (raw) lbRawSet.add(raw);
+    }
+    const lbRaw = [...lbRawSet];
 
     const suggestions = [];
 
@@ -9163,11 +9182,15 @@ app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req
       if (reverse) { suggestions.push({ raw_value: raw, source_name: reverse, provider: 'openphone', confidence: 'prefix' }); continue; }
     }
 
+    // For LB: match by channel part — e.g. "Spotless Homes Tampa (yelp)" matches "Yelp"
     for (const raw of lbRaw) {
       if (mappedSet.has(`leadbridge:${raw}`)) continue;
-      const match = sourceNames.find(s => s.toLowerCase() === raw.toLowerCase());
+      // Extract channel from "AccountName (channel)" format
+      const channelMatch = raw.match(/\((\w+)\)$/);
+      const channel = channelMatch ? channelMatch[1] : raw;
+      const match = sourceNames.find(s => s.toLowerCase() === channel.toLowerCase());
       if (match) { suggestions.push({ raw_value: raw, source_name: match, provider: 'leadbridge', confidence: 'exact' }); continue; }
-      const capitalized = raw.charAt(0).toUpperCase() + raw.slice(1);
+      const capitalized = channel.charAt(0).toUpperCase() + channel.slice(1);
       const capMatch = sourceNames.find(s => s === capitalized);
       if (capMatch) { suggestions.push({ raw_value: raw, source_name: capMatch, provider: 'leadbridge', confidence: 'exact' }); continue; }
     }
@@ -36361,10 +36384,13 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     const conversations = (data || []).map(c => {
       const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
       const loc = c.sf_location_id ? locationMap[c.sf_location_id] : null;
-      // Resolve source: company mapping → LB channel mapping → raw company
+      // Resolve source: company mapping → LB account+channel mapping → LB channel → raw company
       const rawSource = c.company || null;
       const provider = c.provider || 'openphone';
+      const lbAccountKey = (provider === 'leadbridge' && account)
+        ? `leadbridge:${account.displayName} (${c.channel})` : null;
       const resolvedSource = sourceMap[`${provider}:${rawSource}`]
+        || (lbAccountKey && sourceMap[lbAccountKey])
         || sourceMap[`${provider}:${c.channel}`]
         || rawSource;
       return {
@@ -36584,7 +36610,15 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
       detailSourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
     }
     const convProvider = conv.provider || 'openphone';
+    // For LB: also try "AccountName (channel)" format
+    let lbDetailKey = null;
+    if (convProvider === 'leadbridge' && conv.provider_account_id) {
+      const { data: pa } = await supabase.from('communication_provider_accounts')
+        .select('display_name').eq('id', conv.provider_account_id).maybeSingle();
+      if (pa) lbDetailKey = `leadbridge:${pa.display_name} (${conv.channel})`;
+    }
     const resolvedConvSource = detailSourceMap[`${convProvider}:${conv.company}`]
+      || (lbDetailKey && detailSourceMap[lbDetailKey])
       || detailSourceMap[`${convProvider}:${conv.channel}`]
       || conv.company || conv.provider;
 
