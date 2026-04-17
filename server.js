@@ -8996,7 +8996,7 @@ app.post('/api/lead-sources/seed', authenticateToken, async (req, res) => {
     const { count } = await supabase.from('lead_sources')
       .select('id', { count: 'exact', head: true }).eq('user_id', userId);
     if (count > 0) return res.json({ seeded: false, message: 'Sources already exist' });
-    const defaults = ['Website', 'Referral', 'Cold Call', 'Social Media', 'Google', 'Thumbtack', 'Yelp', 'Facebook', 'Other'];
+    const defaults = ['Thumbtack', 'Yelp', 'Google', 'Facebook', 'Website', 'Referral', 'Cold Call', 'Instagram', 'Groupon', 'Bark', 'Other'];
     const rows = defaults.map((name, i) => ({ user_id: userId, name, sort_order: i, is_active: true }));
     await supabase.from('lead_sources').insert(rows);
     const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
