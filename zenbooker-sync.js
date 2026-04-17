@@ -790,39 +790,55 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
     const update = {}
     if (eventType === 'invoice_payment.succeeded' || eventType === 'invoice_payment.recorded') {
-      const amount = parseFloat(data.amount_paid || data.amount) || 0
-      const paymentMethod = data.custom_payment_method_name || data.payment_method || 'other'
+      // Webhook data can be either the invoice (with nested transactions[]) or a transaction.
+      // Try top-level first, then fall back to nested transaction. Invoice payload's nested
+      // transactions lack custom_payment_method_name, so we may only resolve a generic label.
+      const nestedTx = Array.isArray(data.transactions) ? data.transactions[0] : null
+      const amount = parseFloat(data.amount_paid || data.amount || nestedTx?.amount) || 0
+      const rawMethod = data.custom_payment_method_name
+        || nestedTx?.custom_payment_method_name
+        || data.payment_method
+        || nestedTx?.payment_method
+        || null
+      // Only treat a method as "resolved" if it's a real name — skip generic fallbacks like
+      // 'custom' or 'other' so we don't overwrite names previously set by syncTransactions.
+      const GENERIC = new Set(['custom', 'other', 'unknown', ''])
+      const resolvedMethod = rawMethod && !GENERIC.has(String(rawMethod).toLowerCase()) ? rawMethod : null
+
       update.payment_status = 'paid'
       update.invoice_status = 'paid'
-      update.payment_method = paymentMethod
+      if (resolvedMethod) update.payment_method = resolvedMethod
       if (amount > 0) update.total_paid_amount = amount
 
       // Update job status FIRST so paid state reflects even if transaction insert fails
       await supabase.from('jobs').update(update).eq('id', job.id)
-      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} marked paid ($${amount} ${paymentMethod})`)
+      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} marked paid ($${amount} ${resolvedMethod || `raw=${rawMethod || 'none'}, leaving payment_method untouched`})`)
 
-      // Create transaction record if none exists
-      const zbTxId = data.transaction_id || data.id
+      // Create transaction record if none exists. Use the real ZB transaction id from nested
+      // transactions when present — lets syncTransactions later dedup + resolve the method.
+      const zbTxId = data.transaction_id || nestedTx?.id || (data.id && !Array.isArray(data.transactions) ? data.id : null)
       const { data: existingTx } = await supabase.from('transactions')
         .select('id').eq('job_id', job.id).eq('status', 'completed').limit(1)
       if (!existingTx || existingTx.length === 0) {
         try {
           const { error: txErr } = await supabase.from('transactions').insert({
             user_id: userId, job_id: job.id, customer_id: job.customer_id,
-            amount, payment_method: paymentMethod,
+            amount,
+            // Store raw method (even 'custom') on the transaction so syncTransactions can upgrade it later
+            payment_method: rawMethod || 'other',
             payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
             status: 'completed', notes: 'Payment synced from Zenbooker',
             zenbooker_id: zbTxId || null
           })
           if (txErr) logger.error(`[Zenbooker] Transaction insert error: ${JSON.stringify(txErr)}`)
-          else logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${paymentMethod})`)
+          else logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${rawMethod || 'other'})`)
         } catch (e) {
           logger.error(`[Zenbooker] Transaction insert threw: ${e.message}`)
         }
       }
 
       // For cash payments: rebuild cash_collected ledger entries (transaction must exist first)
-      if (paymentMethod.toLowerCase() === 'cash' && createLedgerEntriesForCompletedJob) {
+      if (rawMethod && rawMethod.toLowerCase() === 'cash' && createLedgerEntriesForCompletedJob) {
         await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
         await createLedgerEntriesForCompletedJob(job.id, userId).catch(err => {
           logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
