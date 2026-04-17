@@ -31,6 +31,24 @@ const twilio = require('twilio');
 require('dotenv').config();
 const logger = require('./logger');
 
+// ═══════════════════════════════════════════════════════════════
+// Centralized job-status write path + LeadBridge outbound drainer.
+// EVERY mutation of `jobs.status` in this file MUST route through
+// updateJobStatus. The CI guard (scripts/check-job-status-writes.js)
+// fails the build on direct supabase.from('jobs').update({ status })
+// writes outside the approved service.
+// ═══════════════════════════════════════════════════════════════
+const {
+  updateJobStatus: _updateJobStatus,
+  maybeEmitInsertEvent,
+} = require('./services/job-status-service');
+const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
+
+// Thin shim so callers don't have to pass supabase every time.
+async function updateJobStatus(args) {
+  return _updateJobStatus(supabase, args);
+}
+
 // Global error handlers — capture crashes and forward to LogHub
 process.on('uncaughtException', (err) => {
   logger.error(`Uncaught Exception: ${err.message}`, { error: err.stack });
@@ -5547,6 +5565,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         console.error('❌ Job data that failed:', jobData);
         return res.status(500).json({ error: 'Failed to create job', details: insertError.message });
       }
+
+      // LB insert-time emit (§5). No-op unless the job was created
+      // with LB identity present at INSERT (not enriched later).
+      // Failure is non-blocking — logged inside the helper.
+      maybeEmitInsertEvent(supabase, result, {
+        type: 'account_owner',
+        id: userId,
+        display_name: null,
+      }).catch((e) => console.warn('[LB Outbound] Insert emit skipped:', e?.message));
       
             // Verify customer exists and get customer data
       let customerData = null;
@@ -6223,18 +6250,23 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // Update job status
-    const { error: updateError } = await supabase
-      .from('jobs')
-      .update({ 
-        status: status,
-        updated_at: now
-      })
-      .eq('id', id)
-      .eq('user_id', userId);
-
-    if (updateError) {
-      console.error('Error updating job status:', updateError);
+    // Update job status — goes through the centralized service so
+    // (a) the loop-prevention marker gets written, (b) an outbox row
+    // is queued for LB if the job is LB-linked. Actor metadata is
+    // passed through for the payload.
+    try {
+      await updateJobStatus({
+        jobId: id,
+        userId,
+        newStatus: status,
+        source: changedByType === 'team_member' ? 'team_member' : 'account_owner',
+        actor: { type: changedByType, id: userId, display_name: changedBy },
+      });
+    } catch (err) {
+      if (err.code === 'JOB_NOT_FOUND') {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      console.error('Error updating job status:', err);
       return res.status(500).json({ error: 'Failed to update job status' });
     }
 
@@ -6596,9 +6628,12 @@ app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
     const previousStatus = job.status || 'pending';
     const now = new Date().toISOString();
 
-    // 1. Update job: set status=cancelled + fields
-    const update = {
-      status: 'cancelled',
+    // 1. Update job: set status=cancelled + cancellation fields.
+    //    Routes through updateJobStatus so the LB outbox picks up the
+    //    transition (when the job is LB-linked). Cancellation fields
+    //    ride along as extraFields in the same UPDATE — the service
+    //    merges them without letting them clobber status markers.
+    const cancelExtras = {
       cancellation_reason: reason,
       cancellation_notes: notes,
       cancellation_fee: fee > 0 ? fee : null,
@@ -6607,11 +6642,24 @@ app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
       cancelled_by: userId,
       updated_at: now,
     };
-    const { error: updErr } = await supabase.from('jobs').update(update).eq('id', jobId).eq('user_id', userId);
-    if (updErr) {
-      console.error('[Cancel] Job update failed:', updErr);
+    try {
+      await updateJobStatus({
+        jobId,
+        userId,
+        newStatus: 'cancelled',
+        source: 'account_owner',
+        actor: { type: 'account_owner', id: userId, display_name: 'Staff' },
+        extraFields: cancelExtras,
+      });
+    } catch (err) {
+      if (err.code === 'JOB_NOT_FOUND') {
+        return res.status(404).json({ error: 'Job not found' });
+      }
+      console.error('[Cancel] Job update failed:', err);
       return res.status(500).json({ error: 'Failed to cancel job' });
     }
+    // Mirror the computed fee_status back into the response payload.
+    const update = { cancellation_fee_status: cancelExtras.cancellation_fee_status };
 
     // 2. Status history (best-effort)
     try {
@@ -9246,17 +9294,39 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
     const { data: mappings } = await supabase.from('lead_source_mappings')
       .select('*').eq('user_id', userId).order('raw_value');
 
-    // Get all distinct raw values from OpenPhone conversations
-    const { data: opConvs } = await supabase.from('communication_conversations')
-      .select('company').eq('user_id', userId).not('company', 'is', null);
+    // Paginate ALL OpenPhone conversations (Supabase default limit is 1000)
+    const opConvs = [];
+    {
+      const pageSize = 1000; let from = 0;
+      while (true) {
+        const { data } = await supabase.from('communication_conversations')
+          .select('company').eq('user_id', userId).not('company', 'is', null)
+          .range(from, from + pageSize - 1);
+        if (!data?.length) break;
+        opConvs.push(...data);
+        if (data.length < pageSize) break;
+        from += pageSize;
+      }
+    }
     const opCounts = {};
-    for (const c of (opConvs || [])) {
+    for (const c of opConvs) {
       if (c.company) opCounts[c.company] = (opCounts[c.company] || 0) + 1;
     }
 
-    // Get LeadBridge conversations grouped by provider_account_id + channel
-    const { data: lbConvs } = await supabase.from('communication_conversations')
-      .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge');
+    // Paginate ALL LeadBridge conversations
+    const lbConvs = [];
+    {
+      const pageSize = 1000; let from = 0;
+      while (true) {
+        const { data } = await supabase.from('communication_conversations')
+          .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge')
+          .range(from, from + pageSize - 1);
+        if (!data?.length) break;
+        lbConvs.push(...data);
+        if (data.length < pageSize) break;
+        from += pageSize;
+      }
+    }
     // Get provider account names for display
     const { data: provAccounts } = await supabase.from('communication_provider_accounts')
       .select('id, display_name, channel').eq('user_id', userId);
@@ -9265,7 +9335,7 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
 
     // Build LB raw values as "AccountName (channel)" — e.g. "Spotless Homes Tampa (yelp)"
     const lbCounts = {};
-    for (const c of (lbConvs || [])) {
+    for (const c of lbConvs) {
       const acct = c.provider_account_id ? accountMap[c.provider_account_id] : null;
       const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
       if (raw) lbCounts[raw] = (lbCounts[raw] || 0) + 1;
@@ -9355,20 +9425,33 @@ app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req
       .select('raw_value, provider').eq('user_id', userId);
     const mappedSet = new Set((existing || []).map(m => `${m.provider}:${m.raw_value}`));
 
-    // Get unmapped OpenPhone company values
-    const { data: opConvs } = await supabase.from('communication_conversations')
-      .select('company').eq('user_id', userId).not('company', 'is', null);
-    const opRaw = [...new Set((opConvs || []).map(c => c.company).filter(Boolean))];
+    // Paginated fetch for OpenPhone + LB conversations
+    const opConvs = [];
+    { const pageSize = 1000; let from = 0;
+      while (true) {
+        const { data } = await supabase.from('communication_conversations')
+          .select('company').eq('user_id', userId).not('company', 'is', null).range(from, from + pageSize - 1);
+        if (!data?.length) break; opConvs.push(...data);
+        if (data.length < pageSize) break; from += pageSize;
+      }
+    }
+    const opRaw = [...new Set(opConvs.map(c => c.company).filter(Boolean))];
 
-    // Get unmapped LB values with account names
-    const { data: lbConvs } = await supabase.from('communication_conversations')
-      .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge');
+    const lbConvs = [];
+    { const pageSize = 1000; let from = 0;
+      while (true) {
+        const { data } = await supabase.from('communication_conversations')
+          .select('channel, provider_account_id').eq('user_id', userId).eq('provider', 'leadbridge').range(from, from + pageSize - 1);
+        if (!data?.length) break; lbConvs.push(...data);
+        if (data.length < pageSize) break; from += pageSize;
+      }
+    }
     const { data: suggestAccounts } = await supabase.from('communication_provider_accounts')
       .select('id, display_name, channel').eq('user_id', userId);
     const suggestAcctMap = {};
     for (const pa of (suggestAccounts || [])) suggestAcctMap[pa.id] = pa;
     const lbRawSet = new Set();
-    for (const c of (lbConvs || [])) {
+    for (const c of lbConvs) {
       const acct = c.provider_account_id ? suggestAcctMap[c.provider_account_id] : null;
       const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
       if (raw) lbRawSet.add(raw);
@@ -23244,19 +23327,37 @@ app.put('/api/team-members/jobs/:jobId/status', async (req, res) => {
   try {
     const { jobId } = req.params;
     const { teamMemberId, status, notes } = req.body;
-    
-    // Update job status using Supabase
-    const { error: updateError } = await supabase
+
+    // Route through the centralized status service. NOTE: the
+    // legacy endpoint scopes by team_member_id rather than user_id,
+    // so we read the job directly first, verify the team-member
+    // linkage ourselves, then hand off to updateJobStatus without
+    // the userId scope (it's enforced by our own check here).
+    const { data: job, error: readErr } = await supabase
       .from('jobs')
-      .update({
-        status: status,
-        notes: notes || '',
-        updated_at: new Date().toISOString()
-      })
+      .select('id, user_id, team_member_id')
       .eq('id', jobId)
-      .eq('team_member_id', teamMemberId);
-    
-    if (updateError) {
+      .eq('team_member_id', teamMemberId)
+      .maybeSingle();
+    if (readErr) {
+      console.error('❌ Error reading job for team-member status update:', readErr);
+      return res.status(500).json({ error: 'Failed to update job status' });
+    }
+    if (!job) return res.status(404).json({ error: 'Job not found for this team member' });
+
+    try {
+      await updateJobStatus({
+        jobId,
+        userId: job.user_id,
+        newStatus: status,
+        source: 'team_member',
+        actor: { type: 'team_member', id: teamMemberId, display_name: null },
+        extraFields: { notes: notes || '' },
+      });
+    } catch (updateError) {
+      if (updateError.code === 'JOB_NOT_FOUND') {
+        return res.status(404).json({ error: 'Job not found' });
+      }
       console.error('❌ Error updating job status:', updateError);
       return res.status(500).json({ error: 'Failed to update job status' });
     }
@@ -32987,6 +33088,16 @@ app.listen(PORT, async () => {
   } catch (error) {
     logger.error(`Database initialization failed: ${error.message}`, { error: error.stack });
     logger.warn('Server will continue without database initialization');
+  }
+
+  // Start the LeadBridge outbound delivery drainer. No-ops at process
+  // start if LEADBRIDGE_OUTBOUND_STATUS_ENABLED is not 'true', so the
+  // rollout gates (§11 of JOB_STATUS_SYNC_TO_LB.md) still control
+  // whether delivery actually happens.
+  try {
+    startLbOutboundDrainer({ supabase, logger });
+  } catch (e) {
+    logger.error(`[LB Outbound] Failed to start drainer: ${e.message}`);
   }
 });
 } // end if (require.main === module)
