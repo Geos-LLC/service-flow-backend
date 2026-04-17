@@ -25,7 +25,8 @@ const SCOPES = [
 /** Build the Graph path prefix. Primary → /me, delegated → /users/{email} */
 function mailboxPrefix(targetMailbox) {
   if (!targetMailbox) return '/me'
-  return `/users/${encodeURIComponent(targetMailbox)}`
+  // Graph expects UPN as-is (not URL-encoded): /users/sales@spotless.homes
+  return `/users/${targetMailbox}`
 }
 
 function buildAuthUrl({ redirectUri, state }) {
@@ -116,12 +117,14 @@ async function getProfile(tokens) {
 async function validateMailboxAccess(tokens, targetMailboxEmail) {
   try {
     const prefix = mailboxPrefix(targetMailboxEmail)
+    console.log(`[outlook] validateMailboxAccess: probing ${prefix}/mailFolders/Inbox/messages`)
     const data = await graphGet(tokens, `${prefix}/mailFolders/Inbox/messages?$top=1&$select=id`)
     return { accessible: true, messageCount: (data.value || []).length }
   } catch (e) {
     const status = e.response?.status
     const code = e.response?.data?.error?.code
     const msg = e.response?.data?.error?.message || e.message
+    console.error(`[outlook] validateMailboxAccess failed: status=${status} code=${code} msg=${msg}`)
     const isAccessDenied = status === 403 || status === 401 || code === 'ErrorAccessDenied' || code === 'ErrorItemNotFound'
     return {
       accessible: false,

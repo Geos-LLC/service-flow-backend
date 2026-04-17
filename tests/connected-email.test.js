@@ -352,8 +352,8 @@ describe('outlook.mailboxPrefix', () => {
     expect(mailboxPrefix('')).toBe('/me')
   })
 
-  test('email → /users/{email} (delegated)', () => {
-    expect(mailboxPrefix('sales@spotless.homes')).toBe('/users/sales%40spotless.homes')
+  test('email → /users/{email} (delegated, unencoded UPN)', () => {
+    expect(mailboxPrefix('sales@spotless.homes')).toBe('/users/sales@spotless.homes')
   })
 })
 
