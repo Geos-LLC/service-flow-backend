@@ -6,6 +6,7 @@
  */
 
 const express = require('express')
+const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -636,11 +637,31 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       } catch { /* customer sync failed, continue without linking */ }
     }
 
-    const { data: existing } = await supabase.from('jobs').select('id').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
+    const { data: existing } = await supabase.from('jobs').select('id, status').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
     let jobId
     if (existing) {
       jobId = existing.id
-      await supabase.from('jobs').update(mapped).eq('id', existing.id)
+      // Split the update: the `status` field goes through the
+      // centralized service (loop-safe, emits outbox on LB-linked
+      // jobs). All other fields update directly — they are not
+      // status changes.
+      const { status: mappedStatus, ...mappedRest } = mapped
+      if (Object.keys(mappedRest).length > 0) {
+        await supabase.from('jobs').update(mappedRest).eq('id', existing.id)
+      }
+      if (mappedStatus && mappedStatus !== existing.status) {
+        try {
+          await updateJobStatus(supabase, {
+            jobId: existing.id,
+            userId,
+            newStatus: mappedStatus,
+            source: 'system',
+            actor: { type: 'system', id: null, display_name: 'Zenbooker sync' },
+          })
+        } catch (e) {
+          logger.error(`[Zenbooker] updateJobStatus failed for job ${existing.id}: ${e.message}`)
+        }
+      }
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
 
       // Delete ledger entries when job is cancelled via Zenbooker webhook
@@ -649,8 +670,20 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         logger.log(`[Zenbooker] Ledger entries removed for cancelled job ${existing.id}`)
       }
     } else {
-      const { data: newJob } = await supabase.from('jobs').insert(mapped).select('id').single()
+      // First-time insert — status ships with the row directly.
+      // No centralized service here because the row didn't exist yet;
+      // updateJobStatus would 404. maybeEmitInsertEvent handles the
+      // LB-linked case below (but ZB-sourced jobs won't have lb_*
+      // fields, so this is effectively a no-op for now).
+      const { data: newJob } = await supabase.from('jobs').insert(mapped).select().single()
       jobId = newJob?.id
+      if (newJob) {
+        maybeEmitInsertEvent(supabase, newJob, {
+          type: 'system',
+          id: null,
+          display_name: 'Zenbooker sync',
+        }).catch((e) => logger.warn(`[LB Outbound] ZB insert emit skipped: ${e?.message}`))
+      }
       logger.log(`[Zenbooker] Job created: ${data.id} (${eventType})`)
     }
 

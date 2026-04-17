@@ -18,10 +18,33 @@ const express = require('express')
 const axios = require('axios')
 const crypto = require('crypto')
 
+const {
+  encryptIntegrationSecret,
+  currentEncKeyVersion,
+} = require('./services/lb-encryption')
+
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
 // In-memory sync progress per user
 const syncProgress = {}
+
+// Outbound subscription fields — kept in one place so we never miss
+// one when clearing / reading. The outbound layer is a second
+// direction of THIS integration, not a separate entity.
+const OUTBOUND_COLUMNS = [
+  'leadbridge_outbound_subscription_id',
+  'leadbridge_outbound_encrypted_secret',
+  'leadbridge_outbound_secret_key_version',
+  'leadbridge_outbound_webhook_url',
+  'leadbridge_outbound_events',
+  'leadbridge_outbound_registered_at',
+  'leadbridge_outbound_last_event_at',
+]
+
+// LB subscribe path — see geos-leadbridge/plans/2026-04-17-job-sync-sf-lb.md.
+// LB_BASE already includes /api; the shipped contract is versioned under /v1.
+const LB_SUBSCRIBE_PATH = '/v1/integrations/service-flow/subscribe'
+const LB_SF_INBOUND_PATH = '/v1/integrations/service-flow/job-status'
 
 module.exports = (supabase, logger) => {
   const router = express.Router()
@@ -547,13 +570,150 @@ module.exports = (supabase, logger) => {
         }
       }
 
+      // 5. Register SF as LB's outbound subscription target.
+      //    This adds the SECOND DIRECTION of the same integration
+      //    (SF → LB job-status delivery). Failure here MUST NOT fail
+      //    the connect flow — LB ingest still works without outbound.
+      //    We surface the outcome in the response so the UI can flag
+      //    partial success and the user knows to reconnect if needed.
+      const outboundResult = await registerOutboundSubscription(userId, lbToken)
+      if (outboundResult.registered) {
+        logger.log(`[LB] Outbound subscription registered for user ${userId} — sub_id=${outboundResult.subscriptionId}`)
+      } else {
+        logger.warn(`[LB] Outbound subscription NOT registered for user ${userId}: ${outboundResult.reason}`)
+      }
+
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
-      res.json({ success: true, accounts, userId: lbUserId })
+      res.json({
+        success: true,
+        accounts,
+        userId: lbUserId,
+        direction_inbound: { active: true, accounts: accounts.length },
+        direction_outbound: {
+          active: outboundResult.registered,
+          subscription_id: outboundResult.subscriptionId || null,
+          registered_at: outboundResult.registeredAt || null,
+          error: outboundResult.registered ? null : outboundResult.reason,
+        },
+        reconnect_required: !outboundResult.registered,
+      })
     } catch (error) {
       logger.error('[LB] Connect error:', error.message)
       res.status(500).json({ error: 'Failed to connect LeadBridge' })
     }
   })
+
+  // ══════════════════════════════════════
+  // Outbound subscription helpers (§2a, §2c, §2d of plan)
+  //
+  // Note: LB's /subscribe is idempotent for the same user — "rotating"
+  // the outbound secret just means calling it again, so /reconnect
+  // below simply reuses this helper with the current stored LB token.
+  // ══════════════════════════════════════
+
+  async function registerOutboundSubscription(userId, lbToken) {
+    try {
+      const subRes = await lbRequest('POST', LB_SUBSCRIBE_PATH, lbToken, {
+        name: 'Service Flow',
+        sourceInstance: process.env.SF_INSTANCE || 'sf-prod',
+        events: ['job.status_changed'],
+      })
+
+      const body = subRes?.data || {}
+      const sub = body.subscription || body
+      if (!body.success && !sub?.id) {
+        return { registered: false, reason: `bad_response: ${JSON.stringify(body).slice(0, 200)}` }
+      }
+      if (!sub?.secret) {
+        return { registered: false, reason: 'no_secret_returned' }
+      }
+
+      const encryptedSecret = encryptIntegrationSecret(sub.secret)
+      const registeredAt = new Date().toISOString()
+      const webhookUrl = sub.webhookUrl || `${LB_BASE}${LB_SF_INBOUND_PATH}`
+
+      const { error: upErr } = await supabase.from('communication_settings').update({
+        leadbridge_outbound_subscription_id: sub.id,
+        leadbridge_outbound_encrypted_secret: encryptedSecret,
+        leadbridge_outbound_secret_key_version: currentEncKeyVersion(),
+        leadbridge_outbound_webhook_url: webhookUrl,
+        leadbridge_outbound_events: sub.events || ['job.status_changed'],
+        leadbridge_outbound_registered_at: registeredAt,
+        updated_at: new Date().toISOString(),
+      }).eq('user_id', userId)
+      if (upErr) return { registered: false, reason: `db_update_failed: ${upErr.message}` }
+
+      return {
+        registered: true,
+        subscriptionId: sub.id,
+        registeredAt,
+        events: sub.events || ['job.status_changed'],
+      }
+    } catch (e) {
+      return { registered: false, reason: `subscribe_error: ${e.response?.status || ''} ${e.message}` }
+    }
+  }
+
+  async function clearOutboundSubscription(userId) {
+    const patch = { updated_at: new Date().toISOString() }
+    for (const col of OUTBOUND_COLUMNS) patch[col] = null
+    await supabase.from('communication_settings').update(patch).eq('user_id', userId)
+  }
+
+  async function buildIntegrationStatus(userId) {
+    const settings = await getLbSettings(userId)
+    const connected = Boolean(settings?.leadbridge_connected)
+    if (!connected) {
+      return {
+        leadbridge_connected: false,
+        direction_inbound: { active: false, accounts: 0 },
+        direction_outbound: { active: false },
+        reconnect_required: false,
+      }
+    }
+
+    const { count: accountCount } = await supabase
+      .from('communication_provider_accounts')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId).eq('provider', 'leadbridge').eq('status', 'active')
+
+    const { data: outboundRow } = await supabase
+      .from('communication_settings')
+      .select([
+        'leadbridge_outbound_subscription_id',
+        'leadbridge_outbound_registered_at',
+        'leadbridge_outbound_last_event_at',
+      ].join(','))
+      .eq('user_id', userId).maybeSingle()
+
+    const outboundActive = Boolean(outboundRow?.leadbridge_outbound_subscription_id)
+
+    // Backlog + deferral signal — drives the "reconnect required" flag
+    // when events are piling up because the user has not re-registered
+    // outbound since Phase 6 rollout.
+    const { count: deferredCount } = await supabase
+      .from('leadbridge_outbound_events')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId).eq('state', 'pending').eq('defer_reason', 'no_outbound_subscription')
+
+    const { count: backlogCount } = await supabase
+      .from('leadbridge_outbound_events')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId).eq('state', 'pending')
+
+    return {
+      leadbridge_connected: true,
+      direction_inbound: { active: true, accounts: accountCount || 0 },
+      direction_outbound: {
+        active: outboundActive,
+        subscription_id: outboundRow?.leadbridge_outbound_subscription_id || null,
+        registered_at: outboundRow?.leadbridge_outbound_registered_at || null,
+        last_event_at: outboundRow?.leadbridge_outbound_last_event_at || null,
+        backlog: backlogCount || 0,
+      },
+      reconnect_required: !outboundActive || (deferredCount || 0) > 0,
+    }
+  }
 
   // ══════════════════════════════════════
   // GET /status — Connection status
@@ -611,18 +771,75 @@ module.exports = (supabase, logger) => {
         .update({ status: 'disconnected', updated_at: new Date().toISOString() })
         .eq('user_id', userId).eq('provider', 'leadbridge')
 
-      // Clear settings
-      await supabase.from('communication_settings').update({
+      // Clear settings — BOTH directions of the integration. Any
+      // outbox rows still in 'pending' for this user are left alone:
+      // the drainer will keep deferring them with
+      // defer_reason='no_outbound_subscription' on the long backoff
+      // until the user reconnects (or the per-row DLQ cap fires).
+      const patch = {
         leadbridge_connected: false,
         leadbridge_integration_token: null,
         leadbridge_user_id: null,
         updated_at: new Date().toISOString(),
-      }).eq('user_id', userId)
+      }
+      for (const col of OUTBOUND_COLUMNS) patch[col] = null
+      await supabase.from('communication_settings').update(patch).eq('user_id', userId)
 
-      logger.log(`[LB] Disconnected for user ${userId}`)
-      res.json({ success: true })
+      logger.log(`[LB] Disconnected for user ${userId} (both directions cleared)`)
+      res.json({
+        success: true,
+        direction_inbound: { active: false, accounts: 0 },
+        direction_outbound: { active: false },
+      })
     } catch (error) {
       res.status(500).json({ error: 'Failed to disconnect LeadBridge' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // POST /reconnect — re-register outbound subscription without full
+  // disconnect/connect. Rotates the HMAC secret (LB issues a new one).
+  // See §2c of the plan.
+  // ══════════════════════════════════════
+  router.post('/reconnect', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const settings = await getLbSettings(userId)
+      if (!settings?.leadbridge_connected || !settings.leadbridge_integration_token) {
+        return res.status(400).json({ error: 'LeadBridge not connected — run /connect first' })
+      }
+      const result = await registerOutboundSubscription(userId, settings.leadbridge_integration_token)
+      if (!result.registered) {
+        return res.status(502).json({ error: 'Failed to register outbound subscription', reason: result.reason })
+      }
+      res.json({
+        success: true,
+        direction_outbound: {
+          active: true,
+          subscription_id: result.subscriptionId,
+          registered_at: result.registeredAt,
+        },
+      })
+    } catch (error) {
+      logger.error('[LB] Reconnect error:', error.message)
+      res.status(500).json({ error: 'Failed to reconnect LeadBridge' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // GET / — integration status (both directions).
+  //
+  // Mounted at /api/integrations/leadbridge, so this responds to
+  // GET /api/integrations/leadbridge. Response payload follows §2e
+  // of the plan so the UI can render reconnect CTAs / backlogs.
+  // ══════════════════════════════════════
+  router.get('/', authenticateToken, async (req, res) => {
+    try {
+      const status = await buildIntegrationStatus(req.user.userId)
+      res.json(status)
+    } catch (error) {
+      logger.error('[LB] Integration status error:', error.message)
+      res.status(500).json({ error: 'Failed to fetch integration status' })
     }
   })
 
@@ -957,6 +1174,110 @@ module.exports = (supabase, logger) => {
       syncProgress[userId] = { status: 'error', error: error.message }
     }
   }
+
+  // ══════════════════════════════════════
+  // Admin / observability endpoints — §10 of the plan.
+  //
+  // Mounted under the same /api/integrations/leadbridge namespace as
+  // the lifecycle routes. There is no separate "outbound admin" page
+  // — both directions share one integration surface.
+  //
+  // Auth is the existing JWT. A role gate would belong in the
+  // underlying auth middleware; we don't add a second one here so
+  // the caller's existing access control applies uniformly.
+  // ══════════════════════════════════════
+
+  // GET /outbound/events — list outbox rows (filterable)
+  router.get('/outbound/events', authenticateToken, async (req, res) => {
+    try {
+      const {
+        user_id,
+        sf_job_id,
+        event_id,
+        state,
+        defer_reason,
+        since,
+        limit,
+      } = req.query
+
+      const cap = Math.min(parseInt(limit, 10) || 50, 200)
+      let q = supabase
+        .from('leadbridge_outbound_events')
+        .select('id, event_id, user_id, sf_job_id, event_type, state, result, defer_reason, attempts, next_attempt_at, last_error, last_attempt_at, created_at, terminal_at')
+        .order('created_at', { ascending: false })
+        .limit(cap)
+
+      if (user_id) q = q.eq('user_id', user_id)
+      if (sf_job_id) q = q.eq('sf_job_id', String(sf_job_id))
+      if (event_id) q = q.eq('event_id', event_id)
+      if (state) q = q.eq('state', state)
+      if (defer_reason) q = q.eq('defer_reason', defer_reason)
+      if (since) q = q.gte('created_at', since)
+
+      const { data, error } = await q
+      if (error) return res.status(500).json({ error: error.message })
+      res.json({ events: data || [], limit: cap })
+    } catch (error) {
+      logger.error('[LB Outbound Admin] List error:', error.message)
+      res.status(500).json({ error: 'Failed to list outbound events' })
+    }
+  })
+
+  // POST /outbound/events/:id/replay — force a row back into the queue
+  //
+  // Accepts:
+  //   - state='dlq'
+  //   - state='skipped_unmapped_status'
+  //   - state='pending' with defer_reason='no_outbound_subscription'
+  //   - state='sent' AND result='dry_run'
+  //
+  // PRESERVES the original event_id and payload_json — required for
+  // LB idempotency. Never rebuilds from current job state.
+  router.post('/outbound/events/:id/replay', authenticateToken, async (req, res) => {
+    try {
+      const { id } = req.params
+      const { data: row, error: fetchErr } = await supabase
+        .from('leadbridge_outbound_events')
+        .select('id, state, result, defer_reason')
+        .eq('id', id).maybeSingle()
+
+      if (fetchErr) return res.status(500).json({ error: fetchErr.message })
+      if (!row) return res.status(404).json({ error: 'Event not found' })
+
+      const replayable =
+        row.state === 'dlq' ||
+        row.state === 'skipped_unmapped_status' ||
+        (row.state === 'pending' && row.defer_reason === 'no_outbound_subscription') ||
+        (row.state === 'sent' && row.result === 'dry_run')
+
+      if (!replayable) {
+        return res.status(409).json({
+          error: `Not replayable from state='${row.state}' result='${row.result}' defer_reason='${row.defer_reason}'`,
+        })
+      }
+
+      const { error: upErr } = await supabase
+        .from('leadbridge_outbound_events')
+        .update({
+          state: 'pending',
+          attempts: 0,
+          next_attempt_at: new Date().toISOString(),
+          claimed_by: null,
+          claimed_until: null,
+          last_error: null,
+          defer_reason: null,
+          terminal_at: null,
+          // event_id + payload_json explicitly NOT touched.
+        })
+        .eq('id', id)
+
+      if (upErr) return res.status(500).json({ error: upErr.message })
+      res.json({ success: true, id })
+    } catch (error) {
+      logger.error('[LB Outbound Admin] Replay error:', error.message)
+      res.status(500).json({ error: 'Failed to replay event' })
+    }
+  })
 
   return router
 }
