@@ -10,7 +10,9 @@
         "test:watch": "jest --watch",
         "test:coverage": "jest --coverage",
         "lint": "eslint server.js supabase.js",
-        "lint:fix": "eslint server.js supabase.js --fix"
+        "lint:fix": "eslint server.js supabase.js --fix",
+        "guard:status": "node scripts/check-job-status-writes.js",
+        "ci": "npm run guard:status && npm test"
     },
     "keywords": [
         "nodejs",
