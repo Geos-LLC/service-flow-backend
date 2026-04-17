@@ -125,12 +125,15 @@ async function validateMailboxAccess(tokens, targetMailboxEmail) {
     const code = e.response?.data?.error?.code
     const msg = e.response?.data?.error?.message || e.message
     console.error(`[outlook] validateMailboxAccess failed: status=${status} code=${code} msg=${msg}`)
-    const isAccessDenied = status === 403 || status === 401 || code === 'ErrorAccessDenied' || code === 'ErrorItemNotFound'
+    const isAccessDenied = status === 403 || status === 401 || code === 'ErrorAccessDenied' || code === 'ErrorItemNotFound' || code === 'MailboxNotEnabledForRESTAPI'
     return {
       accessible: false,
       error: isAccessDenied
         ? `Access denied to ${targetMailboxEmail}. The signed-in user needs "Full Access" permission on this shared mailbox.`
         : `Cannot access ${targetMailboxEmail}: ${msg}`,
+      graphStatus: status || null,
+      graphCode: code || null,
+      graphMessage: msg || null,
       helpUrl: isAccessDenied ? 'https://admin.exchange.microsoft.com/#/mailboxes' : null,
       helpSteps: isAccessDenied ? [
         `Open Exchange Admin Center: https://admin.exchange.microsoft.com`,

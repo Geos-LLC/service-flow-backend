@@ -296,12 +296,22 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   // ══════════════════════════════════════════════════════════════
   router.post('/accounts/:id/validate-mailbox', auth, async (req, res) => {
     try {
-      const acct = await store.getWithTokens(supabase, req.params.id)
+      let acct = await store.getWithTokens(supabase, req.params.id)
       if (!acct || acct.user_id !== req.user.id) return res.status(404).json({ error: 'not found' })
       if (acct.provider !== 'outlook') return res.status(400).json({ error: 'shared mailbox only supported for Outlook' })
       const { mailboxEmail } = req.body || {}
       if (!mailboxEmail?.trim()) return res.status(400).json({ error: 'mailboxEmail required' })
+
+      // Refresh token before validation — expired tokens show as "access denied".
       const outlook = getProvider('outlook')
+      try {
+        const refreshed = await outlook.refreshToken({ refreshToken: acct.refreshToken })
+        await store.updateTokens(supabase, acct.id, refreshed)
+        acct = { ...acct, accessToken: refreshed.accessToken }
+      } catch (e) {
+        log.warn?.(`[connected-email] validate-mailbox token refresh: ${e.message}`)
+      }
+
       const result = await outlook.validateMailboxAccess(
         { accessToken: acct.accessToken, refreshToken: acct.refreshToken },
         mailboxEmail.trim().toLowerCase()
