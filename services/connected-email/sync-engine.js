@@ -47,9 +47,6 @@ function getProgress(accountId) {
 function clearProgress(accountId) { progressMap.delete(accountId) }
 
 async function claimLock(supabase, accountId) {
-  // Release stuck locks first.
-  await supabase.rpc('noop').catch(() => {}) // no-op just to warm
-
   const { data: state } = await supabase
     .from('connected_email_sync_state')
     .select('*')
