@@ -9153,6 +9153,20 @@ app.post('/api/lead-sources', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed to create lead source' }); }
 });
 
+// Reorder sources (bulk update sort_order) — MUST be before /:id route
+app.put('/api/lead-sources/reorder', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { order } = req.body; // array of source IDs in desired order
+    if (!Array.isArray(order)) return res.status(400).json({ error: 'order array required' });
+    for (let i = 0; i < order.length; i++) {
+      await supabase.from('lead_sources').update({ sort_order: i }).eq('id', order[i]).eq('user_id', userId);
+    }
+    const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
+    res.json({ sources: data || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to reorder sources' }); }
+});
+
 app.put('/api/lead-sources/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -9178,20 +9192,6 @@ app.delete('/api/lead-sources/:id', authenticateToken, async (req, res) => {
     if (error) return res.status(500).json({ error: 'Failed to delete lead source' });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to delete lead source' }); }
-});
-
-// Reorder sources (bulk update sort_order)
-app.put('/api/lead-sources/reorder', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { order } = req.body; // array of source IDs in desired order
-    if (!Array.isArray(order)) return res.status(400).json({ error: 'order array required' });
-    for (let i = 0; i < order.length; i++) {
-      await supabase.from('lead_sources').update({ sort_order: i }).eq('id', order[i]).eq('user_id', userId);
-    }
-    const { data } = await supabase.from('lead_sources').select('*').eq('user_id', userId).order('sort_order');
-    res.json({ sources: data || [] });
-  } catch (e) { res.status(500).json({ error: 'Failed to reorder sources' }); }
 });
 
 // Seed default sources for a user (called on first load if empty)
