@@ -154,9 +154,10 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         refreshToken: tokens.refreshToken,
       })
 
-      // Store with auth identity. For Outlook, target_mailbox defaults to
-      // auth email (primary); user can select a shared mailbox via the UI after.
-      // For Gmail, auth = target always (no shared mailbox concept).
+      // Store with auth identity. For Outlook, status='awaiting_selection'
+      // until the user explicitly picks a mailbox (prevents /me sync leaking
+      // auto-mapped shared mailboxes into the primary inbox). For Gmail,
+      // auth = target always, no picker needed.
       await store.upsertAccount(supabase, {
         userId: stateRow.user_id,
         provider,
@@ -168,6 +169,7 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         authDisplayName: profile.displayName,
         targetMailboxEmail: profile.emailAddress,
         mailboxType: 'primary',
+        initialStatus: provider === 'outlook' ? 'awaiting_selection' : 'connected',
       })
 
       // For Gmail: kick sync asynchronously (no mailbox picker).
@@ -375,14 +377,15 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         log.warn?.(`[connected-email] select-mailbox cleanup: ${e.message}`)
       }
 
-      // Update account — set target + reset sync cursor (different mailbox = different delta).
+      // Update account — set target + reset sync cursor + flip status to connected.
       await supabase.from('connected_email_accounts').update({
         target_mailbox_email: finalTarget,
         target_mailbox_display_name: null,
         mailbox_type: mailboxType,
-        email_address: finalTarget, // email_address = operative mailbox
-        history_cursor: null, // reset — new mailbox needs fresh delta
-        initial_sync_completed_at: null, // force initial sync for new mailbox
+        email_address: finalTarget,
+        status: 'connected', // was 'awaiting_selection' for fresh Outlook connects
+        history_cursor: null,
+        initial_sync_completed_at: null,
         last_sync_at: null,
         updated_at: new Date().toISOString(),
       }).eq('id', req.params.id)

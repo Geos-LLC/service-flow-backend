@@ -68,7 +68,7 @@ async function getWithTokens(supabase, accountId) {
   return { ...stripTokens(data), accessToken, refreshToken }
 }
 
-async function upsertAccount(supabase, { userId, provider, emailAddress, displayName, tokens, scopes, authEmailAddress, authDisplayName, targetMailboxEmail, mailboxType }) {
+async function upsertAccount(supabase, { userId, provider, emailAddress, displayName, tokens, scopes, authEmailAddress, authDisplayName, targetMailboxEmail, mailboxType, initialStatus }) {
   const accessEnc = encrypt(tokens.accessToken)
   const refreshEnc = encrypt(tokens.refreshToken)
   const row = {
@@ -81,7 +81,7 @@ async function upsertAccount(supabase, { userId, provider, emailAddress, display
     target_mailbox_email: targetMailboxEmail ? String(targetMailboxEmail).toLowerCase() : String(emailAddress).toLowerCase(),
     target_mailbox_display_name: null,
     mailbox_type: mailboxType || 'primary',
-    status: 'connected',
+    status: initialStatus || 'connected',
     access_token_ciphertext: accessEnc.ciphertext,
     access_token_iv: accessEnc.iv,
     access_token_auth_tag: accessEnc.authTag,
