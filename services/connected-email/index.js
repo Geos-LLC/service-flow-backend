@@ -355,6 +355,21 @@ module.exports = function buildConnectedEmail(supabase, logger) {
         if (!check.accessible) return res.status(403).json({ error: check.error })
       }
 
+      // Remove any disconnected row that would conflict on the unique index
+      // (user_id, provider, email_address) when we rename to finalTarget.
+      try {
+        await supabase
+          .from('connected_email_accounts')
+          .delete()
+          .eq('user_id', req.user.id)
+          .eq('provider', 'outlook')
+          .eq('email_address', finalTarget)
+          .eq('status', 'disconnected')
+          .neq('id', req.params.id)
+      } catch (e) {
+        log.warn?.(`[connected-email] select-mailbox conflict cleanup: ${e.message}`)
+      }
+
       // Wipe any conversations/messages that were synced BEFORE mailbox selection
       // (e.g. leaked from auto-mapped shared mailboxes during pre-selection sync).
       // Scope: user + provider=outlook, not yet linked to the chosen target.
@@ -378,17 +393,21 @@ module.exports = function buildConnectedEmail(supabase, logger) {
       }
 
       // Update account — set target + reset sync cursor + flip status to connected.
-      await supabase.from('connected_email_accounts').update({
+      const { error: updateErr } = await supabase.from('connected_email_accounts').update({
         target_mailbox_email: finalTarget,
         target_mailbox_display_name: null,
         mailbox_type: mailboxType,
         email_address: finalTarget,
-        status: 'connected', // was 'awaiting_selection' for fresh Outlook connects
+        status: 'connected',
         history_cursor: null,
         initial_sync_completed_at: null,
         last_sync_at: null,
         updated_at: new Date().toISOString(),
       }).eq('id', req.params.id)
+      if (updateErr) {
+        log.error?.(`[connected-email] select-mailbox update: ${updateErr.message}`)
+        return res.status(500).json({ error: `Database update failed: ${updateErr.message}` })
+      }
 
       // Also reset sync state so poller picks it up immediately.
       await supabase.from('connected_email_sync_state').upsert({
