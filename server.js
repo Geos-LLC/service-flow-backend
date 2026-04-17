@@ -21578,7 +21578,10 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     // Log changes to payroll_edits
     if (edits.length > 0) {
       const editRows = edits.map(e => ({ user_id: userId, job_id: parseInt(id), field: e.field, old_value: e.old_value, new_value: e.new_value, edited_by: userId }));
-      await supabase.from('payroll_edits').insert(editRows).catch(err => console.error('Audit log error:', err));
+      try {
+        const { error: auditErr } = await supabase.from('payroll_edits').insert(editRows);
+        if (auditErr) console.error('Audit log error:', auditErr);
+      } catch (e) { console.error('Audit log threw:', e.message); }
     }
 
     // === Ledger sync strategy ===
@@ -28331,10 +28334,12 @@ app.post('/api/transactions/:id/void', authenticateToken, async (req, res) => {
     }
 
     // Log to payroll_edits for audit
-    await supabase.from('payroll_edits').insert({
-      user_id: userId, job_id: tx.job_id, field: 'transaction_voided',
-      old_value: `${tx.payment_method} $${tx.amount}`, new_value: 'voided', edited_by: userId
-    }).catch(() => {});
+    try {
+      await supabase.from('payroll_edits').insert({
+        user_id: userId, job_id: tx.job_id, field: 'transaction_voided',
+        old_value: `${tx.payment_method} $${tx.amount}`, new_value: 'voided', edited_by: userId
+      });
+    } catch (_) {}
 
     res.json({ success: true, message: 'Transaction voided' });
   } catch (error) {
