@@ -188,6 +188,12 @@ async function syncAccount(supabase, logger, accountId) {
       setProgress(accountId, { phase: 'done', error: 'disconnected' })
       return { skipped: true, reason: 'disconnected' }
     }
+    // Outlook accounts pending mailbox selection — don't sync yet.
+    if (account.status === 'awaiting_selection') {
+      await releaseLock(supabase, accountId, { success: true, messagesSynced: 0 })
+      setProgress(accountId, { phase: 'done' })
+      return { skipped: true, reason: 'awaiting_selection' }
+    }
 
     const provider = getProvider(account.provider)
     account = await ensureFreshToken(supabase, account, provider)
