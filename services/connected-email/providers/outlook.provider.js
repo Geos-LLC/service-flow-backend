@@ -13,9 +13,15 @@
 const axios = require('axios')
 
 const AUTHORITY = process.env.MS_OAUTH_AUTHORITY || 'https://login.microsoftonline.com/common'
+// Delegated permissions — Mail.Read.Shared / Mail.Send.Shared are REQUIRED
+// for shared mailbox access via /users/{shared}/... paths. Without them,
+// Graph returns ErrorAccessDenied even when Exchange delegation is set up.
+// Mail.Read / Mail.Send alone only grant /me access.
 const SCOPES = [
   'https://graph.microsoft.com/Mail.Read',
   'https://graph.microsoft.com/Mail.Send',
+  'https://graph.microsoft.com/Mail.Read.Shared',
+  'https://graph.microsoft.com/Mail.Send.Shared',
   'offline_access',
   'openid',
   'email',
