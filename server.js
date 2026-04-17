@@ -1069,7 +1069,8 @@ try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(su
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
-try { app.use('/api', require('./job-expense-service')(supabase, logger)); } catch (e) { console.log('Job expense module not loaded:', e.message); }
+let jobExpenseRouter = null;
+try { jobExpenseRouter = require('./job-expense-service')(supabase, logger); app.use('/api', jobExpenseRouter); } catch (e) { console.log('Job expense module not loaded:', e.message); }
 
 // Connected Email (Gmail/Outlook OAuth) — System 2 for Communications Hub.
 // Loosely coupled: removing this block + services/connected-email/ = feature gone, zero side effects.
@@ -6495,13 +6496,21 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // === LEDGER CLEANUP: Remove ledger entries when job leaves earnings status ===
+    // === LEDGER CLEANUP: Remove completion-derived entries when job leaves earnings status ===
     // Covers: cancel, reschedule, reset to pending
+    // Only deletes entries derived from completion (earning/tip/incentive/cash_collected).
+    // reimbursement / expense_deduction / adjustment / payout entries are preserved —
+    // those survive a status change (e.g. cancellation reimbursement must not be wiped).
+    const COMPLETION_DERIVED_TYPES = ['earning', 'tip', 'incentive', 'cash_collected'];
     if (earningsStatuses.includes(previousStatus) && !earningsStatuses.includes(status)) {
       try {
-        const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).select('id');
+        const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger')
+          .delete()
+          .eq('job_id', parseInt(id))
+          .in('type', COMPLETION_DERIVED_TYPES)
+          .select('id');
         if (delErr) console.error(`⚠️ Error removing ledger entries for ${status} job:`, delErr);
-        else console.log(`[Ledger] Removed ${deletedEntries?.length || 0} entries for job ${id} (${previousStatus} → ${status})`);
+        else console.log(`[Ledger] Removed ${deletedEntries?.length || 0} completion entries for job ${id} (${previousStatus} → ${status})`);
       } catch (ledgerError) {
         console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
       }
@@ -6509,7 +6518,10 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
     // Also clean up if directly set to cancelled/rescheduled from non-earnings status (e.g. pending→cancelled)
     if ((status === 'cancelled' || status === 'rescheduled') && !earningsStatuses.includes(previousStatus)) {
       try {
-        await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id));
+        await supabase.from('cleaner_ledger')
+          .delete()
+          .eq('job_id', parseInt(id))
+          .in('type', COMPLETION_DERIVED_TYPES);
       } catch (ledgerError) {
         // Non-blocking — there may be no entries to delete
       }
@@ -6522,6 +6534,185 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update job status error:', error);
     res.status(500).json({ error: 'Failed to update job status' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/jobs/:id/cancel — cancel with optional financial handling
+// ══════════════════════════════════════════════════════════════
+// Atomic replacement for the plain status PATCH when cancelling.
+// Accepts:
+//   - cancellation_fee            (number, optional, ≥0)  client-side receivable
+//   - cleaner_reimbursement       (number, optional, ≥0)  cleaner-side payout
+//   - reimbursement_team_member_id (int, required if reimbursement > 0)
+//   - reason                      (string, optional)      dropdown key or free text
+//   - notes                       (string, optional)      internal notes
+//
+// Does NOT mutate service_price / additional_fees / discount.
+// Fee is recorded on the job row (distinct from service revenue).
+// Reimbursement is recorded via job_expenses → cleaner_ledger through the
+// existing approval flow (idempotent, batching-locked, auditable).
+const VALID_CANCEL_REASONS = ['client_cancelled_late', 'client_no_show', 'locked_out', 'cleaner_en_route', 'other'];
+
+app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const jobId = parseInt(req.params.id);
+    if (isNaN(jobId)) return res.status(400).json({ error: 'Invalid job ID' });
+
+    const fee = req.body.cancellation_fee == null || req.body.cancellation_fee === ''
+      ? 0 : parseFloat(req.body.cancellation_fee);
+    const reimb = req.body.cleaner_reimbursement == null || req.body.cleaner_reimbursement === ''
+      ? 0 : parseFloat(req.body.cleaner_reimbursement);
+    const reimbMemberId = req.body.reimbursement_team_member_id
+      ? parseInt(req.body.reimbursement_team_member_id) : null;
+    const reason = req.body.reason ? String(req.body.reason).slice(0, 64) : null;
+    const notes = req.body.notes ? String(req.body.notes) : null;
+
+    if (isNaN(fee) || fee < 0) return res.status(400).json({ error: 'cancellation_fee must be ≥ 0' });
+    if (isNaN(reimb) || reimb < 0) return res.status(400).json({ error: 'cleaner_reimbursement must be ≥ 0' });
+    if (reimb > 0 && !reimbMemberId) {
+      return res.status(400).json({ error: 'reimbursement_team_member_id is required when cleaner_reimbursement > 0' });
+    }
+    if (reason && !VALID_CANCEL_REASONS.includes(reason) && reason.length === 0) {
+      // Free-text allowed; enum check is a soft allowlist — anything non-empty passes
+    }
+
+    // Verify ownership + fetch previous status
+    const { data: job, error: fetchErr } = await supabase
+      .from('jobs')
+      .select('id, status, scheduled_date, cancellation_fee_status')
+      .eq('id', jobId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (fetchErr) return res.status(500).json({ error: 'Failed to fetch job' });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    // If a prior fee was marked paid, we cannot silently mutate it.
+    if (job.cancellation_fee_status === 'paid' && fee > 0 && fee !== job.cancellation_fee) {
+      return res.status(409).json({ error: 'Cancellation fee is already marked paid. Create a reversal before changing the amount.' });
+    }
+
+    const previousStatus = job.status || 'pending';
+    const now = new Date().toISOString();
+
+    // 1. Update job: set status=cancelled + fields
+    const update = {
+      status: 'cancelled',
+      cancellation_reason: reason,
+      cancellation_notes: notes,
+      cancellation_fee: fee > 0 ? fee : null,
+      cancellation_fee_status: fee > 0 ? (job.cancellation_fee_status === 'paid' ? 'paid' : 'pending') : null,
+      cancelled_at: now,
+      cancelled_by: userId,
+      updated_at: now,
+    };
+    const { error: updErr } = await supabase.from('jobs').update(update).eq('id', jobId).eq('user_id', userId);
+    if (updErr) {
+      console.error('[Cancel] Job update failed:', updErr);
+      return res.status(500).json({ error: 'Failed to cancel job' });
+    }
+
+    // 2. Status history (best-effort)
+    try {
+      await supabase.from('job_status_history').insert({
+        job_id: jobId,
+        status: 'cancelled',
+        previous_status: previousStatus,
+        changed_by: 'Staff',
+        changed_by_type: 'account_owner',
+        changed_at: now,
+      });
+    } catch (e) { /* table may not exist */ }
+
+    // 3. Ledger cleanup: delete completion-derived entries (earning/tip/incentive/cash_collected).
+    //    Preserve reimbursement / adjustment / payout / expense_deduction rows.
+    const COMPLETION_DERIVED_TYPES = ['earning', 'tip', 'incentive', 'cash_collected'];
+    try {
+      await supabase.from('cleaner_ledger')
+        .delete()
+        .eq('job_id', jobId)
+        .in('type', COMPLETION_DERIVED_TYPES);
+    } catch (e) {
+      console.error('[Cancel] Ledger cleanup error (non-blocking):', e.message);
+    }
+
+    // 4. Cleaner reimbursement (if requested) — goes through job_expenses approval flow.
+    let reimbursementResult = null;
+    if (reimb > 0 && reimbMemberId && jobExpenseRouter?.syncReimbursementLedger) {
+      try {
+        // Resolve team_member_id if caller passed a users.id for the account owner
+        let resolvedMemberId = reimbMemberId;
+        const { data: member } = await supabase.from('team_members').select('id').eq('id', resolvedMemberId).maybeSingle();
+        if (!member) {
+          const { data: owner } = await supabase.from('users').select('id, email, first_name, last_name, phone').eq('id', resolvedMemberId).maybeSingle();
+          if (owner && parseInt(owner.id) === parseInt(userId)) {
+            const { data: existingTm } = await supabase.from('team_members')
+              .select('id').eq('user_id', userId).eq('role', 'account owner').maybeSingle();
+            if (existingTm) {
+              resolvedMemberId = existingTm.id;
+            } else {
+              const { data: newTm } = await supabase.from('team_members').insert({
+                user_id: userId,
+                email: owner.email,
+                first_name: owner.first_name,
+                last_name: owner.last_name,
+                phone: owner.phone,
+                role: 'account owner',
+                status: 'active',
+                is_service_provider: true,
+              }).select('id').single();
+              resolvedMemberId = newTm?.id;
+            }
+          } else {
+            return res.status(400).json({ error: 'Selected team member not found.' });
+          }
+        }
+
+        // Insert the expense row already in approved state — approval flow is owned by us here.
+        const { data: createdExpense, error: expErr } = await supabase.from('job_expenses').insert({
+          user_id: userId,
+          job_id: jobId,
+          team_member_id: resolvedMemberId,
+          expense_type: 'cancellation',
+          description: reason ? `Cancellation reimbursement (${reason})` : 'Cancellation reimbursement',
+          amount: reimb,
+          paid_by: 'team_member',
+          customer_billable: false,
+          reimbursable_to_team_member: true,
+          status: 'approved',
+          note: notes,
+          approved_at: now,
+          approved_by: userId,
+          created_by: userId,
+        }).select().single();
+
+        if (expErr) {
+          console.error('[Cancel] Expense insert failed:', expErr);
+          reimbursementResult = { error: expErr.message };
+        } else {
+          // Sync to cleaner_ledger via the shared helper (idempotent, batching-locked).
+          const syncRes = await jobExpenseRouter.syncReimbursementLedger(createdExpense, userId);
+          reimbursementResult = { expense_id: createdExpense.id, ledger: syncRes };
+          console.log(`[Cancel] Reimbursement created for job ${jobId}: expense ${createdExpense.id}, ledger ${syncRes.action}`);
+        }
+      } catch (e) {
+        console.error('[Cancel] Reimbursement error:', e.message);
+        reimbursementResult = { error: e.message };
+      }
+    }
+
+    res.json({
+      message: 'Job cancelled',
+      job_id: jobId,
+      previous_status: previousStatus,
+      cancellation_fee: fee > 0 ? fee : null,
+      cancellation_fee_status: update.cancellation_fee_status,
+      reimbursement: reimbursementResult,
+    });
+  } catch (error) {
+    console.error('Cancel job error:', error);
+    res.status(500).json({ error: 'Failed to cancel job' });
   }
 });
 
@@ -35184,8 +35375,10 @@ async function handleWhatsAppWebhook(event, payload) {
         autoLinkConversation(userId, newConv.id, participantPhone);
       }
 
-      // Upsert message: update if exists (by provider_message_id or sigcore conv+body+timestamp), insert if new
-      const sigcoreMessageId = msg.sigcoreMessageId || msg.messageId || null;
+      // Upsert message: update if exists (by provider_message_id), insert if new
+      // Sigcore sends the UUID as msg.id when externalMessageId is the WhatsApp-native ID
+      const sigcoreMessageId = msg.sigcoreMessageId || msg.messageId
+        || (msg.externalMessageId && msg.id !== msg.externalMessageId ? msg.id : null);
       const { data: existingMsg } = await supabase.from('communication_messages')
         .select('id').eq('provider_message_id', externalMessageId).maybeSingle();
 
