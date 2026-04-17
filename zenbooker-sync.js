@@ -729,18 +729,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
             // Invoice endpoint lacks custom_payment_method_name — use what we have,
             // but don't write bare "custom" to the job (syncTransactions will resolve it)
             const fallbackMethod = zbt.custom_payment_method_name || zbt.payment_method || 'other'
-            await supabase.from('transactions').insert({
-              user_id: userId,
-              job_id: jobId,
-              customer_id: mapped.customer_id || null,
-              amount: parseFloat(zbt.amount) || 0,
-              payment_method: fallbackMethod,
-              payment_intent_id: zbt.stripe_transaction_id || `zb_${zbt.id}`,
-              status: 'completed',
-              notes: zbt.memo || 'Synced from Zenbooker on job completion',
-              zenbooker_id: zbt.id,
-              created_at: zbt.payment_date || zbt.created,
-            }).catch(err => logger.warn(`[Zenbooker] Fallback tx insert error: ${err.message}`))
+            try {
+              const { error: fbTxErr } = await supabase.from('transactions').insert({
+                user_id: userId,
+                job_id: jobId,
+                customer_id: mapped.customer_id || null,
+                amount: parseFloat(zbt.amount) || 0,
+                payment_method: fallbackMethod,
+                payment_intent_id: zbt.stripe_transaction_id || `zb_${zbt.id}`,
+                status: 'completed',
+                notes: zbt.memo || 'Synced from Zenbooker on job completion',
+                zenbooker_id: zbt.id,
+                created_at: zbt.payment_date || zbt.created,
+              })
+              if (fbTxErr) logger.warn(`[Zenbooker] Fallback tx insert error: ${JSON.stringify(fbTxErr)}`)
+            } catch (e) {
+              logger.warn(`[Zenbooker] Fallback tx insert threw: ${e.message}`)
+            }
             // Update job payment method — but skip bare "custom" (let syncTransactions resolve it)
             const jobPaymentMethod = fallbackMethod !== 'custom' ? fallbackMethod : null
             if (jobPaymentMethod) {
@@ -792,19 +797,28 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       update.payment_method = paymentMethod
       if (amount > 0) update.total_paid_amount = amount
 
+      // Update job status FIRST so paid state reflects even if transaction insert fails
+      await supabase.from('jobs').update(update).eq('id', job.id)
+      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} marked paid ($${amount} ${paymentMethod})`)
+
       // Create transaction record if none exists
       const zbTxId = data.transaction_id || data.id
       const { data: existingTx } = await supabase.from('transactions')
         .select('id').eq('job_id', job.id).eq('status', 'completed').limit(1)
       if (!existingTx || existingTx.length === 0) {
-        await supabase.from('transactions').insert({
-          user_id: userId, job_id: job.id, customer_id: job.customer_id,
-          amount, payment_method: paymentMethod,
-          payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
-          status: 'completed', notes: 'Payment synced from Zenbooker',
-          zenbooker_id: zbTxId || null
-        }).catch(err => logger.error(`[Zenbooker] Transaction insert error: ${err.message}`))
-        logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${paymentMethod})`)
+        try {
+          const { error: txErr } = await supabase.from('transactions').insert({
+            user_id: userId, job_id: job.id, customer_id: job.customer_id,
+            amount, payment_method: paymentMethod,
+            payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
+            status: 'completed', notes: 'Payment synced from Zenbooker',
+            zenbooker_id: zbTxId || null
+          })
+          if (txErr) logger.error(`[Zenbooker] Transaction insert error: ${JSON.stringify(txErr)}`)
+          else logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${paymentMethod})`)
+        } catch (e) {
+          logger.error(`[Zenbooker] Transaction insert threw: ${e.message}`)
+        }
       }
 
       // For cash payments: rebuild cash_collected ledger entries (transaction must exist first)
@@ -819,6 +833,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       update.payment_status = 'pending'
       update.invoice_status = 'invoiced'
       update.payment_method = null
+      await supabase.from('jobs').update(update).eq('id', job.id)
+      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} reverted to unpaid`)
       // Void the most recent completed transaction for this job
       const { data: latestTx } = await supabase.from('transactions')
         .select('id').eq('job_id', job.id).eq('status', 'completed')
@@ -830,12 +846,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       // Rebuild ledger (cash_collected may need to be removed)
       if (createLedgerEntriesForCompletedJob) {
         await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-        await createLedgerEntriesForCompletedJob(job.id, userId).catch(() => {})
+        try { await createLedgerEntriesForCompletedJob(job.id, userId) } catch (_) {}
       }
-    }
-    if (Object.keys(update).length > 0) {
-      await supabase.from('jobs').update(update).eq('id', job.id)
-      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id}`)
     }
   }
 
