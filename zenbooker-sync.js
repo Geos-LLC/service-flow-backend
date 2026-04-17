@@ -418,11 +418,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         created_at: zbt.payment_date || zbt.created
       }
 
+      // Resolve the real payment method name (custom_payment_method_name has the actual name like "Zelle BofA")
+      const resolvedPaymentMethod = zbt.custom_payment_method_name || zbt.payment_method
+
       // Check if already synced by zenbooker_id → update
       const { data: existingByZbId } = await supabase.from('transactions').select('id').eq('zenbooker_id', zbt.id).maybeSingle()
       if (existingByZbId) {
         const { zenbooker_id: _, created_at: __, ...updateData } = txData
         await supabase.from('transactions').update(updateData).eq('id', existingByZbId.id)
+        // Also update job payment_method if we have a real name (fixes "custom" from invoice fallback)
+        if (sfJob?.id && resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
+          await supabase.from('jobs').update({
+            payment_method: resolvedPaymentMethod,
+            payment_status: 'paid',
+          }).eq('id', sfJob.id).catch(() => {})
+        }
         updated++; continue
       }
 
@@ -431,6 +441,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         const { data: manual } = await supabase.from('transactions').select('id').eq('job_id', sfJob.id).is('zenbooker_id', null).limit(1)
         if (manual && manual.length > 0) {
           await supabase.from('transactions').update(txData).eq('id', manual[0].id)
+          // Also update job payment_method
+          if (resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
+            await supabase.from('jobs').update({
+              payment_method: resolvedPaymentMethod,
+              payment_status: 'paid',
+            }).eq('id', sfJob.id).catch(() => {})
+          }
           updated++; continue
         }
       }
@@ -442,9 +459,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
         // New transaction — mark job for ledger rebuild (important for cash payments)
         if (sfJob?.id) jobsNeedingLedgerRebuild.add(sfJob.id)
         // Also update the job's payment_method + payment_status
-        if (sfJob?.id && (zbt.payment_method || zbt.custom_payment_method_name)) {
+        if (sfJob?.id && resolvedPaymentMethod) {
           await supabase.from('jobs').update({
-            payment_method: zbt.custom_payment_method_name || zbt.payment_method,
+            payment_method: resolvedPaymentMethod,
             payment_status: 'paid',
           }).eq('id', sfJob.id).catch(() => {})
         }
@@ -662,6 +679,10 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       // Fallback: ZB doesn't reliably send invoice_payment webhooks.
       // When a job is completed or paid, proactively fetch the invoice and
       // create missing transaction records so cash_collected entries get created.
+      // NOTE: The /invoices endpoint does NOT return custom_payment_method_name on
+      // nested transactions — only the /transactions endpoint does. So "custom" type
+      // payments will be stored with the literal "custom" here and corrected when
+      // syncTransactions runs (which fetches from /transactions with the real name).
       if ((mapped.status === 'completed' || mapped.status === 'paid') && zbJob.invoice?.id && apiKey) {
         try {
           const invoiceData = await zbFetch(apiKey, `/invoices/${zbJob.invoice.id}`)
@@ -672,24 +693,33 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
             const { data: existing } = await supabase.from('transactions')
               .select('id').eq('zenbooker_id', zbt.id).maybeSingle()
             if (existing) continue
+            // Invoice endpoint lacks custom_payment_method_name — use what we have,
+            // but don't write bare "custom" to the job (syncTransactions will resolve it)
+            const fallbackMethod = zbt.custom_payment_method_name || zbt.payment_method || 'other'
             await supabase.from('transactions').insert({
               user_id: userId,
               job_id: jobId,
               customer_id: mapped.customer_id || null,
               amount: parseFloat(zbt.amount) || 0,
-              payment_method: zbt.custom_payment_method_name || zbt.payment_method || 'other',
+              payment_method: fallbackMethod,
               payment_intent_id: zbt.stripe_transaction_id || `zb_${zbt.id}`,
               status: 'completed',
               notes: zbt.memo || 'Synced from Zenbooker on job completion',
               zenbooker_id: zbt.id,
               created_at: zbt.payment_date || zbt.created,
             }).catch(err => logger.warn(`[Zenbooker] Fallback tx insert error: ${err.message}`))
-            // Update job payment method
-            await supabase.from('jobs').update({
-              payment_method: zbt.custom_payment_method_name || zbt.payment_method,
-              payment_status: 'paid',
-            }).eq('id', jobId).catch(() => {})
-            logger.log(`[Zenbooker] Fallback tx created for job ${jobId}: ${zbt.payment_method} $${zbt.amount}`)
+            // Update job payment method — but skip bare "custom" (let syncTransactions resolve it)
+            const jobPaymentMethod = fallbackMethod !== 'custom' ? fallbackMethod : null
+            if (jobPaymentMethod) {
+              await supabase.from('jobs').update({
+                payment_method: jobPaymentMethod,
+                payment_status: 'paid',
+              }).eq('id', jobId).catch(() => {})
+            } else {
+              // Still mark as paid even if we can't resolve the method name yet
+              await supabase.from('jobs').update({ payment_status: 'paid' }).eq('id', jobId).catch(() => {})
+            }
+            logger.log(`[Zenbooker] Fallback tx created for job ${jobId}: ${fallbackMethod} $${zbt.amount}`)
           }
         } catch (invErr) {
           // Non-fatal — invoice fetch might fail or not exist yet
