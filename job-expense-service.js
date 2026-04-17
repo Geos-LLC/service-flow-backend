@@ -49,7 +49,7 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════════════════════════════
   // Validation helpers
   // ══════════════════════════════════════════════════════════════
-  const VALID_EXPENSE_TYPES = ['parking', 'toll', 'supplies', 'other']
+  const VALID_EXPENSE_TYPES = ['parking', 'toll', 'supplies', 'other', 'cancellation']
   const VALID_PAID_BY = ['company', 'team_member', 'customer', 'deduction']
 
   function validateExpensePayload(body) {
@@ -474,6 +474,13 @@ module.exports = (supabase, logger) => {
     }
   })
 
+  // Expose helpers on the router so server.js can reuse the approval flow
+  // from other endpoints (e.g. POST /api/jobs/:id/cancel) without duplicating
+  // ledger insertion logic. Always go through these — never raw ledger INSERT.
+  router.syncReimbursementLedger = syncReimbursementLedger
+  router.removeReimbursementLedger = removeReimbursementLedger
+  router.ledgerIntent = ledgerIntent
+
   return router
 }
 
@@ -554,7 +561,7 @@ module.exports.buildReimbursementLedgerRow = function buildReimbursementLedgerRo
  */
 module.exports.validateExpensePayload = function validateExpensePayload(body) {
   const errors = []
-  const types = ['parking', 'toll', 'supplies', 'other']
+  const types = ['parking', 'toll', 'supplies', 'other', 'cancellation']
   const paidByOptions = ['company', 'team_member', 'customer', 'deduction']
   if (!body.expense_type || !types.includes(body.expense_type)) {
     errors.push(`expense_type must be one of: ${types.join(', ')}`)
