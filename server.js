@@ -35392,15 +35392,17 @@ async function handleWhatsAppWebhook(event, payload) {
         sigcoreMediaUrl: msg.mediaUrl || null,
       } : null;
 
+      const isCall = msg.type === 'call' || /📞/.test(body);
       const msgData = {
         conversation_id: conversation.id,
         provider_message_id: externalMessageId,
         sigcore_message_id: sigcoreMessageId,
-        direction: isFromMe ? 'out' : 'in', channel: 'whatsapp', body,
+        direction: isFromMe ? 'out' : 'in',
+        channel: isCall ? 'call' : 'whatsapp', body,
         from_number: isFromMe ? (resolvedEndpointPhone || '') : participantPhone,
         to_number: isFromMe ? participantPhone : (resolvedEndpointPhone || ''),
         sender_role: isFromMe ? 'agent' : 'customer', status: 'delivered',
-        metadata: { externalChatId, ...(mediaMeta && { media: mediaMeta }) },
+        metadata: { externalChatId, ...(isCall && { isCall: true, callVariant: /Video/i.test(body) ? 'video' : 'voice' }), ...(mediaMeta && { media: mediaMeta }) },
         created_at: timestamp,
       };
 
@@ -36761,11 +36763,18 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
         const mediaUrl = (hasMedia && m.sigcore_message_id)
           ? `/api/communications/media/${m.sigcore_message_id}`
           : null;
+        // WhatsApp calls arrive as messages with type='call' — render them as call events instead
+        const isCall = m.channel === 'call' || m.metadata?.isCall === true;
+        const eventType = isCall
+          ? (m.direction === 'in' ? 'call_in' : 'call_out')
+          : (m.direction === 'in' ? 'message_in' : 'message_out');
         return {
-          id: `msg-${m.id}`, conversationId: id, channel: m.channel || 'openphone',
-          type: m.direction === 'in' ? 'message_in' : 'message_out',
+          id: `msg-${m.id}`, conversationId: id,
+          channel: isCall ? 'call' : (m.channel || 'openphone'),
+          type: eventType,
           senderRole: m.sender_role, text: m.body, timestamp: m.created_at,
           sigcoreId: m.sigcore_message_id, providerMessageId: m.provider_message_id,
+          ...(isCall && { callDurationSeconds: 0, callVariant: m.metadata?.callVariant || 'voice' }),
           // Legacy OpenPhone MMS (kept for back-compat; ignored when hasMedia is true)
           mediaUrls: Array.isArray(m.metadata?.mediaUrls) ? m.metadata.mediaUrls : [],
           // New WhatsApp media contract
