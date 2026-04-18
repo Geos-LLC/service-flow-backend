@@ -8125,24 +8125,61 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    
+
     const { data: customers, error } = await supabase
       .from('customers')
       .select('*')
       .eq('id', id)
       .eq('user_id', userId)
       .limit(1);
-    
+
     if (error) {
       console.error('Error fetching customer:', error);
       return res.status(500).json({ error: 'Failed to fetch customer' });
     }
-    
+
     if (!customers || customers.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
     }
-    
-    res.json(customers[0]);
+
+    const customer = customers[0];
+
+    // Resolve source through mappings + linked conversation fallback
+    try {
+      // Load all user's source mappings
+      const { data: sourceMappings } = await supabase.from('lead_source_mappings')
+        .select('raw_value, source_name, provider').eq('user_id', userId);
+      const sourceMap = {};
+      for (const m of (sourceMappings || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
+
+      // If customer.source exists, try to resolve it through mappings (OP first, then LB)
+      let resolved = null;
+      if (customer.source) {
+        resolved = sourceMap[`openphone:${customer.source}`]
+          || sourceMap[`leadbridge:${customer.source}`]
+          || customer.source;
+      }
+
+      // If no source on customer, try to find one from linked conversations
+      if (!resolved && customer.phone) {
+        const last10 = String(customer.phone).replace(/\D/g, '').slice(-10);
+        if (last10.length >= 7) {
+          const { data: conv } = await supabase.from('communication_conversations')
+            .select('company, provider, channel, provider_account_id')
+            .eq('user_id', userId)
+            .ilike('participant_phone', `%${last10}%`)
+            .not('company', 'is', null)
+            .limit(1).maybeSingle();
+          if (conv?.company) {
+            resolved = sourceMap[`${conv.provider}:${conv.company}`] || conv.company;
+          }
+        }
+      }
+
+      customer.resolved_source = resolved || customer.source || null;
+    } catch (e) { /* non-fatal — fall back to raw source */ }
+
+    res.json(customer);
   } catch (error) {
     console.error('Get customer error:', error);
     res.status(500).json({ error: 'Failed to fetch customer' });
