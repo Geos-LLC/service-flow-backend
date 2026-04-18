@@ -248,8 +248,16 @@ async function syncAccount(supabase, logger, accountId) {
         : await provider.listRecentMessages(tokens, { maxResults: PER_CYCLE_MAX, afterDate, targetMailbox })
     }
 
+    const rawCount = messageIds.length
     messageIds = messageIds.slice(0, PER_CYCLE_MAX)
-    logger?.info?.(`[connected-email] ${accountId} provider=${account.provider} mailbox=${ownerEmail} isInitial=${isInitial} returned ${messageIds.length} message ids`)
+    const diagMsg = `diag: mailbox=${ownerEmail} target=${targetMailbox||'(me)'} isInitial=${isInitial} rawCount=${rawCount} cap=${PER_CYCLE_MAX}`
+    console.log(`[connected-email] ${diagMsg}`)
+    // Write diagnostic to sync_state so we can see it from DB
+    await supabase.from('connected_email_sync_state').upsert({
+      account_id: accountId,
+      last_error: diagMsg,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'account_id' })
     setProgress(accountId, { phase: 'fetching', total: messageIds.length, scanned: 0, synced: 0 })
 
     let scannedLocal = 0
