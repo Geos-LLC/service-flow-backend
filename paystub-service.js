@@ -40,8 +40,11 @@ module.exports = (supabase, logger, notificationEmail) => {
 
   function formatDate(dateStr) {
     if (!dateStr) return ''
-    const d = new Date(dateStr)
-    if (isNaN(d.getTime())) return String(dateStr)
+    const s = String(dateStr)
+    // Bare YYYY-MM-DD parses as UTC midnight → off-by-one in negative TZs. Anchor at local midnight.
+    const isBareDate = /^\d{4}-\d{2}-\d{2}$/.test(s)
+    const d = new Date(isBareDate ? s + 'T00:00:00' : s)
+    if (isNaN(d.getTime())) return s
     return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
   }
 
