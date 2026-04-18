@@ -442,68 +442,219 @@ module.exports = (supabase, logger, notificationEmail) => {
   })
 
   // ══════════════════════════════════════
-  // POST /api/paystubs/:id/send — send email
-  // POST /api/paystubs/:id/resend — same
+  // Send one paystub — shared by /:id/send and /bulk/send
+  // Returns { ok: true, paystub } or { ok: false, error }
   // ══════════════════════════════════════
-  const sendHandler = async (req, res) => {
+  async function sendOnePaystub(userId, paystubId) {
+    const { data: paystub, error: fetchErr } = await supabase.from('paystubs')
+      .select('*').eq('id', paystubId).eq('user_id', userId).maybeSingle()
+    if (fetchErr || !paystub) return { ok: false, error: 'Paystub not found', status: 404 }
+
+    const snapshot = paystub.snapshot_json || {}
+    const email = snapshot?.cleaner?.email
+    if (!email) {
+      await supabase.from('paystubs').update({
+        email_status: 'error',
+        email_error: 'Team member has no email',
+        updated_at: new Date().toISOString(),
+      }).eq('id', paystub.id)
+      return { ok: false, error: 'Team member has no email address', status: 400, paystubId: paystub.id }
+    }
+
+    const html = renderPaystubHtml(snapshot)
+    const text = renderPaystubText(snapshot)
+    const period = snapshot.period || {}
+    const subject = `Your paystub for ${formatDate(period.start)} – ${formatDate(period.end)}`
+
+    try {
+      const sgResult = await notificationEmail.sendInternalEmail(userId, { to: email, subject, html, text, emailType: 'paystub' })
+      const messageId = sgResult?.messageId || null
+
+      const prevMeta = paystub.metadata || {}
+      const sendCount = (prevMeta.sendCount || 0) + 1
+
+      const { data: updated } = await supabase.from('paystubs').update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        email_to: email,
+        email_status: 'sent',
+        email_message_id: messageId,
+        email_error: null,
+        metadata: { ...prevMeta, sendCount, lastSendAt: new Date().toISOString() },
+        updated_at: new Date().toISOString(),
+      }).eq('id', paystub.id).select().single()
+
+      logger.log(`[Paystubs] Sent paystub ${paystub.id} to ${email} (count=${sendCount})`)
+      return { ok: true, paystub: updated }
+    } catch (sendErr) {
+      const errMsg = sendErr?.response?.body?.errors?.[0]?.message || sendErr.message || 'Send failed'
+      await supabase.from('paystubs').update({
+        status: 'failed',
+        email_status: 'error',
+        email_error: errMsg,
+        updated_at: new Date().toISOString(),
+      }).eq('id', paystub.id)
+      logger.error(`[Paystubs] Send error for paystub ${paystub.id}:`, errMsg)
+      return { ok: false, error: errMsg, status: 500, paystubId: paystub.id }
+    }
+  }
+
+  // ══════════════════════════════════════
+  // POST /api/paystubs/bulk — generate for many members in one call
+  // Body: { teamMemberIds?: number[], periodStart, periodEnd, useBatches?: boolean }
+  // - teamMemberIds empty/missing → all active team members for this user
+  // - useBatches=true → for each member, look up a matching batch in the period;
+  //   if found, link paystub to that batch (idempotent via unique index)
+  // ══════════════════════════════════════
+  router.post('/bulk', async (req, res) => {
     try {
       const userId = req.user.userId
-      const { data: paystub, error: fetchErr } = await supabase.from('paystubs')
-        .select('*').eq('id', req.params.id).eq('user_id', userId).maybeSingle()
-      if (fetchErr || !paystub) return res.status(404).json({ error: 'Paystub not found' })
-
-      const snapshot = paystub.snapshot_json || {}
-      const email = snapshot?.cleaner?.email
-      if (!email) {
-        await supabase.from('paystubs').update({
-          email_status: 'error',
-          email_error: 'Team member has no email',
-          updated_at: new Date().toISOString(),
-        }).eq('id', paystub.id)
-        return res.status(400).json({ error: 'Team member has no email address' })
+      const { teamMemberIds, periodStart, periodEnd, useBatches = true } = req.body || {}
+      if (!periodStart || !periodEnd) {
+        return res.status(400).json({ error: 'periodStart and periodEnd are required' })
       }
 
-      const html = renderPaystubHtml(snapshot)
-      const text = renderPaystubText(snapshot)
-      const period = snapshot.period || {}
-      const subject = `Your paystub for ${formatDate(period.start)} – ${formatDate(period.end)}`
+      // Resolve member list
+      let memberIds = Array.isArray(teamMemberIds) && teamMemberIds.length > 0
+        ? teamMemberIds.map(id => parseInt(id)).filter(Boolean)
+        : null
 
-      try {
-        const sgResult = await notificationEmail.sendInternalEmail(userId, { to: email, subject, html, text, emailType: 'paystub' })
-        const messageId = sgResult?.messageId || null
-
-        // Track send count in metadata
-        const prevMeta = paystub.metadata || {}
-        const sendCount = (prevMeta.sendCount || 0) + 1
-
-        const { data: updated } = await supabase.from('paystubs').update({
-          status: 'sent',
-          sent_at: new Date().toISOString(),
-          email_to: email,
-          email_status: 'sent',
-          email_message_id: messageId,
-          email_error: null,
-          metadata: { ...prevMeta, sendCount, lastSendAt: new Date().toISOString() },
-          updated_at: new Date().toISOString(),
-        }).eq('id', paystub.id).select().single()
-
-        logger.log(`[Paystubs] Sent paystub ${paystub.id} to ${email} (count=${sendCount})`)
-        res.json(updated)
-      } catch (sendErr) {
-        const errMsg = sendErr?.response?.body?.errors?.[0]?.message || sendErr.message || 'Send failed'
-        await supabase.from('paystubs').update({
-          status: 'failed',
-          email_status: 'error',
-          email_error: errMsg,
-          updated_at: new Date().toISOString(),
-        }).eq('id', paystub.id)
-        logger.error(`[Paystubs] Send error for paystub ${paystub.id}:`, errMsg)
-        res.status(500).json({ error: errMsg })
+      if (!memberIds) {
+        const { data: members, error: mErr } = await supabase.from('team_members')
+          .select('id').eq('user_id', userId).eq('status', 'active')
+        if (mErr) return res.status(500).json({ error: mErr.message })
+        memberIds = (members || []).map(m => m.id)
       }
+
+      // Pre-fetch matching batches (one query) when useBatches is true
+      let batchByMember = {}
+      if (useBatches && memberIds.length > 0) {
+        const { data: batches } = await supabase.from('cleaner_payout_batch')
+          .select('id, team_member_id, period_start, period_end')
+          .eq('user_id', userId)
+          .eq('period_start', periodStart)
+          .eq('period_end', periodEnd)
+          .in('team_member_id', memberIds)
+        for (const b of (batches || [])) {
+          // Prefer first match per member
+          if (!batchByMember[b.team_member_id]) batchByMember[b.team_member_id] = b.id
+        }
+      }
+
+      const created = []
+      const skipped = []
+      const errors = []
+
+      for (const memberId of memberIds) {
+        try {
+          const payoutBatchId = batchByMember[memberId] || null
+
+          // Idempotency: skip if paystub already exists for this batch
+          if (payoutBatchId) {
+            const { data: existing } = await supabase.from('paystubs')
+              .select('id').eq('user_id', userId).eq('payout_batch_id', payoutBatchId).maybeSingle()
+            if (existing) {
+              skipped.push({ teamMemberId: memberId, reason: 'already exists for batch', paystubId: existing.id })
+              continue
+            }
+          }
+
+          const snapshot = await buildPaystubSnapshot({
+            userId, teamMemberId: memberId, periodStart, periodEnd, payoutBatchId,
+          })
+
+          // Skip members with zero activity and no batch (nothing to pay)
+          const t = snapshot?.totals || {}
+          const hasActivity = (t.earnings || 0) + (t.tips || 0) + (t.incentives || 0) + (t.adjustments || 0) + (t.reimbursements || 0) !== 0 || (t.cashCollected || 0) !== 0
+          if (!payoutBatchId && !hasActivity) {
+            skipped.push({ teamMemberId: memberId, reason: 'no activity in period' })
+            continue
+          }
+
+          const { data: row, error: insErr } = await supabase.from('paystubs').insert({
+            user_id: userId,
+            team_member_id: memberId,
+            payout_batch_id: payoutBatchId,
+            period_start: snapshot.period.start,
+            period_end: snapshot.period.end,
+            status: 'issued',
+            issued_at: new Date().toISOString(),
+            snapshot_json: snapshot,
+            created_by: userId,
+          }).select().single()
+
+          if (insErr) {
+            errors.push({ teamMemberId: memberId, error: insErr.message })
+            continue
+          }
+          created.push(row)
+        } catch (e) {
+          errors.push({ teamMemberId: memberId, error: e.message || 'Unknown error' })
+        }
+      }
+
+      res.json({
+        created,
+        skipped,
+        errors,
+        summary: { createdCount: created.length, skippedCount: skipped.length, errorCount: errors.length },
+      })
     } catch (e) {
-      logger.error('[Paystubs] Send handler error:', e.message)
-      res.status(500).json({ error: 'Failed to send paystub' })
+      logger.error('[Paystubs] Bulk generate error:', e.message)
+      res.status(500).json({ error: e.message || 'Failed to bulk generate paystubs' })
     }
+  })
+
+  // ══════════════════════════════════════
+  // POST /api/paystubs/bulk/send — send many paystubs in one call
+  // Body: { paystubIds?: number[], includeSent?: boolean }
+  // - paystubIds empty/missing → all paystubs with status in ['issued','failed'] for this user
+  //   (if includeSent=true, also includes 'sent' status → resend)
+  // ══════════════════════════════════════
+  router.post('/bulk/send', async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const { paystubIds, includeSent = false } = req.body || {}
+
+      let ids = Array.isArray(paystubIds) && paystubIds.length > 0
+        ? paystubIds.map(id => parseInt(id)).filter(Boolean)
+        : null
+
+      if (!ids) {
+        const statuses = includeSent ? ['issued', 'failed', 'sent'] : ['issued', 'failed']
+        const { data: rows } = await supabase.from('paystubs')
+          .select('id').eq('user_id', userId).in('status', statuses)
+        ids = (rows || []).map(r => r.id)
+      }
+
+      const sent = []
+      const skipped = []
+      const errors = []
+
+      for (const id of ids) {
+        const result = await sendOnePaystub(userId, id)
+        if (result.ok) sent.push(result.paystub)
+        else if (result.status === 400) skipped.push({ paystubId: id, reason: result.error })
+        else errors.push({ paystubId: id, error: result.error })
+      }
+
+      res.json({
+        sent,
+        skipped,
+        errors,
+        summary: { sentCount: sent.length, skippedCount: skipped.length, errorCount: errors.length },
+      })
+    } catch (e) {
+      logger.error('[Paystubs] Bulk send error:', e.message)
+      res.status(500).json({ error: e.message || 'Failed to bulk send paystubs' })
+    }
+  })
+
+  const sendHandler = async (req, res) => {
+    const userId = req.user.userId
+    const result = await sendOnePaystub(userId, req.params.id)
+    if (result.ok) return res.json(result.paystub)
+    return res.status(result.status || 500).json({ error: result.error })
   }
 
   router.post('/:id/send', sendHandler)
