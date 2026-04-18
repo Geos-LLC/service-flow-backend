@@ -186,6 +186,39 @@ module.exports = (supabase, logger, notificationEmail) => {
 
     const payoutInfo = payout.paidAt ? `<p style="font-size:12px;color:#6b7280;">Paid on ${escapeHtml(formatDate(payout.paidAt))}</p>` : ''
 
+    // Payment block — only rendered when paystub is linked to a payout batch
+    let paymentBlockHtml = ''
+    if (payout.amount !== null && payout.amount !== undefined) {
+      const amt = parseFloat(payout.amount) || 0
+      const isPaid = payout.status === 'paid'
+      let label, valueText, bgColor, textColor
+      if (amt > 0) {
+        label = isPaid ? 'Payment Sent' : 'Payment Pending'
+        valueText = fmt(amt)
+        bgColor = isPaid ? '#ecfdf5' : '#fef3c7'
+        textColor = isPaid ? '#065f46' : '#92400e'
+      } else if (amt < 0) {
+        label = 'Balance Owed (carried to next period)'
+        valueText = fmtNeg(amt)
+        bgColor = '#fef2f2'
+        textColor = '#991b1b'
+      } else {
+        label = 'Settled'
+        valueText = fmt(0)
+        bgColor = '#f3f4f6'
+        textColor = '#374151'
+      }
+      const paidAtLine = payout.paidAt ? `<div style="font-size:11px;color:${textColor};opacity:0.8;margin-top:2px;">on ${escapeHtml(formatDate(payout.paidAt))}</div>` : ''
+      paymentBlockHtml = `
+        <div style="margin-top:12px;padding:14px;background:${bgColor};border-radius:8px;display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:12px;color:${textColor};font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(label)}</div>
+            ${paidAtLine}
+          </div>
+          <div style="font-size:18px;font-weight:700;color:${textColor};">${valueText}</div>
+        </div>`
+    }
+
     return `
 <!DOCTYPE html>
 <html>
@@ -209,8 +242,10 @@ module.exports = (supabase, logger, notificationEmail) => {
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Reimbursements</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.reimbursements)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Adjustments</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.adjustments)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Cash collected</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.cashCollected)}</td></tr>
-        <tr><td style="padding:14px;font-size:15px;font-weight:700;color:#111;border-top:2px solid #111;">Net Paid</td><td style="padding:14px;font-size:15px;font-weight:700;text-align:right;border-top:2px solid #111;">${fmt(totals.netPayout)}</td></tr>
+        <tr><td style="padding:14px;font-size:15px;font-weight:700;color:#111;border-top:2px solid #111;">Net Earned</td><td style="padding:14px;font-size:15px;font-weight:700;text-align:right;border-top:2px solid #111;">${fmt(totals.netPayout)}</td></tr>
       </table>
+
+      ${paymentBlockHtml}
 
       ${lineItemsSection}
 
@@ -347,6 +382,7 @@ module.exports = (supabase, logger, notificationEmail) => {
         batchId: payoutBatch?.id || null,
         status: payoutBatch?.status || null,
         paidAt: payoutBatch?.paid_at || null,
+        amount: payoutBatch ? parseFloat(payoutBatch.total_amount || 0) : null,
         method: null,
       },
     }
