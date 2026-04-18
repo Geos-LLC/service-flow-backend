@@ -435,6 +435,98 @@ module.exports = function buildConnectedEmail(supabase, logger) {
   })
 
   // ══════════════════════════════════════════════════════════════
+  // GET /api/connected-email/accounts/:id/diag
+  //   One-shot probe — shows exactly what Graph returns for the mailbox.
+  //   No persistence; pure read to diagnose sync gaps.
+  // ══════════════════════════════════════════════════════════════
+  router.get('/accounts/:id/diag', auth, async (req, res) => {
+    try {
+      let acct = await store.getWithTokens(supabase, req.params.id)
+      if (!acct || acct.user_id !== req.user.id) return res.status(404).json({ error: 'not found' })
+      if (acct.provider !== 'outlook') return res.status(400).json({ error: 'outlook only' })
+
+      const outlook = getProvider('outlook')
+      try {
+        const refreshed = await outlook.refreshToken({ refreshToken: acct.refreshToken })
+        await store.updateTokens(supabase, acct.id, refreshed)
+        acct.accessToken = refreshed.accessToken
+      } catch {}
+
+      const targetMailbox = acct.mailbox_type === 'shared' ? acct.target_mailbox_email : null
+      const tokens = { accessToken: acct.accessToken, refreshToken: acct.refreshToken }
+
+      const axios = require('axios')
+      const prefix = targetMailbox ? `/users/${targetMailbox}` : '/me'
+
+      const results = {}
+      // Probe 1: List first 20 messages with full details (subject + date)
+      try {
+        const r = await axios.get(
+          `https://graph.microsoft.com/v1.0${prefix}/mailFolders/Inbox/messages?$top=20&$select=id,subject,receivedDateTime,from&$orderby=receivedDateTime desc`,
+          { headers: { Authorization: `Bearer ${tokens.accessToken}` } }
+        )
+        results.inboxProbe = {
+          ok: true,
+          count: (r.data.value || []).length,
+          messages: (r.data.value || []).map(m => ({
+            subject: m.subject,
+            from: m.from?.emailAddress?.address,
+            received: m.receivedDateTime,
+          })),
+        }
+      } catch (e) {
+        results.inboxProbe = {
+          ok: false,
+          error: e.response?.data?.error || e.message,
+          status: e.response?.status,
+        }
+      }
+
+      // Probe 2: List the mail folders visible for this mailbox
+      try {
+        const r = await axios.get(
+          `https://graph.microsoft.com/v1.0${prefix}/mailFolders?$select=id,displayName,totalItemCount,unreadItemCount`,
+          { headers: { Authorization: `Bearer ${tokens.accessToken}` } }
+        )
+        results.foldersProbe = {
+          ok: true,
+          folders: (r.data.value || []).map(f => ({
+            name: f.displayName,
+            total: f.totalItemCount,
+            unread: f.unreadItemCount,
+          })),
+        }
+      } catch (e) {
+        results.foldersProbe = { ok: false, error: e.response?.data?.error || e.message }
+      }
+
+      // Probe 3: Identity check
+      try {
+        const r = await axios.get(`https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName`, {
+          headers: { Authorization: `Bearer ${tokens.accessToken}` },
+        })
+        results.me = r.data
+      } catch (e) {
+        results.me = { error: e.response?.data?.error || e.message }
+      }
+
+      res.json({
+        account: {
+          id: acct.id,
+          auth_email: acct.auth_email_address,
+          target_mailbox: acct.target_mailbox_email,
+          mailbox_type: acct.mailbox_type,
+          graph_prefix: prefix,
+        },
+        probes: results,
+      })
+    } catch (e) {
+      log.error?.(`[connected-email] diag: ${e.message}`)
+      res.status(500).json({ error: e.message })
+    }
+  })
+
+  // ══════════════════════════════════════════════════════════════
   // POST /api/connected-email/conversations/:id/send
   //   Alternative entry point for sending from a connected email thread.
   //   (communications.jsx primary path uses /api/communications/conversations/:id/send
