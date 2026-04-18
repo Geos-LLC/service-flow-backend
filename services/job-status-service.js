@@ -56,13 +56,21 @@ function getMetrics() {
  * Build the minimum set of fields we need from the jobs row to
  * produce an outbound payload + make routing decisions.
  */
-const JOB_SELECT_COLUMNS = 'id, user_id, status, lb_external_request_id, lb_channel, scheduled_date, invoice_amount, total_amount, customer_name, customer_id'
+// NOTE: jobs has customer_id (FK) — there is no customer_name column.
+// The LB outbound payload wants a display name, so we embed first_name/last_name
+// via the customers relation and flatten it into job.customer_name for consumers.
+const JOB_SELECT_COLUMNS = 'id, user_id, status, lb_external_request_id, lb_channel, scheduled_date, invoice_amount, total_amount, customer_id, customer:customers(first_name, last_name)'
 
 async function readJob(supabase, jobId, userId) {
   let query = supabase.from('jobs').select(JOB_SELECT_COLUMNS).eq('id', jobId)
   if (userId != null) query = query.eq('user_id', userId)
   const { data, error } = await query.maybeSingle()
   if (error) throw error
+  if (data) {
+    const c = data.customer
+    data.customer_name = c ? [c.first_name, c.last_name].filter(Boolean).join(' ').trim() || null : null
+    delete data.customer
+  }
   return data
 }
 
