@@ -168,6 +168,22 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     }
   }
 
+  // Normalize ZB invoice.adjustments_applied[] into our fees_breakdown shape.
+  // ZB shape: { id, name, adjustment_type: 'fee'|..., value, value_type, adjustment_amount }
+  // Stored shape: [{ name, type, amount, rate?, rate_type? }]
+  // Type 'fee' = third-party fee (Stripe processing etc.) — excluded from cleaner commission.
+  function mapAdjustments(adjustments) {
+    if (!Array.isArray(adjustments) || adjustments.length === 0) return null
+    return adjustments.map(a => ({
+      name: a.name || null,
+      type: a.adjustment_type || 'fee',
+      amount: parseFloat(a.adjustment_amount) || 0,
+      rate: a.value != null ? parseFloat(a.value) : null,
+      rate_type: a.value_type || null,
+      zb_id: a.id || null,
+    }))
+  }
+
   function mapJob(zb, userId, lookups) {
     const { customerMap, serviceMap, teamMap, territoryMap } = lookups
     const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
@@ -207,6 +223,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       total_amount: parseFloat(inv.total) || 0,
       taxes: parseFloat(inv.tax_amount || inv.total_tax_amount) || 0,
       discount: parseFloat(inv.discount_amount) || 0,
+      // Adjustments (Stripe processing fee, etc.) — sum to additional_fees and keep breakdown
+      additional_fees: parseFloat(inv.adjustment_total) || 0,
+      fees_breakdown: mapAdjustments(inv.adjustments_applied),
       // Only set tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips with 0)
       ...(parseFloat(inv.tip || inv.tip_amount) > 0 ? { tip_amount: parseFloat(inv.tip || inv.tip_amount) } : {}),
       invoice_status: inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft'),
@@ -956,6 +975,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
           const jobUpdate = { invoice_status: 'paid', payment_status: 'paid' }
           if (catchMethod) jobUpdate.payment_method = catchMethod
+          // While we have the invoice in hand, also sync adjustments (processing fee, etc.)
+          const invAdjTotal = parseFloat(invoiceData.adjustment_total) || 0
+          if (invAdjTotal > 0) {
+            jobUpdate.additional_fees = invAdjTotal
+            jobUpdate.fees_breakdown = mapAdjustments(invoiceData.adjustments_applied)
+          }
           await supabase.from('jobs').update(jobUpdate).eq('id', job.id)
 
           await supabase.from('payment_reconcile_catches').insert({
@@ -1325,7 +1350,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               update.total = parseFloat(inv.total) || undefined
               update.total_amount = parseFloat(inv.total) || undefined
               update.discount = parseFloat(inv.discount_amount) || 0
-              update.additional_fees = parseFloat(inv.additional_fees || inv.fees_amount) || 0
+              update.additional_fees = parseFloat(inv.adjustment_total) || 0
+              update.fees_breakdown = mapAdjustments(inv.adjustments_applied)
               // Only update tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips)
               if (parseFloat(inv.tip || inv.tip_amount) > 0) update.tip_amount = parseFloat(inv.tip || inv.tip_amount)
               update.taxes = parseFloat(inv.tax_amount || inv.total_tax_amount) || 0
