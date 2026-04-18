@@ -868,8 +868,211 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
   }
 
   // ══════════════════════════════════════
+  // Auto-Reconcile Sweep
+  //   Safety net for ZB's unreliable invoice.payment_* webhook delivery.
+  //   Runs hourly: scans completed-but-unpaid jobs with a zenbooker_id,
+  //   checks ZB for the current invoice status, and if ZB says paid it
+  //   creates the transaction + flips the job to paid. Each catch is
+  //   logged to payment_reconcile_catches so the UI can distinguish
+  //   webhook-driven updates (default) from auto-reconcile catches.
+  // ══════════════════════════════════════
+  const GENERIC_METHOD = new Set(['custom', 'other', 'unknown', ''])
+  const { randomUUID } = require('crypto')
+
+  async function runPaymentReconcile(userId, apiKey, triggeredBy = 'cron') {
+    const runId = randomUUID()
+    await supabase.from('payment_reconcile_runs').insert({
+      id: runId, user_id: userId, triggered_by: triggeredBy
+    })
+
+    let jobs_scanned = 0, payments_caught = 0, errors = 0
+    const errorDetails = []
+
+    try {
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10)
+      // Candidates: completed jobs with a ZB id that aren't marked paid in SF yet
+      const { data: candidates, error: qErr } = await supabase
+        .from('jobs')
+        .select('id, zenbooker_id, customer_id, invoice_status, payment_status, total_amount')
+        .eq('user_id', userId)
+        .not('zenbooker_id', 'is', null)
+        .eq('status', 'completed')
+        .or('invoice_status.neq.paid,invoice_status.is.null')
+        .gte('scheduled_date', thirtyDaysAgo)
+        .limit(500)
+      if (qErr) throw new Error(`query candidates: ${JSON.stringify(qErr)}`)
+
+      jobs_scanned = candidates.length
+
+      for (const job of candidates) {
+        try {
+          // Already caught by a prior sweep? Skip — unique index enforces this but double-check.
+          const { data: existingCatch } = await supabase
+            .from('payment_reconcile_catches')
+            .select('id').eq('job_id', job.id).limit(1)
+          if (existingCatch && existingCatch.length > 0) continue
+
+          const zbJob = await zbFetch(apiKey, `/jobs/${job.zenbooker_id}`)
+          const inv = zbJob?.invoice
+          if (!inv || inv.status !== 'paid') continue
+
+          // Pull the invoice to get the transactions list, then resolve each
+          // transaction's real name via /transactions/:id (the only endpoint
+          // that returns custom_payment_method_name).
+          const invoiceData = await zbFetch(apiKey, `/invoices/${inv.id}`)
+          const zbTxs = (invoiceData.transactions || []).filter(t => t.status === 'succeeded')
+
+          let catchAmount = 0
+          let catchMethod = null
+          let firstZbTxId = null
+          for (const t of zbTxs) {
+            catchAmount += parseFloat(t.amount) || 0
+            firstZbTxId = firstZbTxId || t.id
+            let full = t
+            try { full = await zbFetch(apiKey, `/transactions/${t.id}`) } catch (_) {}
+            const realName = full.custom_payment_method_name || full.payment_method
+            if (realName && !GENERIC_METHOD.has(String(realName).toLowerCase())) {
+              catchMethod = catchMethod || realName
+            }
+            const { data: existingTx } = await supabase
+              .from('transactions').select('id').eq('zenbooker_id', full.id).maybeSingle()
+            if (existingTx) continue
+            try {
+              const { error: insErr } = await supabase.from('transactions').insert({
+                user_id: userId, job_id: job.id, customer_id: job.customer_id,
+                amount: parseFloat(full.amount) || 0,
+                payment_method: realName || 'other',
+                payment_intent_id: full.stripe_transaction_id || `zb_${full.id}`,
+                status: 'completed',
+                notes: 'Caught by auto-reconcile',
+                zenbooker_id: full.id,
+                created_at: full.payment_date || full.created
+              })
+              if (insErr) logger.warn(`[AutoReconcile] Tx insert err job ${job.id}: ${JSON.stringify(insErr)}`)
+            } catch (e) {
+              logger.warn(`[AutoReconcile] Tx insert threw job ${job.id}: ${e.message}`)
+            }
+          }
+
+          const jobUpdate = { invoice_status: 'paid', payment_status: 'paid' }
+          if (catchMethod) jobUpdate.payment_method = catchMethod
+          await supabase.from('jobs').update(jobUpdate).eq('id', job.id)
+
+          await supabase.from('payment_reconcile_catches').insert({
+            run_id: runId, user_id: userId, job_id: job.id,
+            zb_invoice_id: inv.id,
+            zb_transaction_id: firstZbTxId,
+            amount: catchAmount,
+            payment_method: catchMethod,
+            notes: `Invoice paid in ZB ($${inv.amount_paid}) — no webhook received`
+          })
+
+          // Rebuild ledger so cash_collected entries get created for cash payments
+          if (createLedgerEntriesForCompletedJob) {
+            await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+            try { await createLedgerEntriesForCompletedJob(job.id, userId) } catch (_) {}
+          }
+
+          payments_caught++
+          logger.log(`[AutoReconcile] Caught job ${job.id}: $${catchAmount} ${catchMethod || 'other'}`)
+        } catch (e) {
+          errors++
+          errorDetails.push(`job ${job.id}: ${e.message}`)
+          logger.warn(`[AutoReconcile] Error for job ${job.id}: ${e.message}`)
+        }
+      }
+    } catch (e) {
+      errors++
+      errorDetails.push(`sweep: ${e.message}`)
+      logger.error(`[AutoReconcile] Sweep failed: ${e.message}`)
+    }
+
+    await supabase.from('payment_reconcile_runs').update({
+      finished_at: new Date().toISOString(),
+      jobs_scanned, payments_caught, errors,
+      error_details: errorDetails.length ? errorDetails.join('; ').slice(0, 2000) : null
+    }).eq('id', runId)
+
+    return { runId, jobs_scanned, payments_caught, errors }
+  }
+
+  // Hourly sweep across all ZB-connected users. Disabled in tests.
+  if (process.env.NODE_ENV !== 'test' && process.env.DISABLE_ZB_CRON !== 'true') {
+    const HOUR_MS = 60 * 60 * 1000
+    const sweepAllUsers = async () => {
+      try {
+        const { data: users } = await supabase
+          .from('users')
+          .select('id, zenbooker_api_key')
+          .eq('zenbooker_status', 'connected')
+          .not('zenbooker_api_key', 'is', null)
+        for (const u of users || []) {
+          try {
+            const r = await runPaymentReconcile(u.id, u.zenbooker_api_key, 'cron')
+            if (r.payments_caught > 0 || r.errors > 0) {
+              logger.log(`[AutoReconcile][cron] user=${u.id} scanned=${r.jobs_scanned} caught=${r.payments_caught} errors=${r.errors}`)
+            }
+          } catch (e) {
+            logger.error(`[AutoReconcile][cron] user=${u.id} failed: ${e.message}`)
+          }
+        }
+      } catch (e) {
+        logger.error(`[AutoReconcile][cron] setup failed: ${e.message}`)
+      }
+    }
+    // Stagger first run 60s after boot to let app finish warmup
+    setTimeout(sweepAllUsers, 60 * 1000)
+    setInterval(sweepAllUsers, HOUR_MS)
+    logger.log('[AutoReconcile] Hourly sweep scheduled (first run in 60s)')
+  }
+
+  // ══════════════════════════════════════
   // Routes
   // ══════════════════════════════════════
+
+  // GET /payment-reconcile-log — list catches + recent runs for the current user
+  router.get('/payment-reconcile-log', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const limit = Math.min(parseInt(req.query.limit) || 100, 500)
+      const [{ data: catches }, { data: runs }] = await Promise.all([
+        supabase.from('payment_reconcile_catches')
+          .select('id, run_id, job_id, zb_invoice_id, zb_transaction_id, amount, payment_method, caught_at, notes')
+          .eq('user_id', userId)
+          .order('caught_at', { ascending: false })
+          .limit(limit),
+        supabase.from('payment_reconcile_runs')
+          .select('id, started_at, finished_at, jobs_scanned, payments_caught, errors, triggered_by')
+          .eq('user_id', userId)
+          .order('started_at', { ascending: false })
+          .limit(20)
+      ])
+      res.json({ catches: catches || [], runs: runs || [] })
+    } catch (e) {
+      logger.error(`[AutoReconcile] log endpoint error: ${e.message}`)
+      res.status(500).json({ error: 'Failed to load reconcile log' })
+    }
+  })
+
+  // POST /payment-reconcile/run — manually trigger a sweep for the current user
+  router.post('/payment-reconcile/run', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const { data: user } = await supabase.from('users')
+        .select('zenbooker_api_key, zenbooker_status').eq('id', userId).single()
+      if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+        return res.status(400).json({ error: 'Zenbooker not connected' })
+      }
+      runPaymentReconcile(userId, user.zenbooker_api_key, 'manual').then(
+        r => logger.log(`[AutoReconcile] Manual run complete: ${JSON.stringify(r)}`),
+        e => logger.error(`[AutoReconcile] Manual run failed: ${e.message}`)
+      )
+      res.json({ status: 'started', message: 'Auto-reconcile sweep started in background' })
+    } catch (e) {
+      logger.error(`[AutoReconcile] manual run endpoint error: ${e.message}`)
+      res.status(500).json({ error: 'Failed to start reconcile' })
+    }
+  })
 
   // POST /connect — validate API key + store
   router.post('/connect', authenticateToken, async (req, res) => {
