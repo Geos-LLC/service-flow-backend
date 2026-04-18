@@ -20970,25 +20970,33 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
       from += pageSize;
     }
 
-    const existingSalaryDates = new Set();
+    const existingSalaryByDate = {}; // date → { id, scheduled_hours, hourly_rate, amount, payout_batch_id }
     const existingCommByDate = {}; // date → { id, day_revenue, amount }
     existingEntries.forEach(e => {
       const meta = e.metadata || {};
-      if (meta.is_manager_salary) existingSalaryDates.add(e.effective_date);
+      if (meta.is_manager_salary) existingSalaryByDate[e.effective_date] = {
+        id: e.id,
+        scheduled_hours: meta.scheduled_hours,
+        hourly_rate: meta.hourly_rate,
+        amount: parseFloat(e.amount) || 0,
+        payout_batch_id: e.payout_batch_id
+      };
       if (meta.is_manager_commission) existingCommByDate[e.effective_date] = { id: e.id, day_revenue: meta.day_revenue || 0, amount: parseFloat(e.amount) || 0, payout_batch_id: e.payout_batch_id };
     });
 
     const newEntries = [];
+    const staleSalaryUpdates = [];
 
-    // Generate missing salary entries from availability
+    // Generate missing or stale salary entries from availability
     if (hourlyRate > 0 && mgr.availability) {
       const avail = typeof mgr.availability === 'string' ? JSON.parse(mgr.availability) : mgr.availability;
       const d = new Date(effectiveStart + 'T00:00:00');
       const end = new Date(effectiveEnd + 'T00:00:00');
       while (d <= end) {
         const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-        if (!existingSalaryDates.has(ds)) {
-          const sh = calculateScheduledHoursFromAvailability(avail, ds, ds);
+        const sh = calculateScheduledHoursFromAvailability(avail, ds, ds);
+        const existing = existingSalaryByDate[ds];
+        if (!existing) {
           if (sh > 0) {
             newEntries.push({
               user_id: userId, team_member_id: mgr.id, job_id: null, type: 'earning',
@@ -20999,8 +21007,36 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
               created_by: userId
             });
           }
+        } else if (!existing.payout_batch_id) {
+          // Stale if stored hours/rate missing or differ from current calculation
+          const storedHours = typeof existing.scheduled_hours === 'number' ? existing.scheduled_hours : null;
+          const storedRate = typeof existing.hourly_rate === 'number' ? existing.hourly_rate : null;
+          const hoursChanged = storedHours === null || Math.abs(sh - storedHours) > 0.01;
+          const rateChanged = storedRate === null || Math.abs(hourlyRate - storedRate) > 0.01;
+          if (sh === 0) {
+            // Day no longer scheduled — delete the stale entry
+            staleSalaryUpdates.push({ id: existing.id, _delete: true });
+          } else if (hoursChanged || rateChanged) {
+            staleSalaryUpdates.push({
+              id: existing.id,
+              amount: parseFloat((sh * hourlyRate).toFixed(2)),
+              note: `Scheduled salary: ${sh.toFixed(1)}h × $${hourlyRate}/hr (${ds})`,
+              metadata: { scheduled_hours: sh, hourly_rate: hourlyRate, is_manager_salary: true }
+            });
+          }
         }
         d.setDate(d.getDate() + 1);
+      }
+      // Apply stale salary updates
+      for (const upd of staleSalaryUpdates) {
+        if (upd._delete) {
+          await supabase.from('cleaner_ledger').delete().eq('id', upd.id);
+        } else {
+          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id);
+        }
+      }
+      if (staleSalaryUpdates.length > 0) {
+        console.log(`[Payroll] Updated ${staleSalaryUpdates.length} stale manager salary entries for ${mgr.first_name} ${mgr.last_name}`);
       }
     }
 
