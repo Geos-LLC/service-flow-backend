@@ -8144,23 +8144,32 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 
     const customer = customers[0];
 
-    // Resolve source through mappings + linked conversation fallback
+    // Resolve source — ONLY return values that match a canonical lead_source
     try {
-      // Load all user's source mappings
-      const { data: sourceMappings } = await supabase.from('lead_source_mappings')
-        .select('raw_value, source_name, provider').eq('user_id', userId);
+      // Load canonical sources + mappings in parallel
+      const [sourcesRes, mappingsRes] = await Promise.all([
+        supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+        supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+      ]);
+      const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
       const sourceMap = {};
-      for (const m of (sourceMappings || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
+      for (const m of (mappingsRes.data || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
 
-      // If customer.source exists, try to resolve it through mappings (OP first, then LB)
-      let resolved = null;
-      if (customer.source) {
-        resolved = sourceMap[`openphone:${customer.source}`]
-          || sourceMap[`leadbridge:${customer.source}`]
-          || customer.source;
-      }
+      // Helper: return value only if it's a canonical source
+      const toCanonical = (raw, provider) => {
+        if (!raw) return null;
+        // If raw exactly matches a canonical name, use it
+        if (canonicalSet.has(raw)) return raw;
+        // Otherwise try to resolve through mapping
+        const mapped = provider
+          ? sourceMap[`${provider}:${raw}`]
+          : (sourceMap[`openphone:${raw}`] || sourceMap[`leadbridge:${raw}`]);
+        return (mapped && canonicalSet.has(mapped)) ? mapped : null;
+      };
 
-      // If no source on customer, try to find one from linked conversations
+      let resolved = toCanonical(customer.source);
+
+      // Fallback: look up linked conversation by phone
       if (!resolved && customer.phone) {
         const last10 = String(customer.phone).replace(/\D/g, '').slice(-10);
         if (last10.length >= 7) {
@@ -8170,14 +8179,12 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
             .ilike('participant_phone', `%${last10}%`)
             .not('company', 'is', null)
             .limit(1).maybeSingle();
-          if (conv?.company) {
-            resolved = sourceMap[`${conv.provider}:${conv.company}`] || conv.company;
-          }
+          if (conv?.company) resolved = toCanonical(conv.company, conv.provider);
         }
       }
 
-      customer.resolved_source = resolved || customer.source || null;
-    } catch (e) { /* non-fatal — fall back to raw source */ }
+      customer.resolved_source = resolved; // null if no canonical match
+    } catch (e) { /* non-fatal */ }
 
     res.json(customer);
   } catch (error) {
@@ -36735,26 +36742,29 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     }
 
     // Build source mapping lookup (raw → canonical)
-    const { data: sourceMappings } = await supabase.from('lead_source_mappings')
-      .select('raw_value, source_name, provider').eq('user_id', userId);
+    // Load canonical sources + mappings
+    const [sourcesRes, mappingsRes] = await Promise.all([
+      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+      supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+    ]);
+    const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
     const sourceMap = {};
-    for (const m of (sourceMappings || [])) {
-      sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
-    }
+    for (const m of (mappingsRes.data || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
 
     // Map to frontend shape
     const conversations = (data || []).map(c => {
       const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
       const loc = c.sf_location_id ? locationMap[c.sf_location_id] : null;
-      // Resolve source: company mapping → LB account+channel mapping → LB channel → raw company
+      // Resolve source — only return if it's a canonical lead_source
       const rawSource = c.company || null;
       const provider = c.provider || 'openphone';
       const lbAccountKey = (provider === 'leadbridge' && account)
         ? `leadbridge:${account.displayName} (${c.channel})` : null;
-      const resolvedSource = sourceMap[`${provider}:${rawSource}`]
+      const candidate = sourceMap[`${provider}:${rawSource}`]
         || (lbAccountKey && sourceMap[lbAccountKey])
         || sourceMap[`${provider}:${c.channel}`]
-        || rawSource;
+        || (rawSource && canonicalSet.has(rawSource) ? rawSource : null);
+      const resolvedSource = (candidate && canonicalSet.has(candidate)) ? candidate : null;
       return {
         id: c.id,
         sigcoreConversationId: c.sigcore_conversation_id,
@@ -36975,25 +36985,26 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
       }
     }
 
-    // Resolve source through mappings
-    const { data: detailMappings } = await supabase.from('lead_source_mappings')
-      .select('raw_value, source_name, provider').eq('user_id', userId);
+    // Resolve source through mappings — ONLY canonical sources
+    const [detailSourcesRes, detailMappingsRes] = await Promise.all([
+      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+      supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+    ]);
+    const detailCanonicalSet = new Set((detailSourcesRes.data || []).map(s => s.name));
     const detailSourceMap = {};
-    for (const m of (detailMappings || [])) {
-      detailSourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
-    }
+    for (const m of (detailMappingsRes.data || [])) detailSourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
     const convProvider = conv.provider || 'openphone';
-    // For LB: also try "AccountName (channel)" format
     let lbDetailKey = null;
     if (convProvider === 'leadbridge' && conv.provider_account_id) {
       const { data: pa } = await supabase.from('communication_provider_accounts')
         .select('display_name').eq('id', conv.provider_account_id).maybeSingle();
       if (pa) lbDetailKey = `leadbridge:${pa.display_name} (${conv.channel})`;
     }
-    const resolvedConvSource = detailSourceMap[`${convProvider}:${conv.company}`]
+    const detailCandidate = detailSourceMap[`${convProvider}:${conv.company}`]
       || (lbDetailKey && detailSourceMap[lbDetailKey])
       || detailSourceMap[`${convProvider}:${conv.channel}`]
-      || conv.company || conv.provider;
+      || (conv.company && detailCanonicalSet.has(conv.company) ? conv.company : null);
+    const resolvedConvSource = (detailCandidate && detailCanonicalSet.has(detailCandidate)) ? detailCandidate : null;
 
     // Build lead/customer data from conversation → participant_identity → lead/customer
     let lead = null;
@@ -37065,7 +37076,7 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const hasMore = events.length < totalEvents;
     const oldestTimestamp = events.length > 0 ? events[0].timestamp : null;
 
-    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: resolvedConvSource !== conv.provider ? resolvedConvSource : (conv.company || null) } });
+    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: resolvedConvSource } });
   } catch (error) {
     logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
