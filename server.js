@@ -7903,21 +7903,38 @@ async function buildSourceResolver(userId) {
 }
 
 // Helper: build a phone → { company, provider } map from all conversations (paginated)
+// Includes OpenPhone (via company field) AND LeadBridge (via account display_name + channel)
 async function buildPhoneSourceMap(userId) {
+  // Load provider accounts for LB account-name lookup
+  const { data: provAccounts } = await supabase.from('communication_provider_accounts')
+    .select('id, display_name, channel').eq('user_id', userId);
+  const accountMap = {};
+  for (const pa of (provAccounts || [])) accountMap[pa.id] = pa;
+
   const map = {};
   const pageSize = 1000; let from = 0;
   while (true) {
     const { data } = await supabase.from('communication_conversations')
-      .select('participant_phone, company, provider, channel')
+      .select('participant_phone, company, provider, channel, provider_account_id')
       .eq('user_id', userId)
-      .not('company', 'is', null)
       .range(from, from + pageSize - 1);
     if (!data?.length) break;
     for (const c of data) {
       if (!c.participant_phone) continue;
       const last10 = String(c.participant_phone).replace(/\D/g, '').slice(-10);
-      if (last10.length >= 7 && !map[last10]) {
-        map[last10] = { company: c.company, provider: c.provider };
+      if (last10.length < 7 || map[last10]) continue;
+      // OpenPhone: use company field
+      if (c.provider === 'openphone' && c.company) {
+        map[last10] = { company: c.company, provider: 'openphone' };
+        continue;
+      }
+      // LeadBridge: use "AccountName (channel)" format
+      if (c.provider === 'leadbridge') {
+        const acct = c.provider_account_id ? accountMap[c.provider_account_id] : null;
+        const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
+        if (raw) {
+          map[last10] = { company: raw, provider: 'leadbridge' };
+        }
       }
     }
     if (data.length < pageSize) break;
