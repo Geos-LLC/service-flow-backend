@@ -468,6 +468,15 @@ module.exports = function buildConnectedEmail(supabase, logger) {
       log.info?.('[connected-email] poller not started (feature not configured)')
       return
     }
+    // Clear any stuck is_running=true locks from previous process that died
+    // mid-sync (e.g. Railway deploy restart). A fresh process should never see
+    // pre-existing running flags.
+    supabase.from('connected_email_sync_state')
+      .update({ is_running: false, run_started_at: null, next_run_at: new Date().toISOString() })
+      .eq('is_running', true)
+      .then(() => log.info?.('[connected-email] cleared stuck sync locks on startup'))
+      .catch(() => {})
+
     pollerHandle = setInterval(() => {
       syncEngine.syncAllDue(supabase, log).catch(e =>
         log.error?.(`[connected-email] poller: ${e.message}`)
