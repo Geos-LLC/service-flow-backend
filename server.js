@@ -36726,6 +36726,10 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         displayName: c.participant_name || '',
         fallbackIdentifier: c.participant_phone || c.participant_email || '',
         endpointPhone: c.endpoint_phone,
+        endpointEmail: c.endpoint_email,
+        endpoint_email: c.endpoint_email, // snake_case alias for filter compatibility
+        participantEmail: c.participant_email,
+        emailThreadId: c.email_thread_id,
         endpointSymbol: phoneSymbols[normalizePhone(c.endpoint_phone)] || null,
         lastPreview: c.last_preview,
         lastEventAt: c.last_event_at,
