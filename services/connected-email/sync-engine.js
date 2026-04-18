@@ -249,6 +249,7 @@ async function syncAccount(supabase, logger, accountId) {
     }
 
     messageIds = messageIds.slice(0, PER_CYCLE_MAX)
+    logger?.info?.(`[connected-email] ${accountId} provider=${account.provider} mailbox=${ownerEmail} isInitial=${isInitial} returned ${messageIds.length} message ids`)
     setProgress(accountId, { phase: 'fetching', total: messageIds.length, scanned: 0, synced: 0 })
 
     let scannedLocal = 0
@@ -275,6 +276,17 @@ async function syncAccount(supabase, logger, accountId) {
         })
         newCursor = prof.historyId
       } catch {}
+    }
+    // Outlook: after an initial or no-cursor sync, fetch the current delta link
+    // so next cycle can use incremental /delta sync instead of rescanning the
+    // 30-day window and missing messages that land AFTER the last scan.
+    if (account.provider === 'outlook' && !newCursor) {
+      try {
+        const res = await provider.listHistory(tokens, null, { targetMailbox })
+        if (res.historyId) newCursor = res.historyId
+      } catch (e) {
+        logger?.warn?.(`[connected-email] outlook delta init failed: ${e.message}`)
+      }
     }
 
     const patch = {
