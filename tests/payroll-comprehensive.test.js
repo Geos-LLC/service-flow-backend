@@ -39,11 +39,16 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     if (override) {
       if (override.available === false) continue;
       if (override.hours && Array.isArray(override.hours) && override.hours.length > 0) {
+        let overrideDayTotal = 0;
         override.hours.forEach(h => {
           const hStart = toMinutes(h.start || h.startTime || '09:00');
           const hEnd = toMinutes(h.end || h.endTime || '17:00');
-          if (hEnd > hStart) totalHours += (hEnd - hStart) / 60;
+          if (hEnd > hStart) overrideDayTotal += (hEnd - hStart) / 60;
         });
+        if (breakHours > 0 && overrideDayTotal > 0 && override.hours.length === 1) {
+          overrideDayTotal = Math.max(0, overrideDayTotal - breakHours);
+        }
+        totalHours += overrideDayTotal;
         continue;
       }
     }
@@ -269,6 +274,60 @@ describe('Break calculation in availability', () => {
     };
     const hours = calculateScheduledHoursFromAvailability(avail2hBreak, '2026-03-16', '2026-03-16');
     expect(hours).toBe(7); // 9h - 2h
+  });
+
+  // Regression: customAvailability single-slot overrides must apply the common break.
+  // Worker-availability.jsx writes { available: true, hours: [{ start, end }] } when a worker edits a day,
+  // so those days were previously counted without subtracting the break (e.g. 3 days × 9h = 27h instead of 24h).
+  test('single-slot customAvailability override applies break', () => {
+    const avail = {
+      workingHours: {},
+      break: { start: '13:00', end: '14:00' },
+      customAvailability: [
+        { date: '2026-04-13', available: true, hours: [{ start: '09:00', end: '18:00' }] },
+        { date: '2026-04-15', available: true, hours: [{ start: '09:00', end: '18:00' }] },
+        { date: '2026-04-17', available: true, hours: [{ start: '09:00', end: '18:00' }] }
+      ]
+    };
+    // 3 days × (9h - 1h break) = 24h
+    const hours = calculateScheduledHoursFromAvailability(avail, '2026-04-12', '2026-04-18');
+    expect(hours).toBe(24);
+  });
+
+  test('multi-slot customAvailability override does NOT apply break (already encoded)', () => {
+    const avail = {
+      workingHours: {},
+      break: { start: '13:00', end: '14:00' },
+      customAvailability: [
+        { date: '2026-04-13', available: true, hours: [
+          { start: '09:00', end: '13:00' },
+          { start: '14:00', end: '18:00' }
+        ]}
+      ]
+    };
+    // 4h + 4h = 8h, NOT 7h
+    const hours = calculateScheduledHoursFromAvailability(avail, '2026-04-13', '2026-04-13');
+    expect(hours).toBe(8);
+  });
+
+  test('customAvailability unavailable day is excluded from total', () => {
+    const avail = {
+      workingHours: {
+        monday: { available: true, start: '09:00', end: '18:00' },
+        tuesday: { available: true, start: '09:00', end: '18:00' },
+        wednesday: { available: true, start: '09:00', end: '18:00' },
+        thursday: { available: true, start: '09:00', end: '18:00' },
+        friday: { available: true, start: '09:00', end: '18:00' },
+        saturday: { available: true, start: '09:00', end: '18:00' }
+      },
+      break: { start: '13:00', end: '14:00' },
+      customAvailability: [
+        { date: '2026-04-18', available: false } // Saturday removed
+      ]
+    };
+    // Mon-Fri (5 days × 8h) = 40h, Saturday excluded
+    const hours = calculateScheduledHoursFromAvailability(avail, '2026-04-13', '2026-04-18');
+    expect(hours).toBe(40);
   });
 });
 

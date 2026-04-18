@@ -20892,11 +20892,18 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     if (override) {
       if (override.available === false) continue; // day off
       if (override.hours && Array.isArray(override.hours) && override.hours.length > 0) {
+        let overrideDayTotal = 0;
         override.hours.forEach(h => {
           const hStart = toMinutes(h.start || h.startTime || '09:00');
           const hEnd = toMinutes(h.end || h.endTime || '17:00');
-          if (hEnd > hStart) totalHours += (hEnd - hStart) / 60;
+          if (hEnd > hStart) overrideDayTotal += (hEnd - hStart) / 60;
         });
+        // Single-slot override is a simple from-to (analogous to dayHrs.start/end) — apply common break.
+        // Multi-slot overrides already encode the break, so skip subtraction.
+        if (breakHours > 0 && overrideDayTotal > 0 && override.hours.length === 1) {
+          overrideDayTotal = Math.max(0, overrideDayTotal - breakHours);
+        }
+        totalHours += overrideDayTotal;
         continue;
       }
       // available === true with no custom hours -> fall through to regular schedule
