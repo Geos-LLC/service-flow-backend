@@ -2914,7 +2914,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
       .from('jobs')
       .select(`
         *,
-        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code, source),
         services!left(name, price, duration),
         team_members!left(first_name, last_name, email),
         job_team_assignments!left(team_member_id, is_primary, assigned_by, team_members(id, first_name, last_name, email))
@@ -3287,7 +3287,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
             .from('jobs')
             .select(`
               *,
-              customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+              customers!left(first_name, last_name, email, phone, address, city, state, zip_code, source),
               services!left(name, price, duration),
               team_members!left(first_name, last_name, email)
             `, { count: 'exact' })
@@ -3382,7 +3382,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
                 .from('jobs')
                 .select(`
                   *,
-                  customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+                  customers!left(first_name, last_name, email, phone, address, city, state, zip_code, source),
                   services!left(name, price, duration),
                   team_members!left(first_name, last_name, email)
                 `)
@@ -3488,6 +3488,7 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           customer_city: customer.city,
           customer_state: customer.state,
           customer_zip_code: customer.zip_code,
+          customer_source: customer.source || null,
           service_name: service.name || 'Service Not Available',
           service_price: service.price || 0.00,
           service_duration: service.duration || 60,
@@ -3498,6 +3499,14 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           status_history: allStatusHistory[job.id] || []
         };
       });
+
+      // Resolve customer_source once and attach customer_source_resolved to each job
+      try {
+        const resolve = await buildSourceResolver(userId);
+        for (const j of processedJobs) {
+          j.customer_source_resolved = j.customer_source ? resolve(j.customer_source) : null;
+        }
+      } catch (e) { /* non-fatal */ }
       
       const response = {
         jobs: processedJobs,
@@ -3666,7 +3675,7 @@ app.get('/api/jobs/export', authenticateToken, async (req, res) => {
       .from('jobs')
       .select(`
         *,
-        customers!left(first_name, last_name, email, phone, address, city, state, zip_code),
+        customers!left(first_name, last_name, email, phone, address, city, state, zip_code, source),
         services!left(name, price, duration),
         team_members!left(first_name, last_name, email)
       `)
@@ -5171,6 +5180,18 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
           jobData.total_paid_amount = jobTotal;
         }
       }
+
+      // Flatten customer_source + resolve through mappings
+      try {
+        const rawCustomerSource = job.customers?.source || null;
+        jobData.customer_source = rawCustomerSource;
+        if (rawCustomerSource) {
+          const resolve = await buildSourceResolver(userId);
+          jobData.customer_source_resolved = resolve(rawCustomerSource);
+        } else {
+          jobData.customer_source_resolved = null;
+        }
+      } catch (e) { /* non-fatal */ }
 
       res.json(jobData);
     } catch (error) {
@@ -7852,11 +7873,30 @@ app.delete('/api/jobs/:id', authenticateToken, async (req, res) => {
 });
 
 // Customers endpoints
+// Helper: build source resolver for a user (closure over canonical set + mappings)
+async function buildSourceResolver(userId) {
+  const [sourcesRes, mappingsRes] = await Promise.all([
+    supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+    supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+  ]);
+  const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
+  const sourceMap = {};
+  for (const m of (mappingsRes.data || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
+  return (raw, provider) => {
+    if (!raw) return null;
+    if (canonicalSet.has(raw)) return raw;
+    const mapped = provider
+      ? sourceMap[`${provider}:${raw}`]
+      : (sourceMap[`openphone:${raw}`] || sourceMap[`leadbridge:${raw}`]);
+    return (mapped && canonicalSet.has(mapped)) ? mapped : null;
+  };
+}
+
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { search, page = 1, limit = 20, sortBy = 'created_at', sortOrder = 'DESC', status } = req.query;
-    
+
 
     // Build Supabase query
     let query = supabase
@@ -7968,6 +8008,12 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
         }
       }
       
+      // Attach resolved_source to each customer
+      try {
+        const resolve = await buildSourceResolver(userId);
+        allCustomers = allCustomers.map(c => ({ ...c, resolved_source: resolve(c.source) }));
+      } catch (e) { /* non-fatal */ }
+
       res.json({
         customers: allCustomers,
         pagination: {
@@ -7983,14 +8029,21 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
       query = query.range(offset, offset + limitValue - 1);
       
       const { data: customers, error, count } = await query;
-      
+
       if (error) {
         console.error('Error fetching customers:', error);
         return res.status(500).json({ error: 'Failed to fetch customers' });
       }
-      
+
+      // Attach resolved_source to each customer
+      let withSource = customers || [];
+      try {
+        const resolve = await buildSourceResolver(userId);
+        withSource = withSource.map(c => ({ ...c, resolved_source: resolve(c.source) }));
+      } catch (e) { /* non-fatal */ }
+
       res.json({
-        customers: customers || [],
+        customers: withSource,
         pagination: {
           page: parseInt(page),
           limit: limitValue,
