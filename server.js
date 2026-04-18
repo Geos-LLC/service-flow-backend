@@ -3502,9 +3502,16 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
 
       // Resolve customer_source once and attach customer_source_resolved to each job
       try {
-        const resolve = await buildSourceResolver(userId);
+        const [resolve, phoneMap] = await Promise.all([
+          buildSourceResolver(userId),
+          buildPhoneSourceMap(userId),
+        ]);
         for (const j of processedJobs) {
-          j.customer_source_resolved = j.customer_source ? resolve(j.customer_source) : null;
+          j.customer_source_resolved = resolveCustomerSource(
+            { source: j.customer_source, phone: j.customer_phone },
+            resolve,
+            phoneMap
+          );
         }
       } catch (e) { /* non-fatal */ }
       
@@ -5181,16 +5188,19 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
         }
       }
 
-      // Flatten customer_source + resolve through mappings
+      // Flatten customer_source + resolve through mappings (with conversation fallback)
       try {
         const rawCustomerSource = job.customers?.source || null;
         jobData.customer_source = rawCustomerSource;
-        if (rawCustomerSource) {
-          const resolve = await buildSourceResolver(userId);
-          jobData.customer_source_resolved = resolve(rawCustomerSource);
-        } else {
-          jobData.customer_source_resolved = null;
-        }
+        const [resolve, phoneMap] = await Promise.all([
+          buildSourceResolver(userId),
+          buildPhoneSourceMap(userId),
+        ]);
+        jobData.customer_source_resolved = resolveCustomerSource(
+          { source: rawCustomerSource, phone: job.customers?.phone },
+          resolve,
+          phoneMap
+        );
       } catch (e) { /* non-fatal */ }
 
       res.json(jobData);
@@ -7892,6 +7902,41 @@ async function buildSourceResolver(userId) {
   };
 }
 
+// Helper: build a phone → { company, provider } map from all conversations (paginated)
+async function buildPhoneSourceMap(userId) {
+  const map = {};
+  const pageSize = 1000; let from = 0;
+  while (true) {
+    const { data } = await supabase.from('communication_conversations')
+      .select('participant_phone, company, provider, channel')
+      .eq('user_id', userId)
+      .not('company', 'is', null)
+      .range(from, from + pageSize - 1);
+    if (!data?.length) break;
+    for (const c of data) {
+      if (!c.participant_phone) continue;
+      const last10 = String(c.participant_phone).replace(/\D/g, '').slice(-10);
+      if (last10.length >= 7 && !map[last10]) {
+        map[last10] = { company: c.company, provider: c.provider };
+      }
+    }
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+  return map;
+}
+
+// Resolve customer source: direct customers.source → linked conversation.company → null
+function resolveCustomerSource(customer, resolve, phoneMap) {
+  let resolved = resolve(customer.source);
+  if (!resolved && customer.phone) {
+    const last10 = String(customer.phone).replace(/\D/g, '').slice(-10);
+    const hit = phoneMap[last10];
+    if (hit?.company) resolved = resolve(hit.company, hit.provider);
+  }
+  return resolved;
+}
+
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -8008,10 +8053,13 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
         }
       }
       
-      // Attach resolved_source to each customer
+      // Attach resolved_source to each customer (with conversation fallback)
       try {
-        const resolve = await buildSourceResolver(userId);
-        allCustomers = allCustomers.map(c => ({ ...c, resolved_source: resolve(c.source) }));
+        const [resolve, phoneMap] = await Promise.all([
+          buildSourceResolver(userId),
+          buildPhoneSourceMap(userId),
+        ]);
+        allCustomers = allCustomers.map(c => ({ ...c, resolved_source: resolveCustomerSource(c, resolve, phoneMap) }));
       } catch (e) { /* non-fatal */ }
 
       res.json({
@@ -8035,11 +8083,14 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'Failed to fetch customers' });
       }
 
-      // Attach resolved_source to each customer
+      // Attach resolved_source to each customer (with conversation fallback)
       let withSource = customers || [];
       try {
-        const resolve = await buildSourceResolver(userId);
-        withSource = withSource.map(c => ({ ...c, resolved_source: resolve(c.source) }));
+        const [resolve, phoneMap] = await Promise.all([
+          buildSourceResolver(userId),
+          buildPhoneSourceMap(userId),
+        ]);
+        withSource = withSource.map(c => ({ ...c, resolved_source: resolveCustomerSource(c, resolve, phoneMap) }));
       } catch (e) { /* non-fatal */ }
 
       res.json({
@@ -8197,46 +8248,13 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 
     const customer = customers[0];
 
-    // Resolve source — ONLY return values that match a canonical lead_source
+    // Resolve source with conversation fallback, canonical-only
     try {
-      // Load canonical sources + mappings in parallel
-      const [sourcesRes, mappingsRes] = await Promise.all([
-        supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
-        supabase.from('lead_source_mappings').select('raw_value, source_name, provider').eq('user_id', userId),
+      const [resolve, phoneMap] = await Promise.all([
+        buildSourceResolver(userId),
+        buildPhoneSourceMap(userId),
       ]);
-      const canonicalSet = new Set((sourcesRes.data || []).map(s => s.name));
-      const sourceMap = {};
-      for (const m of (mappingsRes.data || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
-
-      // Helper: return value only if it's a canonical source
-      const toCanonical = (raw, provider) => {
-        if (!raw) return null;
-        // If raw exactly matches a canonical name, use it
-        if (canonicalSet.has(raw)) return raw;
-        // Otherwise try to resolve through mapping
-        const mapped = provider
-          ? sourceMap[`${provider}:${raw}`]
-          : (sourceMap[`openphone:${raw}`] || sourceMap[`leadbridge:${raw}`]);
-        return (mapped && canonicalSet.has(mapped)) ? mapped : null;
-      };
-
-      let resolved = toCanonical(customer.source);
-
-      // Fallback: look up linked conversation by phone
-      if (!resolved && customer.phone) {
-        const last10 = String(customer.phone).replace(/\D/g, '').slice(-10);
-        if (last10.length >= 7) {
-          const { data: conv } = await supabase.from('communication_conversations')
-            .select('company, provider, channel, provider_account_id')
-            .eq('user_id', userId)
-            .ilike('participant_phone', `%${last10}%`)
-            .not('company', 'is', null)
-            .limit(1).maybeSingle();
-          if (conv?.company) resolved = toCanonical(conv.company, conv.provider);
-        }
-      }
-
-      customer.resolved_source = resolved; // null if no canonical match
+      customer.resolved_source = resolveCustomerSource(customer, resolve, phoneMap);
     } catch (e) { /* non-fatal */ }
 
     res.json(customer);
