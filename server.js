@@ -21006,9 +21006,10 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
         const jd = String(job.scheduled_date || '').split('T')[0].split(' ')[0];
         if (jd < effectiveStart || jd > effectiveEnd) return;
         const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+        const tpFees = sumThirdPartyFees(job.fees_breakdown);
         const rev = svcP > 0
-          ? svcP + (parseFloat(job.additional_fees) || 0)
-          : (parseFloat(job.total) || parseFloat(job.total_amount) || 0);
+          ? svcP + (parseFloat(job.additional_fees) || 0) - tpFees
+          : Math.max(0, (parseFloat(job.total) || parseFloat(job.total_amount) || 0) - tpFees);
         dailyRevenue[jd] = (dailyRevenue[jd] || 0) + rev;
       });
       const staleUpdates = [];
@@ -21116,7 +21117,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const pageSize = 1000;
       while (true) {
         let q = supabase.from('jobs')
-          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, status, service_name, customer_id, team_member_id, hours_worked, duration, estimated_duration, start_time, end_time')
+          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, fees_breakdown, status, service_name, customer_id, team_member_id, hours_worked, duration, estimated_duration, start_time, end_time')
           .eq('user_id', userId)
           .range(from, from + pageSize - 1);
         if (startDate) q = q.gte('scheduled_date', startDate);
@@ -33280,13 +33281,22 @@ app.post('/api/fix-schema', async (req, res) => {
 // CLEANER LEDGER SYSTEM
 // ============================================================
 
+// Sum third-party fees (Stripe processing etc.) from the job's fees_breakdown array.
+// Used to exclude those fees from cleaner/manager commission revenue.
+function sumThirdPartyFees(feesBreakdown) {
+  if (!Array.isArray(feesBreakdown)) return 0;
+  return feesBreakdown
+    .filter(f => f && (f.type === 'fee' || f.adjustment_type === 'fee'))
+    .reduce((s, f) => s + (parseFloat(f.amount ?? f.adjustment_amount) || 0), 0);
+}
+
 // Helper: Create ledger entries for a completed job
 // *** Mirrors Payroll endpoint logic exactly (Payroll = single source of truth) ***
 async function createLedgerEntriesForCompletedJob(jobId, userId) {
   // Fetch job details (includes start_time/end_time for hours calc, total_paid_amount for overpayment/tip calc)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, taxes')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, fees_breakdown, taxes')
     .eq('id', jobId)
     .single();
 
@@ -33354,11 +33364,13 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
   // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
+  // Subtract third-party fees (Stripe processing, etc.) — cleaners don't earn commission on those
   // Falls back to total/total_amount if service_price is missing
   const basePrice = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+  const thirdPartyFees = sumThirdPartyFees(job.fees_breakdown);
   const jobRevenue = basePrice > 0
-    ? basePrice + (parseFloat(job.additional_fees) || 0)
-    : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
+    ? basePrice + (parseFloat(job.additional_fees) || 0) - thirdPartyFees
+    : Math.max(0, (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0) - thirdPartyFees);
 
   // Hours for salary: use estimated duration (booked time), not real time
   // Priority 1: hours_worked (manually overridden)
@@ -34763,7 +34775,7 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
       const chunk = revenueJobIds.slice(i, i + 200);
       const { data: revJobs } = await supabase
         .from('jobs')
-        .select('id, price, total, service_price, total_amount, invoice_amount, taxes, discount, additional_fees, status')
+        .select('id, price, total, service_price, total_amount, invoice_amount, taxes, discount, additional_fees, fees_breakdown, status')
         .in('id', chunk);
       revenueData = revenueData.concat(revJobs || []);
     }
@@ -34771,11 +34783,13 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
     revenueData.forEach(job => {
       const s = (job.status || '').toLowerCase();
       if (cancelledStatuses2.includes(s)) return;
-      // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
+      // Revenue for salary/commission = service_price + additional_fees − third-party fees
+      // (discount is for customer, not cleaner pay; Stripe processing fee is not cleaner-earnable)
       const svcP = parseFloat(job.service_price) || parseFloat(job.price) || 0;
+      const tpFees = sumThirdPartyFees(job.fees_breakdown);
       const rev = svcP > 0
-        ? svcP + (parseFloat(job.additional_fees) || 0)
-        : (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0);
+        ? svcP + (parseFloat(job.additional_fees) || 0) - tpFees
+        : Math.max(0, (parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.invoice_amount) || 0) - tpFees);
       totalBusinessRevenue += rev;
     });
 
@@ -34862,9 +34876,10 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
             const revenueMap = {};
             revenueData.forEach(r => {
               const sp = parseFloat(r.service_price) || parseFloat(r.price) || 0;
+              const tp = sumThirdPartyFees(r.fees_breakdown);
               revenueMap[r.id] = sp > 0
-                ? sp + (parseFloat(r.additional_fees) || 0)
-                : (parseFloat(r.total) || parseFloat(r.total_amount) || 0);
+                ? sp + (parseFloat(r.additional_fees) || 0) - tp
+                : Math.max(0, (parseFloat(r.total) || parseFloat(r.total_amount) || 0) - tp);
             });
 
             // Group revenue by day, then batch insert
