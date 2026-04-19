@@ -1082,7 +1082,7 @@ app.use('/api', (req, res, next) => {
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
-try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
@@ -7292,9 +7292,8 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
         const { data: currentJob } = await supabase.from('jobs').select('status').eq('id', id).single();
         const earningsJobStatuses = ['completed', 'complete', 'paid'];
         if (currentJob && earningsJobStatuses.includes((currentJob.status || '').toLowerCase())) {
-          // Delete existing ledger entries and rebuild with new assignments
-          await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id));
-          await createLedgerEntriesForCompletedJob(id, userId);
+          // Rebuild with new assignments — preserves prior payout batch links
+          await rebuildJobLedger(parseInt(id), userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] });
           console.log(`[Ledger] Rebuilt for job ${id} after team assignment change`);
         }
       } catch (rebuildErr) {
@@ -21344,8 +21343,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     if (staleJobIds.size > 0) {
       console.log(`[Payroll] Auto-rebuilding ${staleJobIds.size} stale/missing job ledger entries: ${[...staleJobIds].join(', ')}`);
       for (const jobId of staleJobIds) {
-        await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive']);
-        try { await createLedgerEntriesForCompletedJob(jobId, req.user.userId); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
+        try { await rebuildJobLedger(jobId, req.user.userId, { types: ['earning', 'tip', 'incentive'] }); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
       }
       // Re-fetch ledger entries after rebuild
       ledgerEntries = await fetchLedgerEntries();
@@ -21840,14 +21838,9 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
         }
       }
     } else {
-      // Full rebuild for hours/tips/servicePrice changes
-      const { error: deleteErr } = await supabase.from('cleaner_ledger').delete().eq('job_id', parseInt(id)).in('type', ['earning', 'tip', 'incentive']);
-      if (deleteErr) {
-        console.error(`[Payroll PATCH] Ledger delete failed for job ${id}:`, deleteErr);
-        return res.status(500).json({ error: 'Failed to clear ledger entries for recalculation' });
-      }
+      // Full rebuild for hours/tips/servicePrice changes — preserves prior batch links
       try {
-        await createLedgerEntriesForCompletedJob(parseInt(id), userId);
+        await rebuildJobLedger(parseInt(id), userId, { types: ['earning', 'tip', 'incentive'] });
       } catch (e) {
         console.error(`[Payroll PATCH] Ledger rebuild failed for job ${id}:`, e);
         return res.status(500).json({ error: 'Failed to rebuild ledger entries' });
@@ -28504,9 +28497,8 @@ app.post('/api/transactions/:id/void', authenticateToken, async (req, res) => {
       const invoiceStatus = paymentStatus === 'paid' ? 'paid' : paymentStatus === 'partial' ? 'invoiced' : 'invoiced';
       await supabase.from('jobs').update({ payment_status: paymentStatus, invoice_status: invoiceStatus }).eq('id', tx.job_id);
 
-      // Rebuild ledger (cash_collected changes if cash payment voided)
-      await supabase.from('cleaner_ledger').delete().eq('job_id', tx.job_id).in('type', ['earning', 'tip', 'incentive', 'cash_collected']);
-      try { await createLedgerEntriesForCompletedJob(tx.job_id, userId); } catch (e) { console.error('Ledger rebuild after void:', e); }
+      // Rebuild ledger (cash_collected changes if cash payment voided) — preserves batch links
+      try { await rebuildJobLedger(tx.job_id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }); } catch (e) { console.error('Ledger rebuild after void:', e); }
     }
 
     // Log to payroll_edits for audit
@@ -33595,6 +33587,69 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       console.error('Ledger: Error inserting entries for job', jobId, insertError);
     } else {
       console.log(`Ledger: Created ${ledgerEntries.length} entries for job ${jobId}`);
+    }
+  }
+}
+
+/**
+ * Rebuild ledger entries for a job while preserving existing payout_batch_id links.
+ *
+ * Replaces the delete+createLedgerEntriesForCompletedJob pattern. When a completed
+ * job is rebuilt (ZZB resync, inline edit, cash transaction arrival, etc.) the old
+ * ledger rows get deleted. If any of those rows were linked to a *paid* batch, the
+ * link is lost — the batch still has `total_amount` and was already paid out, but
+ * the new rows come back with `payout_batch_id = NULL`. The paystub and payroll
+ * then disagree with the actual payment.
+ *
+ * This helper captures the `(team_member_id, type) -> payout_batch_id` map from
+ * the old rows *before* deleting, runs the rebuild, and re-attaches the new rows.
+ *
+ * Safe to call even when no prior entries exist — it falls back to a plain rebuild.
+ */
+async function rebuildJobLedger(jobId, userId, { types = ['earning', 'tip', 'incentive', 'cash_collected'] } = {}) {
+  // 1. Capture batch linkage BEFORE delete.
+  const { data: oldEntries } = await supabase
+    .from('cleaner_ledger')
+    .select('team_member_id, type, payout_batch_id')
+    .eq('job_id', jobId)
+    .in('type', types)
+    .not('payout_batch_id', 'is', null);
+
+  const batchMap = {};
+  for (const e of (oldEntries || [])) {
+    const key = `${e.team_member_id}:${e.type}`;
+    if (!batchMap[key]) batchMap[key] = e.payout_batch_id;
+  }
+
+  // 2. Delete old entries.
+  await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', types);
+
+  // 3. Rebuild via the standard path.
+  await createLedgerEntriesForCompletedJob(jobId, userId);
+
+  // 4. Re-attach batch links to the newly inserted rows.
+  if (Object.keys(batchMap).length > 0) {
+    const { data: newEntries } = await supabase
+      .from('cleaner_ledger')
+      .select('id, team_member_id, type')
+      .eq('job_id', jobId)
+      .in('type', types)
+      .is('payout_batch_id', null);
+
+    let reattached = 0;
+    for (const e of (newEntries || [])) {
+      const key = `${e.team_member_id}:${e.type}`;
+      const batchId = batchMap[key];
+      if (batchId) {
+        const { error: updErr } = await supabase
+          .from('cleaner_ledger')
+          .update({ payout_batch_id: batchId })
+          .eq('id', e.id);
+        if (!updErr) reattached++;
+      }
+    }
+    if (reattached > 0) {
+      console.log(`Ledger: Re-attached ${reattached} rebuilt entries for job ${jobId} to prior batch(es)`);
     }
   }
 }

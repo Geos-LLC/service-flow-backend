@@ -13,8 +13,15 @@ const ZB_BASE = 'https://api.zenbooker.com/v1'
 // In-memory sync progress tracking (per userId)
 const syncProgress = {}
 
-module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
+module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger) => {
   const router = express.Router()
+
+  // Fallback when server.js doesn't pass rebuildJobLedger (older builds): do the
+  // plain delete+rebuild pattern so behavior matches the pre-helper era.
+  const rebuildLedger = rebuildJobLedger || (async (jobId, userId, { types = ['earning', 'tip', 'incentive', 'cash_collected'] } = {}) => {
+    await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', types)
+    if (createLedgerEntriesForCompletedJob) await createLedgerEntriesForCompletedJob(jobId, userId)
+  })
 
   // ══════════════════════════════════════
   // Auth middleware — reuse the app's token
@@ -494,8 +501,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
     if (createLedgerEntriesForCompletedJob) {
       for (const jobId of jobsNeedingLedgerRebuild) {
         try {
-          await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-          await createLedgerEntriesForCompletedJob(jobId, userId)
+          await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
           ledgerRebuilt++
         } catch (e) {
           logger.error(`[Zenbooker] Ledger rebuild after tx sync failed for job ${jobId}: ${e.message}`)
@@ -788,8 +794,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       // (runs AFTER fallback tx creation so cash_collected entries get included)
       if ((mapped.status === 'completed' || mapped.status === 'paid') && createLedgerEntriesForCompletedJob) {
         try {
-          await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-          await createLedgerEntriesForCompletedJob(jobId, userId)
+          await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
           logger.log(`[Zenbooker] Ledger entries rebuilt for job ${jobId} (${eventType})`)
         } catch (ledgerErr) {
           logger.error(`[Zenbooker] Ledger rebuild failed for job ${jobId}: ${ledgerErr.message}`)
@@ -858,8 +863,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
       // For cash payments: rebuild cash_collected ledger entries (transaction must exist first)
       if (rawMethod && rawMethod.toLowerCase() === 'cash' && createLedgerEntriesForCompletedJob) {
-        await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-        await createLedgerEntriesForCompletedJob(job.id, userId).catch(err => {
+        await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }).catch(err => {
           logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
         })
         logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
@@ -880,8 +884,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
       }
       // Rebuild ledger (cash_collected may need to be removed)
       if (createLedgerEntriesForCompletedJob) {
-        await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-        try { await createLedgerEntriesForCompletedJob(job.id, userId) } catch (_) {}
+        try { await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }) } catch (_) {}
       }
     }
   }
@@ -994,8 +997,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
 
           // Rebuild ledger so cash_collected entries get created for cash payments
           if (createLedgerEntriesForCompletedJob) {
-            await supabase.from('cleaner_ledger').delete().eq('job_id', job.id).in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
-            try { await createLedgerEntriesForCompletedJob(job.id, userId) } catch (_) {}
+            try { await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }) } catch (_) {}
           }
 
           payments_caught++
@@ -1427,11 +1429,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob) => {
               const multiJobIds = [...new Set((assignedJobs || []).map(a => a.job_id))]
               let ledgerRebuilt = 0
               for (const jobId of multiJobIds) {
-                // Delete old entries for this job
-                await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', ['earning', 'tip', 'incentive'])
-                // Recreate with correct member count
+                // Rebuild, preserving any existing batch links
                 try {
-                  await createLedgerEntriesForCompletedJob(jobId, userId)
+                  await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive'] })
                   ledgerRebuilt++
                 } catch (e) {
                   logger.error(`[Zenbooker] Ledger rebuild error job ${jobId}: ${e.message}`)
