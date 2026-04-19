@@ -245,6 +245,7 @@ module.exports = (supabase, logger, notificationEmail) => {
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Reimbursements</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.reimbursements)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Adjustments</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.adjustments)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Cash collected</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.cashCollected)}</td></tr>
+        ${totals.priorDebt ? `<tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Prior period debt</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.priorDebt)}</td></tr>` : ''}
         <tr><td style="padding:14px;font-size:15px;font-weight:700;color:#111;border-top:2px solid #111;">Net Earned</td><td style="padding:14px;font-size:15px;font-weight:700;text-align:right;border-top:2px solid #111;">${fmt(totals.netPayout)}</td></tr>
       </table>
 
@@ -367,6 +368,35 @@ module.exports = (supabase, logger, notificationEmail) => {
     // 6. Aggregate
     const { totals, lineItems } = aggregateLedgerEntries(entries, jobLookup)
 
+    // 6b. Prior-period debt carry-forward.
+    // When a batch absorbs a prior negative batch (via recovered_by_batch_id) the
+    // absorbed -$X isn't a ledger row in THIS batch — it's netted into batch.total_amount
+    // at creation time. Without surfacing it, the paystub summary (sum of ledger rows)
+    // won't match the actual Payment amount (batch.total_amount).
+    let priorDebt = 0
+    let recoveredBatches = []
+    if (payoutBatch?.id) {
+      const { data: recovered } = await supabase
+        .from('cleaner_payout_batch')
+        .select('id, period_start, period_end, total_amount')
+        .eq('user_id', userId)
+        .eq('recovered_by_batch_id', payoutBatch.id)
+      recoveredBatches = (recovered || []).map(b => ({
+        id: b.id,
+        periodStart: b.period_start,
+        periodEnd: b.period_end,
+        amount: parseFloat(b.total_amount) || 0,
+      }))
+      priorDebt = recoveredBatches.reduce((sum, b) => sum + b.amount, 0)
+    }
+
+    if (priorDebt !== 0) {
+      totals.priorDebt = parseFloat(priorDebt.toFixed(2))
+      totals.netPayout = parseFloat((totals.netPayout + priorDebt).toFixed(2))
+    } else {
+      totals.priorDebt = 0
+    }
+
     return {
       version: 1,
       generatedAt: new Date().toISOString(),
@@ -381,6 +411,7 @@ module.exports = (supabase, logger, notificationEmail) => {
       period: { start: pStart, end: pEnd },
       lineItems,
       totals,
+      recoveredBatches,
       payout: {
         batchId: payoutBatch?.id || null,
         status: payoutBatch?.status || null,
