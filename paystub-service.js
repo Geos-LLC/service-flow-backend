@@ -74,6 +74,8 @@ module.exports = (supabase, logger, notificationEmail) => {
   function aggregateLedgerEntries(entries, jobLookup = {}) {
     const totals = {
       earnings: 0,
+      managerSalary: 0,
+      managerCommission: 0,
       tips: 0,
       incentives: 0,
       adjustments: 0,
@@ -82,13 +84,40 @@ module.exports = (supabase, logger, notificationEmail) => {
       netPayout: 0,
     }
     const lineItemsByJob = new Map()
+    const managerSalaryItems = []     // [{ date, hours, rate, amount, note }]
+    const managerCommissionItems = [] // [{ date, dayRevenue, commissionPct, amount, note }]
 
     for (const entry of (entries || [])) {
       const amt = toNum(entry.amount)
       const type = (entry.type || '').toLowerCase()
+      const meta = entry.metadata || {}
 
       // payout entries are settlement records — not part of earned pay
       if (type === 'payout') continue
+
+      // Manager-level earnings (job_id NULL) — pulled out for per-day breakdowns
+      if (type === 'earning' && !entry.job_id && (meta.is_manager_salary || meta.is_manager_commission)) {
+        if (meta.is_manager_salary) {
+          totals.managerSalary += amt
+          managerSalaryItems.push({
+            date: entry.effective_date || null,
+            hours: toNum(meta.scheduled_hours),
+            rate: toNum(meta.hourly_rate),
+            amount: amt,
+            note: entry.note || '',
+          })
+        } else if (meta.is_manager_commission) {
+          totals.managerCommission += amt
+          managerCommissionItems.push({
+            date: entry.effective_date || null,
+            dayRevenue: toNum(meta.day_revenue),
+            commissionPct: toNum(meta.commission_pct),
+            amount: amt,
+            note: entry.note || '',
+          })
+        }
+        continue
+      }
 
       if (type === 'earning') totals.earnings += amt
       else if (type === 'tip') totals.tips += amt
@@ -125,20 +154,26 @@ module.exports = (supabase, logger, notificationEmail) => {
       }
     }
 
-    totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.reimbursements + totals.cashCollected
+    totals.netPayout =
+      totals.earnings + totals.managerSalary + totals.managerCommission +
+      totals.tips + totals.incentives + totals.adjustments +
+      totals.reimbursements + totals.cashCollected
 
     // Round all totals to 2 decimal places for clean display
     for (const k of Object.keys(totals)) {
       totals[k] = parseFloat(totals[k].toFixed(2))
     }
 
-    const lineItems = Array.from(lineItemsByJob.values()).sort((a, b) => {
+    const byDate = (a, b) => {
       const da = a.date ? new Date(a.date).getTime() : 0
       const db = b.date ? new Date(b.date).getTime() : 0
       return da - db
-    })
+    }
+    const lineItems = Array.from(lineItemsByJob.values()).sort(byDate)
+    managerSalaryItems.sort(byDate)
+    managerCommissionItems.sort(byDate)
 
-    return { totals, lineItems }
+    return { totals, lineItems, managerSalaryItems, managerCommissionItems }
   }
 
   /**
@@ -151,6 +186,8 @@ module.exports = (supabase, logger, notificationEmail) => {
     const period = s.period || {}
     const totals = s.totals || {}
     const lineItems = s.lineItems || []
+    const managerSalaryItems = s.managerSalaryItems || []
+    const managerCommissionItems = s.managerCommissionItems || []
     const payout = s.payout || {}
 
     const cleanerName = escapeHtml(`${cleaner.firstName || ''} ${cleaner.lastName || ''}`.trim() || 'Team Member')
@@ -184,6 +221,48 @@ module.exports = (supabase, logger, notificationEmail) => {
           </tr>
         </thead>
         <tbody>${rowsHtml}</tbody>
+      </table>
+    ` : ''
+
+    const managerSalaryRows = managerSalaryItems.map(it => `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${escapeHtml(formatDate(it.date))}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${it.hours.toFixed(1)}h × $${it.rate.toFixed(2)}/hr</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;text-align:right;">${fmt(it.amount)}</td>
+      </tr>
+    `).join('')
+    const managerSalarySection = managerSalaryItems.length > 0 ? `
+      <h3 style="font-size:14px;color:#111;margin:24px 0 8px 0;">Salary Breakdown</h3>
+      <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #eee;border-radius:6px;overflow:hidden;">
+        <thead>
+          <tr style="background:#f9fafb;">
+            <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Date</th>
+            <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Calculation</th>
+            <th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280;font-weight:600;">Amount</th>
+          </tr>
+        </thead>
+        <tbody>${managerSalaryRows}</tbody>
+      </table>
+    ` : ''
+
+    const managerCommissionRows = managerCommissionItems.map(it => `
+      <tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${escapeHtml(formatDate(it.date))}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${it.commissionPct.toFixed(2)}% of ${fmt(it.dayRevenue)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;text-align:right;">${fmt(it.amount)}</td>
+      </tr>
+    `).join('')
+    const managerCommissionSection = managerCommissionItems.length > 0 ? `
+      <h3 style="font-size:14px;color:#111;margin:24px 0 8px 0;">Commission Breakdown</h3>
+      <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #eee;border-radius:6px;overflow:hidden;">
+        <thead>
+          <tr style="background:#f9fafb;">
+            <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Date</th>
+            <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Calculation</th>
+            <th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280;font-weight:600;">Amount</th>
+          </tr>
+        </thead>
+        <tbody>${managerCommissionRows}</tbody>
       </table>
     ` : ''
 
@@ -240,6 +319,8 @@ module.exports = (supabase, logger, notificationEmail) => {
       <h3 style="font-size:14px;color:#111;margin:24px 0 8px 0;">Summary</h3>
       <table style="width:100%;border-collapse:collapse;background:#f9fafb;border-radius:6px;overflow:hidden;">
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;">Earnings</td><td style="padding:10px 14px;font-size:13px;text-align:right;">${fmt(totals.earnings)}</td></tr>
+        ${totals.managerSalary ? `<tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Manager salary</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.managerSalary)}</td></tr>` : ''}
+        ${totals.managerCommission ? `<tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Manager commission</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.managerCommission)}</td></tr>` : ''}
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Tips</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.tips)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Incentives</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.incentives)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Reimbursements</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.reimbursements)}</td></tr>
@@ -251,6 +332,8 @@ module.exports = (supabase, logger, notificationEmail) => {
 
       ${paymentBlockHtml}
 
+      ${managerSalarySection}
+      ${managerCommissionSection}
       ${lineItemsSection}
 
       <p style="font-size:12px;color:#9ca3af;margin-top:24px;">If anything looks incorrect, please contact your administrator.</p>
@@ -366,7 +449,7 @@ module.exports = (supabase, logger, notificationEmail) => {
     }
 
     // 6. Aggregate
-    const { totals, lineItems } = aggregateLedgerEntries(entries, jobLookup)
+    const { totals, lineItems, managerSalaryItems, managerCommissionItems } = aggregateLedgerEntries(entries, jobLookup)
 
     // 6b. Prior-period debt carry-forward.
     // When a batch absorbs a prior negative batch (via recovered_by_batch_id) the
@@ -410,6 +493,8 @@ module.exports = (supabase, logger, notificationEmail) => {
       company: { name: companyName },
       period: { start: pStart, end: pEnd },
       lineItems,
+      managerSalaryItems,
+      managerCommissionItems,
       totals,
       recoveredBatches,
       payout: {
@@ -777,15 +862,37 @@ module.exports = (supabase, logger, notificationEmail) => {
 // Export helpers statically too for pure-function testing
 module.exports.aggregateLedgerEntries = function aggregateLedgerEntries(entries, jobLookup = {}) {
   const totals = {
-    earnings: 0, tips: 0, incentives: 0, adjustments: 0, reimbursements: 0, cashCollected: 0, netPayout: 0,
+    earnings: 0, managerSalary: 0, managerCommission: 0,
+    tips: 0, incentives: 0, adjustments: 0, reimbursements: 0, cashCollected: 0, netPayout: 0,
   }
   const lineItemsByJob = new Map()
+  const managerSalaryItems = []
+  const managerCommissionItems = []
   const toNum = (v) => { const n = parseFloat(v); return isNaN(n) ? 0 : n }
 
   for (const entry of (entries || [])) {
     const amt = toNum(entry.amount)
     const type = (entry.type || '').toLowerCase()
+    const meta = entry.metadata || {}
     if (type === 'payout') continue
+
+    if (type === 'earning' && !entry.job_id && (meta.is_manager_salary || meta.is_manager_commission)) {
+      if (meta.is_manager_salary) {
+        totals.managerSalary += amt
+        managerSalaryItems.push({
+          date: entry.effective_date || null, hours: toNum(meta.scheduled_hours),
+          rate: toNum(meta.hourly_rate), amount: amt, note: entry.note || '',
+        })
+      } else if (meta.is_manager_commission) {
+        totals.managerCommission += amt
+        managerCommissionItems.push({
+          date: entry.effective_date || null, dayRevenue: toNum(meta.day_revenue),
+          commissionPct: toNum(meta.commission_pct), amount: amt, note: entry.note || '',
+        })
+      }
+      continue
+    }
+
     if (type === 'earning') totals.earnings += amt
     else if (type === 'tip') totals.tips += amt
     else if (type === 'incentive') totals.incentives += amt
@@ -812,14 +919,21 @@ module.exports.aggregateLedgerEntries = function aggregateLedgerEntries(entries,
     }
   }
 
-  totals.netPayout = totals.earnings + totals.tips + totals.incentives + totals.adjustments + totals.reimbursements + totals.cashCollected
+  totals.netPayout =
+    totals.earnings + totals.managerSalary + totals.managerCommission +
+    totals.tips + totals.incentives + totals.adjustments +
+    totals.reimbursements + totals.cashCollected
   for (const k of Object.keys(totals)) totals[k] = parseFloat(totals[k].toFixed(2))
-  const lineItems = Array.from(lineItemsByJob.values()).sort((a, b) => {
+
+  const byDate = (a, b) => {
     const da = a.date ? new Date(a.date).getTime() : 0
     const db = b.date ? new Date(b.date).getTime() : 0
     return da - db
-  })
-  return { totals, lineItems }
+  }
+  const lineItems = Array.from(lineItemsByJob.values()).sort(byDate)
+  managerSalaryItems.sort(byDate)
+  managerCommissionItems.sort(byDate)
+  return { totals, lineItems, managerSalaryItems, managerCommissionItems }
 }
 
 module.exports.escapeHtml = function escapeHtml(str) {

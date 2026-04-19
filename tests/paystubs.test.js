@@ -286,12 +286,40 @@ describe('Paystubs — status state machine invariants', () => {
   })
 
   test('snapshot contract: totals + lineItems keys', () => {
-    const { totals, lineItems } = aggregateLedgerEntries([
+    const { totals, lineItems, managerSalaryItems, managerCommissionItems } = aggregateLedgerEntries([
       { type: 'earning', amount: '100', job_id: 1 },
     ])
     expect(Object.keys(totals).sort()).toEqual(
-      ['adjustments', 'cashCollected', 'earnings', 'incentives', 'netPayout', 'reimbursements', 'tips'].sort()
+      ['adjustments', 'cashCollected', 'earnings', 'incentives', 'managerCommission', 'managerSalary', 'netPayout', 'reimbursements', 'tips'].sort()
     )
     expect(Array.isArray(lineItems)).toBe(true)
+    expect(Array.isArray(managerSalaryItems)).toBe(true)
+    expect(Array.isArray(managerCommissionItems)).toBe(true)
+  })
+
+  test('manager salary entries: pulled out of earnings into managerSalaryItems', () => {
+    const entries = [
+      { type: 'earning', amount: '200', job_id: null, effective_date: '2026-04-12', note: 'Scheduled salary: 8h × $25/hr', metadata: { is_manager_salary: true, scheduled_hours: 8, hourly_rate: 25 } },
+      { type: 'earning', amount: '200', job_id: null, effective_date: '2026-04-13', note: 'Scheduled salary: 8h × $25/hr', metadata: { is_manager_salary: true, scheduled_hours: 8, hourly_rate: 25 } },
+      { type: 'earning', amount: '50', job_id: 42, metadata: {} },
+    ]
+    const { totals, managerSalaryItems } = aggregateLedgerEntries(entries)
+    expect(totals.earnings).toBe(50)          // job earning only
+    expect(totals.managerSalary).toBe(400)    // 2 × $200 manager salary
+    expect(totals.netPayout).toBe(450)        // earnings + managerSalary
+    expect(managerSalaryItems).toHaveLength(2)
+    expect(managerSalaryItems[0]).toMatchObject({ date: '2026-04-12', hours: 8, rate: 25, amount: 200 })
+  })
+
+  test('manager commission entries: pulled out into managerCommissionItems', () => {
+    const entries = [
+      { type: 'earning', amount: '150', job_id: null, effective_date: '2026-04-12', note: '15% of $1000', metadata: { is_manager_commission: true, commission_pct: 15, day_revenue: 1000 } },
+    ]
+    const { totals, managerCommissionItems } = aggregateLedgerEntries(entries)
+    expect(totals.earnings).toBe(0)
+    expect(totals.managerCommission).toBe(150)
+    expect(totals.netPayout).toBe(150)
+    expect(managerCommissionItems).toHaveLength(1)
+    expect(managerCommissionItems[0]).toMatchObject({ date: '2026-04-12', commissionPct: 15, dayRevenue: 1000, amount: 150 })
   })
 })
