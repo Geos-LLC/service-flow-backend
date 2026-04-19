@@ -34492,6 +34492,15 @@ app.delete('/api/ledger/payout-batch/:id', authenticateToken, async (req, res) =
       return res.status(404).json({ error: 'Payout batch not found' });
     }
 
+    // Clear any prior negative batches that were marked as "recovered" by this batch.
+    // FK cleaner_payout_batch_recovered_by_batch_id_fkey has no ON DELETE clause,
+    // so leaving these set would make the batch row delete fail. Unrecovering them
+    // is also semantically correct — if this batch is gone, the debt isn't settled.
+    await supabase
+      .from('cleaner_payout_batch')
+      .update({ recovered_by_batch_id: null })
+      .eq('recovered_by_batch_id', parseInt(id));
+
     // Detach ledger entries from this batch (makes them unpaid again)
     await supabase
       .from('cleaner_ledger')
