@@ -7895,8 +7895,8 @@ async function buildSourceResolver(userId) {
     if (!raw) return null;
     if (canonicalSet.has(raw)) return raw;
     const mapped = provider
-      ? sourceMap[`${provider}:${raw}`]
-      : (sourceMap[`openphone:${raw}`] || sourceMap[`leadbridge:${raw}`]);
+      ? (sourceMap[`${provider}:${raw}`] || sourceMap[`customer:${raw}`])
+      : (sourceMap[`openphone:${raw}`] || sourceMap[`leadbridge:${raw}`] || sourceMap[`customer:${raw}`]);
     return (mapped && canonicalSet.has(mapped)) ? mapped : null;
   };
 }
@@ -9472,6 +9472,18 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
       if (raw) lbCounts[raw] = (lbCounts[raw] || 0) + 1;
     }
 
+    // Also pull distinct non-canonical source values from customers + leads tables
+    // (covers values like "leadbridge_yelp" set by lead-conversion flow that never appeared in conversations)
+    const [custSrcRes, leadSrcRes, canonSrcRes] = await Promise.all([
+      supabase.from('customers').select('source').eq('user_id', userId).not('source', 'is', null),
+      supabase.from('leads').select('source').eq('user_id', userId).not('source', 'is', null).limit(5000),
+      supabase.from('lead_sources').select('name').eq('user_id', userId).eq('is_active', true),
+    ]);
+    const canonicalSet = new Set((canonSrcRes.data || []).map(s => s.name));
+    const custCounts = {};
+    for (const c of (custSrcRes.data || [])) if (c.source) custCounts[c.source] = (custCounts[c.source] || 0) + 1;
+    for (const l of (leadSrcRes.data || [])) if (l.source) custCounts[l.source] = (custCounts[l.source] || 0) + 1;
+
     // Build mapped set for quick lookup
     const mappedSet = new Set((mappings || []).map(m => `${m.provider}:${m.raw_value}`));
 
@@ -9486,6 +9498,12 @@ app.get('/api/lead-source-mappings', authenticateToken, async (req, res) => {
       if (!mappedSet.has(`leadbridge:${raw}`)) {
         unmapped.push({ raw_value: raw, provider: 'leadbridge', count });
       }
+    }
+    // Customer/lead source values — skip if already canonical or mapped for any provider
+    for (const [raw, count] of Object.entries(custCounts)) {
+      if (canonicalSet.has(raw)) continue; // canonical — no mapping needed
+      if (mappedSet.has(`customer:${raw}`) || mappedSet.has(`openphone:${raw}`) || mappedSet.has(`leadbridge:${raw}`)) continue;
+      unmapped.push({ raw_value: raw, provider: 'customer', count });
     }
     unmapped.sort((a, b) => b.count - a.count);
 
