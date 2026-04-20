@@ -9639,6 +9639,134 @@ app.post('/api/lead-source-mappings/auto-suggest', authenticateToken, async (req
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// Source Issues — post-sync manual-resolution helpers
+// ═══════════════════════════════════════════════════════════════
+
+// GET source issues: duplicate customers, conversations with no company, unresolved customer sources
+app.get('/api/source-issues', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // 1. Duplicate customers — same (first_name, last_name), non-archived
+    const dupCustomers = [];
+    {
+      const { data: custs } = await supabase.from('customers')
+        .select('id, first_name, last_name, phone, email, address, city, state, source, zenbooker_id, created_at')
+        .eq('user_id', userId)
+        .or('status.is.null,status.neq.archived');
+      const byName = {};
+      for (const c of (custs || [])) {
+        const key = `${(c.first_name || '').toLowerCase().trim()}|${(c.last_name || '').toLowerCase().trim()}`;
+        if (!key || key === '|') continue;
+        (byName[key] ||= []).push(c);
+      }
+      // Get job counts for all customers with dups
+      const dupIds = Object.values(byName).filter(g => g.length > 1).flatMap(g => g.map(c => c.id));
+      const jobCounts = {};
+      if (dupIds.length > 0) {
+        const { data: jobs } = await supabase.from('jobs').select('customer_id').eq('user_id', userId).in('customer_id', dupIds);
+        for (const j of (jobs || [])) jobCounts[j.customer_id] = (jobCounts[j.customer_id] || 0) + 1;
+      }
+      for (const group of Object.values(byName)) {
+        if (group.length < 2) continue;
+        dupCustomers.push({
+          name: `${group[0].first_name} ${group[0].last_name}`.trim(),
+          records: group.map(c => ({ ...c, job_count: jobCounts[c.id] || 0 })),
+        });
+      }
+    }
+
+    // 2. Conversations without company (OpenPhone only — LB uses channel derivation)
+    const noCompanyConvs = [];
+    {
+      const pageSize = 1000; let from = 0;
+      while (true) {
+        const { data } = await supabase.from('communication_conversations')
+          .select('id, participant_phone, participant_name, last_event_at')
+          .eq('user_id', userId).eq('provider', 'openphone').is('company', null)
+          .range(from, from + pageSize - 1).order('last_event_at', { ascending: false });
+        if (!data?.length) break;
+        noCompanyConvs.push(...data);
+        if (data.length < pageSize) break;
+        from += pageSize;
+      }
+    }
+
+    // 3. Customers with a source that doesn't resolve to any canonical (raw value orphans)
+    const resolve = await buildSourceResolver(userId);
+    const unresolvedCustomerSources = {};
+    {
+      const { data: custs } = await supabase.from('customers')
+        .select('id, source').eq('user_id', userId).not('source', 'is', null)
+        .or('status.is.null,status.neq.archived');
+      for (const c of (custs || [])) {
+        if (!resolve(c.source)) {
+          (unresolvedCustomerSources[c.source] ||= []).push(c.id);
+        }
+      }
+    }
+    const unresolved = Object.entries(unresolvedCustomerSources).map(([raw_value, ids]) => ({ raw_value, count: ids.length }));
+
+    res.json({
+      duplicateCustomers: dupCustomers,
+      duplicateCustomerCount: dupCustomers.length,
+      conversationsWithoutCompany: {
+        count: noCompanyConvs.length,
+        sample: noCompanyConvs.slice(0, 50),
+      },
+      unresolvedCustomerSources: unresolved,
+    });
+  } catch (error) {
+    logger.error('Source issues error:', error);
+    res.status(500).json({ error: 'Failed to fetch source issues' });
+  }
+});
+
+// POST merge duplicate customer: move all FKs from source to target, then delete source
+app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const sourceId = parseInt(req.params.sourceId);
+    const targetId = parseInt(req.params.targetId);
+    if (!sourceId || !targetId || sourceId === targetId) return res.status(400).json({ error: 'Invalid merge params' });
+
+    // Verify both belong to user
+    const { data: both } = await supabase.from('customers')
+      .select('id, user_id').in('id', [sourceId, targetId]).eq('user_id', userId);
+    if ((both || []).length !== 2) return res.status(404).json({ error: 'Customers not found' });
+
+    // Move all FK references from sourceId → targetId
+    const tables = [
+      'jobs', 'invoices', 'estimates', 'transactions', 'communication_conversations',
+      'customer_notification_preferences', 'job_answers', 'leads',
+    ];
+    const moved = {};
+    for (const t of tables) {
+      try {
+        const { count, error } = await supabase.from(t)
+          .update({ customer_id: targetId }, { count: 'exact' })
+          .eq('customer_id', sourceId).eq('user_id', userId);
+        if (!error) moved[t] = count || 0;
+      } catch (e) { /* table or column may not exist — skip */ }
+    }
+    // Special: 'leads' uses converted_customer_id
+    try {
+      await supabase.from('leads').update({ converted_customer_id: targetId })
+        .eq('converted_customer_id', sourceId).eq('user_id', userId);
+    } catch (e) { /* skip */ }
+
+    // Delete source customer
+    const { error: delErr } = await supabase.from('customers').delete().eq('id', sourceId).eq('user_id', userId);
+    if (delErr) return res.status(500).json({ error: 'Failed to delete source customer after merge', moved });
+
+    res.json({ success: true, sourceId, targetId, moved });
+  } catch (error) {
+    logger.error('Merge duplicates error:', error);
+    res.status(500).json({ error: 'Failed to merge customers' });
+  }
+});
+
 // Find and merge duplicate customers endpoint
 app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) => {
   try {
