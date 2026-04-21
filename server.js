@@ -9677,8 +9677,11 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
       }
     }
 
-    // 2. Conversations without company (OpenPhone only — LB uses channel derivation)
-    const noCompanyConvs = [];
+    // 2. Conversations without company — split into two buckets:
+    //    (a) Named contacts missing company (fixable in OpenPhone)
+    //    (b) Unknown numbers with no contact record (expected — nothing to fix)
+    const namedMissingCompany = [];
+    const unknownContacts = [];
     {
       const pageSize = 1000; let from = 0;
       while (true) {
@@ -9687,7 +9690,10 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
           .eq('user_id', userId).eq('provider', 'openphone').is('company', null)
           .range(from, from + pageSize - 1).order('last_event_at', { ascending: false });
         if (!data?.length) break;
-        noCompanyConvs.push(...data);
+        for (const c of data) {
+          if (c.participant_name && c.participant_name.trim()) namedMissingCompany.push(c);
+          else unknownContacts.push(c);
+        }
         if (data.length < pageSize) break;
         from += pageSize;
       }
@@ -9711,9 +9717,12 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     res.json({
       duplicateCustomers: dupCustomers,
       duplicateCustomerCount: dupCustomers.length,
-      conversationsWithoutCompany: {
-        count: noCompanyConvs.length,
-        sample: noCompanyConvs.slice(0, 50),
+      namedContactsMissingCompany: {
+        count: namedMissingCompany.length,
+        sample: namedMissingCompany.slice(0, 50),
+      },
+      unknownContacts: {
+        count: unknownContacts.length,
       },
       unresolvedCustomerSources: unresolved,
     });
