@@ -10026,110 +10026,249 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
 // PR4 — Participant admin endpoints
 // ═══════════════════════════════════════════════════════════════
 
+// Track async backfill progress per user (in-memory, resets on restart)
+const participantBackfillProgress = {};
+
 /**
  * Backfill participant mappings from existing conversations.
  *
- * Strategy:
- *   - If conversation already has customer_id or lead_id, preserve that link in the mapping row (mapping_source='backfill')
- *   - Else run phone-based CRM lookup with precedence to populate status
- *   - Conversations without any identity/phone are left untouched
+ * Batched strategy (to avoid the 30s request timeout):
+ *   1. Fetch ALL conversations + ALL customers + ALL leads once (paginated)
+ *   2. Build in-memory phone→crm index (precedence-aware)
+ *   3. For each conversation: classify by legacy link → phone match → pending
+ *   4. Bulk-insert mapping rows, then batch-update conversations to point to them
  *
- * POST /api/participants/backfill       (dry-run — returns counts only)
- * POST /api/participants/backfill?apply=1  (writes)
+ * Async: dry-run runs sync (pure read, under 5s). Apply runs async and progress
+ * is polled via GET /api/participants/backfill/progress.
+ *
+ * POST /api/participants/backfill              (dry-run, synchronous)
+ * POST /api/participants/backfill?apply=1      (async — returns 202)
+ * GET  /api/participants/backfill/progress     (poll status)
  */
+
+// Shared batched classifier — no per-row DB queries. Pure in-memory logic.
+async function runParticipantBackfill(userId, apply, progress) {
+  const summary = { scanned: 0, mapped: 0, ambiguous: 0, unmapped: 0, pending: 0, reused: 0, errors: 0, sample: [] };
+
+  // Helper: paginate any table
+  const fetchAll = async (tableName, selectCols, filter) => {
+    const rows = []; const pageSize = 1000; let off = 0;
+    while (true) {
+      let q = supabase.from(tableName).select(selectCols).range(off, off + pageSize - 1);
+      if (filter) q = filter(q);
+      const { data, error } = await q;
+      if (error || !data?.length) break;
+      rows.push(...data);
+      if (data.length < pageSize) break;
+      off += pageSize;
+    }
+    return rows;
+  };
+
+  // 1. Fetch everything in parallel
+  progress.phase = 'loading';
+  const [convs, customers, leads, existingMaps] = await Promise.all([
+    fetchAll('communication_conversations',
+      'id, participant_phone, customer_id, lead_id, participant_mapping_id, sigcore_conversation_id',
+      (q) => q.eq('user_id', userId).eq('provider', 'openphone')),
+    fetchAll('customers', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
+    fetchAll('leads', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
+    fetchAll('communication_participant_mappings',
+      'id, sigcore_participant_key',
+      (q) => q.eq('tenant_id', userId).eq('provider', 'openphone').is('sigcore_participant_id', null).not('sigcore_participant_key', 'is', null)),
+  ]);
+
+  progress.total = convs.length;
+  progress.phase = 'building index';
+
+  // 2. Build phone→CRM index
+  const last10 = (s) => String(s || '').replace(/\D/g, '').slice(-10);
+  const custByPhone = {}; // phone → [customer_id...]
+  for (const c of customers) {
+    const p = last10(c.phone);
+    if (p && p.length >= 7) (custByPhone[p] ||= []).push(c.id);
+  }
+  const leadByPhone = {};
+  for (const l of leads) {
+    const p = last10(l.phone);
+    if (p && p.length >= 7) (leadByPhone[p] ||= []).push(l.id);
+  }
+  const existingMapByKey = {};
+  for (const m of existingMaps) existingMapByKey[m.sigcore_participant_key] = m.id;
+
+  // 3. Classify every conversation + prepare batches
+  const rowsToInsert = []; // { syntheticKey, phoneE164, crm_customer_id, crm_lead_id, mapping_status, convId }
+  const rowsToUpdate = []; // { mappingId, phoneE164, crm_customer_id, crm_lead_id, mapping_status, convId }
+  const convsNeedingOnlyMappingIdUpdate = []; // { convId, mappingId }
+
+  for (const c of convs) {
+    summary.scanned++;
+    try {
+      // Already has mapping → reused
+      if (c.participant_mapping_id) { summary.reused++; continue; }
+
+      const phoneE164 = c.participant_phone ? '+' + String(c.participant_phone).replace(/\D/g, '') : null;
+      const hasLegacyCRM = c.customer_id || c.lead_id;
+      const syntheticKey = c.sigcore_conversation_id ? `conv:${c.sigcore_conversation_id}` : null;
+
+      // Nothing to anchor a mapping row on — truly pending
+      if (!syntheticKey && !phoneE164) { summary.pending++; continue; }
+
+      // Classify CRM
+      let status = 'unmapped';
+      let crm_customer_id = null;
+      let crm_lead_id = null;
+      if (hasLegacyCRM) {
+        status = 'mapped';
+        crm_customer_id = c.customer_id || null;
+        crm_lead_id = c.lead_id || null;
+      } else if (phoneE164) {
+        const p10 = last10(phoneE164);
+        const custs = custByPhone[p10] || [];
+        const lds = leadByPhone[p10] || [];
+        if (custs.length === 1) { status = 'mapped'; crm_customer_id = custs[0]; }
+        else if (custs.length === 0 && lds.length === 1) { status = 'mapped'; crm_lead_id = lds[0]; }
+        else if (custs.length === 0 && lds.length === 0) { status = 'unmapped'; }
+        else { status = 'ambiguous'; }
+      }
+
+      // Tally
+      if (status === 'mapped') summary.mapped++;
+      else if (status === 'ambiguous') summary.ambiguous++;
+      else summary.unmapped++;
+
+      if (summary.sample.length < 20) summary.sample.push({ id: c.id, phone: phoneE164, status });
+
+      if (!apply) continue;
+
+      if (syntheticKey && existingMapByKey[syntheticKey]) {
+        rowsToUpdate.push({
+          mappingId: existingMapByKey[syntheticKey],
+          phoneE164, crm_customer_id, crm_lead_id, mapping_status: status,
+          convId: c.id,
+        });
+      } else {
+        rowsToInsert.push({
+          syntheticKey, phoneE164, crm_customer_id, crm_lead_id, mapping_status: status,
+          convId: c.id,
+        });
+      }
+    } catch (e) { summary.errors++; }
+  }
+
+  if (!apply) {
+    progress.phase = 'done';
+    progress.summary = summary;
+    return { dryRun: true, summary };
+  }
+
+  // 4. Bulk insert new mapping rows (in chunks of 500)
+  progress.phase = 'inserting mappings';
+  const insertChunkSize = 500;
+  for (let i = 0; i < rowsToInsert.length; i += insertChunkSize) {
+    const chunk = rowsToInsert.slice(i, i + insertChunkSize);
+    const insertRows = chunk.map(r => ({
+      tenant_id: userId, provider: 'openphone',
+      sigcore_participant_id: null,
+      sigcore_participant_key: r.syntheticKey,
+      participant_phone_e164: r.phoneE164,
+      crm_customer_id: r.crm_customer_id,
+      crm_lead_id: r.crm_lead_id,
+      mapping_status: r.mapping_status,
+      mapping_source: 'backfill',
+    }));
+    const { data: inserted, error: insErr } = await supabase
+      .from('communication_participant_mappings').insert(insertRows).select('id, sigcore_participant_key');
+    if (insErr) { summary.errors += chunk.length; continue; }
+    const insertedByKey = {};
+    for (const row of (inserted || [])) insertedByKey[row.sigcore_participant_key] = row.id;
+    for (const r of chunk) {
+      const mid = insertedByKey[r.syntheticKey];
+      if (mid) convsNeedingOnlyMappingIdUpdate.push({ convId: r.convId, mappingId: mid });
+      else summary.errors++;
+    }
+    progress.inserted = (progress.inserted || 0) + chunk.length;
+  }
+
+  // 5. Update existing mapping rows (if any collided with pre-existing synthetic keys)
+  progress.phase = 'updating mappings';
+  for (const r of rowsToUpdate) {
+    try {
+      await supabase.from('communication_participant_mappings')
+        .update({
+          participant_phone_e164: r.phoneE164,
+          crm_customer_id: r.crm_customer_id,
+          crm_lead_id: r.crm_lead_id,
+          mapping_status: r.mapping_status,
+          updated_at: new Date().toISOString(),
+        }).eq('id', r.mappingId);
+      convsNeedingOnlyMappingIdUpdate.push({ convId: r.convId, mappingId: r.mappingId });
+    } catch (e) { summary.errors++; }
+  }
+
+  // 6. Bulk attach participant_mapping_id on conversations
+  progress.phase = 'linking conversations';
+  const updateChunkSize = 500;
+  for (let i = 0; i < convsNeedingOnlyMappingIdUpdate.length; i += updateChunkSize) {
+    const chunk = convsNeedingOnlyMappingIdUpdate.slice(i, i + updateChunkSize);
+    // Group by mappingId — each unique mappingId gets one UPDATE ... WHERE id IN (...)
+    const byMappingId = {};
+    for (const { convId, mappingId } of chunk) (byMappingId[mappingId] ||= []).push(convId);
+    for (const [mid, ids] of Object.entries(byMappingId)) {
+      try {
+        await supabase.from('communication_conversations')
+          .update({ participant_mapping_id: parseInt(mid), participant_pending: false })
+          .in('id', ids);
+      } catch (e) { summary.errors++; }
+    }
+    progress.linked = (progress.linked || 0) + chunk.length;
+  }
+
+  progress.phase = 'done';
+  progress.summary = summary;
+  return { dryRun: false, summary };
+}
+
 app.post('/api/participants/backfill', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
 
-    const summary = { scanned: 0, mapped: 0, ambiguous: 0, unmapped: 0, pending: 0, reused: 0, errors: 0, sample: [] };
-
-    // Paginate through all OpenPhone conversations (LB has its own identity model via account mapping)
-    const pageSize = 500; let from = 0;
-    while (true) {
-      const { data: batch, error } = await supabase.from('communication_conversations')
-        .select('id, participant_phone, participant_name, customer_id, lead_id, company, participant_mapping_id, sigcore_conversation_id')
-        .eq('user_id', userId).eq('provider', 'openphone')
-        .range(from, from + pageSize - 1);
-      if (error || !batch?.length) break;
-
-      for (const c of batch) {
-        summary.scanned++;
-        try {
-          const phoneE164 = toPhoneE164(c.participant_phone);
-
-          // Case A: already has participant_mapping_id — skip
-          if (c.participant_mapping_id) { summary.reused++; continue; }
-
-          // Case B: has legacy CRM link — preserve it
-          const hasLegacyCRM = c.customer_id || c.lead_id;
-
-          // No participant identity in existing rows; use sigcore_conversation_id as the "key"
-          // This is a transitional bridge — when real participantId arrives from Sigcore,
-          // resolveParticipantMapping will upgrade the row.
-          const syntheticKey = c.sigcore_conversation_id ? `conv:${c.sigcore_conversation_id}` : null;
-          if (!syntheticKey && !phoneE164) { summary.pending++; continue; }
-
-          if (apply) {
-            // Direct row insert (respects uniqueness)
-            const status = hasLegacyCRM ? 'mapped' : (phoneE164 ? (await lookupCRMByPhone(userId, phoneE164)).status : 'unmapped');
-            const crmIds = hasLegacyCRM
-              ? { crm_customer_id: c.customer_id || null, crm_lead_id: c.lead_id || null }
-              : (phoneE164 ? await lookupCRMByPhone(userId, phoneE164) : { crm_customer_id: null, crm_lead_id: null });
-
-            const row = {
-              tenant_id: userId,
-              provider: 'openphone',
-              sigcore_participant_id: null,
-              sigcore_participant_key: syntheticKey,
-              participant_phone_e164: phoneE164,
-              crm_customer_id: crmIds.crm_customer_id,
-              crm_lead_id: crmIds.crm_lead_id,
-              mapping_status: status,
-              mapping_source: 'backfill',
-            };
-            // Upsert by sigcore_participant_key (transitional unique index covers this)
-            const { data: existing } = await supabase.from('communication_participant_mappings')
-              .select('id').eq('tenant_id', userId).eq('provider', 'openphone')
-              .eq('sigcore_participant_key', syntheticKey).is('sigcore_participant_id', null).maybeSingle();
-
-            let mappingId;
-            if (existing) {
-              mappingId = existing.id;
-              await supabase.from('communication_participant_mappings').update(row).eq('id', existing.id);
-            } else {
-              const { data: inserted, error: insErr } = await supabase.from('communication_participant_mappings')
-                .insert(row).select('id').single();
-              if (insErr) { summary.errors++; continue; }
-              mappingId = inserted.id;
-            }
-            await supabase.from('communication_conversations')
-              .update({ participant_mapping_id: mappingId, participant_pending: false })
-              .eq('id', c.id);
-          }
-
-          // Classify
-          if (hasLegacyCRM) { summary.mapped++; continue; }
-          if (phoneE164) {
-            const crm = await lookupCRMByPhone(userId, phoneE164);
-            if (crm.status === 'mapped') summary.mapped++;
-            else if (crm.status === 'ambiguous') summary.ambiguous++;
-            else summary.unmapped++;
-          } else {
-            summary.pending++;
-          }
-          if (summary.sample.length < 20) summary.sample.push({ id: c.id, phone: phoneE164, hasLegacyCRM });
-        } catch (e) { summary.errors++; }
-      }
-      if (batch.length < pageSize) break;
-      from += pageSize;
+    if (!apply) {
+      // Dry-run is fast enough to return inline
+      const progress = { status: 'running', phase: 'starting', total: 0, inserted: 0, linked: 0 };
+      participantBackfillProgress[userId] = progress;
+      const result = await runParticipantBackfill(userId, false, progress);
+      progress.status = 'done';
+      return res.json(result);
     }
 
-    res.json({ dryRun: !apply, summary });
+    // Apply runs async — return 202 immediately, client polls progress endpoint
+    if (participantBackfillProgress[userId]?.status === 'running') {
+      return res.status(409).json({ error: 'Backfill already running', progress: participantBackfillProgress[userId] });
+    }
+    const progress = { status: 'running', phase: 'starting', total: 0, inserted: 0, linked: 0, startedAt: Date.now() };
+    participantBackfillProgress[userId] = progress;
+    setImmediate(async () => {
+      try {
+        await runParticipantBackfill(userId, true, progress);
+        progress.status = 'done';
+      } catch (e) {
+        progress.status = 'error';
+        progress.error = e.message;
+        logger.error('Participant backfill error:', e);
+      }
+    });
+    res.status(202).json({ started: true, progress });
   } catch (error) {
     logger.error('Participant backfill error:', error);
     res.status(500).json({ error: 'Backfill failed' });
   }
+});
+
+app.get('/api/participants/backfill/progress', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  res.json(participantBackfillProgress[userId] || { status: 'idle' });
 });
 
 /**
