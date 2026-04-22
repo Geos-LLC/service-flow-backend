@@ -9949,6 +9949,14 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         const { count } = await q;
         return count || 0;
       };
+      // Count-only (HEAD) helper for conversations table
+      const countConvs = async (filter) => {
+        let q = supabase.from('communication_conversations')
+          .select('id', { count: 'exact', head: true }).eq('user_id', userId);
+        if (filter) q = filter(q);
+        const { count } = await q;
+        return count || 0;
+      };
       const [
         mappedCount, ambiguousCount, unmappedCount, manualCount,
         idMissingCount, pendingCount, noPhoneCount
@@ -9958,20 +9966,16 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         countBy((q) => q.eq('mapping_status', 'unmapped')),
         countBy((q) => q.eq('mapping_status', 'manual')),
         countBy((q) => q.is('sigcore_participant_id', null)),
-        supabase.from('communication_conversations')
-          .select('id', { count: 'exact', head: true })
-          .eq('user_id', userId).eq('participant_pending', true),
-        supabase.from('communication_conversations')
-          .select('id', { count: 'exact', head: true })
-          .eq('user_id', userId).is('participant_phone', null).is('participant_mapping_id', null),
+        countConvs((q) => q.eq('participant_pending', true)),
+        countConvs((q) => q.is('participant_phone', null).is('participant_mapping_id', null)),
       ]);
       participantMetrics.mapped = mappedCount;
       participantMetrics.ambiguous = ambiguousCount;
       participantMetrics.unmapped = unmappedCount;
       participantMetrics.manual = manualCount;
       participantMetrics.participant_id_missing_total = idMissingCount;
-      participantMetrics.participant_pending_total = pendingCount?.count || pendingCount || 0;
-      participantMetrics.participant_phone_missing_total = noPhoneCount?.count || noPhoneCount || 0;
+      participantMetrics.participant_pending_total = pendingCount;
+      participantMetrics.participant_phone_missing_total = noPhoneCount;
     } catch (e) { /* non-fatal */ }
 
     res.json({
