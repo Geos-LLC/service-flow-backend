@@ -7430,6 +7430,17 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to update job' });
     }
 
+    // Incentive ledger sync (completed/paid jobs only).
+    // Isolated from earnings/tips — only touches type='incentive' rows.
+    if (updateDataToSend.incentive_amount !== undefined) {
+      try {
+        await syncJobIncentiveLedger(parseInt(id), userId);
+      } catch (incSyncErr) {
+        console.error(`[PUT Job] Incentive ledger sync failed for job ${id}:`, incSyncErr);
+        // Non-blocking: job row update already succeeded
+      }
+    }
+
     // Get updated job
     const { data: updatedJob, error: fetchError } = await supabase
       .from('jobs')
@@ -7902,42 +7913,68 @@ async function buildSourceResolver(userId) {
 }
 
 // Helper: build a phone → { company, provider } map from all conversations (paginated)
-// Includes OpenPhone (via company field) AND LeadBridge (via account display_name + channel)
+// Includes OpenPhone (via company field) AND LeadBridge (via account display_name + channel).
+// Name-based fallback: if an OP conversation has no company but matches by name to another
+// OP conversation that DOES have company (e.g. "Stephen Jaros" and "Stephen Jaros cell phone"),
+// use that company. Handles OpenPhone duplicate-contact patterns.
 async function buildPhoneSourceMap(userId) {
-  // Load provider accounts for LB account-name lookup
   const { data: provAccounts } = await supabase.from('communication_provider_accounts')
     .select('id, display_name, channel').eq('user_id', userId);
   const accountMap = {};
   for (const pa of (provAccounts || [])) accountMap[pa.id] = pa;
 
-  const map = {};
+  // Name normalizer — strips common aliasing phrases so "Stephen Jaros" == "Stephen Jaros cell phone"
+  const normalizeName = (s) => (s || '').toLowerCase()
+    .replace(/\b(cell phone|cell|mobile|phone|alt|work|home|primary|secondary|husband|wife|spouse|son|daughter)\b/g, '')
+    .replace(/\([^)]*\)/g, '')
+    .replace(/[^a-z ]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+
+  // First pass: build phone map + name→company map (from convs that HAVE company)
+  const convs = [];
   const pageSize = 1000; let from = 0;
   while (true) {
     const { data } = await supabase.from('communication_conversations')
-      .select('participant_phone, company, provider, channel, provider_account_id')
+      .select('participant_phone, participant_name, company, provider, channel, provider_account_id')
       .eq('user_id', userId)
       .range(from, from + pageSize - 1);
     if (!data?.length) break;
-    for (const c of data) {
-      if (!c.participant_phone) continue;
-      const last10 = String(c.participant_phone).replace(/\D/g, '').slice(-10);
-      if (last10.length < 7 || map[last10]) continue;
-      // OpenPhone: use company field
-      if (c.provider === 'openphone' && c.company) {
-        map[last10] = { company: c.company, provider: 'openphone' };
-        continue;
-      }
-      // LeadBridge: use "AccountName (channel)" format
-      if (c.provider === 'leadbridge') {
-        const acct = c.provider_account_id ? accountMap[c.provider_account_id] : null;
-        const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
-        if (raw) {
-          map[last10] = { company: raw, provider: 'leadbridge' };
-        }
-      }
-    }
+    convs.push(...data);
     if (data.length < pageSize) break;
     from += pageSize;
+  }
+
+  const nameToCompany = {};
+  for (const c of convs) {
+    if (c.provider === 'openphone' && c.company && c.participant_name) {
+      const n = normalizeName(c.participant_name);
+      if (n) nameToCompany[n] = c.company;
+    }
+  }
+
+  const map = {};
+  for (const c of convs) {
+    if (!c.participant_phone) continue;
+    const last10 = String(c.participant_phone).replace(/\D/g, '').slice(-10);
+    if (last10.length < 7 || map[last10]) continue;
+    if (c.provider === 'openphone') {
+      if (c.company) {
+        map[last10] = { company: c.company, provider: 'openphone' };
+      } else if (c.participant_name) {
+        // Name-based fallback — same person may have another contact with company set
+        const n = normalizeName(c.participant_name);
+        const siblingCompany = n ? nameToCompany[n] : null;
+        if (siblingCompany) {
+          map[last10] = { company: siblingCompany, provider: 'openphone' };
+        }
+      }
+      continue;
+    }
+    if (c.provider === 'leadbridge') {
+      const acct = c.provider_account_id ? accountMap[c.provider_account_id] : null;
+      const raw = acct ? `${acct.display_name} (${c.channel})` : c.channel;
+      if (raw) map[last10] = { company: raw, provider: 'leadbridge' };
+    }
   }
   return map;
 }
@@ -21914,83 +21951,19 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
     }
 
     // === Ledger sync strategy ===
-    // Incentive-only edits with teamMemberId: directly upsert the incentive ledger entry
-    // (avoids fragile full delete+rebuild that loses entries during deploy restarts or races).
-    // All other edits (hours, tips, servicePrice): full rebuild needed since earnings change.
-    const incentiveOnlyEdit = incentiveAmount !== undefined && teamMemberId &&
+    // Incentive-only edits → isolated incentive sync (never touches earning/tip rows).
+    // All other edits (hours, tips, servicePrice) → full rebuild since earnings change.
+    // Both entry points (job-details modal + payroll inline edit) converge on the
+    // same syncJobIncentiveLedger helper so incentive behavior is identical.
+    const incentiveOnlyEdit = incentiveAmount !== undefined &&
       hoursWorked === undefined && tipAmount === undefined && req.body.servicePrice === undefined;
 
     if (incentiveOnlyEdit) {
-      // Direct upsert: update or create incentive ledger entry for this specific member
-      const newInc = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
-      const effectiveDate = job.scheduled_date
-        ? String(job.scheduled_date).split('T')[0].split(' ')[0]
-        : new Date().toISOString().split('T')[0];
-
-      // Find existing incentive entry for this member+job
-      const { data: existingInc } = await supabase.from('cleaner_ledger')
-        .select('id, amount, payout_batch_id')
-        .eq('job_id', parseInt(id))
-        .eq('team_member_id', parseInt(teamMemberId))
-        .eq('type', 'incentive')
-        .maybeSingle();
-
-      if (newInc > 0) {
-        const incRow = {
-          user_id: userId,
-          team_member_id: parseInt(teamMemberId),
-          job_id: parseInt(id),
-          type: 'incentive',
-          amount: newInc,
-          effective_date: effectiveDate,
-          note: `Incentive for job #${id}`,
-          created_by: userId,
-        };
-        if (existingInc) {
-          if (existingInc.payout_batch_id) {
-            // Already settled — create a correction adjustment for the difference
-            const oldAmount = parseFloat(existingInc.amount) || 0;
-            const diff = parseFloat((newInc - oldAmount).toFixed(2));
-            if (Math.abs(diff) >= 0.01) {
-              await supabase.from('cleaner_ledger').insert({
-                user_id: userId,
-                team_member_id: parseInt(teamMemberId),
-                job_id: parseInt(id),
-                type: 'adjustment',
-                amount: diff,
-                effective_date: new Date().toISOString().split('T')[0],
-                note: `Incentive correction for job #${id} (was ${oldAmount}, now ${newInc})`,
-                metadata: { adjustment_reason: 'incentive_correction', original_ledger_id: existingInc.id, original_amount: oldAmount, new_amount: newInc },
-                created_by: userId,
-              });
-            }
-          } else {
-            await supabase.from('cleaner_ledger').update(incRow).eq('id', existingInc.id);
-          }
-        } else {
-          await supabase.from('cleaner_ledger').insert(incRow);
-        }
-      } else if (newInc === 0 && existingInc) {
-        if (!existingInc.payout_batch_id) {
-          // Unbatched: delete the ledger entry
-          await supabase.from('cleaner_ledger').delete().eq('id', existingInc.id);
-        } else {
-          // Batched: create a negative correction to zero it out in next payout
-          const oldAmount = parseFloat(existingInc.amount) || 0;
-          if (oldAmount > 0) {
-            await supabase.from('cleaner_ledger').insert({
-              user_id: userId,
-              team_member_id: parseInt(teamMemberId),
-              job_id: parseInt(id),
-              type: 'adjustment',
-              amount: -oldAmount,
-              effective_date: new Date().toISOString().split('T')[0],
-              note: `Incentive removed for job #${id} (was ${oldAmount})`,
-              metadata: { adjustment_reason: 'incentive_correction', original_ledger_id: existingInc.id, original_amount: oldAmount, new_amount: 0 },
-              created_by: userId,
-            });
-          }
-        }
+      try {
+        await syncJobIncentiveLedger(parseInt(id), userId);
+      } catch (e) {
+        console.error(`[Payroll PATCH] Incentive sync failed for job ${id}:`, e);
+        return res.status(500).json({ error: 'Failed to sync incentive ledger' });
       }
     } else {
       // Full rebuild for hours/tips/servicePrice changes — preserves prior batch links
@@ -33742,6 +33715,156 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       console.error('Ledger: Error inserting entries for job', jobId, insertError);
     } else {
       console.log(`Ledger: Created ${ledgerEntries.length} entries for job ${jobId}`);
+    }
+  }
+}
+
+/**
+ * Incentive-only ledger sync for a single job.
+ *
+ * Reads `jobs.incentive_amount` (canonical source of truth) and reconciles only the
+ * `type='incentive'` rows in `cleaner_ledger` for this job. Does NOT touch earning,
+ * tip, cash_collected, or any other ledger type.
+ *
+ * Per-member split:
+ *   - If `job_team_assignments` has per-member incentives whose sum matches
+ *     `jobs.incentive_amount`, use the per-member breakdown.
+ *   - Otherwise, split the job total equally across assigned members
+ *     (falls back to `jobs.team_member_id` when no assignments exist).
+ *
+ * Settled rows (already linked to a payout_batch_id) are never mutated or deleted —
+ * historical payout data is preserved.
+ *
+ * Only runs for completed/paid jobs; scheduled/pending jobs exit immediately.
+ */
+async function syncJobIncentiveLedger(jobId, userId) {
+  const { data: job, error: jobErr } = await supabase
+    .from('jobs')
+    .select('id, user_id, status, team_member_id, incentive_amount, scheduled_date')
+    .eq('id', jobId)
+    .single();
+
+  if (jobErr || !job) {
+    console.error(`[Incentive Sync] Could not fetch job ${jobId}:`, jobErr);
+    return;
+  }
+
+  const jobStatus = (job.status || '').toLowerCase();
+  if (jobStatus !== 'completed' && jobStatus !== 'paid') {
+    return;
+  }
+
+  const jobIncentive = parseFloat(job.incentive_amount) || 0;
+
+  const { data: assignments } = await supabase
+    .from('job_team_assignments')
+    .select('team_member_id, incentive_amount')
+    .eq('job_id', jobId);
+
+  let teamMemberIds = [];
+  if (assignments && assignments.length > 0) {
+    teamMemberIds = assignments.map(a => a.team_member_id);
+  } else if (job.team_member_id) {
+    teamMemberIds = [job.team_member_id];
+  }
+
+  const { data: existingRows } = await supabase
+    .from('cleaner_ledger')
+    .select('id, team_member_id, amount, payout_batch_id')
+    .eq('job_id', jobId)
+    .eq('type', 'incentive');
+
+  const existingByMember = {};
+  for (const row of (existingRows || [])) {
+    existingByMember[row.team_member_id] = row;
+  }
+
+  if (teamMemberIds.length === 0 && Object.keys(existingByMember).length === 0) {
+    return;
+  }
+
+  const memberCount = Math.max(1, teamMemberIds.length);
+  const assignmentSum = (assignments || []).reduce(
+    (s, a) => s + (parseFloat(a.incentive_amount) || 0), 0
+  );
+  const hasPerAssignmentIncentives = (assignments || []).some(
+    a => parseFloat(a.incentive_amount) > 0
+  );
+  const useAssignmentBreakdown = hasPerAssignmentIncentives &&
+    Math.abs(assignmentSum - jobIncentive) < 0.01;
+
+  const desiredByMember = {};
+  for (const memberId of teamMemberIds) {
+    if (useAssignmentBreakdown) {
+      const a = assignments.find(x => x.team_member_id === memberId);
+      desiredByMember[memberId] = a ? parseFloat(a.incentive_amount) || 0 : 0;
+    } else {
+      desiredByMember[memberId] = jobIncentive > 0
+        ? parseFloat((jobIncentive / memberCount).toFixed(2))
+        : 0;
+    }
+  }
+
+  const effectiveDate = job.scheduled_date
+    ? String(job.scheduled_date).split('T')[0].split(' ')[0]
+    : new Date().toISOString().split('T')[0];
+
+  const memberIdsToProcess = new Set([
+    ...teamMemberIds,
+    ...Object.keys(existingByMember).map(Number),
+  ]);
+
+  for (const memberId of memberIdsToProcess) {
+    const desired = desiredByMember[memberId] || 0;
+    const existing = existingByMember[memberId];
+
+    if (desired > 0) {
+      if (existing) {
+        if (existing.payout_batch_id) {
+          console.log(
+            `[Incentive Sync] Job ${jobId} member ${memberId}: incentive row in settled batch ${existing.payout_batch_id}, skipping`
+          );
+          continue;
+        }
+        const currentAmount = parseFloat(existing.amount) || 0;
+        if (Math.abs(currentAmount - desired) >= 0.01) {
+          const { error: updErr } = await supabase
+            .from('cleaner_ledger')
+            .update({ amount: desired, effective_date: effectiveDate })
+            .eq('id', existing.id);
+          if (updErr) {
+            console.error(`[Incentive Sync] Update failed for ledger ${existing.id}:`, updErr);
+          }
+        }
+      } else {
+        const { error: insErr } = await supabase.from('cleaner_ledger').insert({
+          user_id: job.user_id || userId,
+          team_member_id: memberId,
+          job_id: jobId,
+          type: 'incentive',
+          amount: desired,
+          effective_date: effectiveDate,
+          note: `Incentive for job #${jobId}`,
+          created_by: userId,
+        });
+        if (insErr) {
+          console.error(`[Incentive Sync] Insert failed for job ${jobId} member ${memberId}:`, insErr);
+        }
+      }
+    } else {
+      if (existing && !existing.payout_batch_id) {
+        const { error: delErr } = await supabase
+          .from('cleaner_ledger')
+          .delete()
+          .eq('id', existing.id);
+        if (delErr) {
+          console.error(`[Incentive Sync] Delete failed for ledger ${existing.id}:`, delErr);
+        }
+      } else if (existing && existing.payout_batch_id) {
+        console.log(
+          `[Incentive Sync] Job ${jobId} member ${memberId}: cannot remove settled incentive row in batch ${existing.payout_batch_id}`
+        );
+      }
     }
   }
 }
