@@ -9933,7 +9933,7 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     }
     const unresolved = Object.entries(unresolvedCustomerSources).map(([raw_value, ids]) => ({ raw_value, count: ids.length }));
 
-    // PR4 — participant metrics
+    // PR4 — participant metrics (paginated counts; Supabase default limit is 1000)
     const participantMetrics = {
       mapped: 0, ambiguous: 0, unmapped: 0, manual: 0,
       participant_pending_total: 0,
@@ -9941,9 +9941,23 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
       participant_phone_missing_total: 0,    // conversations with no phone AND no participant identity
     };
     try {
-      const [mapRes, pendingRes, noPhoneRes] = await Promise.all([
-        supabase.from('communication_participant_mappings')
-          .select('mapping_status, sigcore_participant_id').eq('tenant_id', userId),
+      // Use HEAD count queries (no row fetch) for each status bucket — avoids the 1000-row default
+      const countBy = async (filter) => {
+        let q = supabase.from('communication_participant_mappings')
+          .select('id', { count: 'exact', head: true }).eq('tenant_id', userId);
+        if (filter) q = filter(q);
+        const { count } = await q;
+        return count || 0;
+      };
+      const [
+        mappedCount, ambiguousCount, unmappedCount, manualCount,
+        idMissingCount, pendingCount, noPhoneCount
+      ] = await Promise.all([
+        countBy((q) => q.eq('mapping_status', 'mapped')),
+        countBy((q) => q.eq('mapping_status', 'ambiguous')),
+        countBy((q) => q.eq('mapping_status', 'unmapped')),
+        countBy((q) => q.eq('mapping_status', 'manual')),
+        countBy((q) => q.is('sigcore_participant_id', null)),
         supabase.from('communication_conversations')
           .select('id', { count: 'exact', head: true })
           .eq('user_id', userId).eq('participant_pending', true),
@@ -9951,12 +9965,13 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
           .select('id', { count: 'exact', head: true })
           .eq('user_id', userId).is('participant_phone', null).is('participant_mapping_id', null),
       ]);
-      for (const m of (mapRes.data || [])) {
-        if (participantMetrics[m.mapping_status] !== undefined) participantMetrics[m.mapping_status]++;
-        if (!m.sigcore_participant_id) participantMetrics.participant_id_missing_total++;
-      }
-      participantMetrics.participant_pending_total = pendingRes.count || 0;
-      participantMetrics.participant_phone_missing_total = noPhoneRes.count || 0;
+      participantMetrics.mapped = mappedCount;
+      participantMetrics.ambiguous = ambiguousCount;
+      participantMetrics.unmapped = unmappedCount;
+      participantMetrics.manual = manualCount;
+      participantMetrics.participant_id_missing_total = idMissingCount;
+      participantMetrics.participant_pending_total = pendingCount?.count || pendingCount || 0;
+      participantMetrics.participant_phone_missing_total = noPhoneCount?.count || noPhoneCount || 0;
     } catch (e) { /* non-fatal */ }
 
     res.json({
