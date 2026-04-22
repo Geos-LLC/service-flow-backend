@@ -7990,6 +7990,188 @@ function resolveCustomerSource(customer, resolve, phoneMap) {
   return resolved;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// PR4 — Participant Mapping Layer (Sigcore participant as identity root)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Normalize a phone value to E.164-style digits (last 10 digits, US-centric).
+ * Returns null for unusable input.
+ */
+function toPhoneE164(raw) {
+  if (!raw) return null;
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length < 7) return null;
+  // If already starts with + keep it; otherwise assume US and add +1 on 10-digit, or +<cc>+rest on 11+
+  const s = String(raw).trim();
+  if (s.startsWith('+')) return '+' + digits;
+  if (digits.length === 10) return '+1' + digits;
+  return '+' + digits;
+}
+
+/**
+ * Extract participant identity fields from a Sigcore payload shape.
+ * Handles both the new nested `provider.*` shape and legacy flat fields.
+ */
+function extractSigcoreParticipant(src) {
+  if (!src || typeof src !== 'object') return null;
+  const providerBlock = src.provider && typeof src.provider === 'object' ? src.provider : null;
+  const participantId = src.participantId || src.participant_id || null;
+  const participantKey = src.participantKey || src.participant_key || null;
+  const participantPhoneE164 = toPhoneE164(
+    src.participantPhoneE164 || src.participant_phone_e164 || src.participantPhone || src.participantPhoneNumber
+  );
+  const displayName = (providerBlock?.displayName) || src.contactName || src.conversationName
+    || [src.firstName, src.lastName].filter(Boolean).join(' ') || null;
+  const company = (providerBlock?.company) || src.company || null;
+  const providerContactId = providerBlock?.contactId || src.contactId || null;
+  const providerName = providerBlock?.name || src.providerName || 'openphone';
+  return {
+    participantId,
+    participantKey,
+    participantPhoneE164,
+    providerContactId,
+    provider: providerName,
+    displayName,
+    company,
+  };
+}
+
+/**
+ * Look up CRM matches for a phone using explicit precedence.
+ *
+ * Returns { customers: [], leads: [], status, crm_customer_id, crm_lead_id }.
+ *
+ * Precedence:
+ *   1. exactly 1 customer -> mapped
+ *   2. 0 customers AND exactly 1 lead -> mapped
+ *   3. multiple plausible matches -> ambiguous
+ *   4. no matches -> unmapped
+ */
+async function lookupCRMByPhone(tenantId, phoneE164) {
+  const result = { customers: [], leads: [], status: 'unmapped', crm_customer_id: null, crm_lead_id: null };
+  if (!phoneE164) return result;
+  const last10 = String(phoneE164).replace(/\D/g, '').slice(-10);
+  if (last10.length < 7) return result;
+  const likeFragment = `%${last10}%`;
+
+  const [custsRes, leadsRes] = await Promise.all([
+    supabase.from('customers').select('id').eq('user_id', tenantId).ilike('phone', likeFragment),
+    supabase.from('leads').select('id').eq('user_id', tenantId).ilike('phone', likeFragment).limit(10),
+  ]);
+  result.customers = (custsRes.data || []).map(r => r.id);
+  result.leads = (leadsRes.data || []).map(r => r.id);
+
+  if (result.customers.length === 1) {
+    result.status = 'mapped';
+    result.crm_customer_id = result.customers[0];
+  } else if (result.customers.length === 0 && result.leads.length === 1) {
+    result.status = 'mapped';
+    result.crm_lead_id = result.leads[0];
+  } else if (result.customers.length === 0 && result.leads.length === 0) {
+    result.status = 'unmapped';
+  } else {
+    result.status = 'ambiguous';
+  }
+  return result;
+}
+
+/**
+ * Upsert a participant mapping row. Respects uniqueness by participantId first,
+ * then participantKey (transitional). Runs phone→CRM lookup to populate status + CRM link.
+ *
+ * Returns the mapping row, or null if participant identity is insufficient.
+ */
+async function resolveParticipantMapping(tenantId, sigParticipant, opts = {}) {
+  if (!sigParticipant) return null;
+  const { participantId, participantKey, participantPhoneE164, providerContactId, provider } = sigParticipant;
+  const mappingSource = opts.mappingSource || 'phone_exact';
+
+  // Phone alone is NOT enough — need participantId OR participantKey to create a row
+  if (!participantId && !participantKey) return null;
+
+  // Try to find existing mapping — participantId is the primary key
+  let existing = null;
+  if (participantId) {
+    const r = await supabase.from('communication_participant_mappings')
+      .select('*').eq('tenant_id', tenantId).eq('provider', provider || 'openphone').eq('sigcore_participant_id', participantId).maybeSingle();
+    existing = r.data;
+  }
+  // Upgrade key-only rows when participantId arrives
+  if (participantId && !existing && participantKey) {
+    const r = await supabase.from('communication_participant_mappings')
+      .select('*').eq('tenant_id', tenantId).eq('provider', provider || 'openphone')
+      .eq('sigcore_participant_key', participantKey).is('sigcore_participant_id', null).maybeSingle();
+    if (r.data) existing = r.data;
+  }
+  if (!existing && !participantId && participantKey) {
+    const r = await supabase.from('communication_participant_mappings')
+      .select('*').eq('tenant_id', tenantId).eq('provider', provider || 'openphone')
+      .eq('sigcore_participant_key', participantKey).is('sigcore_participant_id', null).maybeSingle();
+    existing = r.data;
+  }
+
+  // CRM match using precedence rules
+  const crm = await lookupCRMByPhone(tenantId, participantPhoneE164);
+
+  const row = {
+    tenant_id: tenantId,
+    provider: provider || 'openphone',
+    sigcore_participant_id: participantId || existing?.sigcore_participant_id || null,
+    sigcore_participant_key: participantKey || existing?.sigcore_participant_key || null,
+    participant_phone_e164: participantPhoneE164 || existing?.participant_phone_e164 || null,
+    provider_contact_id: providerContactId || existing?.provider_contact_id || null,
+    crm_customer_id: crm.crm_customer_id ?? existing?.crm_customer_id ?? null,
+    crm_lead_id: crm.crm_lead_id ?? existing?.crm_lead_id ?? null,
+    mapping_status: crm.status,
+    mapping_source: existing?.mapping_source || mappingSource,
+    updated_at: new Date().toISOString(),
+  };
+
+  // Manual mappings are sticky — don't overwrite with automated status
+  if (existing?.mapping_status === 'manual') {
+    row.mapping_status = 'manual';
+    row.crm_customer_id = existing.crm_customer_id;
+    row.crm_lead_id = existing.crm_lead_id;
+  }
+
+  if (existing) {
+    const { data } = await supabase.from('communication_participant_mappings')
+      .update(row).eq('id', existing.id).select().single();
+    return data || existing;
+  } else {
+    const { data, error } = await supabase.from('communication_participant_mappings')
+      .insert(row).select().single();
+    if (error) {
+      // Race — the unique index caught a concurrent insert. Re-read.
+      if (participantId) {
+        const r = await supabase.from('communication_participant_mappings')
+          .select('*').eq('tenant_id', tenantId).eq('provider', row.provider).eq('sigcore_participant_id', participantId).maybeSingle();
+        return r.data || null;
+      }
+      return null;
+    }
+    return data;
+  }
+}
+
+/**
+ * Reconcile: when a participant is resolved for a phone, attach any pending conversations
+ * with the same tenant/provider/phone to the newly resolved mapping.
+ */
+async function reconcilePendingConversations(tenantId, provider, phoneE164, mappingId) {
+  if (!tenantId || !provider || !phoneE164 || !mappingId) return 0;
+  const last10 = String(phoneE164).replace(/\D/g, '').slice(-10);
+  if (last10.length < 7) return 0;
+  const { data, error } = await supabase.from('communication_conversations')
+    .update({ participant_mapping_id: mappingId, participant_pending: false })
+    .eq('user_id', tenantId).eq('provider', provider).eq('participant_pending', true)
+    .ilike('participant_phone', `%${last10}%`)
+    .select('id');
+  if (error) return 0;
+  return (data || []).length;
+}
+
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -9751,6 +9933,32 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     }
     const unresolved = Object.entries(unresolvedCustomerSources).map(([raw_value, ids]) => ({ raw_value, count: ids.length }));
 
+    // PR4 — participant metrics
+    const participantMetrics = {
+      mapped: 0, ambiguous: 0, unmapped: 0, manual: 0,
+      participant_pending_total: 0,
+      participant_id_missing_total: 0,       // mapping exists but only participantKey (no participantId)
+      participant_phone_missing_total: 0,    // conversations with no phone AND no participant identity
+    };
+    try {
+      const [mapRes, pendingRes, noPhoneRes] = await Promise.all([
+        supabase.from('communication_participant_mappings')
+          .select('mapping_status, sigcore_participant_id').eq('tenant_id', userId),
+        supabase.from('communication_conversations')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId).eq('participant_pending', true),
+        supabase.from('communication_conversations')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId).is('participant_phone', null).is('participant_mapping_id', null),
+      ]);
+      for (const m of (mapRes.data || [])) {
+        if (participantMetrics[m.mapping_status] !== undefined) participantMetrics[m.mapping_status]++;
+        if (!m.sigcore_participant_id) participantMetrics.participant_id_missing_total++;
+      }
+      participantMetrics.participant_pending_total = pendingRes.count || 0;
+      participantMetrics.participant_phone_missing_total = noPhoneRes.count || 0;
+    } catch (e) { /* non-fatal */ }
+
     res.json({
       duplicateCustomers: dupCustomers,
       duplicateCustomerCount: dupCustomers.length,
@@ -9762,6 +9970,7 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         count: unknownContacts.length,
       },
       unresolvedCustomerSources: unresolved,
+      participantMetrics,
     });
   } catch (error) {
     logger.error('Source issues error:', error);
@@ -9810,6 +10019,151 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
   } catch (error) {
     logger.error('Merge duplicates error:', error);
     res.status(500).json({ error: 'Failed to merge customers' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PR4 — Participant admin endpoints
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Backfill participant mappings from existing conversations.
+ *
+ * Strategy:
+ *   - If conversation already has customer_id or lead_id, preserve that link in the mapping row (mapping_source='backfill')
+ *   - Else run phone-based CRM lookup with precedence to populate status
+ *   - Conversations without any identity/phone are left untouched
+ *
+ * POST /api/participants/backfill       (dry-run — returns counts only)
+ * POST /api/participants/backfill?apply=1  (writes)
+ */
+app.post('/api/participants/backfill', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
+
+    const summary = { scanned: 0, mapped: 0, ambiguous: 0, unmapped: 0, pending: 0, reused: 0, errors: 0, sample: [] };
+
+    // Paginate through all OpenPhone conversations (LB has its own identity model via account mapping)
+    const pageSize = 500; let from = 0;
+    while (true) {
+      const { data: batch, error } = await supabase.from('communication_conversations')
+        .select('id, participant_phone, participant_name, customer_id, lead_id, company, participant_mapping_id, sigcore_conversation_id')
+        .eq('user_id', userId).eq('provider', 'openphone')
+        .range(from, from + pageSize - 1);
+      if (error || !batch?.length) break;
+
+      for (const c of batch) {
+        summary.scanned++;
+        try {
+          const phoneE164 = toPhoneE164(c.participant_phone);
+
+          // Case A: already has participant_mapping_id — skip
+          if (c.participant_mapping_id) { summary.reused++; continue; }
+
+          // Case B: has legacy CRM link — preserve it
+          const hasLegacyCRM = c.customer_id || c.lead_id;
+
+          // No participant identity in existing rows; use sigcore_conversation_id as the "key"
+          // This is a transitional bridge — when real participantId arrives from Sigcore,
+          // resolveParticipantMapping will upgrade the row.
+          const syntheticKey = c.sigcore_conversation_id ? `conv:${c.sigcore_conversation_id}` : null;
+          if (!syntheticKey && !phoneE164) { summary.pending++; continue; }
+
+          if (apply) {
+            // Direct row insert (respects uniqueness)
+            const status = hasLegacyCRM ? 'mapped' : (phoneE164 ? (await lookupCRMByPhone(userId, phoneE164)).status : 'unmapped');
+            const crmIds = hasLegacyCRM
+              ? { crm_customer_id: c.customer_id || null, crm_lead_id: c.lead_id || null }
+              : (phoneE164 ? await lookupCRMByPhone(userId, phoneE164) : { crm_customer_id: null, crm_lead_id: null });
+
+            const row = {
+              tenant_id: userId,
+              provider: 'openphone',
+              sigcore_participant_id: null,
+              sigcore_participant_key: syntheticKey,
+              participant_phone_e164: phoneE164,
+              crm_customer_id: crmIds.crm_customer_id,
+              crm_lead_id: crmIds.crm_lead_id,
+              mapping_status: status,
+              mapping_source: 'backfill',
+            };
+            // Upsert by sigcore_participant_key (transitional unique index covers this)
+            const { data: existing } = await supabase.from('communication_participant_mappings')
+              .select('id').eq('tenant_id', userId).eq('provider', 'openphone')
+              .eq('sigcore_participant_key', syntheticKey).is('sigcore_participant_id', null).maybeSingle();
+
+            let mappingId;
+            if (existing) {
+              mappingId = existing.id;
+              await supabase.from('communication_participant_mappings').update(row).eq('id', existing.id);
+            } else {
+              const { data: inserted, error: insErr } = await supabase.from('communication_participant_mappings')
+                .insert(row).select('id').single();
+              if (insErr) { summary.errors++; continue; }
+              mappingId = inserted.id;
+            }
+            await supabase.from('communication_conversations')
+              .update({ participant_mapping_id: mappingId, participant_pending: false })
+              .eq('id', c.id);
+          }
+
+          // Classify
+          if (hasLegacyCRM) { summary.mapped++; continue; }
+          if (phoneE164) {
+            const crm = await lookupCRMByPhone(userId, phoneE164);
+            if (crm.status === 'mapped') summary.mapped++;
+            else if (crm.status === 'ambiguous') summary.ambiguous++;
+            else summary.unmapped++;
+          } else {
+            summary.pending++;
+          }
+          if (summary.sample.length < 20) summary.sample.push({ id: c.id, phone: phoneE164, hasLegacyCRM });
+        } catch (e) { summary.errors++; }
+      }
+      if (batch.length < pageSize) break;
+      from += pageSize;
+    }
+
+    res.json({ dryRun: !apply, summary });
+  } catch (error) {
+    logger.error('Participant backfill error:', error);
+    res.status(500).json({ error: 'Backfill failed' });
+  }
+});
+
+/**
+ * Repair pass — re-run reconciliation for all pending conversations that now have a resolvable mapping.
+ * Useful after a Sigcore sync that populated new participantIds.
+ */
+app.post('/api/participants/reconcile', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    // Find pending conversations with phone
+    const { data: pending } = await supabase.from('communication_conversations')
+      .select('id, participant_phone')
+      .eq('user_id', userId).eq('provider', 'openphone').eq('participant_pending', true)
+      .not('participant_phone', 'is', null);
+
+    let attached = 0;
+    for (const c of (pending || [])) {
+      const phoneE164 = toPhoneE164(c.participant_phone);
+      if (!phoneE164) continue;
+      // Find a mapping for this phone
+      const { data: map } = await supabase.from('communication_participant_mappings')
+        .select('id').eq('tenant_id', userId).eq('provider', 'openphone')
+        .eq('participant_phone_e164', phoneE164).limit(1).maybeSingle();
+      if (map?.id) {
+        await supabase.from('communication_conversations')
+          .update({ participant_mapping_id: map.id, participant_pending: false })
+          .eq('id', c.id);
+        attached++;
+      }
+    }
+    res.json({ attached, pending: (pending || []).length });
+  } catch (error) {
+    logger.error('Participant reconcile error:', error);
+    res.status(500).json({ error: 'Reconcile failed' });
   }
 });
 
@@ -36221,6 +36575,25 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         else if (msg.includes('yelp')) contactName = 'Yelp';
       }
 
+      // PR4 — Dual-read: try nested provider.* + participant identity from payload or payload.conversation
+      const sig = extractSigcoreParticipant(payload) || extractSigcoreParticipant(payload.conversation) || {};
+      const providerCompany = (payload.provider?.company) || (payload.conversation?.provider?.company) || payload.company || payload.conversation?.company || null;
+
+      let whParticipantMappingId = null;
+      let whParticipantPending = false;
+      if (sig.participantId || sig.participantKey) {
+        try {
+          const mapping = await resolveParticipantMapping(userId, {
+            ...sig,
+            participantPhoneE164: sig.participantPhoneE164 || toPhoneE164(participantPhone),
+            provider: sig.provider || 'openphone',
+          });
+          if (mapping?.id) whParticipantMappingId = mapping.id;
+        } catch (e) { logger.warn(`[Webhook] Participant resolve: ${e.message}`); }
+      } else if (participantPhone) {
+        whParticipantPending = true;
+      }
+
       const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
         user_id: userId,
         sigcore_conversation_id: sigcoreConvId,
@@ -36229,7 +36602,9 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         endpoint_phone: ourEndpointPhone,
         participant_phone: participantPhone,
         participant_name: contactName,
-        company: payload.company || payload.conversation?.company || null,
+        company: providerCompany,
+        participant_mapping_id: whParticipantMappingId,
+        participant_pending: whParticipantPending,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
         last_event_at: payload.createdAt || new Date().toISOString(),
         unread_count: isInbound ? 1 : 0,
@@ -36237,7 +36612,14 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }).select().single();
       if (createErr) { logger.error('[Webhook] Create conversation error:', createErr); return; }
       conversation = created;
-      // Auto-link to customer/lead
+
+      // PR4 — Reconcile any pending conversations for this phone if we just resolved a participant
+      if (whParticipantMappingId && participantPhone) {
+        const phoneForRecon = sig.participantPhoneE164 || toPhoneE164(participantPhone);
+        reconcilePendingConversations(userId, 'openphone', phoneForRecon, whParticipantMappingId).catch(() => {});
+      }
+
+      // Auto-link to customer/lead (legacy — kept during dual-read)
       autoLinkConversation(userId, conversation.id, participantPhone);
 
       // Background: fetch full message history from Sigcore for this new conversation
@@ -36546,16 +36928,23 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
     // Process a single conversation (used by parallel batch runner)
     async function syncOneConversation(conv) {
-      const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone);
+      // PR4 — Dual-read: prefer nested provider.* + participant fields, fall back to legacy flat fields.
+      const sig = extractSigcoreParticipant(conv) || {};
+      const providerBlock = conv.provider && typeof conv.provider === 'object' ? conv.provider : null;
+
+      const participantPhone = normalizePhone(conv.participantPhoneNumber || conv.participantPhone || sig.participantPhoneE164);
       const endpointPhone = normalizePhone(conv.phoneNumber);
       const sigcoreConvId = conv.externalId || conv.id;
-      // Use firstName/lastName from Sigcore (sourced from OpenPhone contact defaultFields) for better name
+
+      // Display name priority: provider.displayName → legacy contactName/firstName+lastName → cross-ref map
       const sigcoreFirstName = conv.firstName || null;
       const sigcoreLastName = conv.lastName || null;
       const sigcoreFullName = [sigcoreFirstName, sigcoreLastName].filter(Boolean).join(' ') || null;
-      let contactName = conv.contactName || sigcoreFullName || conv.conversationName || contactNameMap[participantPhone] || null;
-      // company = OpenPhone contact "company" field — represents the lead source
-      const sigcoreCompany = conv.company || null;
+      let contactName = (providerBlock?.displayName) || conv.contactName || sigcoreFullName
+        || conv.conversationName || contactNameMap[participantPhone] || null;
+      // Company — provider.company is authoritative; legacy conv.company is fallback
+      const sigcoreCompany = (providerBlock?.company) || conv.company || null;
+
       const lastMsg = conv.lastMessage;
       if (!contactName && lastMsg) {
         const msg = lastMsg.toLowerCase();
@@ -36569,8 +36958,25 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
       if (!participantPhone || !endpointPhone) return { synced: 0, messages: 0, error: true };
 
+      // PR4 — Resolve participant mapping (Case A/A' — identity available)
+      let participantMappingId = null;
+      let participantPending = false;
+      if (sig.participantId || sig.participantKey) {
+        try {
+          const mapping = await resolveParticipantMapping(userId, {
+            ...sig,
+            participantPhoneE164: sig.participantPhoneE164 || toPhoneE164(participantPhone),
+            provider: sig.provider || 'openphone',
+          });
+          if (mapping?.id) participantMappingId = mapping.id;
+        } catch (e) { logger.warn(`[Sync] Participant resolve: ${e.message}`); }
+      } else if (participantPhone) {
+        // Case B — phone only, no identity yet. Do NOT create a mapping; mark pending.
+        participantPending = true;
+      }
+
       let msgCount = 0;
-      // Deterministic conversation identity: user + endpoint + participant
+      // Deterministic conversation identity (legacy lookup): user + endpoint + participant
       let localConv = null;
       let found = null;
       if (sigcoreConvId) {
@@ -36590,8 +36996,15 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
         if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
         if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
-        // Persist company from OpenPhone (lead source) — always update if Sigcore provides it
+        // Phase 1 — legacy company kept during dual-read. Phase 4a will stop writing this.
         if (sigcoreCompany && sigcoreCompany !== found.company) updates.company = sigcoreCompany;
+        // PR4 — participant mapping fields
+        if (participantMappingId && participantMappingId !== found.participant_mapping_id) {
+          updates.participant_mapping_id = participantMappingId;
+          updates.participant_pending = false;
+        } else if (!participantMappingId && participantPending && !found.participant_mapping_id && !found.participant_pending) {
+          updates.participant_pending = true;
+        }
         const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
         localConv = updated || found;
       } else {
@@ -36601,6 +37014,8 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           endpoint_phone: endpointPhone,
           participant_phone: participantPhone, participant_name: contactName,
           company: sigcoreCompany,
+          participant_mapping_id: participantMappingId,
+          participant_pending: participantPending,
           last_event_at: lastActivity, metadata: { phoneNumberId },
         }).select().single();
         if (convErr) return { synced: 0, messages: 0, error: true };
@@ -36608,7 +37023,13 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       }
       if (!localConv) return { synced: 0, messages: 0, error: true };
 
-      // Auto-link to SF customer/lead
+      // PR4 — If we just resolved a participant for a phone that had pending conversations, reconcile them
+      if (participantMappingId && participantPhone) {
+        const phoneForRecon = sig.participantPhoneE164 || toPhoneE164(participantPhone);
+        reconcilePendingConversations(userId, 'openphone', phoneForRecon, participantMappingId).catch(() => {});
+      }
+
+      // Auto-link to SF customer/lead (legacy — kept during dual-read; mapping table is authoritative now)
       if (!localConv.customer_id && !localConv.lead_id) {
         autoLinkConversation(userId, localConv.id, participantPhone).catch(() => {});
       }
@@ -37239,10 +37660,62 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
     const sourceMap = {};
     for (const m of (mappingsRes.data || [])) sourceMap[`${m.provider}:${m.raw_value}`] = m.source_name;
 
+    // PR4 — Load participant mappings for this tenant + any linked CRM customers/leads
+    const mappingIds = [...new Set((data || []).map(c => c.participant_mapping_id).filter(Boolean))];
+    const participantMap = {}; // id -> mapping row
+    const crmCustomerIds = new Set();
+    const crmLeadIds = new Set();
+    if (mappingIds.length > 0) {
+      const { data: mappings } = await supabase.from('communication_participant_mappings')
+        .select('id, crm_customer_id, crm_lead_id, mapping_status, participant_phone_e164').in('id', mappingIds);
+      for (const m of (mappings || [])) {
+        participantMap[m.id] = m;
+        if (m.crm_customer_id) crmCustomerIds.add(m.crm_customer_id);
+        if (m.crm_lead_id) crmLeadIds.add(m.crm_lead_id);
+      }
+    }
+    // Also read any legacy customer_id/lead_id refs during dual-read
+    for (const c of (data || [])) {
+      if (c.customer_id) crmCustomerIds.add(c.customer_id);
+      if (c.lead_id) crmLeadIds.add(c.lead_id);
+    }
+    const crmCustomerMap = {}; const crmLeadMap = {};
+    if (crmCustomerIds.size > 0) {
+      const { data: custs } = await supabase.from('customers')
+        .select('id, first_name, last_name, phone, email').in('id', [...crmCustomerIds]);
+      for (const cu of (custs || [])) crmCustomerMap[cu.id] = cu;
+    }
+    if (crmLeadIds.size > 0) {
+      const { data: lds } = await supabase.from('leads')
+        .select('id, first_name, last_name, phone, email').in('id', [...crmLeadIds]);
+      for (const ld of (lds || [])) crmLeadMap[ld.id] = ld;
+    }
+
+    // Helper: non-empty string check (not blank after trim)
+    const nonEmpty = (s) => typeof s === 'string' && s.trim() !== '';
+
     // Map to frontend shape
     const conversations = (data || []).map(c => {
       const account = c.provider_account_id ? accountMap[c.provider_account_id] : null;
       const loc = c.sf_location_id ? locationMap[c.sf_location_id] : null;
+
+      // PR4 — CRM overlay (from participant mapping) OR legacy customer_id/lead_id during dual-read
+      const mapping = c.participant_mapping_id ? participantMap[c.participant_mapping_id] : null;
+      const crmCustomerId = mapping?.crm_customer_id || c.customer_id || null;
+      const crmLeadId = mapping?.crm_lead_id || c.lead_id || null;
+      const crmRecord = crmCustomerId ? crmCustomerMap[crmCustomerId]
+                       : crmLeadId ? crmLeadMap[crmLeadId]
+                       : null;
+
+      // Display priority: CRM (if non-empty) > provider (participant_name here reflects provider.displayName after Phase 1) > phone
+      const crmName = crmRecord
+        ? `${crmRecord.first_name || ''} ${crmRecord.last_name || ''}`.trim()
+        : '';
+      const providerName = c.participant_name || '';
+      const displayName = nonEmpty(crmName) ? crmName
+                        : nonEmpty(providerName) ? providerName
+                        : '';
+
       // Resolve source — only return if it's a canonical lead_source
       const rawSource = c.company || null;
       const provider = c.provider || 'openphone';
@@ -37258,7 +37731,7 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         sigcoreConversationId: c.sigcore_conversation_id,
         provider: provider,
         channel: c.channel || 'sms',
-        displayName: c.participant_name || '',
+        displayName,
         fallbackIdentifier: c.participant_phone || c.participant_email || '',
         endpointPhone: c.endpoint_phone,
         endpointEmail: c.endpoint_email,
@@ -37271,8 +37744,8 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         unreadCount: c.unread_count || 0,
         channels: [c.channel || 'sms'],
         isArchived: c.is_archived,
-        customerId: c.customer_id,
-        leadId: c.lead_id,
+        customerId: crmCustomerId,
+        leadId: crmLeadId,
         // Account info (secondary metadata)
         providerAccountId: c.provider_account_id || null,
         accountName: account?.displayName || null,
@@ -37285,6 +37758,10 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
         // Avatar URL from WhatsApp sync (stored in metadata)
         avatarUrl: c.metadata?.avatarUrl || null,
         isGroup: c.metadata?.isGroup || c.conversation_type === 'group' || false,
+        // PR4 — participant mapping diagnostics
+        participantMappingId: c.participant_mapping_id || null,
+        participantPending: !!c.participant_pending,
+        mappingStatus: mapping?.mapping_status || null,
       };
     });
 
@@ -37464,6 +37941,17 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const availableSendChannels = settings?.openphone_connected ? ['openphone'] : [];
     // Email channel de-scoped from communications inbox (use Notification Email settings instead)
 
+    // PR4 — pull CRM link from participant mapping (authoritative) before falling back to legacy conv.customer_id/lead_id
+    let pr4Mapping = null;
+    if (conv.participant_mapping_id) {
+      const { data: m } = await supabase.from('communication_participant_mappings')
+        .select('id, crm_customer_id, crm_lead_id, mapping_status, participant_phone_e164')
+        .eq('id', conv.participant_mapping_id).eq('tenant_id', userId).maybeSingle();
+      pr4Mapping = m || null;
+      if (pr4Mapping?.crm_customer_id && !conv.customer_id) conv.customer_id = pr4Mapping.crm_customer_id;
+      if (pr4Mapping?.crm_lead_id && !conv.lead_id) conv.lead_id = pr4Mapping.crm_lead_id;
+    }
+
     // Auto-link unlinked conversations on access (lazy relink)
     if (!conv.customer_id && !conv.lead_id && conv.participant_phone) {
       const linkResult = await autoLinkConversation(userId, conv.id, conv.participant_phone);
@@ -37564,7 +38052,27 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
     const hasMore = events.length < totalEvents;
     const oldestTimestamp = events.length > 0 ? events[0].timestamp : null;
 
-    res.json({ events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp, conversation: { id: conv.id, displayName: conv.participant_name, participantPhone: conv.participant_phone, company: resolvedConvSource } });
+    // PR4 — compose displayName with CRM-first priority (non-blank), fall back to provider, then phone
+    const nonEmpty = (s) => typeof s === 'string' && s.trim() !== '';
+    const crmDisplayName = lead ? (lead.name || '') : '';
+    const providerDisplayName = conv.participant_name || '';
+    const finalDisplayName = nonEmpty(crmDisplayName) ? crmDisplayName
+                           : nonEmpty(providerDisplayName) ? providerDisplayName
+                           : (conv.participant_phone || '');
+
+    res.json({
+      events, availableSendChannels, lead, hasMore, totalEvents, oldestTimestamp,
+      conversation: {
+        id: conv.id,
+        displayName: finalDisplayName,
+        participantPhone: conv.participant_phone,
+        company: resolvedConvSource,
+        // PR4 — participant diagnostics
+        participantMappingId: conv.participant_mapping_id || null,
+        participantPending: !!conv.participant_pending,
+        mappingStatus: pr4Mapping?.mapping_status || null,
+      },
+    });
   } catch (error) {
     logger.error('Conversation detail error:', error);
     res.status(500).json({ error: 'Failed to fetch conversation' });
