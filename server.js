@@ -44,6 +44,10 @@ const {
 } = require('./services/job-status-service');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 
+const { resolveIdentity } = require('./lib/identity-resolver');
+const { FLAGS, isEnabled } = require('./lib/feature-flags');
+const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
+
 // Thin shim so callers don't have to pass supabase every time.
 async function updateJobStatus(args) {
   return _updateJobStatus(supabase, args);
@@ -8182,10 +8186,11 @@ async function resolveParticipantMapping(tenantId, sigParticipant, opts = {}) {
     row.crm_lead_id = existing.crm_lead_id;
   }
 
+  let finalMapping = null;
   if (existing) {
     const { data } = await supabase.from('communication_participant_mappings')
       .update(row).eq('id', existing.id).select().single();
-    return data || existing;
+    finalMapping = data || existing;
   } else {
     const { data, error } = await supabase.from('communication_participant_mappings')
       .insert(row).select().single();
@@ -8194,11 +8199,143 @@ async function resolveParticipantMapping(tenantId, sigParticipant, opts = {}) {
       if (participantId) {
         const r = await supabase.from('communication_participant_mappings')
           .select('*').eq('tenant_id', tenantId).eq('provider', row.provider).eq('sigcore_participant_id', participantId).maybeSingle();
-        return r.data || null;
+        finalMapping = r.data || null;
       }
-      return null;
+    } else {
+      finalMapping = data;
     }
-    return data;
+  }
+
+  // Phase C — link mapping row to identity via shared resolveIdentity (flag-gated, additive).
+  // Does not alter legacy classification or crm_* fields; only populates identity_id.
+  if (finalMapping && isEnabled(FLAGS.IDENTITY_RESOLVER_OPENPHONE)) {
+    try { await linkMappingToIdentity(tenantId, sigParticipant, finalMapping); }
+    catch (e) { logger.warn(`[OP] linkMappingToIdentity: ${e.message}`); }
+  }
+
+  return finalMapping;
+}
+
+/**
+ * Phase C — call shared resolveIdentity for this Sigcore participant and link
+ * the result's identity row to mapping.identity_id. Does NOT touch legacy
+ * crm_customer_id / crm_lead_id / mapping_status on the mapping row.
+ *
+ * Returns the identity row on success, null on ambiguous/error.
+ */
+async function linkMappingToIdentity(tenantId, sigParticipant, mapping) {
+  if (!mapping) return null;
+  const result = await resolveIdentity(supabase, {
+    userId: tenantId,
+    source: 'openphone',
+    externalId: sigParticipant.providerContactId || null,
+    sigcoreParticipantId: sigParticipant.participantId || null,
+    sigcoreParticipantKey: sigParticipant.participantKey || null,
+    phone: sigParticipant.participantPhoneE164 || null,
+    displayName: sigParticipant.displayName || null,
+  });
+  if (result.status !== 'matched') {
+    logger.warn(`[OP] Identity resolver non-match: status=${result.status} reason=${result.reason || result.error}`);
+    return null;
+  }
+  if (mapping.identity_id !== result.identity.id) {
+    await supabase.from('communication_participant_mappings')
+      .update({ identity_id: result.identity.id })
+      .eq('id', mapping.id);
+  }
+  return result.identity;
+}
+
+/**
+ * Phase C — conditionally create an SF lead from an OpenPhone conversation.
+ * Called AFTER the identity has been resolved + linked to the mapping row.
+ *
+ * Source derivation: conversation.company → lead_source_mappings → canonical source_name.
+ * Rules enforced by shouldOpenPhoneCreateLead (pure):
+ *   - identity has no existing sf_lead_id / sf_customer_id
+ *   - canonical source resolves (via mapping)
+ *   - participant name is real (non-aggregator / non-empty)
+ *   - LB-owned channels (Thumbtack/Yelp) only create when LB hasn't ingested
+ *     (identity.leadbridge_contact_id IS NULL) — LB-recovery path.
+ *
+ * No-op when OPENPHONE_CONDITIONAL_LEAD_CREATION flag is OFF.
+ * Returns the created lead id on success, null otherwise.
+ */
+async function maybeCreateLeadFromOpenPhone(userId, identity, { company, participantName }) {
+  if (!isEnabled(FLAGS.OPENPHONE_CONDITIONAL_LEAD_CREATION)) return null;
+  if (!identity) return null;
+  if (!company) return null;
+
+  // Look up canonical source via lead_source_mappings (provider='openphone').
+  const { data: mappings } = await supabase.from('lead_source_mappings')
+    .select('source_name').eq('user_id', userId).eq('provider', 'openphone')
+    .ilike('raw_value', String(company).trim()).limit(1);
+  const canonicalSource = mappings?.[0]?.source_name || null;
+
+  const decision = shouldOpenPhoneCreateLead({ identity, canonicalSource, participantName });
+  if (!decision.create) {
+    logger.log(`[OP] Skip lead create for identity ${identity.id}: ${decision.reason}`);
+    return null;
+  }
+
+  // Default pipeline + first stage.
+  const { data: pipeline } = await supabase.from('lead_pipelines')
+    .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle();
+  if (!pipeline) { logger.warn('[OP] No default pipeline for user', userId); return null; }
+  const { data: stages } = await supabase.from('lead_stages')
+    .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true });
+  if (!stages?.length) { logger.warn('[OP] No stages in default pipeline', pipeline.id); return null; }
+  const stage = stages.find(s => s.name === 'New Lead' || s.position === 0) || stages[0];
+
+  const nameParts = (participantName || '').trim().split(/\s+/);
+  const firstName = nameParts[0] || null;
+  const lastName = nameParts.slice(1).join(' ') || null;
+  const phone = identity.normalized_phone ? `+1${identity.normalized_phone}` : null;
+
+  const { data: newLead, error } = await supabase.from('leads').insert({
+    user_id: userId,
+    pipeline_id: pipeline.id,
+    stage_id: stage.id,
+    first_name: firstName,
+    last_name: lastName,
+    phone,
+    email: identity.email || null,
+    source: decision.source,
+    notes: `[${decision.note}] Created from OpenPhone conversation`,
+  }).select().single();
+
+  if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
+
+  // Link identity → new lead + mark status.
+  await supabase.from('communication_participant_identities')
+    .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
+    .eq('id', identity.id);
+
+  logger.log(`[OP] Created lead ${newLead.id} via ${decision.note} (${decision.source}) for identity ${identity.id}`);
+  return newLead.id;
+}
+
+/**
+ * Phase C — call-site helper for OpenPhone conditional lead creation.
+ * Fetches the identity via mapping.identity_id and delegates to maybeCreateLeadFromOpenPhone.
+ * No-op when either feature flag is off or mapping has no identity_id yet.
+ * Non-throwing; webhook-safe to fire-and-forget.
+ */
+async function handleOpenPhoneConditionalLeadCreation(userId, mapping, sigParticipant, company) {
+  if (!isEnabled(FLAGS.OPENPHONE_CONDITIONAL_LEAD_CREATION)) return null;
+  if (!mapping?.identity_id) return null;
+  if (!company) return null;
+  try {
+    const { data: identity } = await supabase.from('communication_participant_identities')
+      .select('*').eq('id', mapping.identity_id).maybeSingle();
+    if (!identity) return null;
+    return await maybeCreateLeadFromOpenPhone(userId, identity, {
+      company,
+      participantName: sigParticipant?.displayName || null,
+    });
+  } catch (e) {
+    logger.warn(`[OP] Conditional lead creation failed: ${e.message}`);
+    return null;
   }
 }
 
@@ -37375,6 +37512,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
             provider: sig.provider || 'openphone',
           });
           if (mapping?.id) whParticipantMappingId = mapping.id;
+          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, providerCompany).catch(() => {});
         } catch (e) { logger.warn(`[Webhook] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
         whParticipantPending = true;
@@ -37755,6 +37893,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             provider: sig.provider || 'openphone',
           });
           if (mapping?.id) participantMappingId = mapping.id;
+          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, sigcoreCompany).catch(() => {});
         } catch (e) { logger.warn(`[Sync] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
         // Case B — phone only, no identity yet. Do NOT create a mapping; mark pending.
