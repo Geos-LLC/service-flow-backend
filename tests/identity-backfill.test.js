@@ -35,11 +35,13 @@ function makeMockSupabase(seed = {}) {
   function tableAccess(rows, unique = []) {
     const filters = [];
     let limit = null;
+    let orderBy = null;
     const applyFilters = (rs) => rs.filter(r => filters.every(f => {
       if (f.op === 'eq') return r[f.col] === f.val;
       if (f.op === 'is_null') return r[f.col] == null;
       if (f.op === 'in') return f.val.includes(r[f.col]);
       if (f.op === 'not_is_null') return r[f.col] != null;
+      if (f.op === 'gt') return r[f.col] > f.val;
       if (f.op === 'ilike') {
         const v = String(r[f.col] || '').toLowerCase();
         return v.includes(String(f.val).toLowerCase().replace(/%/g, ''));
@@ -52,6 +54,8 @@ function makeMockSupabase(seed = {}) {
       select() { return chain; },
       eq(col, val) { filters.push({ op: 'eq', col, val }); return chain; },
       in(col, val) { filters.push({ op: 'in', col, val }); return chain; },
+      gt(col, val) { filters.push({ op: 'gt', col, val }); return chain; },
+      order(col, opts) { orderBy = { col, asc: opts?.ascending !== false }; return chain; },
       is(col, val) {
         if (val === null) filters.push({ op: 'is_null', col });
         return chain;
@@ -110,12 +114,16 @@ function makeMockSupabase(seed = {}) {
         };
       },
       then(fn) {
-        const filtered = applyFilters(rows);
-        const rangeFilter = filters.find(f => f.op === 'range');
-        let result = filtered;
-        if (rangeFilter) {
-          result = result.slice(rangeFilter.start, rangeFilter.end + 1);
+        let result = applyFilters(rows);
+        if (orderBy) {
+          result = [...result].sort((a, b) => {
+            const av = a[orderBy.col]; const bv = b[orderBy.col];
+            const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+            return orderBy.asc ? cmp : -cmp;
+          });
         }
+        const rangeFilter = filters.find(f => f.op === 'range');
+        if (rangeFilter) result = result.slice(rangeFilter.start, rangeFilter.end + 1);
         if (limit) result = result.slice(0, limit);
         return Promise.resolve({ data: result, error: null }).then(fn);
       },
