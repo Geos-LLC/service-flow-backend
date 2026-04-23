@@ -5258,6 +5258,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       qualityCheck = true,
       serviceModifiers,
       serviceIntakeQuestions: serviceIntakeQuestionsInput,
+      propertyId,
       forceBook = false
     } = req.body;
 
@@ -5517,6 +5518,37 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Handle empty recurring end date
       const recurringEndDateValue = recurringEndDate && recurringEndDate !== '' ? recurringEndDate : null;
 
+      // Resolve the customer property this job is for. If the caller sent a
+      // propertyId, honor it (verifying ownership). Otherwise match/create
+      // from serviceAddress so every booking lives under an identifiable
+      // property row — which is what the customer card lists.
+      let resolvedPropertyId = null;
+      try {
+        if (customerId && propertyId) {
+          const { data: existingProp } = await supabase
+            .from('customer_properties')
+            .select('id')
+            .eq('id', propertyId)
+            .eq('customer_id', customerId)
+            .eq('user_id', userId)
+            .limit(1);
+          if (existingProp && existingProp.length) {
+            resolvedPropertyId = existingProp[0].id;
+          }
+        }
+        if (!resolvedPropertyId && customerId && serviceAddress) {
+          const prop = await findOrCreateCustomerProperty(
+            userId,
+            customerId,
+            serviceAddress,
+            { makeDefault: true }
+          );
+          if (prop) resolvedPropertyId = prop.id;
+        }
+      } catch (propErr) {
+        console.error('Property resolution failed (non-blocking):', propErr);
+      }
+
       // Create the job
       const jobData = {
         user_id: userId,
@@ -5571,7 +5603,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         photos_required: photosRequired,
         quality_check: qualityCheck,
         service_modifiers: processedModifiers.length > 0 ? processedModifiers : null,
-        service_intake_questions: processedIntakeQuestions.length > 0 ? processedIntakeQuestions : null
+        service_intake_questions: processedIntakeQuestions.length > 0 ? processedIntakeQuestions : null,
+        property_id: resolvedPropertyId
       };
 
       // Note: Initial status will be inserted into job_status_history table after job creation
@@ -8627,13 +8660,322 @@ app.put('/api/customers/:id', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to update customer' });
     }
     
-    res.json({ 
+    res.json({
       message: 'Customer updated successfully',
       customer: updatedCustomer
     });
   } catch (error) {
     console.error('Update customer error:', error);
     res.status(500).json({ error: 'Failed to update customer' });
+  }
+});
+
+// ============================================
+// CUSTOMER PROPERTIES (multi-address) API
+// ============================================
+
+// Verify a customer belongs to the caller. Returns { customer } or null.
+async function loadCustomerForUser(userId, customerId) {
+  const { data, error } = await supabase
+    .from('customers')
+    .select('id, user_id, address, suite, city, state, zip_code')
+    .eq('id', customerId)
+    .eq('user_id', userId)
+    .limit(1);
+  if (error) throw error;
+  return data && data.length ? data[0] : null;
+}
+
+// Build a normalized-ish key for duplicate detection: lowercased street+city+state+zip,
+// whitespace collapsed. Not perfect but good enough to dedupe obvious repeats.
+function propertyMatchKey(p) {
+  const parts = [p.street, p.city, p.state, p.zip_code].map((v) =>
+    (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ')
+  );
+  return parts.join('|');
+}
+
+// If a customer has no customer_properties rows yet but has legacy single-address
+// data on the customers row, create one default property from it so the UI has
+// something to render without a manual migration step.
+async function ensureBackfilledProperties(userId, customer) {
+  const { data: existing, error: listErr } = await supabase
+    .from('customer_properties')
+    .select('*')
+    .eq('customer_id', customer.id)
+    .eq('user_id', userId)
+    .order('id', { ascending: true });
+  if (listErr) throw listErr;
+  if (existing && existing.length > 0) return existing;
+
+  const hasAny = [customer.address, customer.city, customer.state, customer.zip_code]
+    .some((v) => v && String(v).trim().length > 0);
+  if (!hasAny) return [];
+
+  const { data: inserted, error: insErr } = await supabase
+    .from('customer_properties')
+    .insert({
+      user_id: userId,
+      customer_id: customer.id,
+      street: customer.address || null,
+      suite: customer.suite || null,
+      city: customer.city || null,
+      state: customer.state || null,
+      zip_code: customer.zip_code || null,
+      country: 'USA',
+      is_default: true,
+    })
+    .select();
+  if (insErr) {
+    console.error('Error backfilling customer_properties:', insErr);
+    return [];
+  }
+  return inserted || [];
+}
+
+// Find an existing property for this customer matching the supplied address,
+// or create a new one. Used by job creation so every booking lands on a
+// real customer_properties row. `makeDefault` promotes the row to default when
+// the customer has none yet.
+async function findOrCreateCustomerProperty(userId, customerId, addr, { makeDefault = false } = {}) {
+  if (!addr || (!addr.street && !addr.city && !addr.zip_code)) return null;
+
+  const { data: existing, error: listErr } = await supabase
+    .from('customer_properties')
+    .select('*')
+    .eq('customer_id', customerId)
+    .eq('user_id', userId);
+  if (listErr) throw listErr;
+
+  const wantKey = propertyMatchKey({
+    street: addr.street,
+    city: addr.city,
+    state: addr.state,
+    zip_code: addr.zipCode || addr.zip_code,
+  });
+  const hit = (existing || []).find((p) => propertyMatchKey(p) === wantKey);
+  if (hit) return hit;
+
+  const noneYet = !existing || existing.length === 0;
+  const { data: inserted, error: insErr } = await supabase
+    .from('customer_properties')
+    .insert({
+      user_id: userId,
+      customer_id: customerId,
+      street: addr.street || null,
+      suite: addr.suite || addr.unit || null,
+      city: addr.city || null,
+      state: addr.state || null,
+      zip_code: addr.zipCode || addr.zip_code || null,
+      country: addr.country || 'USA',
+      is_default: makeDefault && noneYet,
+    })
+    .select()
+    .single();
+  if (insErr) {
+    console.error('Error creating customer property:', insErr);
+    return null;
+  }
+  return inserted;
+}
+
+// List properties for a customer (with lazy backfill from legacy single address)
+app.get('/api/customers/:id/properties', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const customer = await loadCustomerForUser(userId, id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const list = await ensureBackfilledProperties(userId, customer);
+    res.json({ properties: list });
+  } catch (error) {
+    console.error('List customer properties error:', error);
+    res.status(500).json({ error: 'Failed to fetch customer properties' });
+  }
+});
+
+// Create a new property
+app.post('/api/customers/:id/properties', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { label, street, suite, city, state, zipCode, country, notes, isDefault } = req.body;
+
+    const customer = await loadCustomerForUser(userId, id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    if (!street && !city && !zipCode) {
+      return res.status(400).json({ error: 'Property must include at least a street, city, or ZIP' });
+    }
+
+    // Seed any missing backfill row first so uniqueness of is_default holds
+    await ensureBackfilledProperties(userId, customer);
+
+    const wantDefault = Boolean(isDefault);
+    if (wantDefault) {
+      const { error: clearErr } = await supabase
+        .from('customer_properties')
+        .update({ is_default: false })
+        .eq('customer_id', id)
+        .eq('user_id', userId)
+        .eq('is_default', true);
+      if (clearErr) {
+        console.error('Error clearing existing default property:', clearErr);
+        return res.status(500).json({ error: 'Failed to create property' });
+      }
+    }
+
+    const { data: existingRows } = await supabase
+      .from('customer_properties')
+      .select('id')
+      .eq('customer_id', id)
+      .eq('user_id', userId)
+      .limit(1);
+    const hasAny = Array.isArray(existingRows) && existingRows.length > 0;
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('customer_properties')
+      .insert({
+        user_id: userId,
+        customer_id: Number(id),
+        label: label ? sanitizeInput(label) : null,
+        street: street ? sanitizeInput(street) : null,
+        suite: suite ? sanitizeInput(suite) : null,
+        city: city ? sanitizeInput(city) : null,
+        state: state ? sanitizeInput(state) : null,
+        zip_code: zipCode ? sanitizeInput(zipCode) : null,
+        country: country ? sanitizeInput(country) : 'USA',
+        notes: notes ? sanitizeInput(notes) : null,
+        is_default: wantDefault || !hasAny,
+      })
+      .select()
+      .single();
+
+    if (insErr) {
+      console.error('Error creating property:', insErr);
+      return res.status(500).json({ error: 'Failed to create property' });
+    }
+
+    res.status(201).json({ property: inserted });
+  } catch (error) {
+    console.error('Create customer property error:', error);
+    res.status(500).json({ error: 'Failed to create property' });
+  }
+});
+
+// Update a property (and optionally promote to default)
+app.patch('/api/customers/:id/properties/:propertyId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id, propertyId } = req.params;
+    const { label, street, suite, city, state, zipCode, country, notes, isDefault } = req.body;
+
+    const customer = await loadCustomerForUser(userId, id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const updatePayload = {};
+    if (label !== undefined) updatePayload.label = label ? sanitizeInput(label) : null;
+    if (street !== undefined) updatePayload.street = street ? sanitizeInput(street) : null;
+    if (suite !== undefined) updatePayload.suite = suite ? sanitizeInput(suite) : null;
+    if (city !== undefined) updatePayload.city = city ? sanitizeInput(city) : null;
+    if (state !== undefined) updatePayload.state = state ? sanitizeInput(state) : null;
+    if (zipCode !== undefined) updatePayload.zip_code = zipCode ? sanitizeInput(zipCode) : null;
+    if (country !== undefined) updatePayload.country = country ? sanitizeInput(country) : 'USA';
+    if (notes !== undefined) updatePayload.notes = notes ? sanitizeInput(notes) : null;
+    updatePayload.updated_at = new Date().toISOString();
+
+    if (isDefault === true) {
+      const { error: clearErr } = await supabase
+        .from('customer_properties')
+        .update({ is_default: false })
+        .eq('customer_id', id)
+        .eq('user_id', userId)
+        .eq('is_default', true)
+        .neq('id', propertyId);
+      if (clearErr) {
+        console.error('Error clearing existing default property:', clearErr);
+        return res.status(500).json({ error: 'Failed to update property' });
+      }
+      updatePayload.is_default = true;
+    } else if (isDefault === false) {
+      updatePayload.is_default = false;
+    }
+
+    const { data: updated, error: updErr } = await supabase
+      .from('customer_properties')
+      .update(updatePayload)
+      .eq('id', propertyId)
+      .eq('customer_id', id)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (updErr) {
+      console.error('Error updating property:', updErr);
+      return res.status(500).json({ error: 'Failed to update property' });
+    }
+    if (!updated) return res.status(404).json({ error: 'Property not found' });
+
+    res.json({ property: updated });
+  } catch (error) {
+    console.error('Update customer property error:', error);
+    res.status(500).json({ error: 'Failed to update property' });
+  }
+});
+
+// Delete a property. Does NOT delete any jobs — jobs.property_id ON DELETE SET NULL.
+app.delete('/api/customers/:id/properties/:propertyId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id, propertyId } = req.params;
+
+    const customer = await loadCustomerForUser(userId, id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const { data: target, error: findErr } = await supabase
+      .from('customer_properties')
+      .select('id, is_default')
+      .eq('id', propertyId)
+      .eq('customer_id', id)
+      .eq('user_id', userId)
+      .single();
+    if (findErr || !target) return res.status(404).json({ error: 'Property not found' });
+
+    const { error: delErr } = await supabase
+      .from('customer_properties')
+      .delete()
+      .eq('id', propertyId)
+      .eq('customer_id', id)
+      .eq('user_id', userId);
+    if (delErr) {
+      console.error('Error deleting property:', delErr);
+      return res.status(500).json({ error: 'Failed to delete property' });
+    }
+
+    // If we deleted the default, promote the oldest remaining row so the
+    // customer always has exactly one default (when any rows remain).
+    if (target.is_default) {
+      const { data: remaining } = await supabase
+        .from('customer_properties')
+        .select('id')
+        .eq('customer_id', id)
+        .eq('user_id', userId)
+        .order('id', { ascending: true })
+        .limit(1);
+      if (remaining && remaining.length) {
+        await supabase
+          .from('customer_properties')
+          .update({ is_default: true })
+          .eq('id', remaining[0].id);
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete customer property error:', error);
+    res.status(500).json({ error: 'Failed to delete property' });
   }
 });
 
