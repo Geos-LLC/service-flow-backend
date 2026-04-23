@@ -10728,6 +10728,26 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
             }
           }
 
+          // Path 3: for customers, also look at the converted-from lead's identity
+          // (lead → customer conversion may leave the identity linked only to the lead)
+          if (!providerAccountId && table === 'customers') {
+            const { data: origLead } = await supabase.from('leads')
+              .select('id').eq('user_id', userId).eq('converted_customer_id', rec.id).limit(1).maybeSingle();
+            if (origLead?.id) {
+              const { data: identity } = await supabase.from('communication_participant_identities')
+                .select('id').eq('user_id', userId).eq('sf_lead_id', origLead.id).limit(1).maybeSingle();
+              if (identity?.id) {
+                const { data: conv } = await supabase.from('communication_conversations')
+                  .select('provider_account_id')
+                  .eq('user_id', userId).eq('provider', 'leadbridge')
+                  .eq('participant_identity_id', identity.id)
+                  .not('provider_account_id', 'is', null)
+                  .limit(1).maybeSingle();
+                providerAccountId = conv?.provider_account_id || null;
+              }
+            }
+          }
+
           if (!providerAccountId || !accountMap[providerAccountId]) {
             summary.unresolved_no_context++;
             if (summary.unresolved_samples.length < 50) summary.unresolved_samples.push({
