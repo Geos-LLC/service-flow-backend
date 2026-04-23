@@ -436,13 +436,15 @@ describe('fillNormalizedNames', () => {
     expect(sb._state.identities.find(x => x.id === 901).normalized_name).toBe('linda mau');
   });
 
-  test('dry-run leaves values untouched but counts them', async () => {
+  test('normalization ALWAYS writes (Phase 0 is not gated by apply) — dry-run preserves this', async () => {
     const sb = makeMockSupabase({
       identities: [{ id: 910, user_id: 2, display_name: 'Linda Mau', normalized_name: null }],
     });
+    // Deliberate: Phase 0 writes regardless — otherwise dry-run can't match
+    // phone+name candidates against unpopulated normalized_name columns.
     const counts = await fillNormalizedNamesIdentities(sb, 2, { apply: false });
     expect(counts.updated).toBe(1);
-    expect(sb._state.identities[0].normalized_name).toBeNull();
+    expect(sb._state.identities[0].normalized_name).toBe('linda mau');
   });
 
   test('CRM backfill concatenates first_name + last_name', async () => {

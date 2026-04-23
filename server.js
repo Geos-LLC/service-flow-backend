@@ -10532,32 +10532,21 @@ app.post('/api/identities/backfill', authenticateToken, async (req, res) => {
     const progress = { status: 'running', apply, phase: 'starting', startedAt: Date.now() };
     identityBackfillProgress[userId] = progress;
 
-    if (!apply) {
-      try {
-        const summary = await runIdentityBackfill(supabase, userId, { apply: false, progress });
-        progress.status = 'done';
-        progress.summary = summary;
-        return res.json({ dryRun: true, summary });
-      } catch (e) {
-        progress.status = 'error';
-        progress.error = e.message;
-        logger.error('[IdentityBackfill] dry-run error:', e);
-        return res.status(500).json({ error: e.message });
-      }
-    }
-
+    // Both dry-run and apply are async — for a tenant with 3k+ mappings,
+    // the synchronous path times out through Vercel/Railway proxies (~30s).
+    // Frontend polls /progress for both modes.
     setImmediate(async () => {
       try {
-        const summary = await runIdentityBackfill(supabase, userId, { apply: true, progress });
+        const summary = await runIdentityBackfill(supabase, userId, { apply, progress });
         progress.status = 'done';
         progress.summary = summary;
       } catch (e) {
         progress.status = 'error';
         progress.error = e.message;
-        logger.error('[IdentityBackfill] apply error:', e);
+        logger.error(`[IdentityBackfill] ${apply ? 'apply' : 'dry-run'} error:`, e);
       }
     });
-    res.status(202).json({ started: true, progress });
+    res.status(202).json({ started: true, dryRun: !apply, progress });
   } catch (error) {
     logger.error('[IdentityBackfill] endpoint error:', error);
     res.status(500).json({ error: error.message || 'Backfill failed' });
