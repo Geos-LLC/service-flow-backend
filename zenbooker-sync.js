@@ -143,6 +143,90 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     }
   }
 
+  /**
+   * Upsert a customer from Zenbooker data with adoption semantics:
+   *
+   *   1. Match by zenbooker_id → reuse + update non-null fields
+   *   2. Match by normalized phone (last 10 digits) → ADOPT the existing SF customer
+   *      (set zenbooker_id, fill in missing fields, do not overwrite non-null SF fields)
+   *   3. Match by email (case-insensitive) → same adoption
+   *   4. Else insert new
+   *
+   * Prevents duplicate customers when a record is created in SF first, then later
+   * synced from Zenbooker.
+   *
+   * Returns { id, mode: 'existing_by_zb' | 'adopted_by_phone' | 'adopted_by_email' | 'created' | 'error' }
+   */
+  async function upsertCustomerFromZB(userId, zb) {
+    const mapped = mapCustomer(zb, userId)
+
+    // 1. Match by zenbooker_id
+    {
+      const { data: existing } = await supabase.from('customers')
+        .select('id, phone, email, address, city, state, zip_code, first_name, last_name')
+        .eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+      if (existing) {
+        const updates = {}
+        for (const f of ['first_name', 'last_name', 'email', 'phone', 'address', 'city', 'state', 'zip_code']) {
+          if (!existing[f] && mapped[f]) updates[f] = mapped[f]
+        }
+        if (Object.keys(updates).length) {
+          await supabase.from('customers').update(updates).eq('id', existing.id)
+        }
+        return { id: existing.id, mode: 'existing_by_zb' }
+      }
+    }
+
+    // 2. Match by phone (last 10 digits) — adopt existing SF-only customer
+    if (mapped.phone) {
+      const last10 = String(mapped.phone).replace(/\D/g, '').slice(-10)
+      if (last10.length >= 7) {
+        const { data: byPhone } = await supabase.from('customers')
+          .select('id, zenbooker_id, phone, email, address, city, state, zip_code, first_name, last_name')
+          .eq('user_id', userId).is('zenbooker_id', null)
+          .ilike('phone', `%${last10}%`)
+          .limit(1).maybeSingle()
+        if (byPhone) {
+          const updates = { zenbooker_id: zb.id }
+          for (const f of ['first_name', 'last_name', 'email', 'address', 'city', 'state', 'zip_code']) {
+            if (!byPhone[f] && mapped[f]) updates[f] = mapped[f]
+          }
+          // Only rewrite phone if SF's current value is empty (preserve user-edited formatting)
+          if (!byPhone.phone && mapped.phone) updates.phone = mapped.phone
+          await supabase.from('customers').update(updates).eq('id', byPhone.id)
+          logger.log(`[Zenbooker] Adopted existing SF customer ${byPhone.id} by phone ${last10} → zb_id ${zb.id}`)
+          return { id: byPhone.id, mode: 'adopted_by_phone' }
+        }
+      }
+    }
+
+    // 3. Match by email — adopt existing SF-only customer
+    if (mapped.email) {
+      const { data: byEmail } = await supabase.from('customers')
+        .select('id, zenbooker_id, phone, email, address, city, state, zip_code, first_name, last_name')
+        .eq('user_id', userId).is('zenbooker_id', null)
+        .ilike('email', mapped.email)
+        .limit(1).maybeSingle()
+      if (byEmail) {
+        const updates = { zenbooker_id: zb.id }
+        for (const f of ['first_name', 'last_name', 'phone', 'address', 'city', 'state', 'zip_code']) {
+          if (!byEmail[f] && mapped[f]) updates[f] = mapped[f]
+        }
+        await supabase.from('customers').update(updates).eq('id', byEmail.id)
+        logger.log(`[Zenbooker] Adopted existing SF customer ${byEmail.id} by email ${mapped.email} → zb_id ${zb.id}`)
+        return { id: byEmail.id, mode: 'adopted_by_email' }
+      }
+    }
+
+    // 4. Insert new
+    const { data: inserted, error } = await supabase.from('customers').insert(mapped).select('id').single()
+    if (error) {
+      logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`)
+      return { id: null, mode: 'error', error }
+    }
+    return { id: inserted.id, mode: 'created' }
+  }
+
   // Map Zenbooker statuses to internal statuses
   // IMPORTANT: The codebase relies on 'completed' (not 'complete') in 50+ places
   // for payroll, ledger, revenue, analytics. Never change 'complete' → anything other than 'completed'.
@@ -379,23 +463,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
-    let created = 0, skipped = 0, errors = 0
+    let created = 0, skipped = 0, adopted = 0, errors = 0
     const total = zbCustomers.length
     let processed = 0
     for (const zb of zbCustomers) {
       processed++
-      // Skip if already exists by zenbooker_id
-      const { data: existing } = await supabase.from('customers').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) { skipped++; continue }
       if (processed % 20 === 0) {
-        syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${skipped} skipped` }
+        syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${adopted} adopted, ${skipped} skipped` }
       }
-      const mapped = mapCustomer(zb, userId)
-      const { error } = await supabase.from('customers').insert(mapped)
-      if (error) { logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
-      else created++
+      const result = await upsertCustomerFromZB(userId, zb)
+      if (result.mode === 'created') created++
+      else if (result.mode === 'existing_by_zb') skipped++
+      else if (result.mode === 'adopted_by_phone' || result.mode === 'adopted_by_email') adopted++
+      else if (result.mode === 'error') errors++
     }
-    return { total: zbCustomers.length, created, skipped, errors }
+    return { total: zbCustomers.length, created, adopted, skipped, errors }
   }
 
   async function syncTransactions(userId, apiKey) {
@@ -652,13 +734,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
     const mapped = mapJob(zbJob, userId, { customerMap, serviceMap, teamMap, territoryMap })
 
-    // Sync customer if new
+    // Sync customer if new (via upsert-with-adoption — dedups against existing SF-only customer by phone/email)
     if (zbJob.customer?.id && !customerMap[zbJob.customer.id]) {
       try {
         const zbCustomer = await zbFetch(apiKey, `/customers/${zbJob.customer.id}`)
-        const mappedCustomer = mapCustomer(zbCustomer, userId)
-        const { data: inserted } = await supabase.from('customers').insert(mappedCustomer).select('id').single()
-        if (inserted) mapped.customer_id = inserted.id
+        const result = await upsertCustomerFromZB(userId, zbCustomer)
+        if (result.id) mapped.customer_id = result.id
       } catch { /* customer sync failed, continue without linking */ }
     }
 
@@ -1536,19 +1617,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
               logger.log(`[Zenbooker] Invoice event ${event} — no job_id to update`)
             }
           } else if (event.startsWith('customer.')) {
-            // Customer created/edited — sync customer data
+            // Customer created/edited — sync via upsert-with-adoption
+            // (dedups against existing SF-only customer by phone/email so we don't create duplicates
+            //  when a customer was created in SF first, then later appears in Zenbooker)
             if (data?.id && user.zenbooker_api_key) {
               try {
                 const zbCustomer = await zbFetch(user.zenbooker_api_key, `/customers/${data.id}`)
-                const mapped = mapCustomer(zbCustomer, user.id)
-                const { data: existing } = await supabase.from('customers').select('id').eq('user_id', user.id).eq('zenbooker_id', data.id).maybeSingle()
-                if (existing) {
-                  await supabase.from('customers').update(mapped).eq('id', existing.id)
-                  logger.log(`[Zenbooker] Customer updated: ${data.id} (${event})`)
-                } else {
-                  await supabase.from('customers').insert(mapped)
-                  logger.log(`[Zenbooker] Customer created: ${data.id} (${event})`)
-                }
+                const result = await upsertCustomerFromZB(user.id, zbCustomer)
+                logger.log(`[Zenbooker] Customer ${result.mode}: ${data.id} → SF #${result.id} (${event})`)
               } catch (custErr) { logger.error(`[Zenbooker] Customer sync error: ${custErr.message}`) }
             }
           } else if (event === 'recurring_booking.created' || event === 'recurring_booking.canceled') {
