@@ -10689,8 +10689,13 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
       for (const rec of (records || [])) {
         summary.total_legacy_flat_rows_found++;
         try {
-          // Find linked LB conversation via phone (the account context)
+          // Resolve LB account via 2 paths (records often lack phone):
+          //   Path 1: phone → conversation.participant_phone → provider_account_id
+          //   Path 2: lead/customer → participant_identity (by sf_lead_id / sf_customer_id)
+          //           → conversation.participant_identity_id → provider_account_id
           let providerAccountId = null;
+
+          // Path 1: phone lookup
           if (rec.phone) {
             const last10 = String(rec.phone).replace(/\D/g, '').slice(-10);
             if (last10.length >= 7) {
@@ -10704,13 +10709,34 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
             }
           }
 
+          // Path 2: identity lookup (for records without phone — e.g. Yelp leads where contact has email only)
+          if (!providerAccountId) {
+            const identityFilter = table === 'customers'
+              ? { column: 'sf_customer_id', value: rec.id }
+              : { column: 'sf_lead_id', value: rec.id };
+            const { data: identity } = await supabase.from('communication_participant_identities')
+              .select('id').eq('user_id', userId)
+              .eq(identityFilter.column, identityFilter.value).limit(1).maybeSingle();
+            if (identity?.id) {
+              const { data: conv } = await supabase.from('communication_conversations')
+                .select('provider_account_id')
+                .eq('user_id', userId).eq('provider', 'leadbridge')
+                .eq('participant_identity_id', identity.id)
+                .not('provider_account_id', 'is', null)
+                .limit(1).maybeSingle();
+              providerAccountId = conv?.provider_account_id || null;
+            }
+          }
+
           if (!providerAccountId || !accountMap[providerAccountId]) {
             summary.unresolved_no_context++;
             if (summary.unresolved_samples.length < 50) summary.unresolved_samples.push({
               table, id: rec.id,
               name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim() || null,
               phone: rec.phone, legacy_source: rec.source,
-              reason: rec.phone ? 'no LB conversation found for this phone' : 'no phone on record',
+              reason: rec.phone
+                ? 'no LB conversation found via phone or identity'
+                : 'no phone + no LB conversation via identity',
             });
             continue;
           }
