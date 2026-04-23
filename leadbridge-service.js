@@ -23,6 +23,10 @@ const {
   currentEncKeyVersion,
 } = require('./services/lb-encryption')
 
+const { resolveIdentity } = require('./lib/identity-resolver')
+const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant } = require('./lib/lb-ingestion')
+
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
 // In-memory sync progress per user
@@ -172,11 +176,34 @@ module.exports = (supabase, logger) => {
     return { locationId: null, resolution: 'unresolved', locationName: null }
   }
 
-  // Get or create participant identity
+  // Get or create participant identity.
+  // Behavior split:
+  //   IDENTITY_RESOLVER_LEADBRIDGE flag ON  → route through shared lib/identity-resolver.
+  //                                            Ambiguous result → null (caller skips CRM work).
+  //   flag OFF (default)                    → legacy phone+lb_contact_id upsert (unchanged).
   async function upsertParticipantIdentity(userId, { phone, email, displayName, lbContactId, channel }) {
-    const normalized = normalizePhone(phone)
+    if (isEnabled(FLAGS.IDENTITY_RESOLVER_LEADBRIDGE)) {
+      const result = await resolveIdentity(supabase, {
+        userId,
+        source: 'leadbridge',
+        externalId: lbContactId,
+        phone,
+        email,
+        displayName,
+      })
+      if (result.status === 'ambiguous') {
+        logger.warn(`[LB] Ambiguous identity for lbContactId=${lbContactId} reason=${result.reason} candidates=${result.candidates.join(',')}`)
+        return null
+      }
+      if (result.status === 'error') {
+        logger.error(`[LB] Identity resolver error: ${result.error}`)
+        return null
+      }
+      return result.identity
+    }
 
-    // Try to find existing by LB contact ID first, then by phone
+    // Legacy path (unchanged) — lb_contact_id OR phone-alone upsert.
+    const normalized = normalizePhone(phone)
     let identity = null
     if (lbContactId) {
       const { data } = await supabase.from('communication_participant_identities')
@@ -190,7 +217,6 @@ module.exports = (supabase, logger) => {
     }
 
     if (identity) {
-      // Update with new info
       const updates = { updated_at: new Date().toISOString() }
       if (displayName && !identity.display_name) updates.display_name = displayName
       if (normalized && !identity.normalized_phone) updates.normalized_phone = normalized
@@ -202,7 +228,6 @@ module.exports = (supabase, logger) => {
       return identity
     }
 
-    // Create new
     const { data: created, error } = await supabase.from('communication_participant_identities').insert({
       user_id: userId,
       normalized_phone: normalized,
@@ -218,87 +243,42 @@ module.exports = (supabase, logger) => {
   }
 
   // ══════════════════════════════════════
-  // Lead Resolution — Phase B
+  // LB Lead Ingestion — split create/enrich with HARD INVARIANT
   //
-  // Given a participant identity + LB lead data, resolve to an
-  // SF lead or customer. Creates a new SF lead if no match.
+  //   resolveOrCreateLead(identity, input)
+  //     if identity.sf_lead_id      → enrichLeadFromLB (NEVER creates)
+  //     elif identity.sf_customer_id → enrichCustomerFromLB (NEVER creates lead)
+  //     else find existing CRM by phone
+  //       found customer/lead → link identity + enrich
+  //       none found          → createLeadFromLB
   //
-  // Resolution order:
-  //   1. Identity already linked to customer → done
-  //   2. Identity already linked to lead → done
-  //   3. Match existing customer by phone → link identity
-  //   4. Match existing lead by phone → link identity
-  //   5. No match → create SF lead + link identity
-  //
-  // Returns: { type: 'customer'|'lead'|'new_lead', id, created }
+  //   createLeadFromLB asserts identity.sf_lead_id IS NULL before running.
+  //   enrichLeadFromLB fills nulls only + upgrades legacy flat LB source
+  //   to per-location source. Never overwrites user-edited fields.
   // ══════════════════════════════════════
 
-  async function resolveOrCreateLead(userId, identity, { channel, customerName, customerPhone, customerEmail, message, externalLeadId, locationId, accountDisplayName }) {
-    if (!identity) return null
+  async function enrichLeadFromLB(userId, leadId, input) {
+    const { data: existing } = await supabase.from('leads')
+      .select('id, source, email').eq('id', leadId).eq('user_id', userId).maybeSingle()
+    if (!existing) return
+    const patch = buildEnrichLeadPatch({ existing, input })
+    if (!patch) return
+    await supabase.from('leads').update(patch).eq('id', leadId)
+  }
 
-    // 1. Already linked to customer?
-    if (identity.sf_customer_id) {
-      return { type: 'customer', id: identity.sf_customer_id, created: false }
-    }
+  async function createLeadFromLB(userId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName }) {
+    assertCreateLeadInvariant(identity)
 
-    // 2. Already linked to lead?
-    if (identity.sf_lead_id) {
-      return { type: 'lead', id: identity.sf_lead_id, created: false }
-    }
-
-    const normalized = normalizePhone(customerPhone)
-    const last10 = normalized?.slice(-10)
-
-    // 3. Match existing customer by phone
-    if (last10 && last10.length >= 7) {
-      const { data: customer } = await supabase.from('customers')
-        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
-
-      if (customer) {
-        // Link identity to customer
-        await supabase.from('communication_participant_identities')
-          .update({ sf_customer_id: customer.id, updated_at: new Date().toISOString() })
-          .eq('id', identity.id)
-        return { type: 'customer', id: customer.id, created: false }
-      }
-    }
-
-    // 4. Match existing lead by phone
-    if (last10 && last10.length >= 7) {
-      const { data: existingLead } = await supabase.from('leads')
-        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
-
-      if (existingLead) {
-        // Link identity to existing lead
-        await supabase.from('communication_participant_identities')
-          .update({ sf_lead_id: existingLead.id, updated_at: new Date().toISOString() })
-          .eq('id', identity.id)
-        return { type: 'lead', id: existingLead.id, created: false }
-      }
-    }
-
-    // 5. No match → create new SF lead
-    // Get default pipeline + first stage
     const { data: pipeline } = await supabase.from('lead_pipelines')
       .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle()
-    if (!pipeline) {
-      logger.warn('[LB Lead] No default pipeline for user', userId)
-      return null
-    }
+    if (!pipeline) { logger.warn('[LB Lead] No default pipeline for user', userId); return null }
 
-    // Determine stage: "Contacted" if messages exist (communication started), else "New Lead"
     const { data: stages } = await supabase.from('lead_stages')
       .select('id, name, position').eq('pipeline_id', pipeline.id).order('position', { ascending: true })
-    if (!stages?.length) {
-      logger.warn('[LB Lead] No stages in default pipeline', pipeline.id)
-      return null
-    }
+    if (!stages?.length) { logger.warn('[LB Lead] No stages in default pipeline', pipeline.id); return null }
 
-    // Use automation rules for initial stage, fall back to defaults
-    let stage = stages[0] // default: first stage
+    let stage = stages[0]
     const eventType = message ? 'first_reply_sent' : 'lead_received'
-
-    // Check automation rules
     const { data: rule } = await supabase.from('lead_stage_automation_rules')
       .select('target_stage_id').eq('user_id', userId).eq('event_type', eventType)
       .eq('enabled', true).in('channel', [channel, 'all']).limit(1).maybeSingle()
@@ -307,23 +287,16 @@ module.exports = (supabase, logger) => {
       const matchedStage = stages.find(s => s.id === rule.target_stage_id)
       if (matchedStage) stage = matchedStage
     } else {
-      // Fallback: contacted if message exists, new lead otherwise
       const contactedStage = stages.find(s => s.name === 'Contacted' || s.position === 1)
       const newLeadStage = stages.find(s => s.name === 'New Lead' || s.position === 0)
       stage = (message && contactedStage) ? contactedStage : (newLeadStage || stages[0])
     }
 
-    // Parse name into first/last
     const nameParts = (customerName || '').trim().split(/\s+/)
     const firstName = nameParts[0] || null
     const lastName = nameParts.slice(1).join(' ') || null
-
-    // Per-location source: "{AccountDisplayName} ({channel})" e.g. "Spotless Homes Tampa (yelp)"
-    // Matches the format used for LeadBridge source mapping elsewhere (conversation list/detail).
-    // Falls back to generic string only if we lack the account display name.
-    const source = accountDisplayName
-      ? `${accountDisplayName} (${channel})`
-      : (channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack')
+    const normalized = normalizePhone(customerPhone)
+    const source = pickLBSource({ accountDisplayName, channel })
 
     const { data: newLead, error } = await supabase.from('leads').insert({
       user_id: userId,
@@ -337,18 +310,56 @@ module.exports = (supabase, logger) => {
       notes: message ? message.substring(0, 500) : null,
     }).select().single()
 
-    if (error) {
-      logger.error('[LB Lead] Create error:', error.message)
-      return null
-    }
+    if (error) { logger.error('[LB Lead] Create error:', error.message); return null }
 
-    // Link identity to new lead
     await supabase.from('communication_participant_identities')
-      .update({ sf_lead_id: newLead.id, updated_at: new Date().toISOString() })
+      .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
       .eq('id', identity.id)
 
     logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source})`)
-    return { type: 'new_lead', id: newLead.id, created: true }
+    return { type: 'new_lead', id: newLead.id, created: true, action: 'created' }
+  }
+
+  async function resolveOrCreateLead(userId, identity, input) {
+    if (!identity) return null
+    const { customerPhone } = input
+
+    // HARD INVARIANT: identity already tied to a lead → enrich, NEVER create.
+    if (identity.sf_lead_id) {
+      await enrichLeadFromLB(userId, identity.sf_lead_id, input)
+      return { type: 'lead', id: identity.sf_lead_id, created: false, action: 'enriched' }
+    }
+
+    // Identity already tied to a customer → do NOT create lead.
+    if (identity.sf_customer_id) {
+      return { type: 'customer', id: identity.sf_customer_id, created: false, action: 'identity_already_customer' }
+    }
+
+    // Try to find existing CRM entity by phone (legacy behavior preserved).
+    const last10 = normalizePhone(customerPhone)?.slice(-10)
+    if (last10 && last10.length >= 7) {
+      const { data: customer } = await supabase.from('customers')
+        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+      if (customer) {
+        await supabase.from('communication_participant_identities')
+          .update({ sf_customer_id: customer.id, status: 'resolved_customer', updated_at: new Date().toISOString() })
+          .eq('id', identity.id)
+        return { type: 'customer', id: customer.id, created: false, action: 'linked_customer' }
+      }
+
+      const { data: existingLead } = await supabase.from('leads')
+        .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
+      if (existingLead) {
+        await supabase.from('communication_participant_identities')
+          .update({ sf_lead_id: existingLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
+          .eq('id', identity.id)
+        await enrichLeadFromLB(userId, existingLead.id, input)
+        return { type: 'lead', id: existingLead.id, created: false, action: 'linked_enriched' }
+      }
+    }
+
+    // No existing CRM entity → create lead.
+    return await createLeadFromLB(userId, identity, input)
   }
 
   // ══════════════════════════════════════

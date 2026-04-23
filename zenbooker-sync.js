@@ -7,6 +7,8 @@
 
 const express = require('express')
 const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
+const { resolveIdentity } = require('./lib/identity-resolver')
+const { FLAGS, isEnabled } = require('./lib/feature-flags')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -160,6 +162,49 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
   async function upsertCustomerFromZB(userId, zb) {
     const mapped = mapCustomer(zb, userId)
 
+    // Phase D — resolve identity FIRST through shared lib/identity-resolver
+    // with sync-adapter semantics (identity_priority_source='sync').
+    // Additive: does not replace the legacy 4-step adoption below; instead,
+    // it produces an identity row that we link to the customer after upsert.
+    // Ambiguous result → SKIP this ZB customer (conservative; ZB cannot pick).
+    let identity = null
+    let resolverSkipped = false
+    if (isEnabled(FLAGS.IDENTITY_RESOLVER_ZENBOOKER)) {
+      try {
+        const fullName = [mapped.first_name, mapped.last_name].filter(Boolean).join(' ') || null
+        const result = await resolveIdentity(supabase, {
+          userId,
+          source: 'zenbooker',
+          externalId: zb.id,
+          phone: mapped.phone,
+          email: mapped.email,
+          displayName: fullName,
+        })
+        if (result.status === 'ambiguous') {
+          logger.warn(`[Zenbooker] Ambiguous identity for zenbooker_id=${zb.id} reason=${result.reason} candidates=${result.candidates.join(',')} — skipping customer upsert`)
+          resolverSkipped = true
+        } else if (result.status === 'matched') {
+          identity = result.identity
+        } else {
+          logger.error(`[Zenbooker] Identity resolver error: ${result.error}`)
+        }
+      } catch (e) {
+        logger.warn(`[Zenbooker] Identity resolver threw: ${e.message}`)
+      }
+    }
+    if (resolverSkipped) {
+      return { id: null, mode: 'skipped_ambiguous_identity' }
+    }
+
+    const linkIdentityToCustomer = async (customerId) => {
+      if (!identity || !customerId) return
+      if (identity.sf_customer_id === customerId) return
+      const newStatus = identity.sf_lead_id ? 'resolved_both' : 'resolved_customer'
+      await supabase.from('communication_participant_identities')
+        .update({ sf_customer_id: customerId, status: newStatus, updated_at: new Date().toISOString() })
+        .eq('id', identity.id)
+    }
+
     // 1. Match by zenbooker_id
     {
       const { data: existing } = await supabase.from('customers')
@@ -173,6 +218,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         if (Object.keys(updates).length) {
           await supabase.from('customers').update(updates).eq('id', existing.id)
         }
+        await linkIdentityToCustomer(existing.id)
         return { id: existing.id, mode: 'existing_by_zb' }
       }
     }
@@ -195,6 +241,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           if (!byPhone.phone && mapped.phone) updates.phone = mapped.phone
           await supabase.from('customers').update(updates).eq('id', byPhone.id)
           logger.log(`[Zenbooker] Adopted existing SF customer ${byPhone.id} by phone ${last10} → zb_id ${zb.id}`)
+          await linkIdentityToCustomer(byPhone.id)
           return { id: byPhone.id, mode: 'adopted_by_phone' }
         }
       }
@@ -214,6 +261,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         }
         await supabase.from('customers').update(updates).eq('id', byEmail.id)
         logger.log(`[Zenbooker] Adopted existing SF customer ${byEmail.id} by email ${mapped.email} → zb_id ${zb.id}`)
+        await linkIdentityToCustomer(byEmail.id)
         return { id: byEmail.id, mode: 'adopted_by_email' }
       }
     }
@@ -224,6 +272,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       logger.error(`[Zenbooker] Customer insert error ${zb.name}: ${JSON.stringify(error)}`)
       return { id: null, mode: 'error', error }
     }
+    await linkIdentityToCustomer(inserted.id)
     return { id: inserted.id, mode: 'created' }
   }
 
