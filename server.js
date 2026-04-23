@@ -47,6 +47,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
+const { runIdentityBackfill } = require('./lib/identity-backfill');
 
 // Thin shim so callers don't have to pass supabase every time.
 async function updateJobStatus(args) {
@@ -10546,6 +10547,64 @@ app.post('/api/participants/import-unmapped-leads', authenticateToken, async (re
 
 app.get('/api/participants/import-unmapped-leads/progress', authenticateToken, (req, res) => {
   res.json(importLeadsProgress[req.user.userId] || { status: 'idle' });
+});
+
+// ── Phase E — Identity backfill ────────────────────────────────────────────
+// Runs the strict backfill (external_id OR phone+name — never phone-alone)
+// across normalize → OP mappings → ZB customers phases for the authed tenant.
+// Gated by IDENTITY_BACKFILL_ENABLED flag.
+
+const identityBackfillProgress = {};
+
+app.post('/api/identities/backfill', authenticateToken, async (req, res) => {
+  try {
+    if (!isEnabled(FLAGS.IDENTITY_BACKFILL_ENABLED)) {
+      return res.status(403).json({ error: 'Identity backfill is disabled (IDENTITY_BACKFILL_ENABLED=1 to enable)' });
+    }
+    const userId = req.user.userId;
+    const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
+
+    if (identityBackfillProgress[userId]?.status === 'running') {
+      return res.status(409).json({ error: 'Backfill already running', progress: identityBackfillProgress[userId] });
+    }
+
+    const progress = { status: 'running', apply, phase: 'starting', startedAt: Date.now() };
+    identityBackfillProgress[userId] = progress;
+
+    if (!apply) {
+      try {
+        const summary = await runIdentityBackfill(supabase, userId, { apply: false, progress });
+        progress.status = 'done';
+        progress.summary = summary;
+        return res.json({ dryRun: true, summary });
+      } catch (e) {
+        progress.status = 'error';
+        progress.error = e.message;
+        logger.error('[IdentityBackfill] dry-run error:', e);
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    setImmediate(async () => {
+      try {
+        const summary = await runIdentityBackfill(supabase, userId, { apply: true, progress });
+        progress.status = 'done';
+        progress.summary = summary;
+      } catch (e) {
+        progress.status = 'error';
+        progress.error = e.message;
+        logger.error('[IdentityBackfill] apply error:', e);
+      }
+    });
+    res.status(202).json({ started: true, progress });
+  } catch (error) {
+    logger.error('[IdentityBackfill] endpoint error:', error);
+    res.status(500).json({ error: error.message || 'Backfill failed' });
+  }
+});
+
+app.get('/api/identities/backfill/progress', authenticateToken, (req, res) => {
+  res.json(identityBackfillProgress[req.user.userId] || { status: 'idle' });
 });
 
 async function runImportUnmappedLeads(userId, apply, progress) {
