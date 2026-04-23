@@ -10506,48 +10506,9 @@ app.get('/api/participants/backfill/progress', authenticateToken, (req, res) => 
 
 // Note: AGGREGATOR_NAME_RE is defined earlier (shared with classifyMapping)
 
-const importLeadsProgress = {};
-
-/**
- * Import unmapped-but-named conversations as leads.
- *
- * GET /api/participants/import-unmapped-leads          (dry-run — returns eligible count)
- * POST /api/participants/import-unmapped-leads?apply=1 (creates leads + attaches to mappings)
- */
-app.post('/api/participants/import-unmapped-leads', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
-
-    if (importLeadsProgress[userId]?.status === 'running') {
-      return res.status(409).json({ error: 'Import already running', progress: importLeadsProgress[userId] });
-    }
-
-    // Synchronous dry-run; async apply
-    if (!apply) {
-      const progress = { status: 'running', phase: 'counting' };
-      importLeadsProgress[userId] = progress;
-      const result = await runImportUnmappedLeads(userId, false, progress);
-      progress.status = 'done';
-      return res.json(result);
-    }
-
-    const progress = { status: 'running', phase: 'starting', created: 0, total: 0, startedAt: Date.now() };
-    importLeadsProgress[userId] = progress;
-    setImmediate(async () => {
-      try { await runImportUnmappedLeads(userId, true, progress); progress.status = 'done'; }
-      catch (e) { progress.status = 'error'; progress.error = e.message; logger.error('Import leads error:', e); }
-    });
-    res.status(202).json({ started: true, progress });
-  } catch (error) {
-    logger.error('Import unmapped leads error:', error);
-    res.status(500).json({ error: 'Import failed' });
-  }
-});
-
-app.get('/api/participants/import-unmapped-leads/progress', authenticateToken, (req, res) => {
-  res.json(importLeadsProgress[req.user.userId] || { status: 'idle' });
-});
+// Phase F — /api/participants/import-unmapped-leads was removed (violated the
+// per-identity source-aware ingestion model). OpenPhone lead creation now
+// runs per-identity via maybeCreateLeadFromOpenPhone with the LB-recovery rule.
 
 // ── Phase E — Identity backfill ────────────────────────────────────────────
 // Runs the strict backfill (external_id OR phone+name — never phone-alone)
@@ -10607,170 +10568,157 @@ app.get('/api/identities/backfill/progress', authenticateToken, (req, res) => {
   res.json(identityBackfillProgress[req.user.userId] || { status: 'idle' });
 });
 
-async function runImportUnmappedLeads(userId, apply, progress) {
-  progress.phase = 'loading candidates';
-  // Resolve default pipeline + first stage (needed by leads.pipeline_id / stage_id NOT NULL)
-  const { data: pipelines } = await supabase.from('lead_pipelines')
-    .select('id').eq('user_id', userId).order('id').limit(1);
-  const pipelineId = pipelines?.[0]?.id;
-  if (!pipelineId) {
-    progress.status = 'error';
-    progress.error = 'No lead pipeline exists — create a pipeline first.';
-    return { error: progress.error };
-  }
-  const { data: stages } = await supabase.from('lead_stages')
-    .select('id, name, position').eq('pipeline_id', pipelineId).order('position').limit(1);
-  const stageId = stages?.[0]?.id;
-  if (!stageId) {
-    progress.status = 'error';
-    progress.error = 'Pipeline has no stages — add at least one stage.';
-    return { error: progress.error };
-  }
+// ── Phase F — Identity reporting endpoints ────────────────────────────────
+// Replaces the 5-bucket classifier UI. All queries scoped to req.user.userId.
 
-  // Load unmapped mappings with a linked conversation name (joined in-memory)
-  const pageSize = 1000;
-  const mappingCandidates = []; // { mapping_id, phone, name }
-  {
-    let off = 0;
-    while (true) {
-      const { data } = await supabase.from('communication_participant_mappings')
-        .select('id, participant_phone_e164').eq('tenant_id', userId).eq('mapping_status', 'unmapped')
-        .not('participant_phone_e164', 'is', null)
-        .range(off, off + pageSize - 1);
-      if (!data?.length) break;
-      for (const m of data) mappingCandidates.push({ mapping_id: m.id, phone: m.participant_phone_e164, name: null });
-      if (data.length < pageSize) break;
-      off += pageSize;
-    }
-  }
-
-  // Get conversation names for these mappings (most recent conversation wins)
-  const mappingIds = mappingCandidates.map(m => m.mapping_id);
-  const nameByMapping = {};
-  {
-    const chunkSize = 500;
-    for (let i = 0; i < mappingIds.length; i += chunkSize) {
-      const chunk = mappingIds.slice(i, i + chunkSize);
-      const { data } = await supabase.from('communication_conversations')
-        .select('participant_mapping_id, participant_name, last_event_at')
-        .in('participant_mapping_id', chunk)
-        .not('participant_name', 'is', null);
-      for (const c of (data || [])) {
-        const n = (c.participant_name || '').trim();
-        if (!n) continue;
-        if (!nameByMapping[c.participant_mapping_id] || c.last_event_at > nameByMapping[c.participant_mapping_id].date) {
-          nameByMapping[c.participant_mapping_id] = { name: n, date: c.last_event_at };
-        }
-      }
-    }
-  }
-  for (const m of mappingCandidates) {
-    const hit = nameByMapping[m.mapping_id];
-    if (hit) m.name = hit.name;
-  }
-
-  // Filter to named-non-aggregator
-  const eligible = mappingCandidates.filter(m => m.name && !AGGREGATOR_NAME_RE.test(m.name));
-  progress.total = eligible.length;
-
-  // Also guard against creating duplicate leads — skip if a lead with this phone already exists
-  const phonesLast10 = [...new Set(eligible.map(m => String(m.phone).replace(/\D/g, '').slice(-10)))];
-  const existingLeadPhones = new Set();
-  {
-    const chunkSize = 100;
-    for (let i = 0; i < phonesLast10.length; i += chunkSize) {
-      const chunk = phonesLast10.slice(i, i + chunkSize);
-      // Build ILIKE OR filter via query string
-      const orFilter = chunk.map(p => `phone.ilike.%${p}%`).join(',');
-      const { data } = await supabase.from('leads')
-        .select('phone').eq('user_id', userId).or(orFilter);
-      for (const l of (data || [])) {
-        const p10 = String(l.phone || '').replace(/\D/g, '').slice(-10);
-        if (p10) existingLeadPhones.add(p10);
-      }
-    }
-  }
-
-  const toImport = eligible.filter(m => {
-    const p10 = String(m.phone).replace(/\D/g, '').slice(-10);
-    return !existingLeadPhones.has(p10);
-  });
-  progress.total = toImport.length;
-  progress.skipped_existing = eligible.length - toImport.length;
-
-  const summary = {
-    candidates: mappingCandidates.length,
-    eligible: eligible.length,
-    skipped_existing_leads: eligible.length - toImport.length,
-    filtered_aggregator: mappingCandidates.filter(m => m.name && AGGREGATOR_NAME_RE.test(m.name)).length,
-    filtered_no_name: mappingCandidates.filter(m => !m.name).length,
-    to_import: toImport.length,
-    created: 0,
-    errors: 0,
-  };
-
-  if (!apply) {
-    progress.phase = 'done';
-    progress.summary = summary;
-    return { dryRun: true, summary };
-  }
-
-  // Insert leads in chunks, capturing inserted IDs
-  progress.phase = 'creating leads';
-  const leadInsertChunk = 100;
-  const createdLeads = []; // { mapping_id, lead_id }
-  for (let i = 0; i < toImport.length; i += leadInsertChunk) {
-    const chunk = toImport.slice(i, i + leadInsertChunk);
-    const leadRows = chunk.map(m => {
-      const parts = m.name.split(/\s+/);
-      const first = parts[0] || m.name;
-      const last = parts.slice(1).join(' ') || null;
-      return {
-        user_id: userId,
-        pipeline_id: pipelineId,
-        stage_id: stageId,
-        first_name: first,
-        last_name: last,
-        phone: m.phone,
-        notes: 'Imported from unmapped OpenPhone conversation',
-        source: null, // set by mapping pattern later if desired
-      };
+/**
+ * GET /api/identities/status
+ *
+ * Identity bucket counts. "Floating" explicitly excludes sync-only identities
+ * per v4 Amendment 5 (sync-only never counted as floating; reported separately).
+ */
+app.get('/api/identities/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const countIdentities = async (filter) => {
+      let q = supabase.from('communication_participant_identities')
+        .select('id', { count: 'exact', head: true }).eq('user_id', userId);
+      if (filter) q = filter(q);
+      const { count } = await q;
+      return count || 0;
+    };
+    const [
+      total, resolvedCustomer, resolvedLead, resolvedBoth, ambiguous,
+      floatingTrue, syncOnly, ambiguousOpen,
+    ] = await Promise.all([
+      countIdentities(),
+      countIdentities(q => q.eq('status', 'resolved_customer')),
+      countIdentities(q => q.eq('status', 'resolved_lead')),
+      countIdentities(q => q.eq('status', 'resolved_both')),
+      countIdentities(q => q.eq('status', 'ambiguous')),
+      countIdentities(q => q.eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')),
+      countIdentities(q => q.eq('identity_priority_source', 'sync')),
+      supabase.from('communication_identity_ambiguities')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId).eq('status', 'open')
+        .then(r => r.count || 0),
+    ]);
+    res.json({
+      total,
+      crm_linked: {
+        resolved_customer: resolvedCustomer,
+        resolved_lead: resolvedLead,
+        resolved_both: resolvedBoth,
+      },
+      ambiguous,
+      unresolved_floating_true: floatingTrue,
+      sync_only: syncOnly,
+      ambiguities_open: ambiguousOpen,
     });
-    const { data: inserted, error: insErr } = await supabase.from('leads').insert(leadRows).select('id, phone');
-    if (insErr) { summary.errors += chunk.length; logger.warn('[ImportLeads] insert error: ' + insErr.message); continue; }
-    // Match inserted leads back to mapping_id by phone
-    const leadsByPhone = {};
-    for (const l of (inserted || [])) {
-      const p10 = String(l.phone || '').replace(/\D/g, '').slice(-10);
-      if (p10) leadsByPhone[p10] = l.id;
-    }
-    for (const m of chunk) {
-      const p10 = String(m.phone).replace(/\D/g, '').slice(-10);
-      const lid = leadsByPhone[p10];
-      if (lid) createdLeads.push({ mapping_id: m.mapping_id, lead_id: lid });
-    }
-    summary.created += (inserted || []).length;
-    progress.created = summary.created;
+  } catch (error) {
+    logger.error('[IdentityStatus]', error);
+    res.status(500).json({ error: 'Failed to load identity status' });
   }
+});
 
-  // Update mappings to point to new leads
-  progress.phase = 'linking mappings';
-  for (const { mapping_id, lead_id } of createdLeads) {
-    try {
-      await supabase.from('communication_participant_mappings')
-        .update({
-          crm_lead_id: lead_id,
-          mapping_status: 'mapped',
-          mapping_source: 'manual',
-          updated_at: new Date().toISOString(),
-        }).eq('id', mapping_id);
-    } catch (e) { summary.errors++; }
+/**
+ * GET /api/identities/by-source
+ *
+ * Source coverage breakdown:
+ *   - multi_source: identities with 2+ external IDs (goal state)
+ *   - single_source: breakdown by which one source
+ *   - by_priority_source: count per identity_priority_source tag
+ */
+app.get('/api/identities/by-source', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const pageSize = 1000;
+    let offset = 0;
+    const singleSource = { leadbridge_only: 0, openphone_only: 0, zenbooker_only: 0, sigcore_only: 0, no_source_ids: 0 };
+    const byPriority = { leadbridge: 0, openphone: 0, sync: 0, manual: 0, null: 0 };
+    let multiSource = 0;
+
+    while (true) {
+      const { data } = await supabase.from('communication_participant_identities')
+        .select('leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, identity_priority_source')
+        .eq('user_id', userId)
+        .range(offset, offset + pageSize - 1);
+      if (!data || data.length === 0) break;
+      for (const r of data) {
+        const sources = [];
+        if (r.leadbridge_contact_id) sources.push('leadbridge');
+        if (r.openphone_contact_id) sources.push('openphone');
+        if (r.sigcore_participant_id) sources.push('sigcore');
+        if (r.zenbooker_customer_id) sources.push('zenbooker');
+        if (sources.length === 0) singleSource.no_source_ids += 1;
+        else if (sources.length === 1) {
+          if (sources[0] === 'leadbridge') singleSource.leadbridge_only += 1;
+          else if (sources[0] === 'openphone') singleSource.openphone_only += 1;
+          else if (sources[0] === 'zenbooker') singleSource.zenbooker_only += 1;
+          else if (sources[0] === 'sigcore') singleSource.sigcore_only += 1;
+        } else {
+          multiSource += 1;
+        }
+        const tag = r.identity_priority_source || 'null';
+        byPriority[tag] = (byPriority[tag] || 0) + 1;
+      }
+      if (data.length < pageSize) break;
+      offset += pageSize;
+    }
+    res.json({ multi_source: multiSource, single_source: singleSource, by_priority_source: byPriority });
+  } catch (error) {
+    logger.error('[IdentityBySource]', error);
+    res.status(500).json({ error: 'Failed to load source coverage' });
   }
+});
 
-  progress.phase = 'done';
-  progress.summary = summary;
-  return { dryRun: false, summary };
-}
+/**
+ * GET /api/identities/unresolved?limit=50
+ *
+ * Paginated floating identities (excluding sync-only) for operator review.
+ * Returns display_name, phone, email, and all source signals attached.
+ */
+app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const { data, error } = await supabase.from('communication_participant_identities')
+      .select('id, display_name, normalized_phone, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, created_at, updated_at')
+      .eq('user_id', userId).eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')
+      .order('updated_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ items: data || [], limit, offset });
+  } catch (error) {
+    logger.error('[IdentityUnresolved]', error);
+    res.status(500).json({ error: 'Failed to load unresolved identities' });
+  }
+});
+
+/**
+ * GET /api/identities/reconciliation-failures?status=open&limit=50
+ *
+ * Ambiguity queue — operator resolves via future per-row dialog.
+ */
+app.get('/api/identities/reconciliation-failures', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const status = req.query.status || 'open';
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const { data, error } = await supabase.from('communication_identity_ambiguities')
+      .select('id, source, attempted_external_id, attempted_phone, attempted_name, candidate_identity_ids, reason, status, created_at')
+      .eq('user_id', userId).eq('status', status)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ items: data || [], limit, offset, status });
+  } catch (error) {
+    logger.error('[IdentityReconciliationFailures]', error);
+    res.status(500).json({ error: 'Failed to load reconciliation failures' });
+  }
+});
 
 /**
  * Repair pass — re-run reconciliation for all pending conversations that now have a resolvable mapping.
