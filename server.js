@@ -10614,6 +10614,90 @@ const reclassifyProgress = {};
  * POST /api/participants/reclassify?apply=1           (async apply)
  * GET  /api/participants/reclassify/progress          (poll)
  */
+// ══════════════════════════════════════
+// Upgrade legacy LB source values
+//
+// Before PR4.1, LB-created leads got customers.source / leads.source = 'leadbridge_yelp'
+// or 'leadbridge_thumbtack' — loses which specific account/location the lead came from.
+// This endpoint looks up each legacy record's linked conversation → provider_account_id
+// → display_name, and rewrites source to "{Account} ({channel})" format matching the
+// source resolver's LB mapping keys.
+//
+// GET /api/participants/upgrade-lb-sources          (dry-run — returns counts)
+// POST /api/participants/upgrade-lb-sources?apply=1 (writes)
+// ══════════════════════════════════════
+app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
+
+    const summary = { scanned: 0, upgraded: 0, unupgradable: 0, errors: 0, samples: [] };
+
+    // Get all LB accounts (id → display_name + channel)
+    const { data: accounts } = await supabase.from('communication_provider_accounts')
+      .select('id, display_name, channel').eq('user_id', userId).eq('provider', 'leadbridge');
+    const accountMap = {};
+    for (const a of (accounts || [])) accountMap[a.id] = a;
+
+    // Process both tables: customers, leads
+    for (const table of ['customers', 'leads']) {
+      const { data: records } = await supabase.from(table)
+        .select('id, first_name, last_name, phone, source')
+        .eq('user_id', userId)
+        .in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']);
+
+      for (const rec of (records || [])) {
+        summary.scanned++;
+        try {
+          // Find linked conversation via phone (LB only)
+          let providerAccountId = null;
+          if (rec.phone) {
+            const last10 = String(rec.phone).replace(/\D/g, '').slice(-10);
+            if (last10.length >= 7) {
+              const { data: conv } = await supabase.from('communication_conversations')
+                .select('provider_account_id')
+                .eq('user_id', userId).eq('provider', 'leadbridge')
+                .ilike('participant_phone', `%${last10}%`)
+                .not('provider_account_id', 'is', null)
+                .limit(1).maybeSingle();
+              providerAccountId = conv?.provider_account_id || null;
+            }
+          }
+
+          if (!providerAccountId || !accountMap[providerAccountId]) {
+            summary.unupgradable++;
+            if (summary.samples.length < 10) summary.samples.push({
+              table, id: rec.id, name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim(),
+              phone: rec.phone, old_source: rec.source, new_source: null, reason: 'no conversation with LB account',
+            });
+            continue;
+          }
+
+          const acct = accountMap[providerAccountId];
+          const newSource = `${acct.display_name} (${acct.channel})`;
+
+          if (summary.samples.length < 10) summary.samples.push({
+            table, id: rec.id, name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim(),
+            phone: rec.phone, old_source: rec.source, new_source: newSource,
+          });
+
+          if (apply) {
+            await supabase.from(table).update({ source: newSource }).eq('id', rec.id);
+          }
+          summary.upgraded++;
+        } catch (e) {
+          summary.errors++;
+        }
+      }
+    }
+
+    res.json({ dryRun: !apply, summary });
+  } catch (error) {
+    logger.error('Upgrade LB sources error:', error);
+    res.status(500).json({ error: 'Upgrade failed' });
+  }
+});
+
 app.post('/api/participants/reclassify', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;

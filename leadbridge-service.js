@@ -233,7 +233,7 @@ module.exports = (supabase, logger) => {
   // Returns: { type: 'customer'|'lead'|'new_lead', id, created }
   // ══════════════════════════════════════
 
-  async function resolveOrCreateLead(userId, identity, { channel, customerName, customerPhone, customerEmail, message, externalLeadId, locationId }) {
+  async function resolveOrCreateLead(userId, identity, { channel, customerName, customerPhone, customerEmail, message, externalLeadId, locationId, accountDisplayName }) {
     if (!identity) return null
 
     // 1. Already linked to customer?
@@ -318,7 +318,12 @@ module.exports = (supabase, logger) => {
     const firstName = nameParts[0] || null
     const lastName = nameParts.slice(1).join(' ') || null
 
-    const source = channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack'
+    // Per-location source: "{AccountDisplayName} ({channel})" e.g. "Spotless Homes Tampa (yelp)"
+    // Matches the format used for LeadBridge source mapping elsewhere (conversation list/detail).
+    // Falls back to generic string only if we lack the account display name.
+    const source = accountDisplayName
+      ? `${accountDisplayName} (${channel})`
+      : (channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack')
 
     const { data: newLead, error } = await supabase.from('leads').insert({
       user_id: userId,
@@ -936,23 +941,25 @@ module.exports = (supabase, logger) => {
         channel,
       })
 
+      // Resolve provider account (need display_name for per-location source)
+      let resolvedAccountId = null
+      let resolvedAccountDisplayName = null
+      if (event.account_id) {
+        const { data: pa } = await supabase.from('communication_provider_accounts')
+          .select('id, display_name').eq('provider', 'leadbridge').eq('external_account_id', event.account_id)
+          .eq('status', 'active').maybeSingle()
+        resolvedAccountId = pa?.id || null
+        resolvedAccountDisplayName = pa?.display_name || null
+      }
+
       // Phase B: resolve or create SF lead (non-blocking for webhook speed)
       if (identity) {
         resolveOrCreateLead(userId, identity, {
           channel, customerName: participant.name, customerPhone: participant.phone,
           customerEmail: participant.email, message: message.body,
           externalLeadId: thread.external_lead_id,
+          accountDisplayName: resolvedAccountDisplayName, // per-location source
         }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
-      }
-
-      // Upsert conversation
-      // Resolve provider account for this event
-      let resolvedAccountId = null
-      if (event.account_id) {
-        const { data: pa } = await supabase.from('communication_provider_accounts')
-          .select('id').eq('provider', 'leadbridge').eq('external_account_id', event.account_id)
-          .eq('status', 'active').maybeSingle()
-        resolvedAccountId = pa?.id
       }
 
       const conv = await upsertConversation(userId, {
@@ -1078,6 +1085,7 @@ module.exports = (supabase, logger) => {
                   channel, customerName: lead.customerName, customerPhone: lead.customerPhone,
                   customerEmail: lead.customerEmail, message: lead.message,
                   externalLeadId: lead.id,
+                  accountDisplayName: acct.display_name, // per-location source
                 })
               }
 
