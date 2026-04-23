@@ -54,6 +54,26 @@ function classifyCRMMatches(customers, leads) {
   return { status: 'ambiguous', crm_customer_id: null, crm_lead_id: null };
 }
 
+// PR4.1 — 5-bucket classifier (mirrors server.js classifyMapping)
+const AGGREGATOR_NAME_RE = /(thumbtack|thumtack|thumback|thumbtac|tumbtack|thambtack|thumntack|yelp|leadbridge|google|facebook|bark|groupon|instagram|angi|homeadvisor|voolt|\bsite\b|cold call|refrenc|reference|recommend)/i;
+function classifyMapping(crmMatches, participantName) {
+  const customers = crmMatches?.customers || [];
+  const leads = crmMatches?.leads || [];
+  if (customers.length === 1) {
+    return { status: 'mapped', crm_customer_id: customers[0], crm_lead_id: null };
+  }
+  if (customers.length === 0 && leads.length === 1) {
+    return { status: 'mapped', crm_customer_id: null, crm_lead_id: leads[0] };
+  }
+  if (customers.length > 0 || leads.length > 0) {
+    return { status: 'ambiguous', crm_customer_id: null, crm_lead_id: null };
+  }
+  const name = (participantName || '').trim();
+  if (!name) return { status: 'noise', crm_customer_id: null, crm_lead_id: null };
+  if (AGGREGATOR_NAME_RE.test(name)) return { status: 'aggregator', crm_customer_id: null, crm_lead_id: null };
+  return { status: 'unmapped', crm_customer_id: null, crm_lead_id: null };
+}
+
 // Pure display-priority helper: CRM (non-empty) → provider → phone
 function resolveDisplayName({ crmFirstName, crmLastName, providerDisplayName, phone }) {
   const nonEmpty = (s) => typeof s === 'string' && s.trim() !== '';
@@ -535,4 +555,155 @@ describe('Phone is NEVER a permanent identity key', () => {
     const participant2 = { participantId: 'P2', participantPhoneE164: '+18139855031' };
     expect(participant1.participantId).not.toBe(participant2.participantId);
   });
+});
+
+// ─────────────────────────────────────────────────────────────
+// PR4.1 — 5-bucket classifier (mapped / ambiguous / unmapped / aggregator / noise)
+// ─────────────────────────────────────────────────────────────
+
+describe('classifyMapping — 5-bucket status', () => {
+  // CRM precedence: mapped / ambiguous dominate regardless of name
+  test('1 customer → mapped (customer wins over name)', () => {
+    expect(classifyMapping({ customers: [42], leads: [] }, 'Thumbtack Miami').status).toBe('mapped');
+    expect(classifyMapping({ customers: [42], leads: [] }, '').status).toBe('mapped');
+  });
+
+  test('0 customer + 1 lead → mapped (lead)', () => {
+    expect(classifyMapping({ customers: [], leads: [99] }, 'any name').status).toBe('mapped');
+  });
+
+  test('multiple matches → ambiguous regardless of name', () => {
+    expect(classifyMapping({ customers: [1, 2], leads: [] }, 'Sue Yoder').status).toBe('ambiguous');
+    expect(classifyMapping({ customers: [], leads: [10, 11] }, '').status).toBe('ambiguous');
+    expect(classifyMapping({ customers: [1], leads: [99] }, 'Aggregator Thumbtack').status).toBe('mapped'); // 1 customer wins
+  });
+
+  // No CRM match → name-based bucketing
+  test('no CRM + blank/null name → noise', () => {
+    expect(classifyMapping({ customers: [], leads: [] }, null).status).toBe('noise');
+    expect(classifyMapping({ customers: [], leads: [] }, '').status).toBe('noise');
+    expect(classifyMapping({ customers: [], leads: [] }, '   ').status).toBe('noise');
+  });
+
+  test('no CRM + aggregator-alias name → aggregator', () => {
+    // Exact platform keywords
+    expect(classifyMapping({ customers: [], leads: [] }, 'Thumbtack').status).toBe('aggregator');
+    expect(classifyMapping({ customers: [], leads: [] }, 'Yelp').status).toBe('aggregator');
+    expect(classifyMapping({ customers: [], leads: [] }, 'LeadBridge').status).toBe('aggregator');
+    // Location variants
+    expect(classifyMapping({ customers: [], leads: [] }, 'Thumbtack Miami').status).toBe('aggregator');
+    expect(classifyMapping({ customers: [], leads: [] }, 'LeadBridge Miami').status).toBe('aggregator');
+    // Common misspellings from OpenPhone contacts
+    expect(classifyMapping({ customers: [], leads: [] }, 'Tumbtack J').status).toBe('aggregator');
+    expect(classifyMapping({ customers: [], leads: [] }, 'Thumback J').status).toBe('aggregator');
+    // Case insensitive
+    expect(classifyMapping({ customers: [], leads: [] }, 'google local ads').status).toBe('aggregator');
+  });
+
+  test('no CRM + real person name → unmapped (actionable)', () => {
+    expect(classifyMapping({ customers: [], leads: [] }, 'Sue Yoder').status).toBe('unmapped');
+    expect(classifyMapping({ customers: [], leads: [] }, 'Patricia Phelps').status).toBe('unmapped');
+    expect(classifyMapping({ customers: [], leads: [] }, 'Connie Lindsey').status).toBe('unmapped');
+  });
+
+  test('name containing aggregator word anywhere triggers aggregator (known tradeoff)', () => {
+    // e.g. "John from Thumbtack" → aggregator. Acceptable: real people rarely named like this.
+    expect(classifyMapping({ customers: [], leads: [] }, 'John Carney from Thumbtack').status).toBe('aggregator');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Reclassify transitions — existing data moves between buckets
+// ─────────────────────────────────────────────────────────────
+
+describe('Reclassify preserves CRM links', () => {
+  function reclassifyDecision(currentRow, classification) {
+    // Mirror server logic: if existing row has CRM link, trust it regardless of classifier
+    if ((currentRow.crm_customer_id || currentRow.crm_lead_id)
+      && classification.status !== 'mapped'
+      && classification.status !== 'ambiguous') {
+      return {
+        status: 'mapped',
+        crm_customer_id: currentRow.crm_customer_id,
+        crm_lead_id: currentRow.crm_lead_id,
+      };
+    }
+    return classification;
+  }
+
+  test('manual mappings are excluded from reclassify (not tested here; guarded at query level)', () => {
+    // The server query filters .neq('mapping_status', 'manual') before reclassifying.
+    // Simulated: manual rows never reach this function.
+    expect(true).toBe(true);
+  });
+
+  test('existing mapped with crm_customer_id stays mapped even if name is aggregator', () => {
+    // Scenario: user manually attached a customer to what's technically a platform alias phone
+    const current = { crm_customer_id: 99, crm_lead_id: null, mapping_status: 'mapped' };
+    const classification = classifyMapping({ customers: [], leads: [] }, 'Thumbtack Miami');
+    const result = reclassifyDecision(current, classification);
+    expect(result.status).toBe('mapped');
+    expect(result.crm_customer_id).toBe(99);
+  });
+
+  test('existing unmapped with name → reclassifies to unmapped (actionable)', () => {
+    const current = { crm_customer_id: null, crm_lead_id: null, mapping_status: 'unmapped' };
+    const result = reclassifyDecision(current, classifyMapping({ customers: [], leads: [] }, 'Sue Yoder'));
+    expect(result.status).toBe('unmapped');
+  });
+
+  test('existing unmapped without name → reclassifies to noise', () => {
+    const current = { crm_customer_id: null, crm_lead_id: null, mapping_status: 'unmapped' };
+    const result = reclassifyDecision(current, classifyMapping({ customers: [], leads: [] }, null));
+    expect(result.status).toBe('noise');
+  });
+
+  test('existing unmapped with aggregator name → reclassifies to aggregator', () => {
+    const current = { crm_customer_id: null, crm_lead_id: null, mapping_status: 'unmapped' };
+    const result = reclassifyDecision(current, classifyMapping({ customers: [], leads: [] }, 'Thumbtack S'));
+    expect(result.status).toBe('aggregator');
+  });
+
+  test('newly-discovered customer match upgrades a previously-noise row to mapped', () => {
+    const current = { crm_customer_id: null, crm_lead_id: null, mapping_status: 'noise' };
+    // Now a customer with matching phone exists
+    const result = reclassifyDecision(current, classifyMapping({ customers: [42], leads: [] }, null));
+    expect(result.status).toBe('mapped');
+    expect(result.crm_customer_id).toBe(42);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Aggregator pattern coverage (prove regex handles SF's actual data)
+// ─────────────────────────────────────────────────────────────
+
+describe('Aggregator regex matches observed SF contact names', () => {
+  const observedAggregatorNames = [
+    'Thumbtack', 'Thumbtack S', 'Thumbtack J', 'Thumbtack T',
+    'Thumbtack Miami', 'Thumbtack Tampa', 'Thumbtack Jacksonville',
+    'Thumbtack NY', 'Thumbtack Saint Peters', 'Thumbtack St Peters',
+    'Tumbtack J', 'Thumback J', 'Thambtack T', 'Thumntack S', 'Thumtack Tampa',
+    'Yelp', 'Yelp J', 'Yelp T', 'Yelp Tampa',
+    'LeadBridge', 'LeadBridge Miami', 'LeadBridge Tampa',
+    'Google', 'Google Local Ads', 'Google Tampa', 'Google Jacksonville', 'Google ad', 'Google Ads',
+    'Facebook', 'Facebook J', 'Instagram', 'Instagramm',
+    'Bark', 'Groupon', 'Voolt',
+    'Cold Call', 'Site request', 'Site Request', 'Site Jacksonville',
+  ];
+
+  for (const name of observedAggregatorNames) {
+    test(`"${name}" classified as aggregator`, () => {
+      expect(AGGREGATOR_NAME_RE.test(name)).toBe(true);
+    });
+  }
+
+  const realNames = [
+    'Sue Yoder', 'Patricia Phelps', 'Connie Lindsey', 'Stephen Jaros',
+    'Shaprika Jones', 'Dannie Ryan', 'Jessica Pringle', 'Nancy Wasserman',
+  ];
+  for (const name of realNames) {
+    test(`real person "${name}" does NOT match aggregator regex`, () => {
+      expect(AGGREGATOR_NAME_RE.test(name)).toBe(false);
+    });
+  }
 });

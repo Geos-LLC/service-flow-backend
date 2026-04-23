@@ -8037,6 +8037,45 @@ function extractSigcoreParticipant(src) {
   };
 }
 
+// Shared — contact name patterns that represent platform/source aliases, not real people.
+// Used for classifying mappings into `aggregator` status + for skipping auto-lead creation.
+const AGGREGATOR_NAME_RE = /(thumbtack|thumtack|thumback|thumbtac|tumbtack|thambtack|thumntack|yelp|leadbridge|google|facebook|bark|groupon|instagram|angi|homeadvisor|voolt|\bsite\b|cold call|refrenc|reference|recommend)/i;
+
+/**
+ * Classify a participant mapping into one of 5 states based on CRM matches + name quality.
+ *
+ * State domain:
+ *   - mapped     : has crm_customer_id or crm_lead_id (1 customer OR 0 customers + 1 lead)
+ *   - ambiguous  : multiple CRM candidates, user must pick
+ *   - aggregator : name matches platform alias regex (Thumbtack/Yelp/LeadBridge/etc)
+ *                  — intentionally no CRM record, not a real person
+ *   - noise      : unnamed phone — intentionally no CRM record, not actionable
+ *   - unmapped   : real person candidate without CRM record yet (actionable)
+ *
+ * Precedence: CRM > name-based bucketing.
+ */
+function classifyMapping(crmMatches, participantName) {
+  const customers = crmMatches?.customers || [];
+  const leads = crmMatches?.leads || [];
+
+  // 1. CRM precedence — mapped/ambiguous regardless of name
+  if (customers.length === 1) {
+    return { status: 'mapped', crm_customer_id: customers[0], crm_lead_id: null };
+  }
+  if (customers.length === 0 && leads.length === 1) {
+    return { status: 'mapped', crm_customer_id: null, crm_lead_id: leads[0] };
+  }
+  if (customers.length > 0 || leads.length > 0) {
+    return { status: 'ambiguous', crm_customer_id: null, crm_lead_id: null };
+  }
+
+  // 2. No CRM match — bucket by name quality
+  const name = (participantName || '').trim();
+  if (!name) return { status: 'noise', crm_customer_id: null, crm_lead_id: null };
+  if (AGGREGATOR_NAME_RE.test(name)) return { status: 'aggregator', crm_customer_id: null, crm_lead_id: null };
+  return { status: 'unmapped', crm_customer_id: null, crm_lead_id: null };
+}
+
 /**
  * Look up CRM matches for a phone using explicit precedence.
  *
@@ -8047,6 +8086,9 @@ function extractSigcoreParticipant(src) {
  *   2. 0 customers AND exactly 1 lead -> mapped
  *   3. multiple plausible matches -> ambiguous
  *   4. no matches -> unmapped
+ *
+ * NOTE: For 5-bucket classification (including aggregator/noise), use classifyMapping
+ * with the conversation's participant_name as input.
  */
 async function lookupCRMByPhone(tenantId, phoneE164) {
   const result = { customers: [], leads: [], status: 'unmapped', crm_customer_id: null, crm_lead_id: null };
@@ -8111,8 +8153,13 @@ async function resolveParticipantMapping(tenantId, sigParticipant, opts = {}) {
     existing = r.data;
   }
 
-  // CRM match using precedence rules
+  // CRM match using precedence rules + classify into 5 buckets
   const crm = await lookupCRMByPhone(tenantId, participantPhoneE164);
+  const participantName = sigParticipant.displayName || null;
+  const classification = classifyMapping(
+    { customers: crm.customers, leads: crm.leads },
+    participantName
+  );
 
   const row = {
     tenant_id: tenantId,
@@ -8121,9 +8168,9 @@ async function resolveParticipantMapping(tenantId, sigParticipant, opts = {}) {
     sigcore_participant_key: participantKey || existing?.sigcore_participant_key || null,
     participant_phone_e164: participantPhoneE164 || existing?.participant_phone_e164 || null,
     provider_contact_id: providerContactId || existing?.provider_contact_id || null,
-    crm_customer_id: crm.crm_customer_id ?? existing?.crm_customer_id ?? null,
-    crm_lead_id: crm.crm_lead_id ?? existing?.crm_lead_id ?? null,
-    mapping_status: crm.status,
+    crm_customer_id: classification.crm_customer_id ?? existing?.crm_customer_id ?? null,
+    crm_lead_id: classification.crm_lead_id ?? existing?.crm_lead_id ?? null,
+    mapping_status: classification.status,
     mapping_source: existing?.mapping_source || mappingSource,
     updated_at: new Date().toISOString(),
   };
@@ -9934,14 +9981,20 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     const unresolved = Object.entries(unresolvedCustomerSources).map(([raw_value, ids]) => ({ raw_value, count: ids.length }));
 
     // PR4 — participant metrics (paginated counts; Supabase default limit is 1000)
+    // 5-bucket status domain: mapped / ambiguous / unmapped / aggregator / noise
+    // (plus 'manual' for user-curated sticky entries)
     const participantMetrics = {
-      mapped: 0, ambiguous: 0, unmapped: 0, manual: 0,
+      mapped: 0,
+      ambiguous: 0,
+      unmapped: 0,      // real-person candidates without CRM record — actionable
+      aggregator: 0,    // platform/source alias — intentionally no CRM
+      noise: 0,         // unnamed/unknown phone — intentionally no CRM
+      manual: 0,
       participant_pending_total: 0,
       participant_id_missing_total: 0,       // mapping exists but only participantKey (no participantId)
       participant_phone_missing_total: 0,    // conversations with no phone AND no participant identity
     };
     try {
-      // Use HEAD count queries (no row fetch) for each status bucket — avoids the 1000-row default
       const countBy = async (filter) => {
         let q = supabase.from('communication_participant_mappings')
           .select('id', { count: 'exact', head: true }).eq('tenant_id', userId);
@@ -9949,7 +10002,6 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         const { count } = await q;
         return count || 0;
       };
-      // Count-only (HEAD) helper for conversations table
       const countConvs = async (filter) => {
         let q = supabase.from('communication_conversations')
           .select('id', { count: 'exact', head: true }).eq('user_id', userId);
@@ -9958,12 +10010,14 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         return count || 0;
       };
       const [
-        mappedCount, ambiguousCount, unmappedCount, manualCount,
+        mappedCount, ambiguousCount, unmappedCount, aggregatorCount, noiseCount, manualCount,
         idMissingCount, pendingCount, noPhoneCount
       ] = await Promise.all([
         countBy((q) => q.eq('mapping_status', 'mapped')),
         countBy((q) => q.eq('mapping_status', 'ambiguous')),
         countBy((q) => q.eq('mapping_status', 'unmapped')),
+        countBy((q) => q.eq('mapping_status', 'aggregator')),
+        countBy((q) => q.eq('mapping_status', 'noise')),
         countBy((q) => q.eq('mapping_status', 'manual')),
         countBy((q) => q.is('sigcore_participant_id', null)),
         countConvs((q) => q.eq('participant_pending', true)),
@@ -9972,6 +10026,8 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
       participantMetrics.mapped = mappedCount;
       participantMetrics.ambiguous = ambiguousCount;
       participantMetrics.unmapped = unmappedCount;
+      participantMetrics.aggregator = aggregatorCount;
+      participantMetrics.noise = noiseCount;
       participantMetrics.manual = manualCount;
       participantMetrics.participant_id_missing_total = idMissingCount;
       participantMetrics.participant_pending_total = pendingCount;
@@ -10088,7 +10144,7 @@ async function runParticipantBackfill(userId, apply, progress) {
   progress.phase = 'loading';
   const [convs, customers, leads, existingMaps] = await Promise.all([
     fetchAll('communication_conversations',
-      'id, participant_phone, customer_id, lead_id, participant_mapping_id, sigcore_conversation_id',
+      'id, participant_phone, participant_name, customer_id, lead_id, participant_mapping_id, sigcore_conversation_id',
       (q) => q.eq('user_id', userId).eq('provider', 'openphone')),
     fetchAll('customers', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
     fetchAll('leads', 'id, phone', (q) => q.eq('user_id', userId).not('phone', 'is', null)),
@@ -10120,6 +10176,10 @@ async function runParticipantBackfill(userId, apply, progress) {
   const rowsToUpdate = []; // { mappingId, phoneE164, crm_customer_id, crm_lead_id, mapping_status, convId }
   const convsNeedingOnlyMappingIdUpdate = []; // { convId, mappingId }
 
+  // Extend summary with refined buckets
+  summary.aggregator = 0;
+  summary.noise = 0;
+
   for (const c of convs) {
     summary.scanned++;
     try {
@@ -10133,27 +10193,28 @@ async function runParticipantBackfill(userId, apply, progress) {
       // Nothing to anchor a mapping row on — truly pending
       if (!syntheticKey && !phoneE164) { summary.pending++; continue; }
 
-      // Classify CRM
-      let status = 'unmapped';
-      let crm_customer_id = null;
-      let crm_lead_id = null;
+      // Classify — preserve legacy CRM links first, then use 5-bucket classifier
+      let status, crm_customer_id, crm_lead_id;
       if (hasLegacyCRM) {
         status = 'mapped';
         crm_customer_id = c.customer_id || null;
         crm_lead_id = c.lead_id || null;
-      } else if (phoneE164) {
-        const p10 = last10(phoneE164);
-        const custs = custByPhone[p10] || [];
-        const lds = leadByPhone[p10] || [];
-        if (custs.length === 1) { status = 'mapped'; crm_customer_id = custs[0]; }
-        else if (custs.length === 0 && lds.length === 1) { status = 'mapped'; crm_lead_id = lds[0]; }
-        else if (custs.length === 0 && lds.length === 0) { status = 'unmapped'; }
-        else { status = 'ambiguous'; }
+      } else {
+        const p10 = phoneE164 ? last10(phoneE164) : '';
+        const classification = classifyMapping(
+          { customers: custByPhone[p10] || [], leads: leadByPhone[p10] || [] },
+          c.participant_name
+        );
+        status = classification.status;
+        crm_customer_id = classification.crm_customer_id;
+        crm_lead_id = classification.crm_lead_id;
       }
 
       // Tally
       if (status === 'mapped') summary.mapped++;
       else if (status === 'ambiguous') summary.ambiguous++;
+      else if (status === 'aggregator') summary.aggregator++;
+      else if (status === 'noise') summary.noise++;
       else summary.unmapped++;
 
       if (summary.sample.length < 20) summary.sample.push({ id: c.id, phone: phoneE164, status });
@@ -10290,8 +10351,7 @@ app.get('/api/participants/backfill/progress', authenticateToken, (req, res) => 
   res.json(participantBackfillProgress[userId] || { status: 'idle' });
 });
 
-// Aggregator / alias name patterns — contacts with these names aren't real people
-const AGGREGATOR_NAME_RE = /(thumbtack|thumback|thumbtac|tumbtack|thambtack|thumntack|yelp|leadbridge|google|facebook|bark|groupon|instagram|angi|homeadvisor|voolt|site request|cold call)/i;
+// Note: AGGREGATOR_NAME_RE is defined earlier (shared with classifyMapping)
 
 const importLeadsProgress = {};
 
@@ -10535,6 +10595,189 @@ app.post('/api/participants/reconcile', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Reconcile failed' });
   }
 });
+
+// One-time refinement — re-bucket existing mappings into 5 states
+const reclassifyProgress = {};
+
+/**
+ * Re-run 5-bucket classification on ALL existing participant mappings.
+ * Useful after migration 023 or when aggregator regex changes.
+ *
+ * Skips:
+ *   - mappings with mapping_status = 'manual' (user-curated, sticky)
+ *   - mappings already pointing to crm_customer_id or crm_lead_id (keep 'mapped')
+ *
+ * Only reclassifies rows that are currently 'mapped' without CRM link, 'unmapped',
+ * 'ambiguous', or any of the new buckets — based on conversation name + aggregator regex.
+ *
+ * POST /api/participants/reclassify                   (dry-run)
+ * POST /api/participants/reclassify?apply=1           (async apply)
+ * GET  /api/participants/reclassify/progress          (poll)
+ */
+app.post('/api/participants/reclassify', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
+
+    if (reclassifyProgress[userId]?.status === 'running') {
+      return res.status(409).json({ error: 'Reclassify already running', progress: reclassifyProgress[userId] });
+    }
+
+    if (!apply) {
+      const progress = { status: 'running', phase: 'classifying' };
+      reclassifyProgress[userId] = progress;
+      const result = await runReclassify(userId, false, progress);
+      progress.status = 'done';
+      return res.json(result);
+    }
+
+    const progress = { status: 'running', phase: 'starting', processed: 0, total: 0, changed: 0, startedAt: Date.now() };
+    reclassifyProgress[userId] = progress;
+    setImmediate(async () => {
+      try { await runReclassify(userId, true, progress); progress.status = 'done'; }
+      catch (e) { progress.status = 'error'; progress.error = e.message; logger.error('Reclassify error:', e); }
+    });
+    res.status(202).json({ started: true, progress });
+  } catch (error) {
+    logger.error('Reclassify error:', error);
+    res.status(500).json({ error: 'Reclassify failed' });
+  }
+});
+
+app.get('/api/participants/reclassify/progress', authenticateToken, (req, res) => {
+  res.json(reclassifyProgress[req.user.userId] || { status: 'idle' });
+});
+
+async function runReclassify(userId, apply, progress) {
+  progress.phase = 'loading';
+
+  const pageSize = 1000;
+  const fetchAll = async (table, cols, filter) => {
+    const rows = []; let off = 0;
+    while (true) {
+      let q = supabase.from(table).select(cols).range(off, off + pageSize - 1);
+      if (filter) q = filter(q);
+      const { data, error } = await q;
+      if (error || !data?.length) break;
+      rows.push(...data);
+      if (data.length < pageSize) break;
+      off += pageSize;
+    }
+    return rows;
+  };
+
+  // Load all mappings for tenant (exclude 'manual' — user-curated, sticky)
+  const mappings = await fetchAll('communication_participant_mappings',
+    'id, mapping_status, crm_customer_id, crm_lead_id, participant_phone_e164',
+    (q) => q.eq('tenant_id', userId).neq('mapping_status', 'manual'));
+
+  progress.total = mappings.length;
+  progress.phase = 'loading crm index';
+
+  // Build phone→crm index for re-lookup
+  const customers = await fetchAll('customers', 'id, phone',
+    (q) => q.eq('user_id', userId).not('phone', 'is', null));
+  const leads = await fetchAll('leads', 'id, phone',
+    (q) => q.eq('user_id', userId).not('phone', 'is', null));
+
+  const last10 = (s) => String(s || '').replace(/\D/g, '').slice(-10);
+  const custByPhone = {}; for (const c of customers) { const p = last10(c.phone); if (p && p.length >= 7) (custByPhone[p] ||= []).push(c.id); }
+  const leadByPhone = {}; for (const l of leads) { const p = last10(l.phone); if (p && p.length >= 7) (leadByPhone[p] ||= []).push(l.id); }
+
+  progress.phase = 'loading conversation names';
+
+  // Get the most recent conversation name per mapping_id
+  const mappingIds = mappings.map(m => m.id);
+  const nameByMapping = {};
+  for (let i = 0; i < mappingIds.length; i += 500) {
+    const chunk = mappingIds.slice(i, i + 500);
+    const { data } = await supabase.from('communication_conversations')
+      .select('participant_mapping_id, participant_name, last_event_at')
+      .in('participant_mapping_id', chunk)
+      .not('participant_name', 'is', null);
+    for (const c of (data || [])) {
+      const n = (c.participant_name || '').trim();
+      if (!n) continue;
+      const cur = nameByMapping[c.participant_mapping_id];
+      if (!cur || (c.last_event_at || '') > (cur.date || '')) {
+        nameByMapping[c.participant_mapping_id] = { name: n, date: c.last_event_at };
+      }
+    }
+  }
+
+  progress.phase = 'classifying';
+
+  const summary = {
+    total: mappings.length,
+    mapped: 0, ambiguous: 0, unmapped: 0, aggregator: 0, noise: 0, manual: 0,
+    transitions: { /* from_to: count */ },
+    changed: 0,
+    unchanged: 0,
+    errors: 0,
+  };
+
+  const updates = []; // { id, status, crm_customer_id, crm_lead_id }
+  for (const m of mappings) {
+    const p10 = m.participant_phone_e164 ? last10(m.participant_phone_e164) : '';
+    const name = nameByMapping[m.id]?.name || null;
+    const classification = classifyMapping(
+      { customers: custByPhone[p10] || [], leads: leadByPhone[p10] || [] },
+      name
+    );
+
+    // If the existing mapping already has crm_customer_id or crm_lead_id, keep it as mapped
+    // (unless CRM lookup now produces a different / better answer)
+    let finalStatus = classification.status;
+    let finalCust = classification.crm_customer_id;
+    let finalLead = classification.crm_lead_id;
+    if ((m.crm_customer_id || m.crm_lead_id) && finalStatus !== 'mapped' && finalStatus !== 'ambiguous') {
+      // Trust the existing CRM link
+      finalStatus = 'mapped';
+      finalCust = m.crm_customer_id || null;
+      finalLead = m.crm_lead_id || null;
+    }
+
+    // Tally the FINAL bucket
+    if (summary[finalStatus] !== undefined) summary[finalStatus]++;
+
+    const changed = m.mapping_status !== finalStatus
+      || (m.crm_customer_id || null) !== (finalCust || null)
+      || (m.crm_lead_id || null) !== (finalLead || null);
+    if (changed) {
+      summary.changed++;
+      const key = `${m.mapping_status}→${finalStatus}`;
+      summary.transitions[key] = (summary.transitions[key] || 0) + 1;
+      updates.push({ id: m.id, status: finalStatus, crm_customer_id: finalCust, crm_lead_id: finalLead });
+    } else {
+      summary.unchanged++;
+    }
+    progress.processed = (progress.processed || 0) + 1;
+  }
+
+  if (!apply) {
+    progress.phase = 'done';
+    progress.summary = summary;
+    return { dryRun: true, summary };
+  }
+
+  progress.phase = 'writing updates';
+  for (const u of updates) {
+    try {
+      await supabase.from('communication_participant_mappings')
+        .update({
+          mapping_status: u.status,
+          crm_customer_id: u.crm_customer_id,
+          crm_lead_id: u.crm_lead_id,
+          updated_at: new Date().toISOString(),
+        }).eq('id', u.id);
+      progress.changed = (progress.changed || 0) + 1;
+    } catch (e) { summary.errors++; }
+  }
+
+  progress.phase = 'done';
+  progress.summary = summary;
+  return { dryRun: false, summary };
+}
 
 // Find and merge duplicate customers endpoint
 app.post('/api/customers/merge-duplicates', authenticateToken, async (req, res) => {
