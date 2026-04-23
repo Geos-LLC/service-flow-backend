@@ -677,6 +677,133 @@ describe('Reclassify preserves CRM links', () => {
 // Aggregator pattern coverage (prove regex handles SF's actual data)
 // ─────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
+// PR4.2 — LeadBridge per-location source write-path + upgrade
+// ─────────────────────────────────────────────────────────────
+
+describe('LeadBridge source write-path (new records)', () => {
+  // Mirror: const source = accountDisplayName ? `${accountDisplayName} (${channel})` : (channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack')
+  function deriveLeadSource({ accountDisplayName, channel }) {
+    if (accountDisplayName) return `${accountDisplayName} (${channel})`;
+    return channel === 'yelp' ? 'leadbridge_yelp' : 'leadbridge_thumbtack';
+  }
+
+  test('with account display_name → per-location source (yelp)', () => {
+    expect(deriveLeadSource({ accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp' }))
+      .toBe('Spotless Homes Tampa (yelp)');
+  });
+
+  test('with account display_name → per-location source (thumbtack)', () => {
+    expect(deriveLeadSource({ accountDisplayName: 'Spotless Homes Saint Petersburg', channel: 'thumbtack' }))
+      .toBe('Spotless Homes Saint Petersburg (thumbtack)');
+  });
+
+  test('no account display_name → legacy flat fallback (yelp)', () => {
+    expect(deriveLeadSource({ accountDisplayName: null, channel: 'yelp' })).toBe('leadbridge_yelp');
+  });
+
+  test('no account display_name → legacy flat fallback (thumbtack)', () => {
+    expect(deriveLeadSource({ accountDisplayName: undefined, channel: 'thumbtack' })).toBe('leadbridge_thumbtack');
+  });
+
+  test('every LB account produces a unique per-location source', () => {
+    const accounts = [
+      { display_name: 'Spotless Homes Tampa', channel: 'yelp' },
+      { display_name: 'Spotless Homes Tampa', channel: 'thumbtack' },
+      { display_name: 'Spotless Homes Jacksonville', channel: 'yelp' },
+      { display_name: 'Spotless Homes Jacksonville', channel: 'thumbtack' },
+      { display_name: 'Spotless Homes Saint Petersburg', channel: 'thumbtack' },
+    ];
+    const sources = new Set(accounts.map(a => deriveLeadSource({ accountDisplayName: a.display_name, channel: a.channel })));
+    expect(sources.size).toBe(accounts.length);
+    // And none of them are the flat legacy values
+    for (const s of sources) {
+      expect(s).not.toBe('leadbridge_yelp');
+      expect(s).not.toBe('leadbridge_thumbtack');
+    }
+  });
+});
+
+describe('LeadBridge source upgrade — idempotency + explicit unresolved handling', () => {
+  // Simulate the upgrade bucket classifier
+  function classifyUpgrade(record, validNewSources, phoneToAccount) {
+    if (validNewSources.has(record.source)) return { bucket: 'already_correct_skipped' };
+    if (!['leadbridge_yelp', 'leadbridge_thumbtack'].includes(record.source)) {
+      return { bucket: 'not_legacy' };
+    }
+    const last10 = String(record.phone || '').replace(/\D/g, '').slice(-10);
+    if (!last10 || last10.length < 7) {
+      return { bucket: 'unresolved_no_context', reason: 'no phone on record' };
+    }
+    const acct = phoneToAccount[last10];
+    if (!acct) return { bucket: 'unresolved_no_context', reason: 'no LB conversation found for this phone' };
+    return { bucket: 'upgraded_successfully', new_source: `${acct.display_name} (${acct.channel})` };
+  }
+
+  const validNewSources = new Set([
+    'Spotless Homes Tampa (yelp)',
+    'Spotless Homes Tampa (thumbtack)',
+    'Spotless Homes Jacksonville (yelp)',
+  ]);
+  const phoneToAccount = {
+    '8139855031': { display_name: 'Spotless Homes Tampa', channel: 'yelp' },
+    '9045778584': { display_name: 'Spotless Homes Jacksonville', channel: 'thumbtack' },
+  };
+
+  test('rewrites legacy flat value when LB context exists', () => {
+    const r = classifyUpgrade(
+      { source: 'leadbridge_yelp', phone: '8139855031' },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).toBe('upgraded_successfully');
+    expect(r.new_source).toBe('Spotless Homes Tampa (yelp)');
+  });
+
+  test('idempotent — re-running skips already-correct values', () => {
+    const r = classifyUpgrade(
+      { source: 'Spotless Homes Tampa (yelp)', phone: '8139855031' },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).toBe('already_correct_skipped');
+  });
+
+  test('unresolved — no phone, cannot infer account', () => {
+    const r = classifyUpgrade(
+      { source: 'leadbridge_yelp', phone: null },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).toBe('unresolved_no_context');
+    expect(r.reason).toMatch(/no phone/);
+  });
+
+  test('unresolved — phone exists but no LB conversation linked to an account', () => {
+    const r = classifyUpgrade(
+      { source: 'leadbridge_thumbtack', phone: '5551234567' },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).toBe('unresolved_no_context');
+    expect(r.reason).toMatch(/no LB conversation/);
+  });
+
+  test('NEVER silently assigns a guessed default for unresolved rows', () => {
+    // Acceptance criterion 4: unresolved rows must be reported explicitly, not silently flattened
+    const r = classifyUpgrade(
+      { source: 'leadbridge_yelp', phone: null },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).not.toBe('upgraded_successfully');
+    expect(r.new_source).toBeUndefined();
+  });
+
+  test('non-legacy rows are not touched', () => {
+    const r = classifyUpgrade(
+      { source: 'Website', phone: '8139855031' },
+      validNewSources, phoneToAccount
+    );
+    expect(r.bucket).toBe('not_legacy');
+  });
+});
+
 describe('Aggregator regex matches observed SF contact names', () => {
   const observedAggregatorNames = [
     'Thumbtack', 'Thumbtack S', 'Thumbtack J', 'Thumbtack T',

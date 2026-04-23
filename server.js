@@ -10034,6 +10034,20 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
       participantMetrics.participant_phone_missing_total = noPhoneCount;
     } catch (e) { /* non-fatal */ }
 
+    // Legacy LeadBridge flat-source rows — explicit issue bucket (not silently hidden)
+    const legacyLbFlat = { customers: 0, leads: 0, total: 0 };
+    try {
+      const [custCount, leadCount] = await Promise.all([
+        supabase.from('customers').select('id', { count: 'exact', head: true })
+          .eq('user_id', userId).in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']),
+        supabase.from('leads').select('id', { count: 'exact', head: true })
+          .eq('user_id', userId).in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']),
+      ]);
+      legacyLbFlat.customers = custCount.count || 0;
+      legacyLbFlat.leads = leadCount.count || 0;
+      legacyLbFlat.total = legacyLbFlat.customers + legacyLbFlat.leads;
+    } catch (e) { /* non-fatal */ }
+
     res.json({
       duplicateCustomers: dupCustomers,
       duplicateCustomerCount: dupCustomers.length,
@@ -10045,6 +10059,7 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         count: unknownContacts.length,
       },
       unresolvedCustomerSources: unresolved,
+      legacyLbFlatSources: legacyLbFlat,
       participantMetrics,
     });
   } catch (error) {
@@ -10631,25 +10646,50 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
     const userId = req.user.userId;
     const apply = String(req.query.apply || req.body?.apply || '') === '1' || req.body?.apply === true;
 
-    const summary = { scanned: 0, upgraded: 0, unupgradable: 0, errors: 0, samples: [] };
+    // Summary buckets — explicit, aligned with task spec
+    const summary = {
+      total_legacy_flat_rows_found: 0,
+      upgraded_successfully: 0,
+      unresolved_no_context: 0,
+      already_correct_skipped: 0,
+      errors: 0,
+      by_new_source: {},      // breakdown of upgraded values for visibility
+      unresolved_samples: [], // up to 50 — user-surfaceable
+      upgraded_samples: [],   // up to 10 — preview
+    };
 
-    // Get all LB accounts (id → display_name + channel)
+    // Get all active LB accounts (id → display_name + channel).
+    // Idempotency: if an 'already correct' value matches "{display_name} ({channel})",
+    // we can recognize it and skip.
     const { data: accounts } = await supabase.from('communication_provider_accounts')
       .select('id, display_name, channel').eq('user_id', userId).eq('provider', 'leadbridge');
     const accountMap = {};
-    for (const a of (accounts || [])) accountMap[a.id] = a;
+    const validNewSources = new Set();
+    for (const a of (accounts || [])) {
+      accountMap[a.id] = a;
+      validNewSources.add(`${a.display_name} (${a.channel})`);
+    }
 
     // Process both tables: customers, leads
     for (const table of ['customers', 'leads']) {
+      // 1. Count rows that ALREADY have a correct per-location source (idempotency visibility)
+      if (validNewSources.size > 0) {
+        const { count } = await supabase.from(table)
+          .select('id', { count: 'exact', head: true })
+          .eq('user_id', userId).in('source', [...validNewSources]);
+        summary.already_correct_skipped += count || 0;
+      }
+
+      // 2. Find legacy flat values
       const { data: records } = await supabase.from(table)
         .select('id, first_name, last_name, phone, source')
         .eq('user_id', userId)
         .in('source', ['leadbridge_yelp', 'leadbridge_thumbtack']);
 
       for (const rec of (records || [])) {
-        summary.scanned++;
+        summary.total_legacy_flat_rows_found++;
         try {
-          // Find linked conversation via phone (LB only)
+          // Find linked LB conversation via phone (the account context)
           let providerAccountId = null;
           if (rec.phone) {
             const last10 = String(rec.phone).replace(/\D/g, '').slice(-10);
@@ -10665,26 +10705,30 @@ app.post('/api/participants/upgrade-lb-sources', authenticateToken, async (req, 
           }
 
           if (!providerAccountId || !accountMap[providerAccountId]) {
-            summary.unupgradable++;
-            if (summary.samples.length < 10) summary.samples.push({
-              table, id: rec.id, name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim(),
-              phone: rec.phone, old_source: rec.source, new_source: null, reason: 'no conversation with LB account',
+            summary.unresolved_no_context++;
+            if (summary.unresolved_samples.length < 50) summary.unresolved_samples.push({
+              table, id: rec.id,
+              name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim() || null,
+              phone: rec.phone, legacy_source: rec.source,
+              reason: rec.phone ? 'no LB conversation found for this phone' : 'no phone on record',
             });
             continue;
           }
 
           const acct = accountMap[providerAccountId];
           const newSource = `${acct.display_name} (${acct.channel})`;
+          summary.by_new_source[newSource] = (summary.by_new_source[newSource] || 0) + 1;
 
-          if (summary.samples.length < 10) summary.samples.push({
-            table, id: rec.id, name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim(),
-            phone: rec.phone, old_source: rec.source, new_source: newSource,
+          if (summary.upgraded_samples.length < 10) summary.upgraded_samples.push({
+            table, id: rec.id,
+            name: `${rec.first_name || ''} ${rec.last_name || ''}`.trim() || null,
+            phone: rec.phone, legacy_source: rec.source, new_source: newSource,
           });
 
           if (apply) {
             await supabase.from(table).update({ source: newSource }).eq('id', rec.id);
           }
-          summary.upgraded++;
+          summary.upgraded_successfully++;
         } catch (e) {
           summary.errors++;
         }
