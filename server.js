@@ -11155,19 +11155,28 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
       offset += 1000;
     }
 
+    // Rollups — three user-facing buckets. Internal details remain in `details`
+    // for drill-down / debugging but should not be surfaced as primary counts.
+    const connected = resolvedCustomer + resolvedLead + resolvedBoth;
+    const needReview = floatingNamedActionable + ambiguousOpen + ambiguous;
+    const ignored = floatingAggregator + floatingNoise;
+
     res.json({
       total,
-      crm_linked: {
+      connected,
+      need_review: needReview,
+      ignored,
+      ambiguities_open: ambiguousOpen,
+      details: {
         resolved_customer: resolvedCustomer,
         resolved_lead: resolvedLead,
         resolved_both: resolvedBoth,
+        ambiguous,
+        floating_named: floatingNamedActionable,
+        floating_aggregator: floatingAggregator,
+        floating_noise: floatingNoise,
+        sync_only: syncOnly,
       },
-      ambiguous,
-      unresolved_floating_true: floatingNamedActionable,
-      floating_aggregator: floatingAggregator,
-      floating_noise: floatingNoise,
-      sync_only: syncOnly,
-      ambiguities_open: ambiguousOpen,
     });
   } catch (error) {
     logger.error('[IdentityStatus]', error);
