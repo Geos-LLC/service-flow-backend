@@ -11370,6 +11370,118 @@ app.get('/api/identities/reconciliation-failures', authenticateToken, async (req
 });
 
 /**
+ * GET /api/identities/reconciliation-failures/export.csv?status=open
+ *
+ * Fully-enriched CSV export for the ambiguity queue. Emits ONE ROW PER
+ * (ambiguity × candidate) pair so each side of the conflict appears on its
+ * own line — the common case is 1 ambiguity × 1 candidate = 2 rows (the
+ * attempted signal appears on the same line as its candidate, repeated).
+ *
+ * Columns:
+ *   ambig_id, reason, attempted_source, attempted_name, attempted_phone,
+ *   attempted_external_id,
+ *   candidate_id, candidate_name, candidate_phone, candidate_email,
+ *   candidate_status, candidate_priority_source,
+ *   candidate_sources (semicolon-joined: openphone;leadbridge;zenbooker),
+ *   candidate_customer_id, candidate_customer_name, candidate_customer_phone,
+ *   candidate_lead_id, candidate_lead_name, candidate_lead_source,
+ *   created_at
+ */
+app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const status = req.query.status || 'open';
+
+    const { data: ambigs, error } = await supabase.from('communication_identity_ambiguities')
+      .select('id, source, attempted_external_id, attempted_phone, attempted_name, candidate_identity_ids, reason, status, created_at')
+      .eq('user_id', userId).eq('status', status)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    // Collect all candidate identity ids, then hydrate in one pass.
+    const allCandIds = new Set();
+    for (const a of (ambigs || [])) {
+      for (const id of (a.candidate_identity_ids || [])) allCandIds.add(id);
+    }
+    const candIds = [...allCandIds];
+
+    const { data: candRows } = candIds.length > 0
+      ? await supabase.from('communication_participant_identities')
+          .select('id, display_name, normalized_phone, email, status, identity_priority_source, sf_customer_id, sf_lead_id, openphone_contact_id, sigcore_participant_id, sigcore_participant_key, leadbridge_contact_id, thumbtack_profile_id, yelp_profile_id, zenbooker_customer_id')
+          .eq('user_id', userId).in('id', candIds)
+      : { data: [] };
+    const candsById = {};
+    for (const c of (candRows || [])) candsById[c.id] = c;
+
+    // CRM hydration.
+    const customerIds = [...new Set((candRows || []).map(c => c.sf_customer_id).filter(Boolean))];
+    const leadIds = [...new Set((candRows || []).map(c => c.sf_lead_id).filter(Boolean))];
+    const [{ data: customers } = { data: [] }, { data: leads } = { data: [] }] = await Promise.all([
+      customerIds.length ? supabase.from('customers').select('id, first_name, last_name, phone, email').in('id', customerIds) : Promise.resolve({ data: [] }),
+      leadIds.length ? supabase.from('leads').select('id, first_name, last_name, phone, email, source').in('id', leadIds) : Promise.resolve({ data: [] }),
+    ]);
+    const custById = {}; for (const c of (customers || [])) custById[c.id] = c;
+    const leadById = {}; for (const l of (leads || [])) leadById[l.id] = l;
+
+    const sourceFlagsOf = (c) => {
+      const s = [];
+      if (c.openphone_contact_id || c.sigcore_participant_id || c.sigcore_participant_key) s.push('openphone');
+      if (c.leadbridge_contact_id || c.thumbtack_profile_id || c.yelp_profile_id) s.push('leadbridge');
+      if (c.zenbooker_customer_id) s.push('zenbooker');
+      return s.join(';');
+    };
+    const nameJoin = (p) => p ? [p.first_name, p.last_name].filter(Boolean).join(' ') : '';
+
+    const esc = v => {
+      if (v == null) return '';
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const HEADERS = [
+      'ambig_id', 'reason', 'attempted_source', 'attempted_name', 'attempted_phone', 'attempted_external_id',
+      'candidate_id', 'candidate_name', 'candidate_phone', 'candidate_email',
+      'candidate_status', 'candidate_priority_source', 'candidate_sources',
+      'candidate_customer_id', 'candidate_customer_name', 'candidate_customer_phone',
+      'candidate_lead_id', 'candidate_lead_name', 'candidate_lead_source',
+      'created_at',
+    ];
+    const lines = [HEADERS.map(esc).join(',')];
+
+    for (const a of (ambigs || [])) {
+      const candIds = a.candidate_identity_ids || [];
+      if (candIds.length === 0) {
+        // Emit a row with empty candidate columns so these still export.
+        lines.push([
+          a.id, a.reason, a.source, a.attempted_name, a.attempted_phone, a.attempted_external_id,
+          '', '', '', '', '', '', '', '', '', '', '', '', '', a.created_at,
+        ].map(esc).join(','));
+        continue;
+      }
+      for (const cid of candIds) {
+        const c = candsById[cid] || {};
+        const cust = c.sf_customer_id ? custById[c.sf_customer_id] : null;
+        const lead = c.sf_lead_id ? leadById[c.sf_lead_id] : null;
+        lines.push([
+          a.id, a.reason, a.source, a.attempted_name, a.attempted_phone, a.attempted_external_id,
+          cid, c.display_name || '', c.normalized_phone || '', c.email || '',
+          c.status || '', c.identity_priority_source || '', sourceFlagsOf(c),
+          cust?.id || '', nameJoin(cust), cust?.phone || '',
+          lead?.id || '', nameJoin(lead), lead?.source || '',
+          a.created_at,
+        ].map(esc).join(','));
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="reconciliation-failures.csv"');
+    res.send(lines.join('\n'));
+  } catch (error) {
+    logger.error('[ReconciliationFailuresCSV]', error);
+    res.status(500).json({ error: 'Failed to export reconciliation failures' });
+  }
+});
+
+/**
  * GET /api/identities/op-lead-outcomes
  *
  * Counts decisions from communication_openphone_lead_decisions for the
