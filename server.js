@@ -47,6 +47,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
+const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
 const {
@@ -8316,6 +8317,35 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return null;
   }
 
+  // Pre-create CRM phone lookup — prevents creating a duplicate lead when
+  // a customer (or lead) with the same phone already exists in SF but was
+  // never linked to this identity (common for manually-entered legacy rows).
+  // Customer precedence over lead.
+  const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
+  if (crmMatch.type === 'customer') {
+    await supabase.from('communication_participant_identities')
+      .update({
+        sf_customer_id: crmMatch.id,
+        status: identity.sf_lead_id ? 'resolved_both' : 'resolved_customer',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', identity.id);
+    logger.log(`[OP] identity ${identity.id} linked_existing_customer_by_phone=${crmMatch.id} (no lead created)`);
+    return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
+  }
+  if (crmMatch.type === 'lead') {
+    await supabase.from('communication_participant_identities')
+      .update({
+        sf_lead_id: crmMatch.id,
+        status: identity.sf_customer_id ? 'resolved_both' : 'resolved_lead',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', identity.id);
+    logger.log(`[OP] identity ${identity.id} linked_existing_lead_by_phone=${crmMatch.id} (no lead created)`);
+    return { action: 'linked_existing_lead_by_phone', lead_id: crmMatch.id };
+  }
+
+  // No CRM match — proceed with lead creation.
   // Default pipeline + first stage.
   const { data: pipeline } = await supabase.from('lead_pipelines')
     .select('id').eq('user_id', userId).eq('is_default', true).maybeSingle();
@@ -8350,7 +8380,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     .eq('id', identity.id);
 
   logger.log(`[OP] Created lead ${newLead.id} via ${decision.note} (${decision.source}) for identity ${identity.id}`);
-  return newLead.id;
+  return { action: decision.note, lead_id: newLead.id };
 }
 
 /**
