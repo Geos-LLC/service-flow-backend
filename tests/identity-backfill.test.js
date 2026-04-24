@@ -233,6 +233,42 @@ describe('resolveIdentity — strict mode', () => {
     expect(r.status).toBe('matched');
     expect(r.createdFloating).toBe(true);
   });
+
+  test('strict weak name match adopts CRM-anchored candidate (crm_anchor)', async () => {
+    // Candidate is linked to a customer AND attempted name is token subset of
+    // candidate's name — previously this logged strict_weak_name_rejected.
+    // Now it should auto-adopt because the CRM link is authoritative.
+    const sb = makeMockSupabase({
+      identities: [{
+        id: 7, user_id: 2, normalized_phone: '8134844937',
+        normalized_name: 'greg provda real number', name_token_set: 'greg number provda real',
+        sf_customer_id: 23158,
+      }],
+    });
+    const r = await resolveIdentity(sb, {
+      userId: 2, source: 'openphone', strict: true,
+      phone: '+18134844937', displayName: 'Greg Provda',
+    });
+    expect(r.status).toBe('matched');
+    expect(r.matchStep).toBe('crm_anchor');
+    expect(r.identity.id).toBe(7);
+  });
+
+  test('strict does NOT adopt CRM-anchored candidate on genuine name conflict', async () => {
+    // Candidate is customer-linked BUT name is in conflict — still reject.
+    const sb = makeMockSupabase({
+      identities: [{
+        id: 8, user_id: 2, normalized_phone: '5551234567',
+        normalized_name: 'john smith', name_token_set: 'john smith',
+        sf_customer_id: 99999,
+      }],
+    });
+    const r = await resolveIdentity(sb, {
+      userId: 2, source: 'openphone', strict: true,
+      phone: '+15551234567', displayName: 'Barbara Jones',
+    });
+    expect(r.status).toBe('ambiguous'); // names conflict, don't auto-adopt
+  });
 });
 
 describe('resolveIdentity — dryRun mode', () => {
