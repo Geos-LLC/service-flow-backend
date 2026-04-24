@@ -11730,35 +11730,30 @@ app.post('/api/identities/:id/classify', authenticateToken, async (req, res) => 
 });
 
 /**
- * POST /api/identities/classify-batch
- * Body: { ids: number[], max?: number }
- *
- * Starts a background batch-classify job and returns immediately with
- * { running: true, total }. Poll GET /api/identities/classify-batch/progress
- * for incremental state. Work runs in-process with setImmediate — a restart
- * loses the progress record, which is fine (each row is idempotent: already-
- * classified rows can be re-classified safely).
+ * Batch-classify worker — runs a single ai_classify_jobs row to completion,
+ * updating progress in the DB after each identity. Resumes from the DB
+ * `done` counter on restart (setImmediate loop picks up where it left off).
+ * At-most-one worker per job is guaranteed by a per-process in-memory lock
+ * (aiClassifyRunningJobIds) so a duplicate resume call is a no-op.
  */
-const aiClassifyProgress = {}; // keyed by userId → { total, done, ok, errors, cost, running, started_at, finished_at }
-app.post('/api/identities/classify-batch', authenticateToken, async (req, res) => {
-  if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
-  const userId = req.user.userId;
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Number.isInteger) : [];
-  const max = Math.min(parseInt(req.body?.max, 10) || 200, 500);
-  const slice = ids.slice(0, max);
-  if (slice.length === 0) return res.json({ running: false, total: 0 });
+const aiClassifyRunningJobIds = new Set();
+async function runClassifyJob(jobId) {
+  if (aiClassifyRunningJobIds.has(jobId)) return;
+  aiClassifyRunningJobIds.add(jobId);
+  try {
+    const { data: job } = await supabase.from('ai_classify_jobs')
+      .select('*').eq('id', jobId).maybeSingle();
+    if (!job || job.status !== 'running') return;
 
-  const cur = aiClassifyProgress[userId];
-  if (cur?.running) return res.status(409).json({ error: 'batch already running', progress: cur });
+    const userId = job.user_id;
+    const ids = Array.isArray(job.ids) ? job.ids : [];
+    let done = job.done || 0;
+    let ok = job.ok || 0;
+    let errors = job.errors || 0;
+    let cost = parseFloat(job.cost_usd) || 0;
 
-  aiClassifyProgress[userId] = {
-    running: true, total: slice.length, done: 0, ok: 0, errors: 0, cost: 0,
-    started_at: new Date().toISOString(), finished_at: null, last_result: null,
-  };
-
-  setImmediate(async () => {
-    const p = aiClassifyProgress[userId];
-    for (const id of slice) {
+    for (let i = done; i < ids.length; i++) {
+      const id = ids[i];
       try {
         const v = await aiClassifyIdentity({ openai: openaiClient, supabase, userId, identityId: id });
         await supabase.from('communication_participant_identities')
@@ -11768,30 +11763,114 @@ app.post('/api/identities/classify-batch', authenticateToken, async (req, res) =
             updated_at: new Date().toISOString(),
           })
           .eq('id', id).eq('user_id', userId);
-        p.cost += v.cost_usd; p.ok += 1;
-        p.last_result = { id, category: v.category, confidence: v.confidence };
+        ok += 1; cost += v.cost_usd;
+        await supabase.from('ai_classify_jobs').update({
+          done: i + 1, ok, cost_usd: +cost.toFixed(6),
+          last_result: { id, category: v.category, confidence: v.confidence },
+          updated_at: new Date().toISOString(),
+        }).eq('id', jobId);
       } catch (e) {
-        p.errors += 1;
-        p.last_result = { id, error: e?.message || String(e) };
-        logger.error(`[AIClassifyBatch] id=${id} err=${e?.message || e}`);
+        errors += 1;
+        await supabase.from('ai_classify_jobs').update({
+          done: i + 1, errors,
+          last_result: { id, error: e?.message || String(e) },
+          updated_at: new Date().toISOString(),
+        }).eq('id', jobId);
+        logger.error(`[AIClassifyBatch] job=${jobId} id=${id} err=${e?.message || e}`);
       }
-      p.done += 1;
     }
-    p.running = false; p.finished_at = new Date().toISOString();
-    p.cost = +p.cost.toFixed(5);
-    logger.log(`[AIClassifyBatch] user=${userId} done=${p.done} ok=${p.ok} err=${p.errors} cost=$${p.cost}`);
-  });
 
-  res.json({ running: true, total: slice.length });
+    await supabase.from('ai_classify_jobs').update({
+      status: 'done', finished_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }).eq('id', jobId);
+    logger.log(`[AIClassifyBatch] job=${jobId} user=${userId} done=${ids.length} ok=${ok} err=${errors} cost=$${cost.toFixed(5)}`);
+  } catch (e) {
+    logger.error(`[AIClassifyBatch] job=${jobId} worker crashed: ${e?.message || e}`);
+  } finally {
+    aiClassifyRunningJobIds.delete(jobId);
+  }
+}
+
+/**
+ * POST /api/identities/classify-batch
+ * Body: { ids: number[], max?: number }
+ *
+ * Creates an ai_classify_jobs row, spawns a worker, returns immediately.
+ * State is persisted per-row so a Railway restart resumes seamlessly from
+ * wherever done was last updated. Only one running job per user at a time
+ * (returns 409 if one already exists).
+ */
+app.post('/api/identities/classify-batch', authenticateToken, async (req, res) => {
+  if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+  try {
+    const userId = req.user.userId;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Number.isInteger) : [];
+    const max = Math.min(parseInt(req.body?.max, 10) || 200, 500);
+    const slice = ids.slice(0, max);
+    if (slice.length === 0) return res.json({ running: false, total: 0 });
+
+    const { data: existing } = await supabase.from('ai_classify_jobs')
+      .select('id, total, done, ok, errors, cost_usd').eq('user_id', userId).eq('status', 'running')
+      .order('id', { ascending: false }).limit(1).maybeSingle();
+    if (existing) {
+      // Already running — ensure a worker is attached (restart might have dropped it).
+      setImmediate(() => runClassifyJob(existing.id));
+      return res.status(409).json({ error: 'batch already running', job: existing });
+    }
+
+    const { data: created, error: insertErr } = await supabase.from('ai_classify_jobs').insert({
+      user_id: userId, ids: slice, total: slice.length,
+    }).select('id').single();
+    if (insertErr) throw insertErr;
+
+    setImmediate(() => runClassifyJob(created.id));
+    res.json({ running: true, total: slice.length, job_id: created.id });
+  } catch (error) {
+    logger.error(`[AIClassifyBatch] start failed: ${error?.message || error}`);
+    res.status(500).json({ error: `Failed to start batch: ${error?.message || 'unknown'}` });
+  }
 });
 
 /**
  * GET /api/identities/classify-batch/progress
- * Returns current in-memory progress or null if none started this session.
+ * Returns the latest job for this user (running or completed).
  */
 app.get('/api/identities/classify-batch/progress', authenticateToken, async (req, res) => {
-  const userId = req.user.userId;
-  res.json(aiClassifyProgress[userId] || null);
+  try {
+    const userId = req.user.userId;
+    const { data } = await supabase.from('ai_classify_jobs')
+      .select('id, total, done, ok, errors, cost_usd, status, last_result, started_at, finished_at')
+      .eq('user_id', userId).order('id', { ascending: false }).limit(1).maybeSingle();
+    if (!data) return res.json(null);
+    res.json({
+      job_id: data.id,
+      running: data.status === 'running',
+      total: data.total, done: data.done, ok: data.ok, errors: data.errors,
+      cost: parseFloat(data.cost_usd) || 0,
+      status: data.status,
+      last_result: data.last_result,
+      started_at: data.started_at, finished_at: data.finished_at,
+    });
+  } catch (error) {
+    logger.error(`[AIClassifyBatch] progress failed: ${error?.message || error}`);
+    res.status(500).json({ error: 'Failed to load progress' });
+  }
+});
+
+// Startup resume — if the server restarted mid-job, pick up from the last
+// recorded `done` offset. Runs once per boot after OpenAI client is ready.
+setImmediate(async function resumeClassifyJobsOnBoot() {
+  if (!openaiClient) return;
+  try {
+    const { data: jobs } = await supabase.from('ai_classify_jobs')
+      .select('id, user_id, done, total').eq('status', 'running');
+    for (const j of (jobs || [])) {
+      logger.log(`[AIClassifyBatch] resuming job ${j.id} user=${j.user_id} from ${j.done}/${j.total}`);
+      setImmediate(() => runClassifyJob(j.id));
+    }
+  } catch (e) {
+    logger.error(`[AIClassifyBatch] resume scan failed: ${e?.message || e}`);
+  }
 });
 
 /**
