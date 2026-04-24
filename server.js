@@ -50,6 +50,7 @@ const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
+const { runIntegrationSync, fillMissingAttribution, SOURCES: INTEGRATION_SOURCES } = require('./lib/integration-sync-orchestrator');
 const {
   validateResolveRequest, buildMergePatch, buildCreateFromAmbiguity, buildAmbiguityAuditPatch,
 } = require('./lib/ambiguity-resolver');
@@ -10986,6 +10987,100 @@ app.post('/api/identities/backfill', authenticateToken, async (req, res) => {
 
 app.get('/api/identities/backfill/progress', authenticateToken, (req, res) => {
   res.json(identityBackfillProgress[req.user.userId] || { status: 'idle' });
+});
+
+// ── Unified integration sync ──────────────────────────────────────────────
+// User-facing "Sync Now" per integration. Replaces the operator-visible
+// technical buttons. All safe repairs (source-fill, etc.) run automatically
+// as part of the pipeline; ambiguities land in the issues queue.
+
+const integrationSyncProgress = {}; // userId → { source, status, startedAt, summary }
+
+app.post('/api/integrations/:source/sync', authenticateToken, async (req, res) => {
+  const { source } = req.params;
+  if (!INTEGRATION_SOURCES.includes(source)) {
+    return res.status(400).json({ error: `unknown source; must be one of ${JSON.stringify(INTEGRATION_SOURCES)}` });
+  }
+  const userId = req.user.userId;
+  const key = `${userId}:${source}`;
+  if (integrationSyncProgress[key]?.status === 'running') {
+    return res.status(409).json({ error: 'sync already running', progress: integrationSyncProgress[key] });
+  }
+  const progress = { source, status: 'running', startedAt: Date.now() };
+  integrationSyncProgress[key] = progress;
+
+  setImmediate(async () => {
+    try {
+      const summary = await runIntegrationSync(supabase, userId, source, {
+        logger,
+        // deps injected lazily so we don't import cross-module. Orchestrator
+        // gracefully no-ops if a dep is missing; for MVP we just run the
+        // source-fill step, which is the net-new behavior users asked for.
+        deps: {},
+      });
+      progress.status = 'done';
+      progress.summary = summary;
+    } catch (e) {
+      progress.status = 'error';
+      progress.error = e.message || String(e);
+      logger.error(`[IntegrationSync:${source}]`, e);
+    }
+  });
+  res.status(202).json({ started: true, progress });
+});
+
+app.get('/api/integrations/:source/sync/progress', authenticateToken, (req, res) => {
+  const { source } = req.params;
+  const key = `${req.user.userId}:${source}`;
+  res.json(integrationSyncProgress[key] || { status: 'idle' });
+});
+
+/**
+ * GET /api/integrations/status
+ *
+ * One-pager for the Integrations page. Returns connection state + last-sync
+ * info + open-issues count per source, so the UI can render one card per
+ * integration without the operator knowing the internals.
+ */
+app.get('/api/integrations/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    // Connection state per source — derived from the respective config tables.
+    const [commSettings, zbSetting, lbSetting, openIssues] = await Promise.all([
+      supabase.from('communication_settings').select('openphone_connected, sigcore_last_sync_at, leadbridge_connected, leadbridge_connected_at').eq('user_id', userId).maybeSingle(),
+      supabase.from('users').select('zenbooker_api_key, zenbooker_last_sync_at').eq('id', userId).maybeSingle(),
+      supabase.from('communication_settings').select('leadbridge_connected, leadbridge_connected_at').eq('user_id', userId).maybeSingle(),
+      supabase.from('communication_identity_ambiguities').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'open'),
+    ]);
+
+    const openphoneProgress = integrationSyncProgress[`${userId}:openphone`] || null;
+    const zbProgress = integrationSyncProgress[`${userId}:zenbooker`] || null;
+    const lbProgress = integrationSyncProgress[`${userId}:leadbridge`] || null;
+
+    res.json({
+      integrations: {
+        openphone: {
+          connected: !!commSettings.data?.openphone_connected,
+          last_sync_at: commSettings.data?.sigcore_last_sync_at || null,
+          last_run: openphoneProgress,
+        },
+        leadbridge: {
+          connected: !!lbSetting.data?.leadbridge_connected,
+          connected_at: lbSetting.data?.leadbridge_connected_at || null,
+          last_run: lbProgress,
+        },
+        zenbooker: {
+          connected: !!zbSetting.data?.zenbooker_api_key,
+          last_sync_at: zbSetting.data?.zenbooker_last_sync_at || null,
+          last_run: zbProgress,
+        },
+      },
+      open_issues: openIssues.count || 0,
+    });
+  } catch (e) {
+    logger.error('[IntegrationStatus]', e);
+    res.status(500).json({ error: 'Failed to load integration status' });
+  }
 });
 
 // ── Phase F — Identity reporting endpoints ────────────────────────────────
