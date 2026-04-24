@@ -48,6 +48,7 @@ const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
+const { classifyIdentitySource } = require('./lib/identity-source-classifier');
 
 // Thin shim so callers don't have to pass supabase every time.
 async function updateJobStatus(args) {
@@ -10981,38 +10982,42 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
 /**
  * GET /api/identities/by-source
  *
- * Source coverage breakdown:
- *   - multi_source: identities with 2+ external IDs (goal state)
- *   - single_source: breakdown by which one source
- *   - by_priority_source: count per identity_priority_source tag
+ * Source coverage breakdown. Uses classifyIdentitySource from
+ * lib/identity-source-classifier — source = logical system, not ID column:
+ *
+ *   openphone  = openphone_contact_id OR sigcore_participant_id OR sigcore_participant_key
+ *   leadbridge = leadbridge_contact_id OR thumbtack_profile_id OR yelp_profile_id
+ *   zenbooker  = zenbooker_customer_id
+ *
+ * Response:
+ *   multi_source         — identities with 2+ distinct sources (goal state)
+ *   single_source        — { leadbridge_only, openphone_only, zenbooker_only, no_source_ids }
+ *   by_priority_source   — count per identity_priority_source tag
+ *   total                — echoed so UI can verify totals reconcile
  */
 app.get('/api/identities/by-source', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const pageSize = 1000;
     let offset = 0;
-    const singleSource = { leadbridge_only: 0, openphone_only: 0, zenbooker_only: 0, sigcore_only: 0, no_source_ids: 0 };
+    const singleSource = { leadbridge_only: 0, openphone_only: 0, zenbooker_only: 0, no_source_ids: 0 };
     const byPriority = { leadbridge: 0, openphone: 0, sync: 0, manual: 0, null: 0 };
     let multiSource = 0;
+    let total = 0;
 
     while (true) {
       const { data } = await supabase.from('communication_participant_identities')
-        .select('leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, identity_priority_source')
+        .select('leadbridge_contact_id, thumbtack_profile_id, yelp_profile_id, openphone_contact_id, sigcore_participant_id, sigcore_participant_key, zenbooker_customer_id, identity_priority_source')
         .eq('user_id', userId)
         .range(offset, offset + pageSize - 1);
       if (!data || data.length === 0) break;
       for (const r of data) {
-        const sources = [];
-        if (r.leadbridge_contact_id) sources.push('leadbridge');
-        if (r.openphone_contact_id) sources.push('openphone');
-        if (r.sigcore_participant_id) sources.push('sigcore');
-        if (r.zenbooker_customer_id) sources.push('zenbooker');
+        total++;
+        const { sources } = classifyIdentitySource(r);
         if (sources.length === 0) singleSource.no_source_ids += 1;
         else if (sources.length === 1) {
-          if (sources[0] === 'leadbridge') singleSource.leadbridge_only += 1;
-          else if (sources[0] === 'openphone') singleSource.openphone_only += 1;
-          else if (sources[0] === 'zenbooker') singleSource.zenbooker_only += 1;
-          else if (sources[0] === 'sigcore') singleSource.sigcore_only += 1;
+          const key = `${sources[0]}_only`;
+          if (singleSource[key] != null) singleSource[key]++;
         } else {
           multiSource += 1;
         }
@@ -11022,7 +11027,7 @@ app.get('/api/identities/by-source', authenticateToken, async (req, res) => {
       if (data.length < pageSize) break;
       offset += pageSize;
     }
-    res.json({ multi_source: multiSource, single_source: singleSource, by_priority_source: byPriority });
+    res.json({ total, multi_source: multiSource, single_source: singleSource, by_priority_source: byPriority });
   } catch (error) {
     logger.error('[IdentityBySource]', error);
     res.status(500).json({ error: 'Failed to load source coverage' });
