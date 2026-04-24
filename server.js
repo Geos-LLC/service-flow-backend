@@ -37888,6 +37888,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       const providerCompany = (payload.provider?.company) || (payload.conversation?.provider?.company) || payload.company || payload.conversation?.company || null;
 
       let whParticipantMappingId = null;
+      let whParticipantIdentityId = null;
       let whParticipantPending = false;
       if (sig.participantId || sig.participantKey) {
         try {
@@ -37897,6 +37898,9 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
             provider: sig.provider || 'openphone',
           });
           if (mapping?.id) whParticipantMappingId = mapping.id;
+          // Direct identity FK — resolveParticipantMapping writes mapping.identity_id
+          // via linkMappingToIdentity when IDENTITY_RESOLVER_OPENPHONE is on.
+          if (mapping?.identity_id) whParticipantIdentityId = mapping.identity_id;
           handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, providerCompany).catch(() => {});
         } catch (e) { logger.warn(`[Webhook] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
@@ -37913,6 +37917,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         participant_name: contactName,
         company: providerCompany,
         participant_mapping_id: whParticipantMappingId,
+        participant_identity_id: whParticipantIdentityId,
         participant_pending: whParticipantPending,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
         last_event_at: payload.createdAt || new Date().toISOString(),
@@ -38269,6 +38274,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
 
       // PR4 — Resolve participant mapping (Case A/A' — identity available)
       let participantMappingId = null;
+      let participantIdentityId = null;
       let participantPending = false;
       if (sig.participantId || sig.participantKey) {
         try {
@@ -38278,6 +38284,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
             provider: sig.provider || 'openphone',
           });
           if (mapping?.id) participantMappingId = mapping.id;
+          if (mapping?.identity_id) participantIdentityId = mapping.identity_id;
           handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, sigcoreCompany).catch(() => {});
         } catch (e) { logger.warn(`[Sync] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
@@ -38315,6 +38322,10 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         } else if (!participantMappingId && participantPending && !found.participant_mapping_id && !found.participant_pending) {
           updates.participant_pending = true;
         }
+        // Phase F fix — populate direct identity FK. Never overwrite existing non-null value.
+        if (participantIdentityId && !found.participant_identity_id) {
+          updates.participant_identity_id = participantIdentityId;
+        }
         const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
         localConv = updated || found;
       } else {
@@ -38325,6 +38336,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           participant_phone: participantPhone, participant_name: contactName,
           company: sigcoreCompany,
           participant_mapping_id: participantMappingId,
+          participant_identity_id: participantIdentityId,
           participant_pending: participantPending,
           last_event_at: lastActivity, metadata: { phoneNumberId },
         }).select().single();
