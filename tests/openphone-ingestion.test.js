@@ -149,22 +149,40 @@ describe('shouldOpenPhoneCreateLead — LB-owned channels (recovery path)', () =
     expect(r.channel).toBe('yelp');
   });
 
-  test('Thumbtack + leadbridge_contact_id PRESENT → skip (LB owns it)', () => {
+  test('Thumbtack + sf_lead_id PRESENT → skip (early-return: identity_has_lead)', () => {
     const r = shouldOpenPhoneCreateLead({
-      identity: { id: 1, leadbridge_contact_id: 'LB-123' },
+      identity: { id: 1, leadbridge_contact_id: 'LB-123', sf_lead_id: 999 },
       canonicalSource: 'Thumbtack Tampa',
       participantName: 'Linda Mau',
     });
-    expect(r).toEqual(expect.objectContaining({ create: false, reason: 'lb_owned_already_ingested' }));
+    expect(r.create).toBe(false);
+    // Caught earlier by the `identity.sf_lead_id` short-circuit; the LB-owned
+    // branch never runs because we already have a lead — same effect.
+    expect(r.reason).toBe('identity_has_lead');
   });
 
-  test('Yelp + leadbridge_contact_id PRESENT → skip', () => {
+  test('Yelp + sf_lead_id PRESENT → skip', () => {
     const r = shouldOpenPhoneCreateLead({
-      identity: { id: 1, leadbridge_contact_id: 'LB-456' },
+      identity: { id: 1, leadbridge_contact_id: 'LB-456', sf_lead_id: 1000 },
       canonicalSource: 'Yelp Tampa',
       participantName: 'Linda Mau',
     });
     expect(r.create).toBe(false);
+  });
+
+  test('Thumbtack + leadbridge_contact_id PRESENT but sf_lead_id MISSING → recover', () => {
+    // LB ingested the contact but never produced an SF lead. The OP path must
+    // recover by creating the lead from the OP signal — otherwise the identity
+    // stays floating forever (observed in production: 6 such identities had
+    // their phone+name+Company complete but no lead because LB never created one).
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1, leadbridge_contact_id: 'LB-789', sf_lead_id: null },
+      canonicalSource: 'Thumbtack Miami',
+      participantName: 'Pramod Yadav',
+    });
+    expect(r.create).toBe(true);
+    expect(r.reason).toBe('lb_recovery');
+    expect(r.source).toBe('Thumbtack Miami');
   });
 });
 
@@ -248,13 +266,18 @@ describe('shouldOpenPhoneCreateLead — end-to-end example (Linda Mau scenarios)
     expect(r.note).toBe('openphone_lb_recovery');
   });
 
-  test('Scenario B: LB already ingested → OP skips', () => {
+  test('Scenario B: LB ingested contact but never created the lead → OP recovers', () => {
+    // Production-observed bug fix: LB sometimes stores leadbridge_contact_id
+    // without producing an SF lead. OP must recover instead of trusting LB
+    // to eventually do it. (Was previously expecting create=false; now
+    // correctly creates the lead via lb_recovery.)
     const r = shouldOpenPhoneCreateLead({
       identity: { id: 100, sf_lead_id: null, sf_customer_id: null, leadbridge_contact_id: 'LB-LINDA' },
       canonicalSource: 'Thumbtack Tampa',
       participantName: 'Linda Mau',
     });
-    expect(r.create).toBe(false);
+    expect(r.create).toBe(true);
+    expect(r.reason).toBe('lb_recovery');
   });
 
   test('Scenario C: LB created lead earlier, identity has sf_lead_id → OP skips', () => {
