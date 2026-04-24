@@ -11391,6 +11391,7 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
   try {
     const userId = req.user.userId;
     const status = req.query.status || 'open';
+    logger.log(`[ReconciliationFailuresCSV] user=${userId} status=${status} ua=${String(req.get('user-agent') || '').slice(0,80)}`);
 
     const { data: ambigs, error } = await supabase.from('communication_identity_ambiguities')
       .select('id, source, attempted_external_id, attempted_phone, attempted_name, candidate_identity_ids, reason, status, created_at')
