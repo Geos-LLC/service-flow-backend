@@ -50,6 +50,12 @@ const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
+const { classifyIdentity: aiClassifyIdentity } = require('./lib/identity-classifier');
+const OpenAI = require('openai').default || require('openai');
+const openaiClient = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+if (!openaiClient) console.warn('[AI] OPENAI_API_KEY not set — /api/identities/:id/classify disabled');
 const { runIntegrationSync, fillMissingAttribution, SOURCES: INTEGRATION_SOURCES } = require('./lib/integration-sync-orchestrator');
 const {
   validateResolveRequest, buildMergePatch, buildCreateFromAmbiguity, buildAmbiguityAuditPatch,
@@ -11272,7 +11278,7 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const category = ['floating', 'aggregator', 'noise'].includes(req.query.category) ? req.query.category : 'floating';
-    const selectCols = 'id, display_name, normalized_phone, normalized_name, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, created_at, updated_at';
+    const selectCols = 'id, display_name, normalized_phone, normalized_name, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, ai_category, ai_confidence, ai_summary, ai_classified_at, created_at, updated_at';
 
     // Exclude identities that are already candidates in an open ambiguity —
     // those appear in the reconciliation-failures queue and would otherwise
@@ -11506,6 +11512,87 @@ app.post('/api/identities/ambiguities/:id/resolve', authenticateToken, async (re
   } catch (error) {
     logger.error(`[AmbiguityResolve] ambig=${req.params.id} action=${req.body?.action} target=${req.body?.target_identity_id} err=${error?.message || error?.code || JSON.stringify(error)}`);
     res.status(500).json({ error: `Failed to resolve ambiguity: ${error?.message || error?.code || 'unknown'}` });
+  }
+});
+
+/**
+ * POST /api/identities/:id/classify
+ *
+ * Send the identity's recent conversation to OpenAI, get back
+ * { category, confidence, reason, summary }, persist on the identity row.
+ *
+ * Body: { auto_apply?: boolean }  // if true + category ∈ {ad, wrong_number} + conf>=90
+ *                                  // → mark identity ambiguous-status dropped
+ *                                  //   (informational fields only; no destructive action)
+ */
+app.post('/api/identities/:id/classify', authenticateToken, async (req, res) => {
+  try {
+    if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+    const userId = req.user.userId;
+    const identityId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(identityId)) return res.status(400).json({ error: 'invalid id' });
+
+    const verdict = await aiClassifyIdentity({
+      openai: openaiClient, supabase, userId, identityId,
+    });
+
+    // Persist on the identity row.
+    await supabase.from('communication_participant_identities')
+      .update({
+        ai_category: verdict.category,
+        ai_confidence: verdict.confidence,
+        ai_summary: verdict.summary,
+        ai_classified_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', identityId).eq('user_id', userId);
+
+    logger.log(`[AIClassify] user=${userId} identity=${identityId} → ${verdict.category} (${verdict.confidence}%) cost=$${verdict.cost_usd}`);
+    res.json(verdict);
+  } catch (error) {
+    logger.error(`[AIClassify] identity=${req.params.id} err=${error?.message || error?.code || JSON.stringify(error)}`);
+    res.status(500).json({ error: `Classify failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
+ * POST /api/identities/classify-batch
+ * Body: { ids: number[], max?: number }
+ * Runs classifier over up to `max` (default 50) identities in sequence, one at
+ * a time to keep costs predictable. Returns per-id results.
+ */
+app.post('/api/identities/classify-batch', authenticateToken, async (req, res) => {
+  try {
+    if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+    const userId = req.user.userId;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Number.isInteger) : [];
+    const max = Math.min(parseInt(req.body?.max, 10) || 50, 200);
+    const slice = ids.slice(0, max);
+    if (slice.length === 0) return res.json({ results: [], cost_usd: 0 });
+
+    const results = [];
+    let totalCost = 0;
+    for (const id of slice) {
+      try {
+        const v = await aiClassifyIdentity({ openai: openaiClient, supabase, userId, identityId: id });
+        await supabase.from('communication_participant_identities')
+          .update({
+            ai_category: v.category, ai_confidence: v.confidence,
+            ai_summary: v.summary, ai_classified_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', id).eq('user_id', userId);
+        totalCost += v.cost_usd;
+        results.push({ id, ...v });
+      } catch (e) {
+        results.push({ id, error: e?.message || String(e) });
+      }
+    }
+    logger.log(`[AIClassifyBatch] user=${userId} n=${slice.length} cost=$${totalCost.toFixed(4)}`);
+    res.json({ results, cost_usd: +totalCost.toFixed(5) });
+  } catch (error) {
+    logger.error(`[AIClassifyBatch] err=${error?.message || error?.code || JSON.stringify(error)}`);
+    res.status(500).json({ error: `Batch classify failed: ${error?.message || 'unknown'}` });
   }
 });
 
