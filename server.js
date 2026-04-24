@@ -11558,20 +11558,32 @@ app.post('/api/identities/:id/classify', authenticateToken, async (req, res) => 
 /**
  * POST /api/identities/classify-batch
  * Body: { ids: number[], max?: number }
- * Runs classifier over up to `max` (default 50) identities in sequence, one at
- * a time to keep costs predictable. Returns per-id results.
+ *
+ * Starts a background batch-classify job and returns immediately with
+ * { running: true, total }. Poll GET /api/identities/classify-batch/progress
+ * for incremental state. Work runs in-process with setImmediate — a restart
+ * loses the progress record, which is fine (each row is idempotent: already-
+ * classified rows can be re-classified safely).
  */
+const aiClassifyProgress = {}; // keyed by userId → { total, done, ok, errors, cost, running, started_at, finished_at }
 app.post('/api/identities/classify-batch', authenticateToken, async (req, res) => {
-  try {
-    if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
-    const userId = req.user.userId;
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Number.isInteger) : [];
-    const max = Math.min(parseInt(req.body?.max, 10) || 50, 200);
-    const slice = ids.slice(0, max);
-    if (slice.length === 0) return res.json({ results: [], cost_usd: 0 });
+  if (!openaiClient) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+  const userId = req.user.userId;
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Number.isInteger) : [];
+  const max = Math.min(parseInt(req.body?.max, 10) || 200, 500);
+  const slice = ids.slice(0, max);
+  if (slice.length === 0) return res.json({ running: false, total: 0 });
 
-    const results = [];
-    let totalCost = 0;
+  const cur = aiClassifyProgress[userId];
+  if (cur?.running) return res.status(409).json({ error: 'batch already running', progress: cur });
+
+  aiClassifyProgress[userId] = {
+    running: true, total: slice.length, done: 0, ok: 0, errors: 0, cost: 0,
+    started_at: new Date().toISOString(), finished_at: null, last_result: null,
+  };
+
+  setImmediate(async () => {
+    const p = aiClassifyProgress[userId];
     for (const id of slice) {
       try {
         const v = await aiClassifyIdentity({ openai: openaiClient, supabase, userId, identityId: id });
@@ -11582,18 +11594,30 @@ app.post('/api/identities/classify-batch', authenticateToken, async (req, res) =
             updated_at: new Date().toISOString(),
           })
           .eq('id', id).eq('user_id', userId);
-        totalCost += v.cost_usd;
-        results.push({ id, ...v });
+        p.cost += v.cost_usd; p.ok += 1;
+        p.last_result = { id, category: v.category, confidence: v.confidence };
       } catch (e) {
-        results.push({ id, error: e?.message || String(e) });
+        p.errors += 1;
+        p.last_result = { id, error: e?.message || String(e) };
+        logger.error(`[AIClassifyBatch] id=${id} err=${e?.message || e}`);
       }
+      p.done += 1;
     }
-    logger.log(`[AIClassifyBatch] user=${userId} n=${slice.length} cost=$${totalCost.toFixed(4)}`);
-    res.json({ results, cost_usd: +totalCost.toFixed(5) });
-  } catch (error) {
-    logger.error(`[AIClassifyBatch] err=${error?.message || error?.code || JSON.stringify(error)}`);
-    res.status(500).json({ error: `Batch classify failed: ${error?.message || 'unknown'}` });
-  }
+    p.running = false; p.finished_at = new Date().toISOString();
+    p.cost = +p.cost.toFixed(5);
+    logger.log(`[AIClassifyBatch] user=${userId} done=${p.done} ok=${p.ok} err=${p.errors} cost=$${p.cost}`);
+  });
+
+  res.json({ running: true, total: slice.length });
+});
+
+/**
+ * GET /api/identities/classify-batch/progress
+ * Returns current in-memory progress or null if none started this session.
+ */
+app.get('/api/identities/classify-batch/progress', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  res.json(aiClassifyProgress[userId] || null);
 });
 
 /**
