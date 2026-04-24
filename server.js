@@ -11134,9 +11134,21 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
     // Floating breakdown — split the raw "unresolved_floating + not sync" set
     // into three sub-buckets by name quality. The old 5-bucket classifier had
     // this distinction; we restore it at report time without a schema change.
+    // Identities that appear as candidates in an open ambiguity row are
+    // excluded from floating_named (to avoid double-listing; the ambiguity
+    // queue is the actionable surface for those).
+    const ambigCandidateIds = new Set();
+    {
+      const { data: ambigs } = await supabase.from('communication_identity_ambiguities')
+        .select('candidate_identity_ids').eq('user_id', userId).eq('status', 'open');
+      for (const a of (ambigs || [])) {
+        for (const id of (a.candidate_identity_ids || [])) ambigCandidateIds.add(id);
+      }
+    }
     let floatingNamedActionable = 0;
     let floatingAggregator = 0;
     let floatingNoise = 0;
+    let floatingNamedInQueue = 0;
     let offset = 0;
     while (true) {
       const { data } = await supabase.from('communication_participant_identities')
@@ -11149,6 +11161,7 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
       for (const row of data) {
         if (!row.normalized_name) floatingNoise++;
         else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) floatingAggregator++;
+        else if (ambigCandidateIds.has(row.id)) floatingNamedInQueue++;
         else floatingNamedActionable++;
       }
       if (data.length < 1000) break;
@@ -11174,6 +11187,7 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
         resolved_both: resolvedBoth,
         ambiguous,
         floating_named: floatingNamedActionable,
+        floating_named_in_queue: floatingNamedInQueue,
         floating_aggregator: floatingAggregator,
         floating_noise: floatingNoise,
         sync_only: syncOnly,
@@ -11255,6 +11269,19 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
     const category = ['floating', 'aggregator', 'noise'].includes(req.query.category) ? req.query.category : 'floating';
     const selectCols = 'id, display_name, normalized_phone, normalized_name, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, created_at, updated_at';
 
+    // Exclude identities that are already candidates in an open ambiguity —
+    // those appear in the reconciliation-failures queue and would otherwise
+    // double-list. Resolving the queue entry handles them.
+    const ambigCandidateIds = new Set();
+    if (category === 'floating') {
+      const { data: ambigs } = await supabase.from('communication_identity_ambiguities')
+        .select('candidate_identity_ids')
+        .eq('user_id', userId).eq('status', 'open');
+      for (const a of (ambigs || [])) {
+        for (const id of (a.candidate_identity_ids || [])) ambigCandidateIds.add(id);
+      }
+    }
+
     // In-memory filter by normalized_name quality — same logic as status endpoint
     // so the list matches the per-bucket count shown in the UI.
     const items = [];
@@ -11268,6 +11295,7 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
       if (error) throw error;
       if (!data || data.length === 0) break;
       for (const row of data) {
+        if (ambigCandidateIds.has(row.id)) continue;
         let rowCategory;
         if (!row.normalized_name) rowCategory = 'noise';
         else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) rowCategory = 'aggregator';
