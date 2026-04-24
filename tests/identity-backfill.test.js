@@ -146,7 +146,7 @@ function makeMockSupabase(seed = {}) {
 }
 
 describe('resolveIdentity — strict mode', () => {
-  test('strict rejects phone-only-no-conflict match (would be merged in runtime)', async () => {
+  test('strict rejects phone-only match when attempted has a name (would merge in runtime)', async () => {
     const sb = makeMockSupabase({
       identities: [{ id: 1, user_id: 2, normalized_phone: '2629305925', normalized_name: null }],
     });
@@ -163,6 +163,20 @@ describe('resolveIdentity — strict mode', () => {
     });
     expect(r2.status).toBe('matched');
     expect(r2.matchStep).toBe('phone_strong');
+  });
+
+  test('strict ADOPTS phone-only match when attempted has no name (no conflict possible)', async () => {
+    // Phone-only SMS comes in anonymously — nothing to strict-reject.
+    const sb = makeMockSupabase({
+      identities: [{ id: 100, user_id: 2, normalized_phone: '2629305925', normalized_name: 'linda mau', name_token_set: 'linda mau' }],
+    });
+    const r = await resolveIdentity(sb, {
+      userId: 2, source: 'openphone', strict: true,
+      phone: '+12629305925', displayName: null,
+    });
+    expect(r.status).toBe('matched');
+    expect(r.matchStep).toBe('phone_strong');
+    expect(r.identity.id).toBe(100);
   });
 
   test('strict rejects weak subset match (runtime would auto-merge with soft log)', async () => {
