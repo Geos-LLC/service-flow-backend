@@ -10524,13 +10524,14 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     //    (b) Unknown numbers with no contact record (expected — nothing to fix)
     // Deduped by participant_phone so a phone with multiple conversation rows
     // doesn't inflate the count — the fix is per-contact, not per-conversation.
+    // Include participant_identity_id so the UI can run AI classification on it.
     const namedByPhone = new Map();
     const unknownByPhone = new Map();
     {
       const pageSize = 1000; let from = 0;
       while (true) {
         const { data } = await supabase.from('communication_conversations')
-          .select('id, participant_phone, participant_name, last_event_at')
+          .select('id, participant_phone, participant_name, participant_identity_id, last_event_at')
           .eq('user_id', userId).eq('provider', 'openphone').is('company', null)
           .range(from, from + pageSize - 1).order('last_event_at', { ascending: false });
         if (!data?.length) break;
@@ -10545,6 +10546,26 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
     }
     const namedMissingCompany = Array.from(namedByPhone.values());
     const unknownContacts = Array.from(unknownByPhone.values());
+
+    // Hydrate AI verdicts from the linked identity (when present) so the UI
+    // can display them inline without a second fetch.
+    const neededIdentityIds = namedMissingCompany
+      .map(c => c.participant_identity_id).filter(Boolean);
+    if (neededIdentityIds.length > 0) {
+      const { data: identities } = await supabase.from('communication_participant_identities')
+        .select('id, ai_category, ai_confidence, ai_summary, ai_classified_at')
+        .eq('user_id', userId).in('id', neededIdentityIds);
+      const byId = {};
+      for (const i of (identities || [])) byId[i.id] = i;
+      for (const c of namedMissingCompany) {
+        const ai = c.participant_identity_id ? byId[c.participant_identity_id] : null;
+        if (ai) {
+          c.ai_category = ai.ai_category;
+          c.ai_confidence = ai.ai_confidence;
+          c.ai_summary = ai.ai_summary;
+        }
+      }
+    }
 
     // 3. Customers with a source that doesn't resolve to any canonical (raw value orphans)
     const resolve = await buildSourceResolver(userId);
