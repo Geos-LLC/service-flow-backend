@@ -11164,23 +11164,34 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
     ]);
 
     // Floating breakdown — split the raw "unresolved_floating + not sync" set
-    // into three sub-buckets by name quality. The old 5-bucket classifier had
-    // this distinction; we restore it at report time without a schema change.
-    // Identities that appear as candidates in an open ambiguity row are
-    // excluded from floating_named (to avoid double-listing; the ambiguity
-    // queue is the actionable surface for those).
+    // into three sub-buckets by name quality. Also excludes identities that
+    // are already surfaced in other actionable lists to avoid double-counting:
+    //   * identities that appear as candidates in an open ambiguity row
+    //   * identities that are linked to an OP conversation with missing Company
+    //     (those show up in the "OP contacts missing Company" list)
     const ambigCandidateIds = new Set();
+    const opMissingCompanyIds = new Set();
     {
-      const { data: ambigs } = await supabase.from('communication_identity_ambiguities')
-        .select('candidate_identity_ids').eq('user_id', userId).eq('status', 'open');
+      const [{ data: ambigs }, { data: opConvs }] = await Promise.all([
+        supabase.from('communication_identity_ambiguities')
+          .select('candidate_identity_ids').eq('user_id', userId).eq('status', 'open'),
+        supabase.from('communication_conversations')
+          .select('participant_identity_id')
+          .eq('user_id', userId).eq('provider', 'openphone').is('company', null)
+          .not('participant_name', 'is', null).not('participant_identity_id', 'is', null),
+      ]);
       for (const a of (ambigs || [])) {
         for (const id of (a.candidate_identity_ids || [])) ambigCandidateIds.add(id);
+      }
+      for (const c of (opConvs || [])) {
+        if (c.participant_identity_id) opMissingCompanyIds.add(c.participant_identity_id);
       }
     }
     let floatingNamedActionable = 0;
     let floatingAggregator = 0;
     let floatingNoise = 0;
     let floatingNamedInQueue = 0;
+    let floatingNamedInOpMissing = 0;
     let offset = 0;
     while (true) {
       const { data } = await supabase.from('communication_participant_identities')
@@ -11194,6 +11205,7 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
         if (!row.normalized_name) floatingNoise++;
         else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) floatingAggregator++;
         else if (ambigCandidateIds.has(row.id)) floatingNamedInQueue++;
+        else if (opMissingCompanyIds.has(row.id)) floatingNamedInOpMissing++;
         else floatingNamedActionable++;
       }
       if (data.length < 1000) break;
@@ -11220,6 +11232,7 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
         ambiguous,
         floating_named: floatingNamedActionable,
         floating_named_in_queue: floatingNamedInQueue,
+        floating_named_in_op_missing: floatingNamedInOpMissing,
         floating_aggregator: floatingAggregator,
         floating_noise: floatingNoise,
         sync_only: syncOnly,
@@ -11301,16 +11314,27 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
     const category = ['floating', 'aggregator', 'noise'].includes(req.query.category) ? req.query.category : 'floating';
     const selectCols = 'id, display_name, normalized_phone, normalized_name, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, ai_category, ai_confidence, ai_summary, ai_classified_at, created_at, updated_at';
 
-    // Exclude identities that are already candidates in an open ambiguity —
-    // those appear in the reconciliation-failures queue and would otherwise
-    // double-list. Resolving the queue entry handles them.
+    // Exclude identities that are already surfaced elsewhere to prevent the
+    // same person showing up in multiple "needs review" lists:
+    //   * candidates in an open ambiguity  → reconciliation failures queue
+    //   * linked to an OP conv missing Company → "OP contacts missing Company"
+    // For those, resolving the relevant list handles the identity too.
     const ambigCandidateIds = new Set();
+    const opMissingCompanyIds = new Set();
     if (category === 'floating') {
-      const { data: ambigs } = await supabase.from('communication_identity_ambiguities')
-        .select('candidate_identity_ids')
-        .eq('user_id', userId).eq('status', 'open');
+      const [{ data: ambigs }, { data: opConvs }] = await Promise.all([
+        supabase.from('communication_identity_ambiguities')
+          .select('candidate_identity_ids').eq('user_id', userId).eq('status', 'open'),
+        supabase.from('communication_conversations')
+          .select('participant_identity_id')
+          .eq('user_id', userId).eq('provider', 'openphone').is('company', null)
+          .not('participant_name', 'is', null).not('participant_identity_id', 'is', null),
+      ]);
       for (const a of (ambigs || [])) {
         for (const id of (a.candidate_identity_ids || [])) ambigCandidateIds.add(id);
+      }
+      for (const c of (opConvs || [])) {
+        if (c.participant_identity_id) opMissingCompanyIds.add(c.participant_identity_id);
       }
     }
 
@@ -11328,6 +11352,7 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
       if (!data || data.length === 0) break;
       for (const row of data) {
         if (ambigCandidateIds.has(row.id)) continue;
+        if (opMissingCompanyIds.has(row.id)) continue;
         let rowCategory;
         if (!row.normalized_name) rowCategory = 'noise';
         else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) rowCategory = 'aggregator';
