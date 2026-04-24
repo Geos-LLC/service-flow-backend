@@ -11046,12 +11046,25 @@ app.get('/api/integrations/status', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     // Connection state per source — derived from the respective config tables.
-    const [commSettings, zbSetting, lbSetting, openIssues] = await Promise.all([
-      supabase.from('communication_settings').select('openphone_connected, sigcore_last_sync_at, leadbridge_connected, leadbridge_connected_at').eq('user_id', userId).maybeSingle(),
-      supabase.from('users').select('zenbooker_api_key, zenbooker_last_sync_at').eq('id', userId).maybeSingle(),
-      supabase.from('communication_settings').select('leadbridge_connected, leadbridge_connected_at').eq('user_id', userId).maybeSingle(),
+    // last_synced_at lives in communication_provider_accounts (per provider, per phone).
+    const [commSettings, zbSetting, providerAccounts, openIssues] = await Promise.all([
+      supabase.from('communication_settings')
+        .select('openphone_connected, leadbridge_connected, leadbridge_connected_at, connected_at')
+        .eq('user_id', userId).maybeSingle(),
+      supabase.from('users').select('zenbooker_api_key, zenbooker_last_sync').eq('id', userId).maybeSingle(),
+      supabase.from('communication_provider_accounts').select('provider, last_synced_at').eq('user_id', userId),
       supabase.from('communication_identity_ambiguities').select('id', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'open'),
     ]);
+
+    // Reduce per-provider rows to the most recent last_synced_at.
+    const providerLastSync = {};
+    for (const r of (providerAccounts.data || [])) {
+      if (!r.last_synced_at) continue;
+      const cur = providerLastSync[r.provider];
+      if (!cur || new Date(r.last_synced_at) > new Date(cur)) {
+        providerLastSync[r.provider] = r.last_synced_at;
+      }
+    }
 
     const openphoneProgress = integrationSyncProgress[`${userId}:openphone`] || null;
     const zbProgress = integrationSyncProgress[`${userId}:zenbooker`] || null;
@@ -11061,17 +11074,17 @@ app.get('/api/integrations/status', authenticateToken, async (req, res) => {
       integrations: {
         openphone: {
           connected: !!commSettings.data?.openphone_connected,
-          last_sync_at: commSettings.data?.sigcore_last_sync_at || null,
+          last_sync_at: providerLastSync.openphone || commSettings.data?.connected_at || null,
           last_run: openphoneProgress,
         },
         leadbridge: {
-          connected: !!lbSetting.data?.leadbridge_connected,
-          connected_at: lbSetting.data?.leadbridge_connected_at || null,
+          connected: !!commSettings.data?.leadbridge_connected,
+          last_sync_at: providerLastSync.leadbridge || commSettings.data?.leadbridge_connected_at || null,
           last_run: lbProgress,
         },
         zenbooker: {
           connected: !!zbSetting.data?.zenbooker_api_key,
-          last_sync_at: zbSetting.data?.zenbooker_last_sync_at || null,
+          last_sync_at: zbSetting.data?.zenbooker_last_sync || null,
           last_run: zbProgress,
         },
       },
