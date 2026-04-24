@@ -11155,10 +11155,11 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
       offset += 1000;
     }
 
-    // Rollups — three user-facing buckets. Internal details remain in `details`
-    // for drill-down / debugging but should not be surfaced as primary counts.
+    // Rollups — three user-facing buckets over the identities table. Must sum
+    // to `total` (no double-count). The ambiguity *queue* count is reported
+    // separately (ambiguities_open) since those are queue rows, not identities.
     const connected = resolvedCustomer + resolvedLead + resolvedBoth;
-    const needReview = floatingNamedActionable + ambiguousOpen + ambiguous;
+    const needReview = floatingNamedActionable + ambiguous;
     const ignored = floatingAggregator + floatingNoise;
 
     res.json({
