@@ -168,6 +168,75 @@ describe('shouldOpenPhoneCreateLead — LB-owned channels (recovery path)', () =
   });
 });
 
+describe('shouldOpenPhoneCreateLead — age-window guard', () => {
+  const NOW = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+
+  test('no maxAgeDays → age check is a no-op', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+    });
+    expect(r.create).toBe(true);
+  });
+
+  test('maxAgeDays=30, event 15 days ago → create', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+      lastEventAt: new Date(NOW - 15 * DAY).toISOString(), maxAgeDays: 30,
+    });
+    expect(r.create).toBe(true);
+  });
+
+  test('maxAgeDays=30, event 60 days ago → out_of_age_window', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+      lastEventAt: new Date(NOW - 60 * DAY).toISOString(), maxAgeDays: 30,
+    });
+    expect(r).toEqual({ create: false, reason: 'out_of_age_window' });
+  });
+
+  test('missing lastEventAt with maxAgeDays set → out_of_age_window (safer default)', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+      maxAgeDays: 30,
+    });
+    expect(r).toEqual({ create: false, reason: 'out_of_age_window' });
+  });
+
+  test('unparseable lastEventAt → out_of_age_window', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+      lastEventAt: 'not-a-date', maxAgeDays: 30,
+    });
+    expect(r.reason).toBe('out_of_age_window');
+  });
+
+  test('age check runs AFTER name/source checks — noise wins on no-name', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: null,
+      lastEventAt: new Date(NOW - 60 * DAY).toISOString(), maxAgeDays: 30,
+    });
+    expect(r.reason).toBe('noise_no_name');
+  });
+
+  test('LB-recovery path is ALSO gated by age', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1, leadbridge_contact_id: null },
+      canonicalSource: 'Thumbtack Tampa', participantName: 'Linda Mau',
+      lastEventAt: new Date(NOW - 100 * DAY).toISOString(), maxAgeDays: 30,
+    });
+    expect(r.reason).toBe('out_of_age_window');
+  });
+
+  test('maxAgeDays=null → no-op (even if lastEventAt missing)', () => {
+    const r = shouldOpenPhoneCreateLead({
+      identity: { id: 1 }, canonicalSource: 'Google Tampa', participantName: 'Linda Mau',
+      lastEventAt: null, maxAgeDays: null,
+    });
+    expect(r.create).toBe(true);
+  });
+});
+
 describe('shouldOpenPhoneCreateLead — end-to-end example (Linda Mau scenarios)', () => {
   test('Scenario A: OpenPhone sees Thumbtack SMS first, LB lagging → recovery', () => {
     const r = shouldOpenPhoneCreateLead({

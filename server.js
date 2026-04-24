@@ -45,7 +45,7 @@ const {
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
-const { FLAGS, isEnabled } = require('./lib/feature-flags');
+const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
@@ -8300,27 +8300,64 @@ async function linkMappingToIdentity(tenantId, sigParticipant, mapping) {
  * No-op when OPENPHONE_CONDITIONAL_LEAD_CREATION flag is OFF.
  * Returns the created lead id on success, null otherwise.
  */
-async function maybeCreateLeadFromOpenPhone(userId, identity, { company, participantName }) {
+// Append one outcome row to the decisions table. Non-throwing; if the
+// write fails we still want the primary decision to stand.
+async function logOpDecision({ userId, identityId, outcome, reason, leadId, customerId, canonicalSource, company, lastEventAt }) {
+  try {
+    await supabase.from('communication_openphone_lead_decisions').insert({
+      user_id: userId,
+      identity_id: identityId || null,
+      outcome,
+      reason: reason || null,
+      lead_id: leadId || null,
+      customer_id: customerId || null,
+      canonical_source: canonicalSource || null,
+      company: company || null,
+      last_event_at: lastEventAt || null,
+    });
+  } catch (_) { /* non-fatal */ }
+}
+
+async function maybeCreateLeadFromOpenPhone(userId, identity, { company, participantName, lastEventAt }) {
   if (!isEnabled(FLAGS.OPENPHONE_CONDITIONAL_LEAD_CREATION)) return null;
   if (!identity) return null;
-  if (!company) return null;
+  if (!company) {
+    await logOpDecision({ userId, identityId: identity?.id, outcome: 'skipped_missing_company', reason: 'no_company_tag', lastEventAt });
+    return null;
+  }
 
-  // Look up canonical source via lead_source_mappings (provider='openphone').
   const { data: mappings } = await supabase.from('lead_source_mappings')
     .select('source_name').eq('user_id', userId).eq('provider', 'openphone')
     .ilike('raw_value', String(company).trim()).limit(1);
   const canonicalSource = mappings?.[0]?.source_name || null;
 
-  const decision = shouldOpenPhoneCreateLead({ identity, canonicalSource, participantName });
+  const maxAgeDays = getOpenPhoneLeadMaxAgeDays();
+  const decision = shouldOpenPhoneCreateLead({ identity, canonicalSource, participantName, lastEventAt, maxAgeDays });
+
+  // Map skip reasons to observability outcomes (when meaningful — the
+  // identity-already-has-lead/customer cases are silent by design).
+  const SKIP_OUTCOME_BY_REASON = {
+    no_canonical_source: 'skipped_missing_company',
+    out_of_age_window: 'skipped_out_of_age_window',
+    lb_owned_already_ingested: 'skipped_lb_owned_already_ingested',
+    identity_has_lead: 'skipped_identity_has_lead',
+    identity_has_customer: 'skipped_identity_has_customer',
+    aggregator_name: 'skipped_aggregator_name',
+    noise_no_name: 'skipped_noise_no_name',
+  };
+
   if (!decision.create) {
-    logger.log(`[OP] Skip lead create for identity ${identity.id}: ${decision.reason}`);
+    const outcome = SKIP_OUTCOME_BY_REASON[decision.reason] || null;
+    if (outcome) {
+      await logOpDecision({ userId, identityId: identity.id, outcome, reason: decision.reason, canonicalSource, company, lastEventAt });
+    }
+    logger.log(`[OP] Skip lead for identity ${identity.id}: ${decision.reason}`);
     return null;
   }
 
   // Pre-create CRM phone lookup — prevents creating a duplicate lead when
   // a customer (or lead) with the same phone already exists in SF but was
-  // never linked to this identity (common for manually-entered legacy rows).
-  // Customer precedence over lead.
+  // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
     await supabase.from('communication_participant_identities')
@@ -8330,7 +8367,12 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
         updated_at: new Date().toISOString(),
       })
       .eq('id', identity.id);
-    logger.log(`[OP] identity ${identity.id} linked_existing_customer_by_phone=${crmMatch.id} (no lead created)`);
+    await logOpDecision({
+      userId, identityId: identity.id,
+      outcome: 'linked_existing_customer_by_phone', reason: decision.reason,
+      customerId: crmMatch.id, canonicalSource, company, lastEventAt,
+    });
+    logger.log(`[OP] identity ${identity.id} linked_existing_customer_by_phone=${crmMatch.id}`);
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
@@ -8341,7 +8383,12 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
         updated_at: new Date().toISOString(),
       })
       .eq('id', identity.id);
-    logger.log(`[OP] identity ${identity.id} linked_existing_lead_by_phone=${crmMatch.id} (no lead created)`);
+    await logOpDecision({
+      userId, identityId: identity.id,
+      outcome: 'linked_existing_lead_by_phone', reason: decision.reason,
+      leadId: crmMatch.id, canonicalSource, company, lastEventAt,
+    });
+    logger.log(`[OP] identity ${identity.id} linked_existing_lead_by_phone=${crmMatch.id}`);
     return { action: 'linked_existing_lead_by_phone', lead_id: crmMatch.id };
   }
 
@@ -8379,6 +8426,13 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
     .eq('id', identity.id);
 
+  const outcome = decision.note === 'openphone_lb_recovery'
+    ? 'created_lead_openphone_lb_recovery'
+    : 'created_lead_openphone_direct';
+  await logOpDecision({
+    userId, identityId: identity.id, outcome, reason: decision.reason,
+    leadId: newLead.id, canonicalSource, company, lastEventAt,
+  });
   logger.log(`[OP] Created lead ${newLead.id} via ${decision.note} (${decision.source}) for identity ${identity.id}`);
   return { action: decision.note, lead_id: newLead.id };
 }
@@ -8389,7 +8443,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
  * No-op when either feature flag is off or mapping has no identity_id yet.
  * Non-throwing; webhook-safe to fire-and-forget.
  */
-async function handleOpenPhoneConditionalLeadCreation(userId, mapping, sigParticipant, company) {
+async function handleOpenPhoneConditionalLeadCreation(userId, mapping, sigParticipant, company, lastEventAt) {
   if (!isEnabled(FLAGS.OPENPHONE_CONDITIONAL_LEAD_CREATION)) return null;
   if (!mapping?.identity_id) return null;
   if (!company) return null;
@@ -8400,6 +8454,7 @@ async function handleOpenPhoneConditionalLeadCreation(userId, mapping, sigPartic
     return await maybeCreateLeadFromOpenPhone(userId, identity, {
       company,
       participantName: sigParticipant?.displayName || null,
+      lastEventAt: lastEventAt || null,
     });
   } catch (e) {
     logger.warn(`[OP] Conditional lead creation failed: ${e.message}`);
@@ -11133,6 +11188,41 @@ app.get('/api/identities/reconciliation-failures', authenticateToken, async (req
   } catch (error) {
     logger.error('[IdentityReconciliationFailures]', error);
     res.status(500).json({ error: 'Failed to load reconciliation failures' });
+  }
+});
+
+/**
+ * GET /api/identities/op-lead-outcomes
+ *
+ * Counts decisions from communication_openphone_lead_decisions for the
+ * authed tenant over the last 24h and last 7d, grouped by outcome.
+ * Drives the "OpenPhone lead creation — last 24h / 7d" dashboard card.
+ */
+app.get('/api/identities/op-lead-outcomes', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data, error } = await supabase.from('communication_openphone_lead_decisions')
+      .select('outcome, created_at')
+      .eq('user_id', userId)
+      .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+    if (error) throw error;
+    const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+    const last24h = {}; const last7d = {};
+    for (const r of (data || [])) {
+      const ts = new Date(r.created_at).getTime();
+      last7d[r.outcome] = (last7d[r.outcome] || 0) + 1;
+      if (ts >= cutoff24h) last24h[r.outcome] = (last24h[r.outcome] || 0) + 1;
+    }
+    const total24 = Object.values(last24h).reduce((a, b) => a + b, 0);
+    const total7 = Object.values(last7d).reduce((a, b) => a + b, 0);
+    const flagsOn = {
+      OPENPHONE_CONDITIONAL_LEAD_CREATION: isEnabled(FLAGS.OPENPHONE_CONDITIONAL_LEAD_CREATION),
+      max_age_days: getOpenPhoneLeadMaxAgeDays(),
+    };
+    res.json({ flagsOn, last24h, last7d, total24h: total24, total7d: total7 });
+  } catch (error) {
+    logger.error('[OpLeadOutcomes]', error);
+    res.status(500).json({ error: 'Failed to load outcomes' });
   }
 });
 
@@ -38071,7 +38161,8 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
           // Direct identity FK — resolveParticipantMapping writes mapping.identity_id
           // via linkMappingToIdentity when IDENTITY_RESOLVER_OPENPHONE is on.
           if (mapping?.identity_id) whParticipantIdentityId = mapping.identity_id;
-          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, providerCompany).catch(() => {});
+          const whLastEventAt = payload.createdAt || payload.occurredAt || payload.updatedAt || null;
+          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, providerCompany, whLastEventAt).catch(() => {});
         } catch (e) { logger.warn(`[Webhook] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
         whParticipantPending = true;
@@ -38455,7 +38546,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           });
           if (mapping?.id) participantMappingId = mapping.id;
           if (mapping?.identity_id) participantIdentityId = mapping.identity_id;
-          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, sigcoreCompany).catch(() => {});
+          handleOpenPhoneConditionalLeadCreation(userId, mapping, sig, sigcoreCompany, lastActivity).catch(() => {});
         } catch (e) { logger.warn(`[Sync] Participant resolve: ${e.message}`); }
       } else if (participantPhone) {
         // Case B — phone only, no identity yet. Do NOT create a mapping; mark pending.
