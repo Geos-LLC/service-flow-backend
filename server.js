@@ -49,6 +49,9 @@ const { FLAGS, isEnabled } = require('./lib/feature-flags');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
+const {
+  validateResolveRequest, buildMergePatch, buildCreateFromAmbiguity, buildAmbiguityAuditPatch,
+} = require('./lib/ambiguity-resolver');
 
 // Thin shim so callers don't have to pass supabase every time.
 async function updateJobStatus(args) {
@@ -11100,6 +11103,138 @@ app.get('/api/identities/reconciliation-failures', authenticateToken, async (req
   } catch (error) {
     logger.error('[IdentityReconciliationFailures]', error);
     res.status(500).json({ error: 'Failed to load reconciliation failures' });
+  }
+});
+
+/**
+ * GET /api/identities/ambiguities/:id/candidates
+ *
+ * Full payload for a single ambiguity's resolution UI:
+ *   ambiguity     — the row itself
+ *   candidates    — each candidate identity + its linked lead/customer +
+ *                   source coverage + 3 most recent conversations
+ */
+app.get('/api/identities/ambiguities/:id/candidates', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const ambigId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(ambigId)) return res.status(400).json({ error: 'invalid ambiguity id' });
+
+    const { data: ambiguity, error: ambigErr } = await supabase.from('communication_identity_ambiguities')
+      .select('*').eq('id', ambigId).eq('user_id', userId).maybeSingle();
+    if (ambigErr) throw ambigErr;
+    if (!ambiguity) return res.status(404).json({ error: 'ambiguity not found' });
+
+    const candidateIds = Array.isArray(ambiguity.candidate_identity_ids) ? ambiguity.candidate_identity_ids : [];
+    let candidates = [];
+    if (candidateIds.length > 0) {
+      const { data: rows } = await supabase.from('communication_participant_identities')
+        .select('*').eq('user_id', userId).in('id', candidateIds);
+      candidates = rows || [];
+    }
+
+    // Enrich each candidate with its linked lead/customer + recent conversations.
+    const leadIds = candidates.map(c => c.sf_lead_id).filter(Boolean);
+    const customerIds = candidates.map(c => c.sf_customer_id).filter(Boolean);
+    const [leads, customers] = await Promise.all([
+      leadIds.length ? supabase.from('leads').select('id, first_name, last_name, phone, email, source, stage_id').in('id', leadIds) : Promise.resolve({ data: [] }),
+      customerIds.length ? supabase.from('customers').select('id, first_name, last_name, phone, email, zenbooker_id').in('id', customerIds) : Promise.resolve({ data: [] }),
+    ]);
+    const leadsById = {}; for (const l of (leads.data || [])) leadsById[l.id] = l;
+    const customersById = {}; for (const c of (customers.data || [])) customersById[c.id] = c;
+
+    // Recent conversations per candidate (3 latest by last_event_at).
+    const convsByIdentity = {};
+    if (candidates.length > 0) {
+      const { data: convs } = await supabase.from('communication_conversations')
+        .select('id, participant_identity_id, provider, channel, last_preview, last_event_at, participant_name')
+        .eq('user_id', userId).in('participant_identity_id', candidates.map(c => c.id))
+        .order('last_event_at', { ascending: false }).limit(60);
+      for (const c of (convs || [])) {
+        const k = c.participant_identity_id;
+        if (!convsByIdentity[k]) convsByIdentity[k] = [];
+        if (convsByIdentity[k].length < 3) convsByIdentity[k].push(c);
+      }
+    }
+
+    const enriched = candidates.map(c => ({
+      ...c,
+      sources: classifyIdentitySource(c).sources,
+      lead: c.sf_lead_id ? leadsById[c.sf_lead_id] || null : null,
+      customer: c.sf_customer_id ? customersById[c.sf_customer_id] || null : null,
+      recent_conversations: convsByIdentity[c.id] || [],
+    }));
+
+    res.json({ ambiguity, candidates: enriched });
+  } catch (error) {
+    logger.error('[AmbiguityCandidates]', error);
+    res.status(500).json({ error: 'Failed to load ambiguity candidates' });
+  }
+});
+
+/**
+ * POST /api/identities/ambiguities/:id/resolve
+ *
+ * Body: { action: 'merge_into'|'create_new'|'abandon', target_identity_id?: number }
+ *
+ *   merge_into  — fill nulls on target identity from attempted_* fields,
+ *                 add source-specific external ID if missing, tag manual.
+ *                 Target must be in ambiguity.candidate_identity_ids.
+ *   create_new  — create a new identity from attempted data, status=manual.
+ *   abandon     — mark ambiguity abandoned, no identity change.
+ *
+ * Never creates a lead/customer. All actions write audit fields back to
+ * communication_identity_ambiguities (resolved_at, resolved_by, resolved_identity_id).
+ */
+app.post('/api/identities/ambiguities/:id/resolve', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const ambigId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(ambigId)) return res.status(400).json({ error: 'invalid ambiguity id' });
+
+    const { data: ambiguity, error: ambigErr } = await supabase.from('communication_identity_ambiguities')
+      .select('*').eq('id', ambigId).eq('user_id', userId).maybeSingle();
+    if (ambigErr) throw ambigErr;
+    try { validateResolveRequest(ambiguity, req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const action = req.body.action;
+    let resolvedIdentityId = null;
+
+    if (action === 'merge_into') {
+      const targetId = req.body.target_identity_id;
+      const { data: target, error: tErr } = await supabase.from('communication_participant_identities')
+        .select('*').eq('id', targetId).eq('user_id', userId).maybeSingle();
+      if (tErr) throw tErr;
+      if (!target) return res.status(400).json({ error: 'target identity not found or not owned by this user' });
+
+      const patch = buildMergePatch(target, ambiguity);
+      if (patch) {
+        const { error: uErr } = await supabase.from('communication_participant_identities')
+          .update(patch).eq('id', target.id);
+        if (uErr) throw uErr;
+      }
+      resolvedIdentityId = target.id;
+    } else if (action === 'create_new') {
+      const row = buildCreateFromAmbiguity(ambiguity);
+      if (!row) return res.status(400).json({ error: 'ambiguity has no source signals to create from' });
+      const { data: created, error: cErr } = await supabase.from('communication_participant_identities')
+        .insert(row).select().single();
+      if (cErr) throw cErr;
+      resolvedIdentityId = created.id;
+    }
+    // abandon — no identity action
+
+    const auditPatch = buildAmbiguityAuditPatch({ action, resolvedBy: userId, resolvedIdentityId });
+    const { error: aErr } = await supabase.from('communication_identity_ambiguities')
+      .update(auditPatch).eq('id', ambigId);
+    if (aErr) throw aErr;
+
+    logger.log(`[AmbiguityResolve] user=${userId} ambig=${ambigId} action=${action} identity=${resolvedIdentityId}`);
+    res.json({ ok: true, action, resolved_identity_id: resolvedIdentityId });
+  } catch (error) {
+    logger.error('[AmbiguityResolve]', error);
+    res.status(500).json({ error: 'Failed to resolve ambiguity' });
   }
 });
 
