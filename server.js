@@ -10920,20 +10920,44 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
     };
     const [
       total, resolvedCustomer, resolvedLead, resolvedBoth, ambiguous,
-      floatingTrue, syncOnly, ambiguousOpen,
+      syncOnly, ambiguousOpen,
     ] = await Promise.all([
       countIdentities(),
       countIdentities(q => q.eq('status', 'resolved_customer')),
       countIdentities(q => q.eq('status', 'resolved_lead')),
       countIdentities(q => q.eq('status', 'resolved_both')),
       countIdentities(q => q.eq('status', 'ambiguous')),
-      countIdentities(q => q.eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')),
       countIdentities(q => q.eq('identity_priority_source', 'sync')),
       supabase.from('communication_identity_ambiguities')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', userId).eq('status', 'open')
         .then(r => r.count || 0),
     ]);
+
+    // Floating breakdown — split the raw "unresolved_floating + not sync" set
+    // into three sub-buckets by name quality. The old 5-bucket classifier had
+    // this distinction; we restore it at report time without a schema change.
+    let floatingNamedActionable = 0;
+    let floatingAggregator = 0;
+    let floatingNoise = 0;
+    let offset = 0;
+    while (true) {
+      const { data } = await supabase.from('communication_participant_identities')
+        .select('id, normalized_name')
+        .eq('user_id', userId)
+        .eq('status', 'unresolved_floating')
+        .neq('identity_priority_source', 'sync')
+        .range(offset, offset + 999);
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        if (!row.normalized_name) floatingNoise++;
+        else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) floatingAggregator++;
+        else floatingNamedActionable++;
+      }
+      if (data.length < 1000) break;
+      offset += 1000;
+    }
+
     res.json({
       total,
       crm_linked: {
@@ -10942,7 +10966,9 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
         resolved_both: resolvedBoth,
       },
       ambiguous,
-      unresolved_floating_true: floatingTrue,
+      unresolved_floating_true: floatingNamedActionable,
+      floating_aggregator: floatingAggregator,
+      floating_noise: floatingNoise,
       sync_only: syncOnly,
       ambiguities_open: ambiguousOpen,
     });
@@ -11004,23 +11030,44 @@ app.get('/api/identities/by-source', authenticateToken, async (req, res) => {
 });
 
 /**
- * GET /api/identities/unresolved?limit=50
+ * GET /api/identities/unresolved?limit=50&category=floating|aggregator|noise
  *
- * Paginated floating identities (excluding sync-only) for operator review.
- * Returns display_name, phone, email, and all source signals attached.
+ * Paginated identities in the specified floating sub-bucket.
+ *   floating (default) — named real-person candidates (actionable)
+ *   aggregator         — platform alias (Thumbtack/Yelp/etc — intentional skip)
+ *   noise              — unnamed phone (unsaved callers — intentional skip)
  */
 app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
-    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-    const { data, error } = await supabase.from('communication_participant_identities')
-      .select('id, display_name, normalized_phone, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, created_at, updated_at')
-      .eq('user_id', userId).eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')
-      .order('updated_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-    if (error) throw error;
-    res.json({ items: data || [], limit, offset });
+    const category = ['floating', 'aggregator', 'noise'].includes(req.query.category) ? req.query.category : 'floating';
+    const selectCols = 'id, display_name, normalized_phone, normalized_name, email, leadbridge_contact_id, openphone_contact_id, sigcore_participant_id, zenbooker_customer_id, thumbtack_profile_id, yelp_profile_id, identity_priority_source, created_at, updated_at';
+
+    // In-memory filter by normalized_name quality — same logic as status endpoint
+    // so the list matches the per-bucket count shown in the UI.
+    const items = [];
+    let offset = 0;
+    while (items.length < limit) {
+      const { data, error } = await supabase.from('communication_participant_identities')
+        .select(selectCols)
+        .eq('user_id', userId).eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')
+        .order('updated_at', { ascending: false })
+        .range(offset, offset + 199);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        let rowCategory;
+        if (!row.normalized_name) rowCategory = 'noise';
+        else if (AGGREGATOR_NAME_RE.test(row.normalized_name)) rowCategory = 'aggregator';
+        else rowCategory = 'floating';
+        if (rowCategory === category) items.push(row);
+        if (items.length >= limit) break;
+      }
+      if (data.length < 200) break;
+      offset += 200;
+    }
+    res.json({ items, limit, category });
   } catch (error) {
     logger.error('[IdentityUnresolved]', error);
     res.status(500).json({ error: 'Failed to load unresolved identities' });
