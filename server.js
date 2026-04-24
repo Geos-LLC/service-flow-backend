@@ -11716,6 +11716,74 @@ app.post('/api/identities/ambiguities/:id/resolve', authenticateToken, async (re
 });
 
 /**
+ * POST /api/identities/recreate-leads-from-op
+ *
+ * Manual backfill: for each unresolved_floating identity with no SF lead,
+ * find its most recent OP conversation that has a Company tag and re-run
+ * maybeCreateLeadFromOpenPhone. Used after the LB-recovery fix to clear
+ * stuck identities that LB ingested as contacts but never created leads for.
+ *
+ * Body (optional): { identity_ids: number[] } — limit to specific ids.
+ * Otherwise scans all eligible.
+ */
+app.post('/api/identities/recreate-leads-from-op', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const explicitIds = Array.isArray(req.body?.identity_ids)
+      ? req.body.identity_ids.filter(Number.isInteger)
+      : null;
+
+    // Pull eligible identities — floating, no lead, no customer (real-name only,
+    // since aggregator/noise are correctly skipped by the helper anyway).
+    let q = supabase.from('communication_participant_identities')
+      .select('id, display_name, normalized_phone, sf_lead_id, sf_customer_id, leadbridge_contact_id')
+      .eq('user_id', userId)
+      .eq('status', 'unresolved_floating')
+      .is('sf_lead_id', null).is('sf_customer_id', null);
+    if (explicitIds && explicitIds.length > 0) q = q.in('id', explicitIds);
+    const { data: identities } = await q.limit(500);
+
+    const summary = { scanned: 0, created: 0, skipped: 0, by_reason: {} };
+
+    for (const identity of (identities || [])) {
+      summary.scanned++;
+      // Find the most recent OP conversation for this identity that has a Company tag.
+      const { data: convs } = await supabase.from('communication_conversations')
+        .select('participant_name, company, last_event_at')
+        .eq('user_id', userId).eq('provider', 'openphone')
+        .eq('participant_identity_id', identity.id)
+        .not('company', 'is', null)
+        .order('last_event_at', { ascending: false })
+        .limit(1);
+      const conv = convs?.[0];
+      if (!conv) {
+        summary.skipped++;
+        summary.by_reason.no_op_conv_with_company = (summary.by_reason.no_op_conv_with_company || 0) + 1;
+        continue;
+      }
+      const result = await maybeCreateLeadFromOpenPhone(userId, identity, {
+        company: conv.company,
+        participantName: conv.participant_name || identity.display_name,
+        lastEventAt: conv.last_event_at,
+      });
+      if (result?.lead?.id) {
+        summary.created++;
+      } else {
+        summary.skipped++;
+        const reason = result?.reason || 'unknown';
+        summary.by_reason[reason] = (summary.by_reason[reason] || 0) + 1;
+      }
+    }
+
+    logger.log(`[RecreateOpLeads] user=${userId} scanned=${summary.scanned} created=${summary.created} skipped=${summary.skipped}`);
+    res.json(summary);
+  } catch (error) {
+    logger.error(`[RecreateOpLeads] err=${error?.message || error}`);
+    res.status(500).json({ error: `Recreate failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
  * POST /api/identities/:id/classify
  *
  * Send the identity's recent conversation to OpenAI, get back
