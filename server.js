@@ -11423,6 +11423,36 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
     const custById = {}; for (const c of (customers || [])) custById[c.id] = c;
     const leadById = {}; for (const l of (leads || [])) leadById[l.id] = l;
 
+    // Recent conversations per candidate (last 3 across all their conversations).
+    // Also last 3 messages (body text) from those conversations so the operator
+    // can see what the candidate actually discussed, right in the CSV row.
+    const convsByCand = {};
+    const messagesByCand = {};
+    if (candIds.length > 0) {
+      const { data: convs } = await supabase.from('communication_conversations')
+        .select('id, participant_identity_id, channel, last_preview, last_event_at')
+        .eq('user_id', userId).in('participant_identity_id', candIds)
+        .order('last_event_at', { ascending: false }).limit(candIds.length * 3);
+      for (const c of (convs || [])) {
+        const k = c.participant_identity_id;
+        if (!convsByCand[k]) convsByCand[k] = [];
+        if (convsByCand[k].length < 3) convsByCand[k].push(c);
+      }
+      const allConvIds = (convs || []).map(c => c.id);
+      if (allConvIds.length > 0) {
+        const { data: msgs } = await supabase.from('communication_messages')
+          .select('conversation_id, direction, body, body_text, created_at')
+          .in('conversation_id', allConvIds)
+          .order('created_at', { ascending: false }).limit(allConvIds.length * 2);
+        const convToCand = {}; for (const c of (convs || [])) convToCand[c.id] = c.participant_identity_id;
+        for (const m of (msgs || [])) {
+          const k = convToCand[m.conversation_id]; if (!k) continue;
+          if (!messagesByCand[k]) messagesByCand[k] = [];
+          if (messagesByCand[k].length < 3) messagesByCand[k].push(m);
+        }
+      }
+    }
+
     const sourceFlagsOf = (c) => {
       const s = [];
       if (c.openphone_contact_id || c.sigcore_participant_id || c.sigcore_participant_key) s.push('openphone');
@@ -11443,17 +11473,25 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
       'candidate_status', 'candidate_priority_source', 'candidate_sources',
       'candidate_customer_id', 'candidate_customer_name', 'candidate_customer_phone',
       'candidate_lead_id', 'candidate_lead_name', 'candidate_lead_source',
+      'recent_conversations', 'recent_messages',
       'created_at',
     ];
     const lines = [HEADERS.map(esc).join(',')];
 
+    const fmtConv = c => `${(c.last_event_at || '').slice(0, 10)} · ${c.channel || '?'} · ${(c.last_preview || '(empty)').replace(/\s+/g, ' ').slice(0, 80)}`;
+    const fmtMsg = m => {
+      const dir = (m.direction === 'in' || m.direction === 'inbound') ? 'THEM'
+        : (m.direction === 'out' || m.direction === 'outbound') ? 'US' : '?';
+      const txt = (m.body_text || m.body || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      return `[${dir}] ${txt}`;
+    };
+
     for (const a of (ambigs || [])) {
       const candIds = a.candidate_identity_ids || [];
       if (candIds.length === 0) {
-        // Emit a row with empty candidate columns so these still export.
         lines.push([
           a.id, a.reason, a.source, a.attempted_name, a.attempted_phone, a.attempted_external_id,
-          '', '', '', '', '', '', '', '', '', '', '', '', '', a.created_at,
+          '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', a.created_at,
         ].map(esc).join(','));
         continue;
       }
@@ -11461,12 +11499,15 @@ app.get('/api/identities/reconciliation-failures/export.csv', authenticateToken,
         const c = candsById[cid] || {};
         const cust = c.sf_customer_id ? custById[c.sf_customer_id] : null;
         const lead = c.sf_lead_id ? leadById[c.sf_lead_id] : null;
+        const convs = (convsByCand[cid] || []).map(fmtConv).join(' | ');
+        const msgs = (messagesByCand[cid] || []).map(fmtMsg).join(' | ');
         lines.push([
           a.id, a.reason, a.source, a.attempted_name, a.attempted_phone, a.attempted_external_id,
           cid, c.display_name || '', c.normalized_phone || '', c.email || '',
           c.status || '', c.identity_priority_source || '', sourceFlagsOf(c),
           cust?.id || '', nameJoin(cust), cust?.phone || '',
           lead?.id || '', nameJoin(lead), lead?.source || '',
+          convs, msgs,
           a.created_at,
         ].map(esc).join(','));
       }
