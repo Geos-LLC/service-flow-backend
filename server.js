@@ -11504,8 +11504,8 @@ app.post('/api/identities/ambiguities/:id/resolve', authenticateToken, async (re
     logger.log(`[AmbiguityResolve] user=${userId} ambig=${ambigId} action=${action} identity=${resolvedIdentityId}`);
     res.json({ ok: true, action, resolved_identity_id: resolvedIdentityId });
   } catch (error) {
-    logger.error('[AmbiguityResolve]', error);
-    res.status(500).json({ error: 'Failed to resolve ambiguity' });
+    logger.error(`[AmbiguityResolve] ambig=${req.params.id} action=${req.body?.action} target=${req.body?.target_identity_id} err=${error?.message || error?.code || JSON.stringify(error)}`);
+    res.status(500).json({ error: `Failed to resolve ambiguity: ${error?.message || error?.code || 'unknown'}` });
   }
 });
 

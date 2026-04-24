@@ -63,7 +63,8 @@ describe('buildMergePatch — fill nulls only, never overwrite', () => {
     expect(patch.openphone_contact_id).toBe('OP-123');
     expect(patch.normalized_phone).toBeUndefined(); // target already has
     expect(patch.display_name).toBeUndefined(); // target already has
-    expect(patch.status).toBe('manual');
+    expect(patch.identity_priority_source).toBe('manual');
+    expect(patch.status).toBeUndefined(); // status is a constrained enum — manual flag lives on priority_source
   });
   test('does NOT overwrite existing external ID', () => {
     const target = { id: 500, openphone_contact_id: 'OP-EXISTING' };
@@ -87,15 +88,15 @@ describe('buildMergePatch — fill nulls only, never overwrite', () => {
     expect(patch.display_name).toBe('Linda Mau');
     expect(patch.normalized_name).toBe('linda mau');
   });
-  test('sticky manual tag always set', () => {
-    const target = { id: 500, status: 'resolved_lead', openphone_contact_id: 'X', normalized_phone: 'Y', display_name: 'Z', normalized_name: 'z' };
+  test('sticky manual tag always set on identity_priority_source', () => {
+    const target = { id: 500, status: 'resolved_lead', identity_priority_source: 'openphone', openphone_contact_id: 'X', normalized_phone: 'Y', display_name: 'Z', normalized_name: 'z' };
     const patch = buildMergePatch(target, mkAmbig());
-    // Nothing to fill but status still flips to manual.
-    expect(patch?.status).toBe('manual');
+    // Nothing to fill but priority_source still flips to manual.
+    expect(patch?.identity_priority_source).toBe('manual');
   });
-  test('no-op if everything already populated and status already manual', () => {
+  test('no-op if everything already populated and priority_source already manual', () => {
     const target = {
-      id: 500, status: 'manual',
+      id: 500, status: 'resolved_lead', identity_priority_source: 'manual',
       openphone_contact_id: 'OP-EXT',
       normalized_phone: '2629305925', display_name: 'Linda Mau', normalized_name: 'linda mau',
     };
@@ -109,13 +110,13 @@ describe('buildCreateFromAmbiguity — new identity from attempted data', () => 
     expect(row.openphone_contact_id).toBe('OP-42');
     expect(row.normalized_phone).toBe('2629305925');
     expect(row.display_name).toBe('Linda Mau');
-    expect(row.status).toBe('manual');
-    expect(row.identity_priority_source).toBe('openphone');
+    expect(row.status).toBe('unresolved_floating'); // valid enum value; sticky flag is on priority_source
+    expect(row.identity_priority_source).toBe('manual');
     expect(row.source_confidence).toBe('manual');
   });
-  test('zenbooker source → priority tag "sync"', () => {
+  test('zenbooker source also gets manual priority (operator-created)', () => {
     const row = buildCreateFromAmbiguity(mkAmbig({ source: 'zenbooker', attempted_external_id: 'ZB-1' }));
-    expect(row.identity_priority_source).toBe('sync');
+    expect(row.identity_priority_source).toBe('manual');
     expect(row.zenbooker_customer_id).toBe('ZB-1');
   });
   test('returns null when no source signals at all', () => {
