@@ -11768,6 +11768,84 @@ async function recreateOpLeadsForUser(userId, { identityIds = null, limit = 500 
 }
 
 /**
+ * PATCH /api/op-contacts/set-company
+ * Body: { phone: string, company: string }
+ *
+ * Sets `company` on every OP conversation for this phone, then runs the
+ * source-fill step so customer/lead `source` is populated from the
+ * lead_source_mappings table. Lets the operator triage OP-missing-Company
+ * contacts directly in SF without bouncing into OpenPhone for each.
+ *
+ * The OP system itself stays unchanged — we don't push back to OP's
+ * contact API today. Operator should still tag in OpenPhone for future
+ * inbound messages, but attribution in SF is fixed immediately.
+ */
+app.patch('/api/op-contacts/set-company', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const phone = String(req.body?.phone || '').trim();
+    const company = String(req.body?.company || '').trim();
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+    if (!company) return res.status(400).json({ error: 'company is required' });
+
+    const last10 = phone.replace(/\D/g, '').slice(-10);
+    const { data: updated, error } = await supabase.from('communication_conversations')
+      .update({ company, updated_at: new Date().toISOString() })
+      .eq('user_id', userId).eq('provider', 'openphone')
+      .or(`participant_phone.eq.+1${last10},participant_phone.eq.${last10},participant_phone.ilike.%${last10}`)
+      .select('id');
+    if (error) throw error;
+
+    const sourceFill = await fillMissingAttribution(supabase, userId, { logger });
+    logger.log(`[SetCompany] user=${userId} phone=${last10} company="${company}" convs=${updated?.length || 0}`);
+    res.json({
+      conversations_updated: updated?.length || 0,
+      company_applied: company,
+      source_fill: sourceFill,
+    });
+  } catch (error) {
+    logger.error(`[SetCompany] err=${error?.message || error}`);
+    res.status(500).json({ error: `Set company failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
+ * POST /api/op-contacts/bulk-set-company
+ * Body: { items: [{ phone, company }, ...] }
+ */
+app.post('/api/op-contacts/bulk-set-company', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (items.length === 0) return res.json({ updated_count: 0, errors: 0 });
+    let updatedCount = 0, errors = 0;
+    for (const it of items) {
+      const phone = String(it?.phone || '').trim();
+      const company = String(it?.company || '').trim();
+      if (!phone || !company) { errors++; continue; }
+      const last10 = phone.replace(/\D/g, '').slice(-10);
+      try {
+        const { data: updated } = await supabase.from('communication_conversations')
+          .update({ company, updated_at: new Date().toISOString() })
+          .eq('user_id', userId).eq('provider', 'openphone')
+          .or(`participant_phone.eq.+1${last10},participant_phone.eq.${last10},participant_phone.ilike.%${last10}`)
+          .select('id');
+        updatedCount += (updated?.length || 0);
+      } catch (e) {
+        errors++;
+        logger.error(`[BulkSetCompany] phone=${last10} err=${e?.message || e}`);
+      }
+    }
+    const sourceFill = await fillMissingAttribution(supabase, userId, { logger });
+    logger.log(`[BulkSetCompany] user=${userId} items=${items.length} updated=${updatedCount} errors=${errors}`);
+    res.json({ updated_count: updatedCount, errors, source_fill: sourceFill });
+  } catch (error) {
+    logger.error(`[BulkSetCompany] err=${error?.message || error}`);
+    res.status(500).json({ error: `Bulk set failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
  * POST /api/identities/recreate-leads-from-op
  *
  * Manual trigger for the same recovery pass that runs as part of every
