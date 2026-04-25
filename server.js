@@ -24115,8 +24115,28 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     });
     revenueJobsList.sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
-    // Fetch customer names for jobs
-    const allCustomerIds = [...new Set((allJobs || []).map(j => j.customer_id).filter(Boolean))];
+    // Out-of-period job hydration.
+    // Some ledger entries reference a job whose scheduled_date is OUTSIDE the current
+    // pay period — e.g. a tip/incentive bumped from a closed period to today (see
+    // rebuildJobLedger step 5). The breakdown row needs the original job's date and
+    // customer to be useful, so fetch any missing jobs by id.
+    const ledgerJobIds = [...new Set((ledgerEntries || []).map(e => e.job_id).filter(Boolean))];
+    const missingJobIds = ledgerJobIds.filter(jid => !allJobsById[jid]);
+    if (missingJobIds.length > 0) {
+      for (let i = 0; i < missingJobIds.length; i += 100) {
+        const chunk = missingJobIds.slice(i, i + 100);
+        const { data: extraJobs } = await supabase.from('jobs')
+          .select('id, scheduled_date, service_price, price, total, total_amount, invoice_amount, taxes, discount, additional_fees, fees_breakdown, status, service_name, customer_id, team_member_id, hours_worked, duration, estimated_duration, start_time, end_time')
+          .in('id', chunk);
+        (extraJobs || []).forEach(j => { allJobsById[j.id] = j; });
+      }
+    }
+
+    // Fetch customer names for jobs (including the hydrated out-of-period ones)
+    const allCustomerIds = [...new Set([
+      ...((allJobs || []).map(j => j.customer_id).filter(Boolean)),
+      ...missingJobIds.map(jid => allJobsById[jid]?.customer_id).filter(Boolean),
+    ])];
     const globalCustomerMap = {};
     if (allCustomerIds.length > 0) {
       for (let i = 0; i < allCustomerIds.length; i += 100) {
