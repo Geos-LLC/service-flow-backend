@@ -36300,12 +36300,14 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   }
 
-  // Cash collected: if job was paid cash, cleaner collected the money — create negative offset
+  // Cash collected: if job was paid cash, cleaner collected the money — create negative offset.
+  // Use ilike() to match 'cash' case-insensitively — ZB sometimes returns 'Cash' (capital C)
+  // via custom_payment_method_name, and a strict eq() would silently miss those rows.
   const { data: cashTxs } = await supabase.from('transactions')
     .select('amount, payment_method')
     .eq('job_id', jobId)
     .eq('status', 'completed')
-    .eq('payment_method', 'cash');
+    .ilike('payment_method', 'cash');
   if (cashTxs && cashTxs.length > 0) {
     const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
     if (totalCash > 0) {
@@ -36579,6 +36581,36 @@ async function rebuildJobLedger(jobId, userId, { types = ['earning', 'tip', 'inc
     }
     if (reattached > 0) {
       console.log(`Ledger: Re-attached ${reattached} rebuilt entries for job ${jobId} to prior batch(es)`);
+    }
+  }
+
+  // 5. Late tip/incentive bump.
+  // If a tip or incentive arrives AFTER the job's earning was already paid out
+  // (e.g. customer pays + leaves a tip several days after the pay period closed),
+  // it would land in the closed period and be invisible until you look back at it.
+  // The cleaner won't see it in their current paystub. Bump effective_date to today
+  // so it lands in the current pay period and gets paid in the next batch.
+  // Only applies to tip/incentive — cash_collected uses a different rule (handled
+  // by attaching to the prior paid batch in the backfill flow).
+  const todayStr = new Date().toISOString().split('T')[0];
+  const { data: postRebuildEntries } = await supabase
+    .from('cleaner_ledger')
+    .select('id, team_member_id, type, payout_batch_id, effective_date')
+    .eq('job_id', jobId);
+  const memberHasBatched = new Set(
+    (postRebuildEntries || []).filter(e => e.payout_batch_id).map(e => e.team_member_id)
+  );
+  for (const e of (postRebuildEntries || [])) {
+    if (
+      !e.payout_batch_id &&
+      (e.type === 'tip' || e.type === 'incentive') &&
+      memberHasBatched.has(e.team_member_id) &&
+      e.effective_date !== todayStr
+    ) {
+      await supabase.from('cleaner_ledger')
+        .update({ effective_date: todayStr })
+        .eq('id', e.id);
+      console.log(`Ledger: Bumped late ${e.type} #${e.id} (job ${jobId}) to ${todayStr} — earning was already in a paid batch`);
     }
   }
 }
@@ -36999,9 +37031,9 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
     const parsedAmount = Math.abs(parseFloat(amount));
     const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-    // Get total cash for this job from transactions
+    // Get total cash for this job from transactions (case-insensitive — ZB may store 'Cash')
     const { data: cashTxs } = await supabase.from('transactions')
-      .select('amount').eq('job_id', jobId).eq('status', 'completed').eq('payment_method', 'cash');
+      .select('amount').eq('job_id', jobId).eq('status', 'completed').ilike('payment_method', 'cash');
     const totalCash = (cashTxs || []).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
 
     // Get all assigned members for this job
