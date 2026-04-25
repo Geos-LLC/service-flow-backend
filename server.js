@@ -24221,23 +24221,32 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
 
     // ===== Include projected entries for scheduled/in-progress jobs when jobFilter=all =====
     if (includeScheduled) {
-      const cancelStatuses = ['cancelled', 'canceled', 'cancel'];
-      const completedStatuses = ['completed'];
+      const cancelStatuses = ['cancelled', 'canceled', 'cancel', 'rescheduled'];
+      const completedStatuses = ['completed', 'complete', 'paid'];
       const jobsWithLedger = new Set((ledgerEntries || []).map(e => e.job_id).filter(Boolean));
       const teamMemberMap = {};
       (teamMembers || []).forEach(m => { teamMemberMap[m.id] = m; });
       const managerRolesSet = new Set(['manager', 'scheduler', 'admin', 'account owner', 'owner']);
 
-      // Fetch assignments for non-completed jobs in this period
-      const nonCompletedJobIds = (allJobs || []).filter(j => {
+      // Filter helper: a job is projectable when it's not cancelled/rescheduled/completed,
+      // hasn't already been ledgerized, and isn't a stale past-date job that never got
+      // marked complete (those are typically cancelled in ZB but not synced).
+      const isProjectable = (j) => {
         const s = (j.status || '').toLowerCase();
-        return !cancelStatuses.includes(s) && !completedStatuses.includes(s) && !jobsWithLedger.has(j.id);
-      }).map(j => j.id);
+        if (cancelStatuses.includes(s) || completedStatuses.includes(s)) return false;
+        if (jobsWithLedger.has(j.id)) return false;
+        const jobDate = String(j.scheduled_date || '').split('T')[0].split(' ')[0];
+        if (jobDate && jobDate < todayStr) return false;
+        return true;
+      };
+
+      // Fetch assignments for projectable jobs only
+      const projectableJobIds = (allJobs || []).filter(isProjectable).map(j => j.id);
 
       const assignmentsByJob = {};
-      if (nonCompletedJobIds.length > 0) {
-        for (let i = 0; i < nonCompletedJobIds.length; i += 100) {
-          const chunk = nonCompletedJobIds.slice(i, i + 100);
+      if (projectableJobIds.length > 0) {
+        for (let i = 0; i < projectableJobIds.length; i += 100) {
+          const chunk = projectableJobIds.slice(i, i + 100);
           const { data: assigns } = await supabase.from('job_team_assignments').select('job_id, team_member_id').in('job_id', chunk);
           (assigns || []).forEach(a => {
             if (!assignmentsByJob[a.job_id]) assignmentsByJob[a.job_id] = [];
@@ -24247,9 +24256,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       }
 
       for (const job of (allJobs || [])) {
-        const s = (job.status || '').toLowerCase();
-        if (cancelStatuses.includes(s) || completedStatuses.includes(s)) continue;
-        if (jobsWithLedger.has(job.id)) continue;
+        if (!isProjectable(job)) continue;
 
         // Get assigned members: from job_team_assignments or direct team_member_id
         let memberIds = assignmentsByJob[job.id] || [];
