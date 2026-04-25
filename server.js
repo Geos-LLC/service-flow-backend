@@ -36468,6 +36468,36 @@ async function rebuildJobLedger(jobId, userId, { types = ['earning', 'tip', 'inc
       console.log(`Ledger: Re-attached ${reattached} rebuilt entries for job ${jobId} to prior batch(es)`);
     }
   }
+
+  // 5. Late tip/incentive bump.
+  // If a tip or incentive arrives AFTER the job's earning was already paid out
+  // (e.g. customer pays + leaves a tip several days after the pay period closed),
+  // it would land in the closed period and be invisible until you look back at it.
+  // The cleaner won't see it in their current paystub. Bump effective_date to today
+  // so it lands in the current pay period and gets paid in the next batch.
+  // Only applies to tip/incentive — cash_collected uses a different rule (handled
+  // by attaching to the prior paid batch in the backfill flow).
+  const todayStr = new Date().toISOString().split('T')[0];
+  const { data: postRebuildEntries } = await supabase
+    .from('cleaner_ledger')
+    .select('id, team_member_id, type, payout_batch_id, effective_date')
+    .eq('job_id', jobId);
+  const memberHasBatched = new Set(
+    (postRebuildEntries || []).filter(e => e.payout_batch_id).map(e => e.team_member_id)
+  );
+  for (const e of (postRebuildEntries || [])) {
+    if (
+      !e.payout_batch_id &&
+      (e.type === 'tip' || e.type === 'incentive') &&
+      memberHasBatched.has(e.team_member_id) &&
+      e.effective_date !== todayStr
+    ) {
+      await supabase.from('cleaner_ledger')
+        .update({ effective_date: todayStr })
+        .eq('id', e.id);
+      console.log(`Ledger: Bumped late ${e.type} #${e.id} (job ${jobId}) to ${todayStr} — earning was already in a paid batch`);
+    }
+  }
 }
 
 // === LEDGER API ENDPOINTS ===
