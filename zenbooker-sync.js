@@ -1050,7 +1050,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       // an earlier syncTransactions correction), so we check the DB rather than the payload.
       if (createLedgerEntriesForCompletedJob) {
         const { data: cashTxCheck } = await supabase.from('transactions')
-          .select('id').eq('job_id', job.id).eq('status', 'completed').eq('payment_method', 'cash').limit(1)
+          .select('id').eq('job_id', job.id).eq('status', 'completed').ilike('payment_method', 'cash').limit(1)
         if (cashTxCheck && cashTxCheck.length > 0) {
           await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }).catch(err => {
             logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)

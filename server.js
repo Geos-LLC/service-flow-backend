@@ -36185,12 +36185,14 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
 
   }
 
-  // Cash collected: if job was paid cash, cleaner collected the money — create negative offset
+  // Cash collected: if job was paid cash, cleaner collected the money — create negative offset.
+  // Use ilike() to match 'cash' case-insensitively — ZB sometimes returns 'Cash' (capital C)
+  // via custom_payment_method_name, and a strict eq() would silently miss those rows.
   const { data: cashTxs } = await supabase.from('transactions')
     .select('amount, payment_method')
     .eq('job_id', jobId)
     .eq('status', 'completed')
-    .eq('payment_method', 'cash');
+    .ilike('payment_method', 'cash');
   if (cashTxs && cashTxs.length > 0) {
     const totalCash = cashTxs.reduce((sum, tx) => sum + (parseFloat(tx.amount) || 0), 0);
     if (totalCash > 0) {
@@ -36884,9 +36886,9 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
     const parsedAmount = Math.abs(parseFloat(amount));
     const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
-    // Get total cash for this job from transactions
+    // Get total cash for this job from transactions (case-insensitive — ZB may store 'Cash')
     const { data: cashTxs } = await supabase.from('transactions')
-      .select('amount').eq('job_id', jobId).eq('status', 'completed').eq('payment_method', 'cash');
+      .select('amount').eq('job_id', jobId).eq('status', 'completed').ilike('payment_method', 'cash');
     const totalCash = (cashTxs || []).reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
 
     // Get all assigned members for this job
