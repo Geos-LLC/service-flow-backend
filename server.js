@@ -11797,11 +11797,48 @@ app.patch('/api/op-contacts/set-company', authenticateToken, async (req, res) =>
     if (error) throw error;
 
     const sourceFill = await fillMissingAttribution(supabase, userId, { logger });
-    logger.log(`[SetCompany] user=${userId} phone=${last10} company="${company}" convs=${updated?.length || 0}`);
+
+    // If the identity behind this phone is unresolved_floating with no CRM
+    // link, try to create the lead now using the freshly-set Company tag.
+    // Avoids waiting for the next Sync Now / recreate pass.
+    let lead_created = null;
+    try {
+      const { data: identity } = await supabase.from('communication_participant_identities')
+        .select('*')
+        .eq('user_id', userId).eq('normalized_phone', last10)
+        .eq('status', 'unresolved_floating')
+        .is('sf_lead_id', null).is('sf_customer_id', null)
+        .maybeSingle();
+      if (identity) {
+        const { data: convs } = await supabase.from('communication_conversations')
+          .select('participant_name, company, last_event_at')
+          .eq('user_id', userId).eq('provider', 'openphone')
+          .eq('participant_identity_id', identity.id)
+          .not('company', 'is', null)
+          .order('last_event_at', { ascending: false })
+          .limit(1);
+        const conv = convs?.[0];
+        if (conv) {
+          const result = await maybeCreateLeadFromOpenPhone(userId, identity, {
+            company: conv.company,
+            participantName: conv.participant_name || identity.display_name,
+            lastEventAt: conv.last_event_at,
+          });
+          if (result?.lead?.id) {
+            lead_created = { id: result.lead.id, source: result.lead.source };
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`[SetCompany] inline lead create failed: ${e?.message || e}`);
+    }
+
+    logger.log(`[SetCompany] user=${userId} phone=${last10} company="${company}" convs=${updated?.length || 0} lead_created=${lead_created?.id || 'no'}`);
     res.json({
       conversations_updated: updated?.length || 0,
       company_applied: company,
       source_fill: sourceFill,
+      lead_created,
     });
   } catch (error) {
     logger.error(`[SetCompany] err=${error?.message || error}`);
