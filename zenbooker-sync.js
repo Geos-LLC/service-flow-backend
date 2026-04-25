@@ -512,21 +512,66 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   async function syncCustomers(userId, apiKey) {
     const zbCustomers = await zbFetchAll(apiKey, '/customers')
-    let created = 0, skipped = 0, adopted = 0, errors = 0
+    let created = 0, skipped = 0, adopted = 0, errors = 0, archived = 0
     const total = zbCustomers.length
     let processed = 0
+    const seenZbIds = new Set()
     for (const zb of zbCustomers) {
       processed++
       if (processed % 20 === 0) {
         syncProgress[userId] = { ...syncProgress[userId], phase: `Customers (${processed}/${total})`, detail: `${created} new, ${adopted} adopted, ${skipped} skipped` }
       }
+      if (zb?.id) seenZbIds.add(zb.id)
       const result = await upsertCustomerFromZB(userId, zb)
       if (result.mode === 'created') created++
       else if (result.mode === 'existing_by_zb') skipped++
       else if (result.mode === 'adopted_by_phone' || result.mode === 'adopted_by_email') adopted++
       else if (result.mode === 'error') errors++
     }
-    return { total: zbCustomers.length, created, adopted, skipped, errors }
+
+    // Detect deletions: SF customers with a zenbooker_id that no longer
+    // appears in ZB's response. Only run if pagination completed without
+    // wholesale errors (avoid mass-archiving on partial pulls).
+    if (errors === 0 && total > 0) {
+      try {
+        // Pull all SF customers with a zenbooker_id (paginate to avoid 1000-row cap)
+        const sfZbCustomers = []
+        let from = 0
+        const pageSize = 1000
+        while (true) {
+          const { data } = await supabase.from('customers')
+            .select('id, zenbooker_id, status').eq('user_id', userId)
+            .not('zenbooker_id', 'is', null)
+            .range(from, from + pageSize - 1)
+          if (!data?.length) break
+          sfZbCustomers.push(...data)
+          if (data.length < pageSize) break
+          from += pageSize
+        }
+        const toArchive = sfZbCustomers.filter(c =>
+          c.status !== 'archived' && !seenZbIds.has(c.zenbooker_id)
+        )
+        // Safety threshold — if more than 10% of ZB-linked customers would be
+        // archived, abort and warn. ZB pagination glitches shouldn't nuke
+        // everyone's CRM.
+        const ratio = sfZbCustomers.length > 0 ? toArchive.length / sfZbCustomers.length : 0
+        if (ratio > 0.1) {
+          logger.warn(`[Zenbooker] Deletion-detection aborted: would archive ${toArchive.length}/${sfZbCustomers.length} (${(ratio*100).toFixed(1)}%) — sanity threshold 10% exceeded. Skipping to avoid mass-archive.`)
+        } else if (toArchive.length > 0) {
+          for (const c of toArchive) {
+            await supabase.from('customers')
+              .update({ status: 'archived', updated_at: new Date().toISOString() })
+              .eq('id', c.id)
+            archived++
+          }
+          logger.log(`[Zenbooker] Archived ${archived} customers no longer present in ZB.`)
+        }
+      } catch (e) {
+        logger.error('[Zenbooker] Deletion-detection step failed:', e?.message || e)
+      }
+    }
+
+    return { total: zbCustomers.length, created, adopted, skipped, errors, archived }
   }
 
   async function syncTransactions(userId, apiKey) {
@@ -580,7 +625,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       const resolvedPaymentMethod = zbt.custom_payment_method_name || zbt.payment_method
 
       // Check if already synced by zenbooker_id → update
-      const { data: existingByZbId } = await supabase.from('transactions').select('id').eq('zenbooker_id', zbt.id).maybeSingle()
+      const { data: existingByZbId } = await supabase.from('transactions').select('id, payment_method').eq('zenbooker_id', zbt.id).maybeSingle()
       if (existingByZbId) {
         const { zenbooker_id: _, created_at: __, ...updateData } = txData
         await supabase.from('transactions').update(updateData).eq('id', existingByZbId.id)
@@ -591,12 +636,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             payment_status: 'paid',
           }).eq('id', sfJob.id).catch(() => {})
         }
+        // If payment_method changed (e.g. "custom"/"other" → "cash"), rebuild ledger so
+        // cash_collected entries get created. Without this, payroll over-pays cleaners.
+        if (sfJob?.id && existingByZbId.payment_method !== txData.payment_method) {
+          jobsNeedingLedgerRebuild.add(sfJob.id)
+        }
         updated++; continue
       }
 
       // Check if manually added (same job_id, no zenbooker_id) → adopt and update
       if (sfJob?.id) {
-        const { data: manual } = await supabase.from('transactions').select('id').eq('job_id', sfJob.id).is('zenbooker_id', null).limit(1)
+        const { data: manual } = await supabase.from('transactions').select('id, payment_method').eq('job_id', sfJob.id).is('zenbooker_id', null).limit(1)
         if (manual && manual.length > 0) {
           await supabase.from('transactions').update(txData).eq('id', manual[0].id)
           // Also update job payment_method
@@ -605,6 +655,10 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
               payment_method: resolvedPaymentMethod,
               payment_status: 'paid',
             }).eq('id', sfJob.id).catch(() => {})
+          }
+          // Adopting a manual tx with a different payment_method requires ledger rebuild
+          if (manual[0].payment_method !== txData.payment_method) {
+            jobsNeedingLedgerRebuild.add(sfJob.id)
           }
           updated++; continue
         }
@@ -991,12 +1045,18 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         }
       }
 
-      // For cash payments: rebuild cash_collected ledger entries (transaction must exist first)
-      if (rawMethod && rawMethod.toLowerCase() === 'cash' && createLedgerEntriesForCompletedJob) {
-        await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }).catch(err => {
-          logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
-        })
-        logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
+      // Rebuild ledger if any cash transaction now exists for this job. The webhook may
+      // arrive with rawMethod = 'custom'/null while the DB already has a cash tx (e.g. from
+      // an earlier syncTransactions correction), so we check the DB rather than the payload.
+      if (createLedgerEntriesForCompletedJob) {
+        const { data: cashTxCheck } = await supabase.from('transactions')
+          .select('id').eq('job_id', job.id).eq('status', 'completed').eq('payment_method', 'cash').limit(1)
+        if (cashTxCheck && cashTxCheck.length > 0) {
+          await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }).catch(err => {
+            logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
+          })
+          logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
+        }
       }
     } else if (eventType === 'invoice_payment.voided') {
       update.payment_status = 'pending'
