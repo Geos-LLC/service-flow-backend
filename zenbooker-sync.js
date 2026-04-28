@@ -456,13 +456,47 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   async function syncTerritories(userId, apiKey) {
     const zbTerritories = await zbFetchAll(apiKey, '/territories')
-    let created = 0, skipped = 0, errors = 0
+    let created = 0, skipped = 0, adopted = 0, errors = 0
     for (const zb of zbTerritories) {
       try {
-        // Skip if already exists
+        // 1. Already linked by zenbooker_id → skip
         const { data: existing } = await supabase.from('territories').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
         if (existing) { skipped++; continue }
+
         const mapped = mapTerritory(zb, userId)
+
+        // 2. Adopt an existing same-name territory that isn't yet linked to ZB.
+        //    Avoids creating duplicates when the operator manually created the
+        //    territory in SF before connecting Zenbooker (e.g. two "Tampa" rows).
+        const trimmedName = (mapped.name || '').trim()
+        if (trimmedName) {
+          const { data: nameMatches } = await supabase
+            .from('territories')
+            .select('id, location, business_hours, zip_codes, timezone, radius_miles, services, team_members, pricing_multiplier, status, description')
+            .eq('user_id', userId)
+            .is('zenbooker_id', null)
+            .ilike('name', trimmedName)
+          const nameMatch = (nameMatches || [])[0]
+          if (nameMatch) {
+            // Fill blanks from ZB; never overwrite values the operator already set
+            const adoption = { zenbooker_id: zb.id }
+            const fillIfEmpty = (key) => {
+              if (mapped[key] === undefined || mapped[key] === null) return
+              const cur = nameMatch[key]
+              const isEmpty = cur === null || cur === undefined
+                || (typeof cur === 'string' && cur.trim() === '')
+                || (Array.isArray(cur) && cur.length === 0)
+              if (isEmpty) adoption[key] = mapped[key]
+            }
+            ;['location', 'business_hours', 'zip_codes', 'timezone', 'radius_miles', 'services', 'team_members', 'pricing_multiplier', 'description'].forEach(fillIfEmpty)
+            const { error: adoptErr } = await supabase.from('territories').update(adoption).eq('id', nameMatch.id)
+            if (adoptErr) { logger.error(`[Zenbooker] Territory adopt error for ${zb.name}: ${JSON.stringify(adoptErr)}`); errors++ }
+            else { adopted++; logger.log(`[Zenbooker] Adopted existing territory id=${nameMatch.id} (${zb.name}) → linked to zb ${zb.id}`) }
+            continue
+          }
+        }
+
+        // 3. Otherwise insert fresh
         const { error } = await supabase.from('territories').insert(mapped)
         if (error) { logger.error(`[Zenbooker] Territory insert error: ${JSON.stringify(error)}`); errors++ }
         else created++
@@ -470,7 +504,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         logger.error(`[Zenbooker] Territory CRASH ${zb.name}: ${err.message}`); errors++
       }
     }
-    return { total: zbTerritories.length, created, skipped, errors }
+    return { total: zbTerritories.length, created, skipped, adopted, errors }
   }
 
   async function syncServices(userId, apiKey) {
