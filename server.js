@@ -21531,7 +21531,11 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
     
     // First order by role (account owner first), then by the requested sort field
     query = query.order('role', { ascending: true }); // This will put 'account owner' first alphabetically
-    
+    // Stable tiebreaker on id — without this, Postgres returns null-role rows in
+    // arbitrary order across pages, so a row at the role-tier boundary can drop
+    // off when LIMIT < total count.
+    query = query.order('id', { ascending: true });
+
     if (allowedSortFields.includes(sortBy) && allowedSortOrders.includes(sortOrder.toUpperCase())) {
       // Add secondary sort by the requested field
       // Note: Supabase doesn't support multiple orderBy in a single call easily,
