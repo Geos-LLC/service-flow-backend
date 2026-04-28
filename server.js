@@ -19383,20 +19383,54 @@ app.put('/api/territories/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/territories/:id', async (req, res) => {
+app.delete('/api/territories/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Ownership check — only allow deleting territories that belong to the caller's account
+    const { data: existing, error: fetchError } = await supabase
+      .from('territories')
+      .select('id, user_id, name')
+      .eq('id', id)
+      .maybeSingle();
+    if (fetchError) {
+      console.error('Territory lookup error:', fetchError);
+      return res.status(500).json({ error: 'Failed to look up territory' });
+    }
+    if (!existing) return res.status(404).json({ error: 'Territory not found' });
+    if (Number(existing.user_id) !== Number(userId)) {
+      return res.status(403).json({ error: 'Forbidden — territory belongs to another account' });
+    }
+
+    // Tally what will cascade / orphan so the UI can show a meaningful confirmation
+    // FK rules (verified): jobs.territory_id SET NULL, communication_conversations.sf_location_id SET NULL,
+    // communication_account_location_mappings.sf_location_id CASCADE, territory_pricing.territory_id CASCADE.
+    const [jobsRes, convsRes, mappingsRes, pricingRes] = await Promise.all([
+      supabase.from('jobs').select('id', { count: 'exact', head: true }).eq('territory_id', id),
+      supabase.from('communication_conversations').select('id', { count: 'exact', head: true }).eq('sf_location_id', id),
+      supabase.from('communication_account_location_mappings').select('id', { count: 'exact', head: true }).eq('sf_location_id', id),
+      supabase.from('territory_pricing').select('id', { count: 'exact', head: true }).eq('territory_id', id),
+    ]);
+    const impact = {
+      jobs_unlinked: jobsRes.count || 0,
+      conversations_unlinked: convsRes.count || 0,
+      endpoint_mappings_deleted: mappingsRes.count || 0,
+      pricing_rows_deleted: pricingRes.count || 0,
+    };
+
     const { error } = await supabase
       .from('territories')
       .delete()
       .eq('id', id);
-    
+
     if (error) {
       console.error('Supabase delete error:', error);
       return res.status(500).json({ error: 'Failed to delete territory' });
     }
-    
-    res.json({ message: 'Territory deleted successfully' });
+
+    res.json({ message: 'Territory deleted successfully', name: existing.name, impact });
   } catch (error) {
     console.error('Delete territory error:', error);
     res.status(500).json({ error: 'Failed to delete territory' });
