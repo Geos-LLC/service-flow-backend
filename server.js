@@ -11768,6 +11768,55 @@ async function recreateOpLeadsForUser(userId, { identityIds = null, limit = 500 
 }
 
 /**
+ * POST /api/op-contacts/refresh-from-openphone
+ *
+ * Triggers Sigcore's contacts/backfill endpoint, which:
+ *   1. Pulls all OpenPhone contacts via OP API (including the Company custom field)
+ *   2. Writes to openphone_contact_snapshot
+ *   3. Cascades to communication_participants
+ *   4. Repairs stale provider fields
+ *
+ * Use this when you've added/updated Company tags in OpenPhone and want SF
+ * to pick them up. After this returns, run a normal Sync All — SF's pull
+ * from Sigcore will now see the fresh provider.company values.
+ *
+ * Returns: { sigcore_response, status }. Sigcore's backfill can take 2-5
+ * minutes; we forward whatever Sigcore returns (often a 502 if it exceeds
+ * their HTTP timeout, but the backfill continues server-side regardless).
+ */
+app.post('/api/op-contacts/refresh-from-openphone', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { data: settings } = await supabase.from('communication_settings')
+      .select('sigcore_tenant_api_key').eq('user_id', userId).maybeSingle();
+    if (!settings?.sigcore_tenant_api_key) {
+      return res.status(400).json({ error: 'Sigcore not connected for this tenant' });
+    }
+    const sigcoreUrl = process.env.SIGCORE_API_URL || 'https://sigcore-production.up.railway.app';
+    const url = `${sigcoreUrl}/api/integrations/openphone/contacts/sync`;
+
+    // Fire-and-forget — don't block the HTTP request on Sigcore's full backfill.
+    // We use the /sync endpoint (returns 202 immediately) instead of /backfill
+    // (synchronous, prone to timeout). /sync alone repopulates the snapshot,
+    // which is what's needed for the company values to flow through.
+    fetch(url, {
+      method: 'POST',
+      headers: { 'x-api-key': settings.sigcore_tenant_api_key, 'Content-Type': 'application/json' },
+      body: '{}',
+    }).then(r => logger.log(`[OPRefresh] sigcore status=${r.status}`))
+      .catch(e => logger.warn(`[OPRefresh] sigcore call failed: ${e?.message || e}`));
+
+    res.json({
+      started: true,
+      message: 'Sigcore is refreshing OP contacts. Wait ~2-5 minutes, then click Sync All to pull updated company values.',
+    });
+  } catch (error) {
+    logger.error(`[OPRefresh] err=${error?.message || error}`);
+    res.status(500).json({ error: `Refresh failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
  * PATCH /api/op-contacts/set-company
  * Body: { phone: string, company: string }
  *
