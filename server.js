@@ -22783,6 +22783,62 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
       } catch (e) { console.error('Manager salary rebuild after rate change:', e); }
     }
 
+    // Bidirectional territory sync — when team_members.territories changes, also
+    // update territories.team_members[] so the schedule page (which reads from the
+    // territory side) sees the assignment. Without this, the two halves of the m:n
+    // relationship drift apart silently.
+    if (territories !== undefined) {
+      try {
+        const memberId = parseInt(actualTeamMemberId);
+        // Normalize the new territory id list from the request
+        let newTerritoryIds = territories;
+        if (typeof newTerritoryIds === 'string') {
+          try { newTerritoryIds = JSON.parse(newTerritoryIds); } catch { newTerritoryIds = []; }
+        }
+        if (!Array.isArray(newTerritoryIds)) newTerritoryIds = [];
+        newTerritoryIds = newTerritoryIds.map(Number).filter(n => Number.isFinite(n));
+        const newSet = new Set(newTerritoryIds);
+
+        // Pull every territory for this user that *currently* lists this member, so
+        // we can remove them from territories the operator just unassigned.
+        const { data: allUserTerritories } = await supabase
+          .from('territories')
+          .select('id, team_members')
+          .eq('user_id', userId);
+
+        const updates = [];
+        for (const t of (allUserTerritories || [])) {
+          let current = t.team_members;
+          if (typeof current === 'string') {
+            try { current = JSON.parse(current); } catch { current = []; }
+          }
+          if (!Array.isArray(current)) current = [];
+          const currentIds = current.map(Number).filter(n => Number.isFinite(n));
+          const hasMember = currentIds.includes(memberId);
+          const shouldHave = newSet.has(t.id);
+          if (hasMember && !shouldHave) {
+            updates.push({ id: t.id, team_members: currentIds.filter(x => x !== memberId) });
+          } else if (!hasMember && shouldHave) {
+            updates.push({ id: t.id, team_members: [...currentIds, memberId] });
+          }
+        }
+
+        for (const u of updates) {
+          const { error: tmUpdErr } = await supabase
+            .from('territories')
+            .update({ team_members: u.team_members })
+            .eq('id', u.id);
+          if (tmUpdErr) console.error(`[TeamMember] Territory sync error (territory id=${u.id}):`, tmUpdErr);
+        }
+        if (updates.length > 0) {
+          console.log(`[TeamMember] Synced territory.team_members on ${updates.length} territories for member ${memberId}`);
+        }
+      } catch (syncErr) {
+        // Bidirectional sync is best-effort — don't fail the whole save on it
+        console.error('Territory bidirectional sync error:', syncErr);
+      }
+    }
+
     res.json({ message: 'Team member updated successfully' });
     }
   } catch (error) {
