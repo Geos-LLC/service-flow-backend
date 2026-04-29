@@ -338,10 +338,21 @@ async function touchLastEventAt(supabase, userId) {
   }
 }
 
+// §7 lifecycle log — short prefix, one line per terminal/retry transition.
+// State→verb map keeps log lines greppable per the spec.
+function verbForState(to, result) {
+  if (to === 'sent' && result === 'duplicate') return 'event duplicate'
+  if (to === 'sent') return 'event sent'
+  if (to === 'dlq') return 'dlq'
+  if (to === 'skipped_unmapped_status') return 'skipped_unmapped_status'
+  if (to === 'pending') return 'retry'
+  return to
+}
+
 function logLine(logger, { row, to, result, attempts, note }) {
-  const payload = row.payload_json || {}
+  const verb = verbForState(to, result)
   logger.log(
-    `[LB Outbound] event=${row.event_id} job=${row.sf_job_id} user=${row.user_id} state=${to}` +
+    `[SF → LB] ${verb} event=${row.event_id} job=${row.sf_job_id} user=${row.user_id}` +
     (result ? ` result=${result}` : '') +
     ` attempts=${attempts}` +
     (note ? ` note=${note}` : '')
@@ -391,6 +402,8 @@ module.exports = {
   startDrainer,
   runDrainerTick,
   // exposed for tests
+  processRow,
+  verbForState,
   networkBackoff,
   deferBackoff,
   NETWORK_MAX_ATTEMPTS,

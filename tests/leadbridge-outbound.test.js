@@ -364,3 +364,165 @@ describe('drainer backoff schedules (§8)', () => {
     expect(deferBackoff(10)).toBe(14400) // capped
   })
 })
+
+// ──────────────────────────────────────────────────────────────────
+// Drainer response handling — exercises processRow against a mocked
+// axios so we cover every branch of §5 Drainer + §8 Idempotency.
+//
+// processRow expects a fake supabase that supports:
+//   - getLbOutboundSubscription (reads communication_settings)
+//   - update on leadbridge_outbound_events
+//   - update on communication_settings (touchLastEventAt)
+// The makeFakeSupabase double above already covers the table writes;
+// here we extend with a settings row + axios mock so we can drive
+// each response code.
+// ──────────────────────────────────────────────────────────────────
+
+jest.mock('axios')
+const axios = require('axios')
+
+const { processRow, verbForState } = require('../workers/leadbridge-outbound-drainer')
+const { encryptIntegrationSecret: encrypt2 } = require('../services/lb-encryption')
+
+function seedDrainerFixture({ subscriptionPresent = true } = {}) {
+  const settings = subscriptionPresent ? [{
+    user_id: 'u1',
+    leadbridge_connected: true,
+    leadbridge_outbound_subscription_id: 'sub_test',
+    leadbridge_outbound_encrypted_secret: encrypt2('whsec_drainer_secret'),
+    leadbridge_outbound_secret_key_version: 1,
+    leadbridge_outbound_webhook_url: 'https://lb.example/api/v1/integrations/service-flow/job-status',
+    leadbridge_outbound_events: ['job.status_changed'],
+    leadbridge_outbound_registered_at: '2026-04-17T12:00:00Z',
+    leadbridge_outbound_last_event_at: null,
+  }] : []
+  const outbox = [{
+    id: 'row-1',
+    event_id: 'evt_drainer_1',
+    user_id: 'u1',
+    sf_job_id: '99',
+    event_type: 'job.status_changed',
+    payload_json: {
+      event_id: 'evt_drainer_1',
+      event_type: 'job.status_changed',
+      occurred_at: new Date().toISOString(),
+      source: 'service_flow',
+      sf_job_id: '99',
+      external_request_id: 'req_99',
+      channel: 'thumbtack',
+      status: { new: 'completed', previous: 'pending' },
+      actor: { type: 'account_owner', id: 1 },
+      job: {},
+      raw: {},
+    },
+    state: 'sending',
+    attempts: 0,
+  }]
+  return makeFakeSupabase({ jobs: [], outbox, settings })
+}
+
+describe('drainer processRow — response handling (§5)', () => {
+  const ORIGINAL_DRY_RUN = process.env.LEADBRIDGE_OUTBOUND_DRY_RUN
+  beforeAll(() => { process.env.LEADBRIDGE_OUTBOUND_DRY_RUN = 'false' })
+  afterAll(() => { process.env.LEADBRIDGE_OUTBOUND_DRY_RUN = ORIGINAL_DRY_RUN })
+  beforeEach(() => { axios.mockReset() })
+
+  test('200 → state=sent, result from body', async () => {
+    const s = seedDrainerFixture()
+    axios.mockResolvedValueOnce({ status: 200, data: { result: 'applied' } })
+    const row = s._db.outbox[0]
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('applied')
+    expect(s._db.outbox[0].terminal_at).toBeTruthy()
+  })
+
+  test('409 → state=sent, result=duplicate (LB idempotency hit)', async () => {
+    const s = seedDrainerFixture()
+    axios.mockResolvedValueOnce({ status: 409, data: { error: 'duplicate event_id' } })
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('duplicate')
+  })
+
+  test('422 → state=skipped_unmapped_status (allowlist drift)', async () => {
+    const s = seedDrainerFixture()
+    axios.mockResolvedValueOnce({ status: 422, data: { error: 'unmapped status' } })
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('skipped_unmapped_status')
+    expect(s._db.outbox[0].terminal_at).toBeTruthy()
+  })
+
+  test('400 → state=dlq (hard error, no retry)', async () => {
+    const s = seedDrainerFixture()
+    axios.mockResolvedValueOnce({ status: 400, data: 'bad request' })
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('dlq')
+  })
+
+  test('5xx → state=pending (retryable), attempts++', async () => {
+    const s = seedDrainerFixture()
+    axios.mockResolvedValueOnce({ status: 503, data: 'gateway' })
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('pending')
+    expect(s._db.outbox[0].attempts).toBe(1)
+    expect(s._db.outbox[0].next_attempt_at).toBeTruthy()
+  })
+
+  test('network error → state=pending (retryable), then DLQ after MAX', async () => {
+    const s = seedDrainerFixture()
+    axios.mockRejectedValueOnce(Object.assign(new Error('ECONNRESET'), { code: 'ECONNRESET' }))
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('pending')
+    expect(s._db.outbox[0].last_error).toMatch(/ECONNRESET/)
+
+    // Now bump attempts to MAX and re-process — should land in DLQ.
+    s._db.outbox[0].attempts = 5
+    s._db.outbox[0].state = 'sending' // simulate re-claim
+    axios.mockRejectedValueOnce(Object.assign(new Error('ECONNRESET'), { code: 'ECONNRESET' }))
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('dlq')
+  })
+
+  test('no subscription → defer (NOT terminal), defer_reason set', async () => {
+    const s = seedDrainerFixture({ subscriptionPresent: false })
+    await processRow({ supabase: s, logger: { log: () => {}, error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('pending')
+    expect(s._db.outbox[0].defer_reason).toBe('no_outbound_subscription')
+    // axios should not have been called
+    expect(axios).not.toHaveBeenCalled()
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────
+describe('verbForState log mapping (§7)', () => {
+  test('maps every spec\'d transition', () => {
+    expect(verbForState('sent', 'applied')).toBe('event sent')
+    expect(verbForState('sent', 'duplicate')).toBe('event duplicate')
+    expect(verbForState('dlq')).toBe('dlq')
+    expect(verbForState('skipped_unmapped_status')).toBe('skipped_unmapped_status')
+    expect(verbForState('pending')).toBe('retry')
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────
+describe('SF → LB status mapping coverage (§3)', () => {
+  // §3 of "Finalize ServiceFlow → LeadBridge Sync" enumerates the SF
+  // statuses that LB can accept. SF's allowlist must include every
+  // one of them — narrowing the allowlist is a regression that would
+  // silently drop events as `skipped_unmapped_status` even though LB
+  // would have happily accepted them.
+  const SPEC_REQUIRED_STATUSES = [
+    'pending', 'confirmed', 'rescheduled',
+    'en-route', 'started', 'in-progress',
+    'completed', 'paid', 'done',
+    'cancelled',
+    'no-show',
+    'archived',
+    'lost',
+  ]
+
+  test.each(SPEC_REQUIRED_STATUSES)('"%s" is in SF allowlist', (s) => {
+    expect(isOutboundAllowed(s)).toBe(true)
+  })
+})

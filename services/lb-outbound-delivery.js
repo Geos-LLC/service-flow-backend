@@ -107,9 +107,15 @@ async function insertOutboxRow(supabase, { user_id, sf_job_id, payload, state = 
     .single()
   if (error) {
     // UNIQUE violation on event_id → idempotent no-op (retry safety).
-    if (error.code === '23505') return { duplicate: true, event_id: payload.event_id }
+    if (error.code === '23505') {
+      console.log(`[SF → LB] event duplicate event=${payload.event_id} job=${sf_job_id}`)
+      return { duplicate: true, event_id: payload.event_id }
+    }
     throw error
   }
+  // §7 lifecycle log — every persisted outbox row gets one of these.
+  const verb = state === 'pending' ? 'event queued' : `skipped_unmapped_status`
+  console.log(`[SF → LB] ${verb} event=${payload.event_id} job=${sf_job_id} status=${payload?.status?.new}`)
   return data
 }
 
