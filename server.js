@@ -15161,6 +15161,7 @@ const bookingKoalaImportHandler = async (req, res) => {
             zip_code: customer.zipCode || customer['Zip/Postal Code'] || customer['Zip/Postal code'] || customer['Zip Code'] || customer.zip_code || customer.postal_code || null,
             // Note: company_name column doesn't exist in customers table, so we skip it
             notes: customer.notes || customer.Note || customer['Note'] || customer.Notes || customer.comments || null,
+            source: customer.source || customer.Source || customer['Lead Source'] || customer['lead_source'] || customer['Referral Source'] || null,
             // Normalize status to lowercase enum values: 'active', 'inactive', 'archived'
             status: (() => {
               const statusValue = customer.status || customer.Status || 'active';
