@@ -14551,7 +14551,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           intake_question_answers: job.intakeQuestionAnswers || null,
           service_modifiers: job.serviceModifiers || null,
           service_intake_questions: job.serviceIntakeQuestions || null,
-          tip_amount: parseFloat(job.tipAmount) || 0
+          tip_amount: parseFloat(job.tipAmount) || 0,
+          incentive_amount: job.incentiveAmount != null && job.incentiveAmount !== ''
+            ? parseFloat(job.incentiveAmount) || 0
+            : 0,
+          hours_worked: job.hoursWorked != null && job.hoursWorked !== ''
+            ? parseFloat(job.hoursWorked)
+            : null,
+          start_time: job.startTime || null,
+          end_time: job.endTime || null,
         };
 
         // Check if this is an update or insert
