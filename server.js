@@ -15108,8 +15108,11 @@ const sendProgress = (res, type, data) => {
   res.write(JSON.stringify({ type, ...data }) + '\n');
 };
 
-// Booking Koala import endpoint
-app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
+// Booking Koala import endpoint — handler is shared with the generic
+// /api/data-import/import endpoint for customers/jobs (preset = booking-koala
+// or any custom mapping). The handler reads req.body.{customers,jobs,importSettings};
+// the generic endpoint pre-rewrites req.body before delegating.
+const bookingKoalaImportHandler = async (req, res) => {
   // Set headers for streaming response
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -16582,6 +16585,175 @@ app.post('/api/booking-koala/import', authenticateToken, async (req, res) => {
       message: error.message
     });
     res.end();
+  }
+};
+app.post('/api/booking-koala/import', authenticateToken, bookingKoalaImportHandler);
+
+// Generic Data Import — single endpoint that handles all five import types:
+//   * customers, jobs              → delegates to bookingKoalaImportHandler
+//   * team_members, services, territories → uses lib/importers/data-importer.js
+//
+// Body: { type, rows, mapping, importSettings }
+//   type           — one of: customers | jobs | team_members | services | territories
+//   rows           — raw parsed rows keyed by CSV header name
+//   mapping        — { sfFieldKey: csvHeaderName } (from preset or manual mapping)
+//   importSettings — { skipDuplicates, updateExisting }
+const dataImporter = require('./lib/importers/data-importer');
+app.post('/api/data-import/import', authenticateToken, async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  try {
+    const userId = req.user.userId;
+    const { type, rows, mapping, importSettings } = req.body || {};
+
+    if (!type || !dataImporter.SUPPORTED_TYPES.includes(type)) {
+      sendProgress(res, 'error', {
+        error: 'Invalid type',
+        message: `type must be one of: ${dataImporter.SUPPORTED_TYPES.join(', ')}`
+      });
+      return res.end();
+    }
+    if (!Array.isArray(rows)) {
+      sendProgress(res, 'error', { error: 'rows must be an array' });
+      return res.end();
+    }
+
+    const mappedRows = dataImporter.applyMapping(rows, mapping || {});
+    const settings = importSettings || { skipDuplicates: true, updateExisting: false };
+
+    // Customers + jobs → delegate to the proven BK handler. It reads from
+    // req.body.{customers,jobs,importSettings}, so rewrite the body before
+    // forwarding. mappedRows keep the raw CSV headers as fallback so BK's
+    // permissive matchers still find what they need.
+    if (type === 'customers' || type === 'jobs') {
+      req.body = {
+        customers: type === 'customers' ? mappedRows : undefined,
+        jobs: type === 'jobs' ? mappedRows : undefined,
+        importSettings: settings,
+      };
+      return bookingKoalaImportHandler(req, res);
+    }
+
+    // team_members / services / territories → handled here.
+    const onProgress = (progress) => {
+      sendProgress(res, 'progress', { [type]: progress });
+    };
+
+    let importerFn;
+    if (type === 'team_members') importerFn = dataImporter.importTeamMembers;
+    else if (type === 'services') importerFn = dataImporter.importServices;
+    else if (type === 'territories') importerFn = dataImporter.importTerritories;
+
+    const result = await importerFn(supabase, userId, mappedRows, settings, onProgress);
+
+    sendProgress(res, 'complete', {
+      results: { [type]: result },
+    });
+    res.end();
+  } catch (error) {
+    console.error('Data import error:', error);
+    sendProgress(res, 'error', {
+      error: 'Failed to import data',
+      message: error.message,
+    });
+    res.end();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Import mapping presets — system + per-user
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List presets visible to the current user (system presets + user's own)
+app.get('/api/import-mapping-presets', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { target } = req.query;
+
+    let q = supabase
+      .from('import_mapping_presets')
+      .select('id, user_id, name, target, mapping, is_system, description, created_at')
+      .or(`is_system.eq.true,user_id.eq.${userId}`)
+      .order('is_system', { ascending: false })
+      .order('name', { ascending: true });
+
+    if (target && dataImporter.SUPPORTED_TYPES.includes(target)) {
+      q = q.eq('target', target);
+    }
+
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ presets: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Save a new user preset (system presets cannot be created via this endpoint)
+app.post('/api/import-mapping-presets', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { name, target, mapping, description } = req.body || {};
+
+    if (!name || !target || !mapping) {
+      return res.status(400).json({ error: 'name, target, and mapping are required' });
+    }
+    if (!dataImporter.SUPPORTED_TYPES.includes(target)) {
+      return res.status(400).json({ error: `target must be one of: ${dataImporter.SUPPORTED_TYPES.join(', ')}` });
+    }
+    if (typeof mapping !== 'object' || Array.isArray(mapping)) {
+      return res.status(400).json({ error: 'mapping must be an object' });
+    }
+
+    const { data, error } = await supabase
+      .from('import_mapping_presets')
+      .insert({
+        user_id: userId,
+        name: String(name).trim(),
+        target,
+        mapping,
+        description: description ? String(description).trim() : null,
+        is_system: false,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      // Unique violation = duplicate name for this user+target
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'A preset with that name already exists for this type' });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+    res.json({ preset: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete a user preset (system presets are immutable)
+app.delete('/api/import-mapping-presets/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from('import_mapping_presets')
+      .select('id, is_system, user_id')
+      .eq('id', id)
+      .single();
+
+    if (fetchErr || !existing) return res.status(404).json({ error: 'Preset not found' });
+    if (existing.is_system) return res.status(403).json({ error: 'Cannot delete system presets' });
+    if (existing.user_id !== userId) return res.status(403).json({ error: 'Not your preset' });
+
+    const { error: delErr } = await supabase.from('import_mapping_presets').delete().eq('id', id);
+    if (delErr) return res.status(500).json({ error: delErr.message });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
