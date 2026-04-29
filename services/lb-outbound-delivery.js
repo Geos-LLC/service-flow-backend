@@ -57,7 +57,9 @@ function buildPayload({ job, oldStatus, newStatus, actor }) {
     },
     actor: {
       type: actor?.type || 'system',
-      id: actor?.id ?? null,
+      // LB's LeadStatusAuditLog.actorId is String — coerce numeric SF
+      // user/team_member ids to string so Prisma validation passes.
+      id: actor?.id == null ? null : String(actor.id),
       display_name: actor?.display_name ?? null,
     },
     job: {

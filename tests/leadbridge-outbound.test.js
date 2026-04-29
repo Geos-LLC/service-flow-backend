@@ -206,7 +206,8 @@ describe('payload + signer (§7)', () => {
     expect(p.channel).toBe('thumbtack')
     expect(p.status.previous).toBe('pending')
     expect(p.status.new).toBe('completed')
-    expect(p.actor).toMatchObject({ type: 'account_owner', id: 42 })
+    // actor.id is coerced to string for LB compatibility (Prisma actorId is String)
+    expect(p.actor).toMatchObject({ type: 'account_owner', id: '42' })
   })
 
   test('signature is deterministic for (secret, ts, body)', () => {
