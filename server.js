@@ -16097,6 +16097,49 @@ const bookingKoalaImportHandler = async (req, res) => {
             }
           }
           
+          // Generic CSV imports: assign by team-member email or full name when
+          // no external ID is present.
+          if (teamMemberIds.length === 0) {
+            const assignedEmail = (job.assignedTeamMemberEmail || job.teamMemberEmail || '').toString().trim().toLowerCase();
+            const assignedName = (job.assignedTeamMemberName || job.teamMemberName || job.assignedTeamMember || '').toString().trim();
+
+            if (assignedEmail) {
+              const { data: byEmail } = await supabase
+                .from('team_members')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('email', assignedEmail)
+                .limit(1);
+              if (byEmail && byEmail.length === 1) {
+                teamMemberIds.push(byEmail[0].id);
+                primaryTeamMemberId = byEmail[0].id;
+                console.log(`Row ${i + 1}: ✅ Found team member ${byEmail[0].id} by email "${assignedEmail}"`);
+              }
+            }
+
+            if (!primaryTeamMemberId && assignedName) {
+              const parts = assignedName.split(/\s+/);
+              const fn = parts[0];
+              const ln = parts.slice(1).join(' ');
+              let q = supabase
+                .from('team_members')
+                .select('id, first_name, last_name')
+                .eq('user_id', userId)
+                .ilike('first_name', fn);
+              if (ln) q = q.ilike('last_name', ln);
+              const { data: byName } = await q.limit(2);
+              if (byName && byName.length === 1) {
+                teamMemberIds.push(byName[0].id);
+                primaryTeamMemberId = byName[0].id;
+                console.log(`Row ${i + 1}: ✅ Found team member ${byName[0].id} by name "${assignedName}"`);
+              } else if (byName && byName.length > 1) {
+                console.warn(`Row ${i + 1}: ⚠️ Multiple team members match name "${assignedName}" — skipping ambiguous assignment`);
+              } else if (byName && byName.length === 0) {
+                console.warn(`Row ${i + 1}: ⚠️ No team member found matching name "${assignedName}"`);
+              }
+            }
+          }
+
           // Set primary team member ID (first one in the array, or single ID)
           const teamMemberId = primaryTeamMemberId || (teamMemberIds.length > 0 ? teamMemberIds[0] : null);
           console.log(`Row ${i + 1}: Team member assignment - Primary: ${teamMemberId}, All: [${teamMemberIds.join(', ')}]`);
