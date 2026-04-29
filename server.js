@@ -3002,6 +3002,16 @@ app.get('/api/jobs', authenticateToken, async (req, res) => {
           orConditions.push(`customer_id.in.(${matchingCustomerIds.join(',')})`);
         }
 
+        // Job-number search: jobs.id is an integer, so a purely numeric query
+        // (with optional leading "#") should match by id.
+        const numericMatch = search.trim().replace(/^#/, '');
+        if (/^\d+$/.test(numericMatch)) {
+          const idNum = Number(numericMatch);
+          if (Number.isSafeInteger(idNum) && idNum > 0 && idNum <= 2147483647) {
+            orConditions.push(`id.eq.${idNum}`);
+          }
+        }
+
         query = query.or(orConditions.join(','));
       } catch (searchError) {
         console.error('🔄 Backend: Search query error:', searchError);
