@@ -15162,6 +15162,19 @@ const bookingKoalaImportHandler = async (req, res) => {
             // Note: company_name column doesn't exist in customers table, so we skip it
             notes: customer.notes || customer.Note || customer['Note'] || customer.Notes || customer.comments || null,
             source: customer.source || customer.Source || customer['Lead Source'] || customer['lead_source'] || customer['Referral Source'] || null,
+            // Allow caller to override created_at with the lead's original date
+            // (otherwise Postgres default = now()). Accept ISO strings, date-only,
+            // or US "MM/DD/YYYY"; Postgres parses the rest.
+            created_at: (() => {
+              const raw = customer.createdAt || customer.created_at || customer['Created At'] || customer['Created Date'] || customer['Date Added'] || customer['Lead Date'] || customer['Date'] || customer['Created on'];
+              if (!raw) return undefined; // omit → Postgres default
+              const s = String(raw).trim();
+              if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)) {
+                const [m,d,y] = s.split(/[\/\s]/);
+                return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+              }
+              return s;
+            })(),
             // Normalize status to lowercase enum values: 'active', 'inactive', 'archived'
             status: (() => {
               const statusValue = customer.status || customer.Status || 'active';
