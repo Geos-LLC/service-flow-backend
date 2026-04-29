@@ -16721,6 +16721,7 @@ app.post('/api/data-import/import', authenticateToken, async (req, res) => {
     else if (type === 'services') importerFn = dataImporter.importServices;
     else if (type === 'territories') importerFn = dataImporter.importTerritories;
     else if (type === 'leads') importerFn = dataImporter.importLeads;
+    else if (type === 'reviews') importerFn = dataImporter.importReviews;
 
     const result = await importerFn(supabase, userId, mappedRows, settings, onProgress);
 
