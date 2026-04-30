@@ -14560,6 +14560,9 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             : null,
           start_time: job.startTime || null,
           end_time: job.endTime || null,
+          cleaner_salary_override: job.cleanerSalaryOverride != null && job.cleanerSalaryOverride !== ''
+            ? parseFloat(job.cleanerSalaryOverride) || null
+            : null,
         };
 
         // Check if this is an update or insert
@@ -14877,7 +14880,97 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           } else {
             console.log(`Row ${i + 1}: ⚠️ No team members to assign - teamMemberIds array is empty`);
           }
-          
+
+          // ── Expense / reimbursement row from CSV ──────────────────
+          // Optional. If the job CSV carries expense fields (amount + type),
+          // create one job_expenses row tied to this job. If the expense is
+          // approved + reimbursable + paid_by=team_member, the existing
+          // reimbursement ledger sync runs (same path as the manual UI).
+          const expenseAmountRaw = job.expenseAmount;
+          const expenseAmount = expenseAmountRaw != null && expenseAmountRaw !== ''
+            ? parseFloat(expenseAmountRaw)
+            : null;
+          if (expenseAmount && expenseAmount > 0 && newJob && !insertError) {
+            try {
+              const rawType = (job.expenseType || 'other').toString().toLowerCase().trim();
+              const validTypes = new Set(['supplies','travel','equipment','tools','meals','parking','tolls','fuel','other','cancellation']);
+              const expenseType = validTypes.has(rawType) ? rawType : 'other';
+
+              const rawPaidBy = (job.expensePaidBy || 'team_member').toString().toLowerCase().trim();
+              const paidBy = ['team_member','company','customer'].includes(rawPaidBy) ? rawPaidBy : 'team_member';
+
+              const reimbursable = (() => {
+                const v = (job.expenseReimbursable ?? '').toString().toLowerCase().trim();
+                if (['true','yes','1','y'].includes(v)) return true;
+                if (['false','no','0','n'].includes(v)) return false;
+                return paidBy === 'team_member'; // sensible default
+              })();
+              const customerBillable = (() => {
+                const v = (job.expenseCustomerBillable ?? '').toString().toLowerCase().trim();
+                if (['true','yes','1','y'].includes(v)) return true;
+                if (['false','no','0','n'].includes(v)) return false;
+                return false;
+              })();
+              const rawStatus = (job.expenseStatus || 'approved').toString().toLowerCase().trim();
+              const status = ['pending','approved','rejected'].includes(rawStatus) ? rawStatus : 'approved';
+
+              // Resolve which team member the expense belongs to (defaults to
+              // the job's primary assignee if not specified)
+              let expenseTeamMemberId = primaryTeamMemberId || null;
+              if (job.expenseTeamMemberEmail) {
+                const { data: byEmail } = await supabase
+                  .from('team_members')
+                  .select('id')
+                  .eq('user_id', userId)
+                  .eq('email', job.expenseTeamMemberEmail.toString().toLowerCase().trim())
+                  .limit(1);
+                if (byEmail && byEmail.length === 1) expenseTeamMemberId = byEmail[0].id;
+              }
+
+              const expensePayload = {
+                user_id: userId,
+                job_id: newJob.id,
+                team_member_id: expenseTeamMemberId,
+                expense_type: expenseType,
+                description: job.expenseDescription || null,
+                amount: expenseAmount,
+                paid_by: paidBy,
+                customer_billable: customerBillable,
+                reimbursable_to_team_member: reimbursable,
+                status,
+                created_by: userId,
+              };
+              if (status === 'approved') {
+                expensePayload.approved_at = new Date().toISOString();
+                expensePayload.approved_by = userId;
+              }
+
+              const { data: createdExpense, error: expenseError } = await supabase
+                .from('job_expenses')
+                .insert(expensePayload)
+                .select()
+                .single();
+
+              if (expenseError) {
+                console.error(`Row ${i + 1}: ❌ Expense insert failed:`, expenseError);
+                results.warnings.push(`Row ${i + 1}: Job created but expense row failed - ${expenseError.message}`);
+              } else if (createdExpense && status === 'approved' && reimbursable && paidBy === 'team_member' && expenseTeamMemberId && jobExpenseRouter?.syncReimbursementLedger) {
+                // Mirror the manual approve-flow: create a reimbursement
+                // ledger entry. syncReimbursementLedger is idempotent.
+                try {
+                  await jobExpenseRouter.syncReimbursementLedger(createdExpense, userId);
+                  console.log(`Row ${i + 1}: ✅ Reimbursement ledger entry created for $${expenseAmount}`);
+                } catch (e) {
+                  console.error(`Row ${i + 1}: ❌ Reimbursement ledger sync failed:`, e);
+                  results.warnings.push(`Row ${i + 1}: Expense created but ledger sync failed - ${e.message}`);
+                }
+              }
+            } catch (e) {
+              console.error(`Row ${i + 1}: Unexpected expense creation error:`, e);
+              results.warnings.push(`Row ${i + 1}: Could not create expense row - ${e.message}`);
+            }
+          }
+
           // Duplicate detection is handled by _id checking above
         }
 
@@ -36529,7 +36622,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   // Fetch job details (includes start_time/end_time for hours calc, total_paid_amount for overpayment/tip calc)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
-    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, fees_breakdown, taxes')
+    .select('id, user_id, team_member_id, status, price, service_price, total, total_amount, invoice_amount, tip_amount, incentive_amount, hours_worked, duration, estimated_duration, scheduled_date, start_time, end_time, discount, additional_fees, fees_breakdown, taxes, cleaner_salary_override')
     .eq('id', jobId)
     .single();
 
@@ -36650,19 +36743,29 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     // but still get tips/incentives below
     if (!isManager) {
       let earningAmount = 0;
-      // Duration is wall-clock time — each cleaner works the full hours
-      // Only commission/revenue is split by memberCount
-      if (hourlyRate > 0 && commissionPct > 0) {
+      let metadata;
+      const overrideTotal = job.cleaner_salary_override;
+
+      if (overrideTotal != null && parseFloat(overrideTotal) > 0) {
+        // Manual per-job override: split the dollar amount evenly across
+        // assigned non-manager members. Bypasses hours × rate + commission.
+        earningAmount = parseFloat((parseFloat(overrideTotal) / memberCount).toFixed(2));
+        metadata = { override_total: parseFloat(overrideTotal), member_count: memberCount, source: 'cleaner_salary_override' };
+      } else if (hourlyRate > 0 && commissionPct > 0) {
         // Hybrid: hourly (full hours) + commission (split revenue)
         const hourlyPay = hoursWorked * hourlyRate;
         const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
         earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
+        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
       } else if (commissionPct > 0) {
         earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
+        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
       } else if (hourlyRate > 0) {
         earningAmount = parseFloat((hoursWorked * hourlyRate).toFixed(2));
+        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
       }
-      // No fallback: if worker has no hourly rate and no commission, earning = $0
+      // No fallback: if worker has no hourly rate and no commission and
+      // no override, earning = $0
 
       if (earningAmount > 0) {
         ledgerEntries.push({
@@ -36673,7 +36776,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
           amount: earningAmount,
           effective_date: effectiveDate,
           note: `Earning for job #${jobId}`,
-          metadata: { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+          metadata: metadata || { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
           created_by: userId
         });
       }
