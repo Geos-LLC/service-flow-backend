@@ -14833,19 +14833,36 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             results.errors.push(`Row ${i + 1}: Failed to update existing job (ID: ${job.existingJobId}) - ${errorMessage.substring(0, 100)}`);
           }
           results.skipped++;
-        } else if (newJob && !isUpdate) {
-          // Only log import success for new jobs (updates are logged above)
-          console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
-          results.imported++;
-          
-          // RISK #3 FIX: Add new job to existingJobIdMap immediately after successful insert
-          // This prevents duplicates within the same CSV if the same _id appears later
-          if (jobId) {
-            const normalizedJobId = String(jobId).trim();
-            existingJobIdMap.set(normalizedJobId, newJob.id);
-            console.log(`Row ${i + 1}: Added job _id "${normalizedJobId}" to duplicate detection map (job ID: ${newJob.id})`);
+        } else if (newJob) {
+          // INSERT path success — bookkeeping. UPDATE path success is logged
+          // earlier; we still want to fall through to the assignment +
+          // expense logic below (so re-imports refresh team_member_id and
+          // can populate newly-mapped expense columns).
+          if (!isUpdate) {
+            console.log(`Row ${i + 1}: ✅ Successfully imported job with ID:`, newJob.id);
+            results.imported++;
+
+            // RISK #3 FIX: Add new job to existingJobIdMap immediately after successful insert
+            // This prevents duplicates within the same CSV if the same _id appears later
+            if (jobId) {
+              const normalizedJobId = String(jobId).trim();
+              existingJobIdMap.set(normalizedJobId, newJob.id);
+              console.log(`Row ${i + 1}: Added job _id "${normalizedJobId}" to duplicate detection map (job ID: ${newJob.id})`);
+            }
+          } else {
+            // For UPDATE path, replace existing assignments so this re-import
+            // reflects the new team-member mapping.
+            if (teamMemberIds.length > 0) {
+              const { error: delErr } = await supabase
+                .from('job_team_assignments')
+                .delete()
+                .eq('job_id', newJob.id);
+              if (delErr) {
+                console.warn(`Row ${i + 1}: Could not clear existing job_team_assignments for update: ${delErr.message}`);
+              }
+            }
           }
-          
+
           // Create team member assignments in job_team_assignments table for multiple team members
           // IMPORTANT: This must run for ALL team members, including existing ones
           if (teamMemberIds.length > 0) {
@@ -15688,6 +15705,29 @@ const bookingKoalaImportHandler = async (req, res) => {
             const normalizedLastName = lookupLastName.trim().replace(/\s+/g, ' ');
             const normalizedName = `${normalizedFirstName} ${normalizedLastName}`.trim().toLowerCase();
             customerId = customerMap[normalizedName] || customerIdMapping[normalizedName];
+          }
+
+          // If matched an existing customer AND updateExisting is on, refresh
+          // the fields that may have new values from this row's mapping.
+          // (Without this, re-importing with newly-mapped fields like Lead
+          // Source leaves the existing customer untouched.)
+          if (customerId && settings.updateExisting) {
+            const customerUpdate = {};
+            const csvSource = job.source || job.Source || job['Lead Source'] || job['lead_source'] || null;
+            if (csvSource) customerUpdate.source = csvSource;
+            const csvNotes = job.notes || job.Note || job['Note'] || null;
+            if (csvNotes) customerUpdate.notes = csvNotes;
+            if (Object.keys(customerUpdate).length > 0) {
+              const { error: custUpErr } = await supabase
+                .from('customers')
+                .update(customerUpdate)
+                .eq('id', customerId);
+              if (custUpErr) {
+                console.warn(`Row ${i + 1}: Could not update existing customer ${customerId}: ${custUpErr.message}`);
+              } else {
+                console.log(`Row ${i + 1}: ✅ Refreshed existing customer ${customerId} fields:`, Object.keys(customerUpdate).join(', '));
+              }
+            }
           }
 
           // Create customer on-the-fly if not found (like team members and territories)
