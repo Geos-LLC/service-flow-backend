@@ -14048,14 +14048,15 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Normalize date to YYYY-MM-DD format
               let datePart = job.scheduledDate.split(' ')[0].trim(); // Get just the date part
               
-              // Handle MM/DD/YYYY format (e.g., "12/20/2025")
+              // Handle MM/DD/YYYY (or M/D/YY) format
               if (datePart.includes('/')) {
                 const dateParts = datePart.split('/');
                 if (dateParts.length === 3) {
                   const month = parseInt(dateParts[0], 10);
                   const day = parseInt(dateParts[1], 10);
-                  const year = parseInt(dateParts[2], 10);
+                  let year = parseInt(dateParts[2], 10);
                   if (!isNaN(month) && !isNaN(day) && !isNaN(year)) {
+                    if (year < 100) year += 2000;
                     datePart = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                   }
                 }
@@ -14164,14 +14165,16 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               // Only date provided, use default time
               let dateStr = job.scheduledDate.trim();
 
-              // Normalize MM/DD/YYYY → YYYY-MM-DD (US-format CSV exports)
+              // Normalize MM/DD/YYYY (or M/D/YY) → YYYY-MM-DD
               if (dateStr.includes('/')) {
                 const parts = dateStr.split('/');
                 if (parts.length === 3) {
                   const m = parseInt(parts[0], 10);
                   const d = parseInt(parts[1], 10);
-                  const y = parseInt(parts[2], 10);
+                  let y = parseInt(parts[2], 10);
                   if (!isNaN(m) && !isNaN(d) && !isNaN(y)) {
+                    // 2-digit year → assume 2000+ (e.g. 25 → 2025)
+                    if (y < 100) y += 2000;
                     dateStr = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
                   }
                 }
