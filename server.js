@@ -14983,6 +14983,60 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
           }
 
+          // ── Payment / transaction row from amountPaidByCustomer ───
+          // The job card's "Amount paid" sums transactions linked to the
+          // job. So when the CSV row carries amountPaidByCustomer (or
+          // amountPaid), insert a deterministic transaction row that
+          // re-imports either find or upsert without duplicating.
+          const csvPaidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
+          if (newJob && !insertError && csvPaidAmount > 0) {
+            try {
+              const intentId = `csv-import-job-${newJob.id}`;
+              const txnPayload = {
+                user_id: userId,
+                job_id: newJob.id,
+                customer_id: customerId,
+                amount: csvPaidAmount,
+                payment_intent_id: intentId,
+                payment_method: job.paymentMethod || 'other',
+                status: 'succeeded',
+                tip_amount: parseFloat(job.tipAmount) || 0,
+              };
+
+              // Idempotent: look up by deterministic intent ID; update if
+              // present, insert otherwise.
+              const { data: existingTxn } = await supabase
+                .from('transactions')
+                .select('id')
+                .eq('user_id', userId)
+                .eq('payment_intent_id', intentId)
+                .limit(1);
+
+              if (existingTxn && existingTxn.length > 0) {
+                const { error: txnUpdErr } = await supabase
+                  .from('transactions')
+                  .update(txnPayload)
+                  .eq('id', existingTxn[0].id);
+                if (txnUpdErr) {
+                  console.error(`Row ${i + 1}: ❌ Transaction update failed:`, txnUpdErr.message);
+                  results.warnings.push(`Row ${i + 1}: Job updated but transaction update failed - ${txnUpdErr.message}`);
+                }
+              } else {
+                const { error: txnInsErr } = await supabase
+                  .from('transactions')
+                  .insert(txnPayload);
+                if (txnInsErr) {
+                  console.error(`Row ${i + 1}: ❌ Transaction insert failed:`, txnInsErr.message);
+                  results.warnings.push(`Row ${i + 1}: Job created but transaction insert failed - ${txnInsErr.message}`);
+                } else {
+                  console.log(`Row ${i + 1}: ✅ Transaction created for $${csvPaidAmount} (${job.paymentMethod || 'other'})`);
+                }
+              }
+            } catch (e) {
+              console.error(`Row ${i + 1}: Unexpected transaction error:`, e);
+            }
+          }
+
           // ── Review row from CSV (multi-table write) ───────────────
           // If the same job row carries review fields (rating + source),
           // also create a reviews row tied to this job + customer. Keeps
