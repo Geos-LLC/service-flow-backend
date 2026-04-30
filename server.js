@@ -14933,6 +14933,52 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             }
           }
 
+          // ── Review row from CSV (multi-table write) ───────────────
+          // If the same job row carries review fields (rating + source),
+          // also create a reviews row tied to this job + customer. Keeps
+          // the "one CSV upload, multiple tables populated" flow working
+          // for jobs-with-review imports without forcing a second pass.
+          if (newJob && !insertError && (job.rating != null && job.rating !== '' && job.reviewSource)) {
+            try {
+              const ratingVal = parseFloat(job.rating);
+              if (Number.isFinite(ratingVal)) {
+                const sourceRaw = String(job.reviewSource).toLowerCase().trim().replace(/\s+/g, '_');
+                const reviewPayload = {
+                  user_id: userId,
+                  customer_id: customerId || null,
+                  job_id: newJob.id,
+                  rating: ratingVal,
+                  rating_max: parseFloat(job.ratingMax) || 5,
+                  review_text: job.reviewText || null,
+                  reviewer_name: job.reviewerName || `${customerFirstName} ${customerLastName}`.trim() || null,
+                  reviewer_email: customerEmail || null,
+                  source: sourceRaw === 'bk' ? 'booking_koala' : sourceRaw,
+                  external_id: job.reviewExternalId || null,
+                  external_url: job.reviewExternalUrl || null,
+                  review_date: job.reviewDate || null,
+                  response_text: job.reviewResponse || null,
+                  response_date: job.reviewResponseDate || null,
+                  status: 'published',
+                };
+                Object.keys(reviewPayload).forEach((k) => reviewPayload[k] === null && delete reviewPayload[k]);
+
+                const { error: reviewErr } = await supabase
+                  .from('reviews')
+                  .insert(reviewPayload);
+                if (reviewErr && reviewErr.code !== '23505') {
+                  // 23505 = unique violation on (user_id, source, external_id) — already imported
+                  console.error(`Row ${i + 1}: ❌ Review insert failed:`, reviewErr);
+                  results.warnings.push(`Row ${i + 1}: Job created but review row failed - ${reviewErr.message}`);
+                } else if (!reviewErr) {
+                  console.log(`Row ${i + 1}: ✅ Review attached to job ${newJob.id} (${sourceRaw}, ${ratingVal} stars)`);
+                }
+              }
+            } catch (e) {
+              console.error(`Row ${i + 1}: Unexpected review creation error:`, e);
+              results.warnings.push(`Row ${i + 1}: Could not create review row - ${e.message}`);
+            }
+          }
+
           // Duplicate detection is handled by _id checking above
         }
 
