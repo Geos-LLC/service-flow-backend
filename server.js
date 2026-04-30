@@ -14224,24 +14224,26 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           territory_id: territoryId || null,
           notes: sanitizedNotes,
           status: (() => {
-            // Date-first auto-derive runs ALWAYS (not gated on absence of
-            // explicit status). Past + paid signal → "paid" regardless of
-            // any other status the CSV carries. Past + no signal + no
-            // explicit status → "completed". Future / undated falls through
-            // to the explicit normalizer.
+            // Strong signal: any non-zero paid amount OR a non-empty payment
+            // method on the row means the job was paid. Trust the CSV — no
+            // date check, no gating.
+            const paidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
+            const hasPaymentMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
+            console.log(`Row ${i + 1}: status auto-derive — paidAmount=${paidAmount}, hasPaymentMethod=${hasPaymentMethod}, paymentMethod="${job.paymentMethod}"`);
+            if (paidAmount > 0 || hasPaymentMethod) return 'paid';
+
+            // No payment signal but job is in the past → it happened, mark
+            // completed (only if user didn't supply an explicit status).
             try {
               const dateStr = scheduledDateString || job.scheduledDate;
               if (dateStr) {
                 const dt = new Date(String(dateStr).replace(' ', 'T'));
                 if (!isNaN(dt.getTime()) && dt < new Date()) {
-                  const paidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
-                  const hasPaymentMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
-                  console.log(`Row ${i + 1}: status auto-derive — dateStr=${dateStr}, paidAmount=${paidAmount}, hasPaymentMethod=${hasPaymentMethod}`);
-                  if (paidAmount > 0 || hasPaymentMethod) return 'paid';
                   if (!job.status || !job.status.trim()) return 'completed';
                 }
               }
             } catch (_) { /* fall through */ }
+
             if (!job.status || !job.status.trim()) return 'pending';
             const normalized = job.status.trim().toLowerCase();
             
