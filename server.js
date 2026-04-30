@@ -16317,8 +16317,46 @@ const bookingKoalaImportHandler = async (req, res) => {
                 console.log(`Row ${i + 1}: ✅ Found team member ${byName[0].id} by name "${assignedName}"`);
               } else if (byName && byName.length > 1) {
                 console.warn(`Row ${i + 1}: ⚠️ Multiple team members match name "${assignedName}" — skipping ambiguous assignment`);
-              } else if (byName && byName.length === 0) {
-                console.warn(`Row ${i + 1}: ⚠️ No team member found matching name "${assignedName}"`);
+              } else {
+                // Auto-create — same pattern as customer/territory/service.
+                // Use a stable placeholder email so re-imports of the same
+                // row find the auto-created member instead of duplicating.
+                const slug = assignedName.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '');
+                const placeholderEmail = `imported-${slug}-u${userId}@imported.local`;
+
+                const { data: existing } = await supabase
+                  .from('team_members')
+                  .select('id')
+                  .eq('user_id', userId)
+                  .eq('email', placeholderEmail)
+                  .limit(1);
+
+                if (existing && existing.length > 0) {
+                  teamMemberIds.push(existing[0].id);
+                  primaryTeamMemberId = existing[0].id;
+                  console.log(`Row ${i + 1}: ✅ Reused auto-created team member ${existing[0].id} for "${assignedName}"`);
+                } else {
+                  const { data: created, error: createErr } = await supabase
+                    .from('team_members')
+                    .insert({
+                      user_id: userId,
+                      first_name: fn,
+                      last_name: ln || '',
+                      email: placeholderEmail,
+                      role: 'cleaner',
+                      is_service_provider: true,
+                      status: 'active',
+                    })
+                    .select('id')
+                    .single();
+                  if (created) {
+                    teamMemberIds.push(created.id);
+                    primaryTeamMemberId = created.id;
+                    console.log(`Row ${i + 1}: ✅ Auto-created team member ${created.id} for "${assignedName}" (placeholder ${placeholderEmail})`);
+                  } else if (createErr) {
+                    console.error(`Row ${i + 1}: ❌ Could not auto-create team member "${assignedName}":`, createErr.message);
+                  }
+                }
               }
             }
           }
