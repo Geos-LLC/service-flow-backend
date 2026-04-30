@@ -15001,7 +15001,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                 amount: csvPaidAmount,
                 payment_intent_id: intentId,
                 payment_method: job.paymentMethod || 'other',
-                status: 'succeeded',
+                // Must be 'completed' (not 'succeeded') — the UI's
+                // /transactions/job/:id endpoint filters by status IN
+                // ('completed','voided') and a self-heal there resets the
+                // job's payment_status back to 'pending' when it finds
+                // zero 'completed' transactions. Using 'succeeded' meant
+                // every page load undid this transaction's effect.
+                status: 'completed',
                 tip_amount: parseFloat(job.tipAmount) || 0,
               };
 
