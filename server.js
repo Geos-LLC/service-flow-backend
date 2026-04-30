@@ -14440,6 +14440,13 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           special_instructions: job.specialInstructions || null,
           // Determine payment status - check multiple possible field names and values
           payment_status: (() => {
+            // Strong signal: any non-zero paid amount OR a non-empty payment
+            // method on the row means the job was paid. (Aligns with the
+            // status IIFE above so all three columns agree on "paid".)
+            const _csvAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || job['Amount paid by customer'] || 0);
+            const _csvHasMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
+            if (_csvAmount > 0 || _csvHasMethod) return 'paid';
+
             // First, check invoice_fully_paid_boolean field (highest priority)
             // Try all possible field name variations (CSV column names can vary)
             const invoiceFullyPaid = job.invoice_fully_paid_boolean || 
@@ -14500,6 +14507,12 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           })(),
           // Determine invoice status - check multiple possible field names
           invoice_status: (() => {
+            // Strong signal: same rule as status / payment_status — paid
+            // amount OR payment method = invoice paid.
+            const _csvAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || job['Amount paid by customer'] || 0);
+            const _csvHasMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
+            if (_csvAmount > 0 || _csvHasMethod) return 'paid';
+
             // First, check invoice_fully_paid_boolean field (highest priority)
             // Try all possible field name variations (CSV column names can vary)
             const invoiceFullyPaid = job.invoice_fully_paid_boolean || 
