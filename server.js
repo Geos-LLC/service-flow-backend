@@ -14224,24 +14224,25 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           territory_id: territoryId || null,
           notes: sanitizedNotes,
           status: (() => {
-            // No explicit status from CSV → auto-derive from date + payment.
-            // A past job that was paid is "paid"; a past job without payment
-            // is "completed" (it happened, just nothing to collect); a
-            // future job is "pending" (default).
-            if (!job.status || !job.status.trim()) {
-              try {
-                const dateStr = scheduledDateString || job.scheduledDate;
-                if (dateStr) {
-                  const dt = new Date(String(dateStr).replace(' ', 'T'));
-                  if (!isNaN(dt.getTime()) && dt < new Date()) {
-                    const paidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
-                    const hasPaymentMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
-                    return (paidAmount > 0 || hasPaymentMethod) ? 'paid' : 'completed';
-                  }
+            // Date-first auto-derive runs ALWAYS (not gated on absence of
+            // explicit status). Past + paid signal → "paid" regardless of
+            // any other status the CSV carries. Past + no signal + no
+            // explicit status → "completed". Future / undated falls through
+            // to the explicit normalizer.
+            try {
+              const dateStr = scheduledDateString || job.scheduledDate;
+              if (dateStr) {
+                const dt = new Date(String(dateStr).replace(' ', 'T'));
+                if (!isNaN(dt.getTime()) && dt < new Date()) {
+                  const paidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
+                  const hasPaymentMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
+                  console.log(`Row ${i + 1}: status auto-derive — dateStr=${dateStr}, paidAmount=${paidAmount}, hasPaymentMethod=${hasPaymentMethod}`);
+                  if (paidAmount > 0 || hasPaymentMethod) return 'paid';
+                  if (!job.status || !job.status.trim()) return 'completed';
                 }
-              } catch (_) { /* fall through */ }
-              return 'pending';
-            }
+              }
+            } catch (_) { /* fall through */ }
+            if (!job.status || !job.status.trim()) return 'pending';
             const normalized = job.status.trim().toLowerCase();
             
             // Handle cancelled/canceled variations
