@@ -14881,93 +14881,55 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
             console.log(`Row ${i + 1}: ⚠️ No team members to assign - teamMemberIds array is empty`);
           }
 
-          // ── Expense / reimbursement row from CSV ──────────────────
-          // Optional. If the job CSV carries expense fields (amount + type),
-          // create one job_expenses row tied to this job. If the expense is
-          // approved + reimbursable + paid_by=team_member, the existing
-          // reimbursement ledger sync runs (same path as the manual UI).
-          const expenseAmountRaw = job.expenseAmount;
-          const expenseAmount = expenseAmountRaw != null && expenseAmountRaw !== ''
-            ? parseFloat(expenseAmountRaw)
-            : null;
-          if (expenseAmount && expenseAmount > 0 && newJob && !insertError) {
-            try {
-              const rawType = (job.expenseType || 'other').toString().toLowerCase().trim();
-              const validTypes = new Set(['supplies','travel','equipment','tools','meals','parking','tolls','fuel','other','cancellation']);
-              const expenseType = validTypes.has(rawType) ? rawType : 'other';
-
-              const rawPaidBy = (job.expensePaidBy || 'team_member').toString().toLowerCase().trim();
-              const paidBy = ['team_member','company','customer'].includes(rawPaidBy) ? rawPaidBy : 'team_member';
-
-              const reimbursable = (() => {
-                const v = (job.expenseReimbursable ?? '').toString().toLowerCase().trim();
-                if (['true','yes','1','y'].includes(v)) return true;
-                if (['false','no','0','n'].includes(v)) return false;
-                return paidBy === 'team_member'; // sensible default
-              })();
-              const customerBillable = (() => {
-                const v = (job.expenseCustomerBillable ?? '').toString().toLowerCase().trim();
-                if (['true','yes','1','y'].includes(v)) return true;
-                if (['false','no','0','n'].includes(v)) return false;
-                return false;
-              })();
-              const rawStatus = (job.expenseStatus || 'approved').toString().toLowerCase().trim();
-              const status = ['pending','approved','rejected'].includes(rawStatus) ? rawStatus : 'approved';
-
-              // Resolve which team member the expense belongs to (defaults to
-              // the job's primary assignee if not specified)
-              let expenseTeamMemberId = primaryTeamMemberId || null;
-              if (job.expenseTeamMemberEmail) {
-                const { data: byEmail } = await supabase
-                  .from('team_members')
-                  .select('id')
-                  .eq('user_id', userId)
-                  .eq('email', job.expenseTeamMemberEmail.toString().toLowerCase().trim())
-                  .limit(1);
-                if (byEmail && byEmail.length === 1) expenseTeamMemberId = byEmail[0].id;
-              }
-
-              const expensePayload = {
-                user_id: userId,
-                job_id: newJob.id,
-                team_member_id: expenseTeamMemberId,
-                expense_type: expenseType,
-                description: job.expenseDescription || null,
-                amount: expenseAmount,
-                paid_by: paidBy,
-                customer_billable: customerBillable,
-                reimbursable_to_team_member: reimbursable,
-                status,
-                created_by: userId,
-              };
-              if (status === 'approved') {
-                expensePayload.approved_at = new Date().toISOString();
-                expensePayload.approved_by = userId;
-              }
-
-              const { data: createdExpense, error: expenseError } = await supabase
-                .from('job_expenses')
-                .insert(expensePayload)
-                .select()
-                .single();
-
-              if (expenseError) {
-                console.error(`Row ${i + 1}: ❌ Expense insert failed:`, expenseError);
-                results.warnings.push(`Row ${i + 1}: Job created but expense row failed - ${expenseError.message}`);
-              } else if (createdExpense && status === 'approved' && reimbursable && paidBy === 'team_member' && expenseTeamMemberId && jobExpenseRouter?.syncReimbursementLedger) {
-                // Mirror the manual approve-flow: create a reimbursement
-                // ledger entry. syncReimbursementLedger is idempotent.
-                try {
-                  await jobExpenseRouter.syncReimbursementLedger(createdExpense, userId);
-                  console.log(`Row ${i + 1}: ✅ Reimbursement ledger entry created for $${expenseAmount}`);
-                } catch (e) {
-                  console.error(`Row ${i + 1}: ❌ Reimbursement ledger sync failed:`, e);
-                  results.warnings.push(`Row ${i + 1}: Expense created but ledger sync failed - ${e.message}`);
+          // ── Expense / reimbursement rows ──────────────────────────
+          // expenseColumns = [{ column, type }, …] (sent from generic Data
+          // Import wizard). Each entry → ONE job_expenses row per job using
+          // the cell value at that column as the amount and the configured
+          // type. Skip rows where the cell is empty / non-positive.
+          const expCols = Array.isArray(req.body.expenseColumns) ? req.body.expenseColumns : [];
+          const validTypes = new Set(['supplies','travel','equipment','tools','meals','parking','tolls','fuel','other','cancellation']);
+          if (expCols.length > 0 && newJob && !insertError) {
+            for (const ec of expCols) {
+              if (!ec || !ec.column) continue;
+              const raw = job[ec.column];
+              const amt = raw != null && raw !== '' ? parseFloat(String(raw).replace(/[$,\s]/g, '')) : null;
+              if (!amt || amt <= 0) continue;
+              const expenseType = validTypes.has((ec.type || '').toLowerCase()) ? ec.type.toLowerCase() : 'other';
+              try {
+                const expensePayload = {
+                  user_id: userId,
+                  job_id: newJob.id,
+                  team_member_id: primaryTeamMemberId || null,
+                  expense_type: expenseType,
+                  description: ec.column,
+                  amount: amt,
+                  paid_by: 'team_member',
+                  customer_billable: false,
+                  reimbursable_to_team_member: true,
+                  status: 'approved',
+                  approved_at: new Date().toISOString(),
+                  approved_by: userId,
+                  created_by: userId,
+                };
+                const { data: createdExpense, error: expenseError } = await supabase
+                  .from('job_expenses')
+                  .insert(expensePayload)
+                  .select()
+                  .single();
+                if (expenseError) {
+                  console.error(`Row ${i + 1}: ❌ Expense [${ec.column}] insert failed:`, expenseError);
+                  results.warnings.push(`Row ${i + 1}: ${ec.column} expense row failed - ${expenseError.message}`);
+                } else if (createdExpense && primaryTeamMemberId && jobExpenseRouter?.syncReimbursementLedger) {
+                  try {
+                    await jobExpenseRouter.syncReimbursementLedger(createdExpense, userId);
+                  } catch (e) {
+                    console.error(`Row ${i + 1}: ❌ Reimb ledger sync failed for [${ec.column}]:`, e);
+                  }
                 }
+              } catch (e) {
+                console.error(`Row ${i + 1}: Unexpected expense error [${ec.column}]:`, e);
+                results.warnings.push(`Row ${i + 1}: ${ec.column} expense - ${e.message}`);
               }
-            } catch (e) {
-              console.error(`Row ${i + 1}: Unexpected expense creation error:`, e);
-              results.warnings.push(`Row ${i + 1}: Could not create expense row - ${e.message}`);
             }
           }
 
@@ -16774,7 +16736,7 @@ app.post('/api/data-import/import', authenticateToken, async (req, res) => {
 
   try {
     const userId = req.user.userId;
-    const { type, rows, mapping, importSettings } = req.body || {};
+    const { type, rows, mapping, importSettings, expenseColumns } = req.body || {};
 
     if (!type || !dataImporter.SUPPORTED_TYPES.includes(type)) {
       sendProgress(res, 'error', {
@@ -16800,6 +16762,7 @@ app.post('/api/data-import/import', authenticateToken, async (req, res) => {
         customers: type === 'customers' ? mappedRows : undefined,
         jobs: type === 'jobs' ? mappedRows : undefined,
         importSettings: settings,
+        expenseColumns: Array.isArray(expenseColumns) ? expenseColumns : [],
       };
       return bookingKoalaImportHandler(req, res);
     }
