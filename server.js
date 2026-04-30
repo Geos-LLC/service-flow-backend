@@ -14224,8 +14224,24 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           territory_id: territoryId || null,
           notes: sanitizedNotes,
           status: (() => {
-            // Normalize status values to handle variations like "cancelled" vs "canceled"
-            if (!job.status || !job.status.trim()) return 'pending';
+            // No explicit status from CSV → auto-derive from date + payment.
+            // A past job that was paid is "paid"; a past job without payment
+            // is "completed" (it happened, just nothing to collect); a
+            // future job is "pending" (default).
+            if (!job.status || !job.status.trim()) {
+              try {
+                const dateStr = scheduledDateString || job.scheduledDate;
+                if (dateStr) {
+                  const dt = new Date(String(dateStr).replace(' ', 'T'));
+                  if (!isNaN(dt.getTime()) && dt < new Date()) {
+                    const paidAmount = parseFloat(job.amountPaidByCustomer || job.amountPaid || 0);
+                    const hasPaymentMethod = !!(job.paymentMethod && String(job.paymentMethod).trim());
+                    return (paidAmount > 0 || hasPaymentMethod) ? 'paid' : 'completed';
+                  }
+                }
+              } catch (_) { /* fall through */ }
+              return 'pending';
+            }
             const normalized = job.status.trim().toLowerCase();
             
             // Handle cancelled/canceled variations
