@@ -14940,6 +14940,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
           // type. Skip rows where the cell is empty / non-positive.
           const expCols = Array.isArray(req.body.expenseColumns) ? req.body.expenseColumns : [];
           const validTypes = new Set(['supplies','travel','equipment','tools','meals','parking','tolls','fuel','other','cancellation']);
+          console.log(`Row ${i + 1}: expense block — expCols.length=${expCols.length} newJob=${!!newJob} insertError=${!!insertError} primaryTeamMemberId=${primaryTeamMemberId}`);
           if (expCols.length > 0 && newJob && !insertError) {
             for (const ec of expCols) {
               if (!ec || !ec.column) continue;
@@ -14970,6 +14971,7 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
                   .single();
                 if (expenseError) {
                   console.error(`Row ${i + 1}: ❌ Expense [${ec.column}] insert failed:`, expenseError);
+                  results.jobs.errors.push(`Row ${i + 1}: ${ec.column} expense row failed - ${expenseError.message}`);
                   results.warnings.push(`Row ${i + 1}: ${ec.column} expense row failed - ${expenseError.message}`);
                 } else if (createdExpense && primaryTeamMemberId && jobExpenseRouter?.syncReimbursementLedger) {
                   try {
