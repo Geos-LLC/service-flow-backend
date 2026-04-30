@@ -16857,14 +16857,16 @@ app.post('/api/data-import/import', authenticateToken, async (req, res) => {
     const mappedRows = dataImporter.applyMapping(rows, mapping || {});
     const settings = importSettings || { skipDuplicates: true, updateExisting: false };
 
-    // Customers + jobs → delegate to the proven BK handler. It reads from
-    // req.body.{customers,jobs,importSettings}, so rewrite the body before
-    // forwarding. mappedRows keep the raw CSV headers as fallback so BK's
-    // permissive matchers still find what they need.
-    if (type === 'customers' || type === 'jobs') {
+    // If ANY row has a scheduledDate (or the type is explicitly customers/jobs),
+    // route through the BK orchestrator. It writes to customer + job +
+    // team_members + territories + services + job_expenses + reviews from
+    // each row, which matches the user's "import everything related" intent.
+    const hasScheduledDate = mappedRows.some((r) => r && (r.scheduledDate || r.bookingStartDateTime));
+    if (type === 'customers' || type === 'jobs' || hasScheduledDate) {
+      const effectiveType = (type === 'customers' && !hasScheduledDate) ? 'customers' : 'jobs';
       req.body = {
-        customers: type === 'customers' ? mappedRows : undefined,
-        jobs: type === 'jobs' ? mappedRows : undefined,
+        customers: effectiveType === 'customers' ? mappedRows : undefined,
+        jobs: effectiveType === 'jobs' ? mappedRows : undefined,
         importSettings: settings,
         expenseColumns: Array.isArray(expenseColumns) ? expenseColumns : [],
       };
