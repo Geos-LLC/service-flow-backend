@@ -14162,8 +14162,21 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
               }
             } else if (job.scheduledDate) {
               // Only date provided, use default time
-              const dateStr = job.scheduledDate.trim();
-              // Validate the date format (YYYY-MM-DD)
+              let dateStr = job.scheduledDate.trim();
+
+              // Normalize MM/DD/YYYY → YYYY-MM-DD (US-format CSV exports)
+              if (dateStr.includes('/')) {
+                const parts = dateStr.split('/');
+                if (parts.length === 3) {
+                  const m = parseInt(parts[0], 10);
+                  const d = parseInt(parts[1], 10);
+                  const y = parseInt(parts[2], 10);
+                  if (!isNaN(m) && !isNaN(d) && !isNaN(y)) {
+                    dateStr = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+                  }
+                }
+              }
+
               if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
                 console.warn(`Row ${i + 1}: Invalid date format (expected YYYY-MM-DD): ${dateStr}`);
               }
@@ -15701,7 +15714,9 @@ const bookingKoalaImportHandler = async (req, res) => {
                 state: customerState ? customerState.trim() : null,
                 zip_code: customerZip ? customerZip.trim() : null,
                 // Note: company_name column doesn't exist in customers table, so we skip it
-                notes: job.notes || job.Note || job['Note'] || null
+                notes: job.notes || job.Note || job['Note'] || null,
+                // Lead/customer source carried on the row (Lead Source field)
+                source: job.source || job.Source || job['Lead Source'] || job['lead_source'] || null,
               };
 
               const { data: createdCustomer, error: createCustomerError } = await supabase
