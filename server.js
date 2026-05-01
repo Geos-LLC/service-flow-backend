@@ -1068,7 +1068,15 @@ app.options('/api/team-members', (req, res) => {
   res.status(204).send();
 });
 
-app.use(express.json({ limit: '10mb' }));
+// `verify` callback runs during parsing — we stash the raw bytes on
+// `req.rawBody` for HMAC-signed webhooks (e.g. LB CrmWebhookSubscription
+// at /api/integrations/leadbridge/lead-status) that need to verify the
+// signature against the exact bytes LB hashed. Re-stringifying the
+// parsed body is not byte-stable (key order, whitespace).
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => { if (buf?.length) req.rawBody = buf },
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Normalize search query params: trim leading/trailing whitespace and collapse
