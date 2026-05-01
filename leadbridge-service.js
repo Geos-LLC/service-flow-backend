@@ -1209,7 +1209,7 @@ module.exports = (supabase, logger) => {
       logger.log(`[LB Lead-Status] Skipping event=${eventId} — no external_lead_id`)
       if (webhookEventId) {
         await supabase.from('communication_webhook_events')
-          .update({ processed: true, processed_at: new Date().toISOString(), error: 'no_external_lead_id' })
+          .update({ processed: true, processed_at: new Date().toISOString(), processing_error: 'no_external_lead_id' })
           .eq('id', webhookEventId)
       }
       return res.status(200).json({ ok: true, action: 'skipped_no_external_lead_id' })
@@ -1226,7 +1226,7 @@ module.exports = (supabase, logger) => {
       logger.log(`[LB Lead-Status] Skipping event=${eventId} lb_status=${lbStatus} — ${reason}`)
       if (webhookEventId) {
         await supabase.from('communication_webhook_events')
-          .update({ processed: true, processed_at: new Date().toISOString(), error: `skipped_${reason}` })
+          .update({ processed: true, processed_at: new Date().toISOString(), processing_error: `skipped_${reason}` })
           .eq('id', webhookEventId)
       }
       // Touch the last_event_at marker even when skipped — proves the
@@ -1257,7 +1257,7 @@ module.exports = (supabase, logger) => {
       logger.log(`[LB Lead-Status] No SF job for external_lead_id=${externalRequestId} channel=${channel}`)
       if (webhookEventId) {
         await supabase.from('communication_webhook_events')
-          .update({ processed: true, processed_at: new Date().toISOString(), error: 'no_matching_job' })
+          .update({ processed: true, processed_at: new Date().toISOString(), processing_error: 'no_matching_job' })
           .eq('id', webhookEventId)
       }
       await supabase.from('communication_settings')
@@ -1270,7 +1270,7 @@ module.exports = (supabase, logger) => {
       logger.warn(`[LB Lead-Status] Ambiguous: ${jobs.length} jobs for external_lead_id=${externalRequestId} user=${userId}`)
       if (webhookEventId) {
         await supabase.from('communication_webhook_events')
-          .update({ processed: true, processed_at: new Date().toISOString(), error: 'ambiguous_job' })
+          .update({ processed: true, processed_at: new Date().toISOString(), processing_error: 'ambiguous_job' })
           .eq('id', webhookEventId)
       }
       return res.status(200).json({ ok: true, action: 'skipped_ambiguous' })
@@ -1294,7 +1294,7 @@ module.exports = (supabase, logger) => {
       logger.error(`[LB Lead-Status] updateJobStatus failed for job ${job.id}: ${e.message}`)
       if (webhookEventId) {
         await supabase.from('communication_webhook_events')
-          .update({ processed: true, processed_at: new Date().toISOString(), error: e.message?.slice(0, 500) || 'update_failed' })
+          .update({ processed: true, processed_at: new Date().toISOString(), processing_error: e.message?.slice(0, 500) || 'update_failed' })
           .eq('id', webhookEventId)
       }
       return res.status(500).json({ error: 'job_update_failed' })
