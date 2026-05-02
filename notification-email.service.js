@@ -148,10 +148,11 @@ module.exports = (supabase, logger) => {
   /**
    * Send a customer-facing notification email.
    * @param {number} userId - Tenant owner user ID
-   * @param {object} opts - { to, toName, subject, html, text, emailType }
+   * @param {object} opts - { to, toName, subject, html, text, emailType, attachments }
    * emailType is REQUIRED (e.g. 'estimate', 'invoice', 'receipt', 'appointment', 'custom')
+   * attachments (optional) - array of { content (base64 string), filename, type, disposition }
    */
-  async function sendCustomerEmail(userId, { to, toName, subject, html, text, emailType }) {
+  async function sendCustomerEmail(userId, { to, toName, subject, html, text, emailType, attachments }) {
     if (!emailType) throw new Error('emailType is required for all notification sends')
     if (!to) throw new Error('Recipient email (to) is required')
 
@@ -178,6 +179,9 @@ module.exports = (supabase, logger) => {
         ? { email: config.replyToEmail, name: config.replyToName }
         : config.replyToEmail
     }
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      msg.attachments = attachments
+    }
 
     try {
       const result = await sendWithRetry(msg)
@@ -203,10 +207,11 @@ module.exports = (supabase, logger) => {
   /**
    * Send an internal/team notification email.
    * @param {number} userId - Tenant owner user ID
-   * @param {object} opts - { to, toName, subject, html, text, emailType }
+   * @param {object} opts - { to, toName, subject, html, text, emailType, attachments }
    * emailType is REQUIRED (e.g. 'team_invite', 'team_welcome', 'paystub', 'admin_new_member')
+   * attachments (optional) - array of { content (base64 string), filename, type, disposition }
    */
-  async function sendInternalEmail(userId, { to, toName, subject, html, text, emailType }) {
+  async function sendInternalEmail(userId, { to, toName, subject, html, text, emailType, attachments }) {
     if (!emailType) throw new Error('emailType is required for all notification sends')
     if (!to) throw new Error('Recipient email (to) is required')
 
@@ -232,6 +237,9 @@ module.exports = (supabase, logger) => {
       msg.replyTo = config.replyToName
         ? { email: config.replyToEmail, name: config.replyToName }
         : config.replyToEmail
+    }
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      msg.attachments = attachments
     }
 
     try {

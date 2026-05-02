@@ -12,6 +12,7 @@
  */
 
 const express = require('express')
+const PDFDocument = require('pdfkit')
 
 module.exports = (supabase, logger, notificationEmail) => {
   const router = express.Router()
@@ -361,7 +362,330 @@ module.exports = (supabase, logger, notificationEmail) => {
       `Adjustments:    ${fmt(totals.adjustments)}`,
       `Cash collected: ${fmt(totals.cashCollected)}`,
       `Net Paid:       ${fmt(totals.netPayout)}`,
+      '',
+      'Full breakdown attached as PDF.',
     ].join('\n')
+  }
+
+  /**
+   * Render a slim, mobile-friendly email body summary.
+   * Designed to fit on a 320px screen with no horizontal scroll.
+   * Full breakdown lives in the attached PDF.
+   */
+  function renderPaystubSummaryHtml(snapshot) {
+    const s = snapshot || {}
+    const cleaner = s.cleaner || {}
+    const company = s.company || {}
+    const period = s.period || {}
+    const totals = s.totals || {}
+    const payout = s.payout || {}
+
+    const cleanerName = escapeHtml(`${cleaner.firstName || ''} ${cleaner.lastName || ''}`.trim() || 'Team Member')
+    const companyName = escapeHtml(company.name || 'Service Flow')
+    const periodLabel = `${formatDate(period.start)} – ${formatDate(period.end)}`
+
+    const fmt = (n) => `$${(parseFloat(n) || 0).toFixed(2)}`
+    const fmtNeg = (n) => {
+      const v = parseFloat(n) || 0
+      return v < 0 ? `-$${Math.abs(v).toFixed(2)}` : `$${v.toFixed(2)}`
+    }
+
+    // Stacked rows — each is a flex row, label left, value right. Always fits ≥320px.
+    const row = (label, value, opts = {}) => {
+      const bold = opts.bold ? 'font-weight:700;' : ''
+      const top = opts.top ? 'border-top:2px solid #111;margin-top:6px;padding-top:12px;' : 'border-top:1px solid #e5e7eb;padding-top:10px;'
+      const sz = opts.bold ? '15px' : '13px'
+      return `<div style="display:flex;justify-content:space-between;align-items:baseline;${top}padding-bottom:0;font-size:${sz};color:#111;${bold}">
+        <span style="color:#374151;">${escapeHtml(label)}</span>
+        <span style="text-align:right;">${value}</span>
+      </div>`
+    }
+
+    const rows = []
+    rows.push(row('Earnings', fmt(totals.earnings)))
+    if (totals.managerSalary) rows.push(row('Manager salary', fmt(totals.managerSalary)))
+    if (totals.managerCommission) rows.push(row('Manager commission', fmt(totals.managerCommission)))
+    if (totals.tips) rows.push(row('Tips', fmt(totals.tips)))
+    if (totals.incentives) rows.push(row('Incentives', fmt(totals.incentives)))
+    if (totals.reimbursements) rows.push(row('Reimbursements', fmt(totals.reimbursements)))
+    if (totals.adjustments) rows.push(row('Adjustments', fmtNeg(totals.adjustments)))
+    if (totals.cashCollected) rows.push(row('Cash collected', fmtNeg(totals.cashCollected)))
+    if (totals.priorDebt) rows.push(row('Prior period debt', fmtNeg(totals.priorDebt)))
+    rows.push(row('Net Earned', fmt(totals.netPayout), { bold: true, top: true }))
+
+    let paymentBlock = ''
+    if (payout.amount !== null && payout.amount !== undefined) {
+      const amt = parseFloat(payout.amount) || 0
+      const isPaid = payout.status === 'paid'
+      let label, valueText, bgColor, textColor
+      if (amt > 0) {
+        label = isPaid ? 'Payment Sent' : 'Payment Pending'
+        valueText = fmt(amt)
+        bgColor = isPaid ? '#ecfdf5' : '#fef3c7'
+        textColor = isPaid ? '#065f46' : '#92400e'
+      } else if (amt < 0) {
+        label = 'Balance Owed (carried to next period)'
+        valueText = fmtNeg(amt)
+        bgColor = '#fef2f2'
+        textColor = '#991b1b'
+      } else {
+        label = 'Settled'
+        valueText = fmt(0)
+        bgColor = '#f3f4f6'
+        textColor = '#374151'
+      }
+      const paidAtLine = payout.paidAt ? `<div style="font-size:11px;color:${textColor};opacity:0.8;margin-top:2px;">on ${escapeHtml(formatDate(payout.paidAt))}</div>` : ''
+      paymentBlock = `
+        <div style="margin-top:16px;padding:14px;background:${bgColor};border-radius:8px;">
+          <div style="font-size:11px;color:${textColor};font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">${escapeHtml(label)}</div>
+          ${paidAtLine}
+          <div style="font-size:20px;font-weight:700;color:${textColor};margin-top:4px;">${valueText}</div>
+        </div>`
+    }
+
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paystub</title>
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f3f4f6;margin:0;padding:16px;">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+    <div style="background:#2563eb;color:#fff;padding:20px;">
+      <div style="font-size:11px;opacity:0.9;text-transform:uppercase;letter-spacing:1px;">${companyName}</div>
+      <div style="font-size:20px;font-weight:700;margin-top:4px;">Paystub</div>
+    </div>
+    <div style="padding:20px;">
+      <div style="font-size:14px;color:#111;">Hello <strong>${cleanerName}</strong>,</div>
+      <div style="font-size:13px;color:#6b7280;margin-top:4px;">Pay period: <strong>${escapeHtml(periodLabel)}</strong></div>
+
+      <div style="margin-top:18px;background:#f9fafb;border-radius:8px;padding:14px;">
+        ${rows.join('')}
+      </div>
+
+      ${paymentBlock}
+
+      <p style="font-size:13px;color:#374151;margin-top:20px;">
+        The full breakdown — every job, manager salary days, and commission entries — is attached to this email as a PDF.
+      </p>
+      <p style="font-size:12px;color:#9ca3af;margin-top:12px;">If anything looks incorrect, please contact your administrator.</p>
+    </div>
+  </div>
+</body>
+</html>`.trim()
+  }
+
+  /**
+   * Render the paystub as a PDF buffer using pdfkit.
+   * Returns a Promise<Buffer>. Mirrors the full-detail HTML view.
+   */
+  function renderPaystubPdfBuffer(snapshot) {
+    return new Promise((resolve, reject) => {
+      try {
+        const s = snapshot || {}
+        const cleaner = s.cleaner || {}
+        const company = s.company || {}
+        const period = s.period || {}
+        const totals = s.totals || {}
+        const lineItems = s.lineItems || []
+        const managerSalaryItems = s.managerSalaryItems || []
+        const managerCommissionItems = s.managerCommissionItems || []
+        const payout = s.payout || {}
+
+        const cleanerName = `${cleaner.firstName || ''} ${cleaner.lastName || ''}`.trim() || 'Team Member'
+        const companyName = company.name || 'Service Flow'
+        const periodLabel = `${formatDate(period.start)} – ${formatDate(period.end)}`
+
+        const fmt = (n) => `$${(parseFloat(n) || 0).toFixed(2)}`
+        const fmtNeg = (n) => {
+          const v = parseFloat(n) || 0
+          return v < 0 ? `-$${Math.abs(v).toFixed(2)}` : `$${v.toFixed(2)}`
+        }
+
+        const doc = new PDFDocument({ size: 'LETTER', margin: 48 })
+        const buffers = []
+        doc.on('data', b => buffers.push(b))
+        doc.on('end', () => resolve(Buffer.concat(buffers)))
+        doc.on('error', reject)
+
+        const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right
+
+        // Header
+        doc.fillColor('#2563eb').fontSize(10).text(companyName.toUpperCase(), { characterSpacing: 1 })
+        doc.moveDown(0.2)
+        doc.fillColor('#111').fontSize(22).text('Paystub')
+        doc.moveDown(0.4)
+        doc.fillColor('#374151').fontSize(11).text(`Hello ${cleanerName},`)
+        doc.fillColor('#6b7280').fontSize(10).text(`Pay period: ${periodLabel}`)
+        doc.moveDown(1)
+
+        // Summary block — two-column key/value list
+        const summaryRows = []
+        summaryRows.push(['Earnings', fmt(totals.earnings)])
+        if (totals.managerSalary) summaryRows.push(['Manager salary', fmt(totals.managerSalary)])
+        if (totals.managerCommission) summaryRows.push(['Manager commission', fmt(totals.managerCommission)])
+        summaryRows.push(['Tips', fmt(totals.tips)])
+        summaryRows.push(['Incentives', fmt(totals.incentives)])
+        summaryRows.push(['Reimbursements', fmt(totals.reimbursements)])
+        summaryRows.push(['Adjustments', fmtNeg(totals.adjustments)])
+        summaryRows.push(['Cash collected', fmtNeg(totals.cashCollected)])
+        if (totals.priorDebt) summaryRows.push(['Prior period debt', fmtNeg(totals.priorDebt)])
+
+        doc.fillColor('#111').fontSize(13).text('Summary')
+        doc.moveDown(0.3)
+        const summaryStartY = doc.y
+        // Light gray box behind summary
+        const summaryHeight = (summaryRows.length + 1) * 18 + 16
+        doc.save()
+          .roundedRect(doc.page.margins.left, summaryStartY, pageWidth, summaryHeight, 6)
+          .fill('#f9fafb')
+          .restore()
+
+        doc.y = summaryStartY + 10
+        doc.fontSize(11)
+        for (const [label, value] of summaryRows) {
+          doc.fillColor('#374151').text(label, doc.page.margins.left + 12, doc.y, { continued: false, width: pageWidth / 2 })
+          doc.fillColor('#111').text(value, doc.page.margins.left + pageWidth / 2, doc.y - doc.currentLineHeight(), {
+            width: pageWidth / 2 - 12,
+            align: 'right',
+          })
+          doc.moveDown(0.4)
+        }
+        // Net Earned bold row
+        doc.moveDown(0.2)
+        doc.strokeColor('#111').lineWidth(1.2).moveTo(doc.page.margins.left + 12, doc.y).lineTo(doc.page.margins.left + pageWidth - 12, doc.y).stroke()
+        doc.moveDown(0.4)
+        doc.fillColor('#111').fontSize(13).text('Net Earned', doc.page.margins.left + 12, doc.y, { width: pageWidth / 2 })
+        doc.fillColor('#111').fontSize(13).text(fmt(totals.netPayout), doc.page.margins.left + pageWidth / 2, doc.y - doc.currentLineHeight(), {
+          width: pageWidth / 2 - 12,
+          align: 'right',
+        })
+        doc.y = summaryStartY + summaryHeight + 12
+
+        // Payment block
+        if (payout.amount !== null && payout.amount !== undefined) {
+          const amt = parseFloat(payout.amount) || 0
+          const isPaid = payout.status === 'paid'
+          let label, valueText, bgColor, textColor
+          if (amt > 0) {
+            label = isPaid ? 'PAYMENT SENT' : 'PAYMENT PENDING'
+            valueText = fmt(amt)
+            bgColor = isPaid ? '#ecfdf5' : '#fef3c7'
+            textColor = isPaid ? '#065f46' : '#92400e'
+          } else if (amt < 0) {
+            label = 'BALANCE OWED (CARRIED FORWARD)'
+            valueText = fmtNeg(amt)
+            bgColor = '#fef2f2'
+            textColor = '#991b1b'
+          } else {
+            label = 'SETTLED'
+            valueText = fmt(0)
+            bgColor = '#f3f4f6'
+            textColor = '#374151'
+          }
+          const blockY = doc.y
+          const blockH = 44
+          doc.save().roundedRect(doc.page.margins.left, blockY, pageWidth, blockH, 6).fill(bgColor).restore()
+          doc.fillColor(textColor).fontSize(9).text(label, doc.page.margins.left + 12, blockY + 10, { width: pageWidth - 24, characterSpacing: 0.5 })
+          if (payout.paidAt) {
+            doc.fontSize(9).fillColor(textColor).text(`on ${formatDate(payout.paidAt)}`, doc.page.margins.left + 12, blockY + 22, { width: pageWidth - 24 })
+          }
+          doc.fontSize(15).fillColor(textColor).text(valueText, doc.page.margins.left + 12, blockY + 14, { width: pageWidth - 24, align: 'right' })
+          doc.y = blockY + blockH + 12
+        }
+
+        // Helper: draw a 3-column or 4-column table
+        const drawTable = (title, headers, rows, colWidths) => {
+          if (!rows || rows.length === 0) return
+          // Page break if needed
+          if (doc.y > doc.page.height - doc.page.margins.bottom - 80) {
+            doc.addPage()
+          }
+          doc.fillColor('#111').fontSize(13).text(title)
+          doc.moveDown(0.3)
+          const tableX = doc.page.margins.left
+          let y = doc.y
+
+          // Header row
+          doc.save().rect(tableX, y, pageWidth, 22).fill('#f9fafb').restore()
+          doc.fillColor('#6b7280').fontSize(9)
+          let cx = tableX + 8
+          headers.forEach((h, i) => {
+            const align = i === headers.length - 1 ? 'right' : 'left'
+            const w = colWidths[i] - (i === 0 ? 8 : 0) - (i === headers.length - 1 ? 8 : 0)
+            doc.text(h.toUpperCase(), cx, y + 7, { width: w, align, characterSpacing: 0.4 })
+            cx += colWidths[i]
+          })
+          y += 22
+
+          // Body rows
+          doc.fontSize(10).fillColor('#111')
+          for (const row of rows) {
+            // Page break if row would overflow
+            if (y > doc.page.height - doc.page.margins.bottom - 24) {
+              doc.addPage()
+              y = doc.page.margins.top
+            }
+            cx = tableX + 8
+            row.forEach((cell, i) => {
+              const align = i === row.length - 1 ? 'right' : 'left'
+              const w = colWidths[i] - (i === 0 ? 8 : 0) - (i === row.length - 1 ? 8 : 0)
+              doc.fillColor('#111').text(String(cell), cx, y + 6, { width: w, align })
+              cx += colWidths[i]
+            })
+            // Border
+            doc.strokeColor('#eeeeee').lineWidth(0.5).moveTo(tableX, y + 22).lineTo(tableX + pageWidth, y + 22).stroke()
+            y += 22
+          }
+          doc.y = y + 12
+        }
+
+        // Manager salary breakdown
+        if (managerSalaryItems.length > 0) {
+          const cols = [pageWidth * 0.25, pageWidth * 0.45, pageWidth * 0.30]
+          const rows = managerSalaryItems.map(it => [
+            formatDate(it.date),
+            `${(it.hours || 0).toFixed(1)}h × $${(it.rate || 0).toFixed(2)}/hr`,
+            fmt(it.amount),
+          ])
+          drawTable('Salary Breakdown', ['Date', 'Calculation', 'Amount'], rows, cols)
+        }
+
+        // Manager commission breakdown
+        if (managerCommissionItems.length > 0) {
+          const cols = [pageWidth * 0.25, pageWidth * 0.45, pageWidth * 0.30]
+          const rows = managerCommissionItems.map(it => [
+            formatDate(it.date),
+            `${(it.commissionPct || 0).toFixed(2)}% of ${fmt(it.dayRevenue)}`,
+            fmt(it.amount),
+          ])
+          drawTable('Commission Breakdown', ['Date', 'Calculation', 'Amount'], rows, cols)
+        }
+
+        // Jobs
+        if (lineItems.length > 0) {
+          const cols = [pageWidth * 0.20, pageWidth * 0.30, pageWidth * 0.30, pageWidth * 0.20]
+          const rows = lineItems.map(it => [
+            formatDate(it.date),
+            it.service || '',
+            it.customerName || '',
+            fmt(it.earning),
+          ])
+          drawTable('Jobs', ['Date', 'Service', 'Customer', 'Earning'], rows, cols)
+        }
+
+        // Footer
+        if (doc.y > doc.page.height - doc.page.margins.bottom - 30) doc.addPage()
+        doc.moveDown(0.5)
+        doc.fillColor('#9ca3af').fontSize(9).text('If anything looks incorrect, please contact your administrator.', { align: 'left' })
+
+        doc.end()
+      } catch (e) {
+        reject(e)
+      }
+    })
   }
 
   /**
@@ -616,13 +940,40 @@ module.exports = (supabase, logger, notificationEmail) => {
       return { ok: false, error: 'Team member has no email address', status: 400, paystubId: paystub.id }
     }
 
-    const html = renderPaystubHtml(snapshot)
+    const html = renderPaystubSummaryHtml(snapshot)
     const text = renderPaystubText(snapshot)
     const period = snapshot.period || {}
     const subject = `Your paystub for ${formatDate(period.start)} – ${formatDate(period.end)}`
 
+    // Generate PDF attachment. If PDF generation fails, fall back to full HTML body
+    // so the cleaner still gets a usable paystub.
+    let attachments
+    let fallbackHtml = html
     try {
-      const sgResult = await notificationEmail.sendInternalEmail(userId, { to: email, subject, html, text, emailType: 'paystub' })
+      const pdfBuffer = await renderPaystubPdfBuffer(snapshot)
+      const safePeriod = `${period.start || 'period'}_${period.end || ''}`.replace(/[^0-9A-Za-z_-]/g, '')
+      attachments = [{
+        content: pdfBuffer.toString('base64'),
+        filename: `paystub_${safePeriod}.pdf`,
+        type: 'application/pdf',
+        disposition: 'attachment',
+      }]
+    } catch (pdfErr) {
+      logger.error(`[Paystubs] PDF render failed for paystub ${paystub.id}:`, pdfErr.message)
+      // Without PDF, send full breakdown inline so nothing is lost.
+      fallbackHtml = renderPaystubHtml(snapshot)
+      attachments = undefined
+    }
+
+    try {
+      const sgResult = await notificationEmail.sendInternalEmail(userId, {
+        to: email,
+        subject,
+        html: attachments ? html : fallbackHtml,
+        text,
+        emailType: 'paystub',
+        attachments,
+      })
       const messageId = sgResult?.messageId || null
 
       const prevMeta = paystub.metadata || {}
@@ -832,6 +1183,28 @@ module.exports = (supabase, logger, notificationEmail) => {
   })
 
   // ══════════════════════════════════════
+  // GET /api/paystubs/:id/pdf — downloadable PDF
+  // ══════════════════════════════════════
+  router.get('/:id/pdf', async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const { data: paystub } = await supabase.from('paystubs')
+        .select('snapshot_json, period_start, period_end').eq('id', req.params.id).eq('user_id', userId).maybeSingle()
+      if (!paystub) return res.status(404).json({ error: 'Paystub not found' })
+
+      const pdfBuffer = await renderPaystubPdfBuffer(paystub.snapshot_json || {})
+      const safePeriod = `${paystub.period_start || 'period'}_${paystub.period_end || ''}`.replace(/[^0-9A-Za-z_-]/g, '')
+      res.setHeader('Content-Type', 'application/pdf')
+      res.setHeader('Content-Disposition', `attachment; filename="paystub_${safePeriod}.pdf"`)
+      res.setHeader('Cache-Control', 'no-cache')
+      res.send(pdfBuffer)
+    } catch (e) {
+      logger.error('[Paystubs] PDF render error:', e.message)
+      res.status(500).json({ error: 'Error rendering paystub PDF' })
+    }
+  })
+
+  // ══════════════════════════════════════
   // DELETE /api/paystubs/:id — delete
   // ══════════════════════════════════════
   router.delete('/:id', async (req, res) => {
@@ -851,7 +1224,9 @@ module.exports = (supabase, logger, notificationEmail) => {
   router.__helpers = {
     aggregateLedgerEntries,
     renderPaystubHtml,
+    renderPaystubSummaryHtml,
     renderPaystubText,
+    renderPaystubPdfBuffer,
     escapeHtml,
     formatDate,
   }
