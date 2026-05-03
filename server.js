@@ -37478,9 +37478,30 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
         unpaid_cash_offsets: 0,
         unpaid_adjustments: 0,
         unpaid_reimbursements: 0,
+        prior_debt: 0,
         job_count: 0,
         _jobIds: new Set()
       };
+    }
+
+    // Negative paid batches whose debt hasn't been recovered by a later batch
+    // carry forward as real money owed by the cleaner. Their underlying ledger
+    // entries are already settled (payout_batch_id != null) so the unpaid-rows
+    // sum below misses this debt — we add it explicitly.
+    let priorDebtQuery = supabase.from('cleaner_payout_batch')
+      .select('team_member_id, total_amount, period_end')
+      .eq('user_id', userId)
+      .eq('status', 'paid')
+      .lt('total_amount', 0)
+      .is('recovered_by_batch_id', null);
+    if (startDate) priorDebtQuery = priorDebtQuery.lt('period_end', startDate);
+    const { data: negativeBatches } = await priorDebtQuery;
+    for (const b of (negativeBatches || [])) {
+      const m = memberMap[b.team_member_id];
+      if (!m) continue;
+      const amt = parseFloat(b.total_amount) || 0;
+      m.prior_debt += amt;
+      m.current_balance += amt;
     }
 
     for (const entry of (entries || [])) {
@@ -37522,7 +37543,7 @@ app.get('/api/ledger/balances', authenticateToken, async (req, res) => {
     const balances = Object.values(memberMap).map(m => {
       m.job_count = m._jobIds.size;
       delete m._jobIds;
-      for (const key of ['current_balance', 'unpaid_earnings', 'unpaid_tips', 'unpaid_incentives', 'unpaid_cash_offsets', 'unpaid_adjustments']) {
+      for (const key of ['current_balance', 'unpaid_earnings', 'unpaid_tips', 'unpaid_incentives', 'unpaid_cash_offsets', 'unpaid_adjustments', 'prior_debt']) {
         m[key] = parseFloat(m[key].toFixed(2));
       }
       return m;
