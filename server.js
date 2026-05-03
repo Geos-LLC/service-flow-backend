@@ -40124,8 +40124,22 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const sigcoreFullName = [sigcoreFirstName, sigcoreLastName].filter(Boolean).join(' ') || null;
       let contactName = (providerBlock?.displayName) || conv.contactName || sigcoreFullName
         || conv.conversationName || contactNameMap[participantPhone] || null;
-      // Company — provider.company is authoritative; legacy conv.company is fallback
-      const sigcoreCompany = (providerBlock?.company) || conv.company || null;
+      // Company — provider.company is authoritative; legacy conv.company is fallback.
+      // Distinguish "Sigcore returned an explicit empty/null value (operator cleared
+      // it in OpenPhone — propagate the clear)" from "Sigcore didn't include the
+      // field at all (don't touch SF's existing value)". Sigcore returns "" when
+      // a Company custom field was set then deleted in OP; we must honor that as
+      // a clear, not ignore it.
+      const sigcoreCompanyRaw =
+        providerBlock && Object.prototype.hasOwnProperty.call(providerBlock, 'company')
+          ? providerBlock.company
+          : (Object.prototype.hasOwnProperty.call(conv, 'company') ? conv.company : undefined);
+      const sigcoreCompanyHasSignal = sigcoreCompanyRaw !== undefined;
+      // Normalize "" → null so downstream filters match the same way they do for
+      // never-set rows (company IS NULL).
+      const sigcoreCompany = (sigcoreCompanyRaw === '' || sigcoreCompanyRaw == null)
+        ? null
+        : sigcoreCompanyRaw;
 
       const lastMsg = conv.lastMessage;
       if (!contactName && lastMsg) {
@@ -40181,8 +40195,13 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
         if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
         if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
-        // Phase 1 — legacy company kept during dual-read. Phase 4a will stop writing this.
-        if (sigcoreCompany && sigcoreCompany !== found.company) updates.company = sigcoreCompany;
+        // Phase 1 — legacy company kept during dual-read. Phase 4a will stop
+        // writing this. Honor explicit clears (Sigcore returns "" when operator
+        // deleted the Company tag in OpenPhone) — sigcoreCompany has been
+        // normalized to null in that case, and sigcoreCompanyHasSignal is true.
+        if (sigcoreCompanyHasSignal && sigcoreCompany !== found.company) {
+          updates.company = sigcoreCompany;
+        }
         // PR4 — participant mapping fields
         if (participantMappingId && participantMappingId !== found.participant_mapping_id) {
           updates.participant_mapping_id = participantMappingId;
