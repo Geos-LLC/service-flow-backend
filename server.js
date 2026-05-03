@@ -11218,6 +11218,7 @@ app.get('/api/identities/status', authenticateToken, async (req, res) => {
         .eq('user_id', userId)
         .eq('status', 'unresolved_floating')
         .neq('identity_priority_source', 'sync')
+        .is('hidden_at', null)
         .range(offset, offset + 999);
       if (!data || data.length === 0) break;
       for (const row of data) {
@@ -11365,6 +11366,7 @@ app.get('/api/identities/unresolved', authenticateToken, async (req, res) => {
       const { data, error } = await supabase.from('communication_participant_identities')
         .select(selectCols)
         .eq('user_id', userId).eq('status', 'unresolved_floating').neq('identity_priority_source', 'sync')
+        .is('hidden_at', null)
         .order('updated_at', { ascending: false })
         .range(offset, offset + 199);
       if (error) throw error;
@@ -11784,6 +11786,98 @@ async function recreateOpLeadsForUser(userId, { identityIds = null, limit = 500 
 
   return summary;
 }
+
+/**
+ * POST /api/identities/:id/hide
+ *
+ * Soft-delete an identity from the "Needs attention" lists. Sets hidden_at,
+ * abandons any open ambiguity referencing it, and marks any of its OP
+ * conversations with company='(hidden)' so they leave the OP-missing-Company
+ * list. The identity row itself stays (don't break linked customers/leads),
+ * it just doesn't show up in operator triage anymore.
+ */
+app.post('/api/identities/:id/hide', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+
+    await supabase.from('communication_participant_identities')
+      .update({ hidden_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', id).eq('user_id', userId);
+
+    await supabase.from('communication_identity_ambiguities')
+      .update({ status: 'abandoned', resolved_at: new Date().toISOString(), resolved_by: userId })
+      .eq('user_id', userId).eq('status', 'open')
+      .contains('candidate_identity_ids', [id]);
+
+    await supabase.from('communication_conversations')
+      .update({ company: '(hidden)', updated_at: new Date().toISOString() })
+      .eq('user_id', userId).eq('provider', 'openphone')
+      .eq('participant_identity_id', id).is('company', null);
+
+    res.json({ ok: true });
+  } catch (error) {
+    logger.error(`[HideIdentity] err=${error?.message || error}`);
+    res.status(500).json({ error: `Hide failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
+ * POST /api/op-contacts/hide-by-phone
+ * Body: { phone: string }
+ *
+ * Soft-delete an OP-missing-Company entry: sets company='(hidden)' on every
+ * OP conversation for this phone (so the company-IS-NULL filter excludes them)
+ * and hides any linked identity (so floating list excludes them too).
+ */
+app.post('/api/op-contacts/hide-by-phone', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const phone = String(req.body?.phone || '').trim();
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+    const last10 = phone.replace(/\D/g, '').slice(-10);
+
+    const { data: convs } = await supabase.from('communication_conversations')
+      .update({ company: '(hidden)', updated_at: new Date().toISOString() })
+      .eq('user_id', userId).eq('provider', 'openphone')
+      .or(`participant_phone.eq.+1${last10},participant_phone.eq.${last10},participant_phone.ilike.%${last10}`)
+      .is('company', null)
+      .select('id, participant_identity_id');
+
+    const identityIds = [...new Set((convs || []).map(c => c.participant_identity_id).filter(Boolean))];
+    if (identityIds.length > 0) {
+      await supabase.from('communication_participant_identities')
+        .update({ hidden_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('user_id', userId).in('id', identityIds);
+    }
+
+    res.json({ ok: true, conversations_hidden: convs?.length || 0, identities_hidden: identityIds.length });
+  } catch (error) {
+    logger.error(`[HideByPhone] err=${error?.message || error}`);
+    res.status(500).json({ error: `Hide failed: ${error?.message || 'unknown'}` });
+  }
+});
+
+/**
+ * POST /api/identities/ambiguities/:id/abandon
+ * Quick abandon (no modal needed) — same effect as resolve with action='abandon'.
+ */
+app.post('/api/identities/ambiguities/:id/abandon', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const ambigId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(ambigId)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('communication_identity_ambiguities')
+      .update({ status: 'abandoned', resolved_at: new Date().toISOString(), resolved_by: userId })
+      .eq('id', ambigId).eq('user_id', userId).eq('status', 'open');
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    logger.error(`[AbandonAmbig] err=${error?.message || error}`);
+    res.status(500).json({ error: `Abandon failed: ${error?.message || 'unknown'}` });
+  }
+});
 
 /**
  * POST /api/op-contacts/refresh-from-openphone
