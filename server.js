@@ -11990,6 +11990,55 @@ app.post('/api/op-contacts/refresh-and-sync', authenticateToken, async (req, res
         with_name: (touched || []).filter(r => r.participant_name != null && r.participant_name !== '').length,
         cleared_name: (touched || []).filter(r => r.participant_name == null).length,
       };
+
+      // Step 6 — sweep phantom identities. Rows that exist nowhere upstream:
+      //   - never had an OP contact (openphone_contact_id IS NULL)
+      //   - not linked to any SF customer or lead
+      //   - all linked conversations went silent > 30 days ago (or no convs)
+      // These are typically dead Thumbtack/Yelp leads piped in through
+      // LeadBridge that fizzled — nothing to "review", nothing to fix
+      // upstream. Hide them so the floating-names panel reflects reality.
+      let phantomsArchived = 0;
+      try {
+        const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+        const { data: candidates } = await supabase
+          .from('communication_participant_identities')
+          .select('id, updated_at')
+          .eq('user_id', userId)
+          .eq('status', 'unresolved_floating')
+          .is('hidden_at', null)
+          .is('openphone_contact_id', null)
+          .is('sf_customer_id', null)
+          .is('sf_lead_id', null)
+          .neq('identity_priority_source', 'sync')
+          .not('display_name', 'is', null)
+          .lt('updated_at', cutoff);
+        const candidateIds = (candidates || []).map(c => c.id);
+        if (candidateIds.length > 0) {
+          // Verify no recent conv activity for any of these identities.
+          const { data: recentConvs } = await supabase
+            .from('communication_conversations')
+            .select('participant_identity_id, last_event_at')
+            .eq('user_id', userId)
+            .in('participant_identity_id', candidateIds)
+            .gte('last_event_at', cutoff);
+          const recentlyActive = new Set((recentConvs || []).map(c => c.participant_identity_id));
+          const toArchive = candidateIds.filter(id => !recentlyActive.has(id));
+          if (toArchive.length > 0) {
+            const nowIso = new Date().toISOString();
+            await supabase
+              .from('communication_participant_identities')
+              .update({ hidden_at: nowIso, updated_at: nowIso })
+              .in('id', toArchive);
+            phantomsArchived = toArchive.length;
+            logger.log(`[RefreshAndSync] user=${userId} archived ${phantomsArchived} phantom identities`);
+          }
+        }
+      } catch (e) {
+        logger.warn(`[RefreshAndSync] phantom sweep failed for user=${userId}: ${e.message}`);
+      }
+      counts.phantoms_archived = phantomsArchived;
+
       p.phase = 'done';
       p.finished_at = new Date().toISOString();
       p.counts = counts;
