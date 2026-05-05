@@ -10563,19 +10563,27 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         from += pageSize;
       }
     }
-    const namedMissingCompany = Array.from(namedByPhone.values());
+    let namedMissingCompany = Array.from(namedByPhone.values());
     const unknownContacts = Array.from(unknownByPhone.values());
 
-    // Hydrate AI verdicts from the linked identity (when present) so the UI
-    // can display them inline without a second fetch.
+    // Hydrate AI verdicts + CRM-resolution status from the linked identity.
+    // Conversations linked to a resolved CRM customer/lead are NOT actionable —
+    // adding a Company tag in OpenPhone won't change anything because the
+    // contact is already attributed in SF. Exclude them from the panel.
     const neededIdentityIds = namedMissingCompany
       .map(c => c.participant_identity_id).filter(Boolean);
+    const resolvedIdentityIds = new Set();
     if (neededIdentityIds.length > 0) {
       const { data: identities } = await supabase.from('communication_participant_identities')
-        .select('id, ai_category, ai_confidence, ai_summary, ai_classified_at')
+        .select('id, status, ai_category, ai_confidence, ai_summary, ai_classified_at')
         .eq('user_id', userId).in('id', neededIdentityIds);
       const byId = {};
-      for (const i of (identities || [])) byId[i.id] = i;
+      for (const i of (identities || [])) {
+        byId[i.id] = i;
+        if (i.status === 'resolved_customer' || i.status === 'resolved_lead' || i.status === 'resolved_both') {
+          resolvedIdentityIds.add(i.id);
+        }
+      }
       for (const c of namedMissingCompany) {
         const ai = c.participant_identity_id ? byId[c.participant_identity_id] : null;
         if (ai) {
@@ -10585,6 +10593,8 @@ app.get('/api/source-issues', authenticateToken, async (req, res) => {
         }
       }
     }
+    namedMissingCompany = namedMissingCompany
+      .filter(c => !c.participant_identity_id || !resolvedIdentityIds.has(c.participant_identity_id));
 
     // 3. Customers with a source that doesn't resolve to any canonical (raw value orphans)
     const resolve = await buildSourceResolver(userId);
