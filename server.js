@@ -40359,6 +40359,46 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         }
         const { data: updated } = await supabase.from('communication_conversations').update(updates).eq('id', found.id).select().single();
         localConv = updated || found;
+
+        // Identity propagation — when Sigcore confirms the OP contact is
+        // deleted, the conversation row gets nulled (above), but the linked
+        // identity row is otherwise sticky. The "Floating names to review"
+        // panel reads display_name from identities, so without this propagation
+        // deleted OP contacts linger forever (Yellow Pages, Melinda Tyson).
+        // Rules:
+        //   - Only touch unresolved_floating identities — never overwrite a
+        //     resolved customer/lead/both, even if their OP linkage broke.
+        //   - If the identity has any non-OP source (LB/TT/Yelp/Zenbooker/SF
+        //     customer/lead), drop only openphone_contact_id; the cross-source
+        //     identity is still meaningful elsewhere.
+        //   - If OP was the only source, the identity is orphaned by the
+        //     deletion: clear display_name + hide it from the panel.
+        if (nameDecision.reason === 'op_contact_deleted' && found.participant_identity_id) {
+          try {
+            const { data: identity } = await supabase
+              .from('communication_participant_identities')
+              .select('id, status, hidden_at, openphone_contact_id, leadbridge_contact_id, thumbtack_profile_id, yelp_profile_id, zenbooker_customer_id, sf_customer_id, sf_lead_id')
+              .eq('id', found.participant_identity_id).maybeSingle();
+            if (identity && identity.status === 'unresolved_floating' && !identity.hidden_at) {
+              const hasOtherSource =
+                identity.leadbridge_contact_id ||
+                identity.thumbtack_profile_id ||
+                identity.yelp_profile_id ||
+                identity.zenbooker_customer_id ||
+                identity.sf_customer_id ||
+                identity.sf_lead_id;
+              const idUpdates = { openphone_contact_id: null, updated_at: new Date().toISOString() };
+              if (!hasOtherSource) {
+                idUpdates.display_name = null;
+                idUpdates.hidden_at = new Date().toISOString();
+              }
+              await supabase
+                .from('communication_participant_identities')
+                .update(idUpdates).eq('id', identity.id);
+              logger.log(`[OP-Sync] identity #${identity.id} ${hasOtherSource ? 'OP-link cleared' : 'orphaned, hidden'} (OP contact deleted)`);
+            }
+          } catch (e) { /* non-fatal — identity propagation is best-effort */ }
+        }
       } else {
         const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
           user_id: userId, sigcore_conversation_id: sigcoreConvId,
