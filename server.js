@@ -40124,6 +40124,19 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       const sigcoreFullName = [sigcoreFirstName, sigcoreLastName].filter(Boolean).join(' ') || null;
       let contactName = (providerBlock?.displayName) || conv.contactName || sigcoreFullName
         || conv.conversationName || contactNameMap[participantPhone] || null;
+      // Detect "OpenPhone deleted this contact" — Sigcore's snapshot reports
+      // displayName=null AND contactId=null AND company=null. In that case
+      // every name source above is null and the conversation has no live
+      // contact backing it. Treat as an explicit clear so SF stops showing a
+      // stale participant_name like "Yellow Pages" forever.
+      const contactDeletedInOp =
+        providerBlock != null
+        && providerBlock.displayName == null
+        && providerBlock.contactId == null
+        && providerBlock.company == null
+        && conv.contactName == null
+        && sigcoreFullName == null
+        && conv.conversationName == null;
       // Company — provider.company is authoritative; legacy conv.company is fallback.
       // Distinguish "Sigcore returned an explicit empty/null value (operator cleared
       // it in OpenPhone — propagate the clear)" from "Sigcore didn't include the
@@ -40193,6 +40206,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         const updates = { updated_at: new Date().toISOString() };
         if (lastActivity) updates.last_event_at = lastActivity;
         if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
+        else if (contactDeletedInOp && found.participant_name != null) updates.participant_name = null;
         if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
         if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
         // Phase 1 — legacy company kept during dual-read. Phase 4a will stop
