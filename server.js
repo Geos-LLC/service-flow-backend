@@ -40365,6 +40365,12 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         // identity row is otherwise sticky. The "Floating names to review"
         // panel reads display_name from identities, so without this propagation
         // deleted OP contacts linger forever (Yellow Pages, Melinda Tyson).
+        // Trigger off classifyConversationSyncStatus(conv)==='op_deleted' rather
+        // than nameDecision.reason — the helper's reason flips to 'no_signal'
+        // on the second+ sync after the conv was already cleared, but the
+        // identity may still be stale from a sync that ran before this code
+        // existed. The classification is purely a property of the Sigcore
+        // payload (provider all-null) and doesn't depend on conv state.
         // Rules:
         //   - Only touch unresolved_floating identities — never overwrite a
         //     resolved customer/lead/both, even if their OP linkage broke.
@@ -40373,7 +40379,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
         //     identity is still meaningful elsewhere.
         //   - If OP was the only source, the identity is orphaned by the
         //     deletion: clear display_name + hide it from the panel.
-        if (nameDecision.reason === 'op_contact_deleted' && found.participant_identity_id) {
+        if (classifyConversationSyncStatus(conv) === 'op_deleted' && found.participant_identity_id) {
           try {
             const { data: identity } = await supabase
               .from('communication_participant_identities')
