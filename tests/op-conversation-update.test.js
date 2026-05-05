@@ -124,6 +124,60 @@ describe('computeNameUpdate — set / clear / leave-alone', () => {
       shouldUpdate: true, value: 'Jane Doe', reason: 'set_from_sigcore',
     });
   });
+
+  test('OP contact deleted + conversationName="Yellow Pages" fallback → still clear (aggregator noise)', () => {
+    // Real bug: prod identity 1841 / phone +18773920112. Sigcore returned
+    // provider all-null but conversationName lingered as "Yellow Pages",
+    // which would have caused us to write "Yellow Pages" back.
+    const sigcoreConv = {
+      provider: { displayName: null, contactId: null, company: null },
+      conversationName: 'Yellow Pages',
+    };
+    const found = { participant_name: 'Yellow Pages' };
+    expect(computeNameUpdate(sigcoreConv, found)).toEqual({
+      shouldUpdate: true, value: null, reason: 'op_contact_deleted',
+    });
+  });
+
+  test('OP contact deleted + crossRef "Thumbtack" fallback → clear (aggregator noise)', () => {
+    const sigcoreConv = { provider: { displayName: null, contactId: null, company: null } };
+    const found = { participant_name: 'Thumbtack' };
+    expect(computeNameUpdate(sigcoreConv, found, 'Thumbtack')).toEqual({
+      shouldUpdate: true, value: null, reason: 'op_contact_deleted',
+    });
+  });
+
+  test('aggregator firstName+lastName ("Yellow Pages") with no provider signal → leave alone', () => {
+    // No providerBlock → can't confirm contact deleted. Aggregator name should
+    // not be written either, so we end up at "no_signal".
+    const sigcoreConv = { firstName: 'Yellow', lastName: 'Pages' };
+    const found = { participant_name: 'Yellow Pages' };
+    expect(computeNameUpdate(sigcoreConv, found)).toEqual({
+      shouldUpdate: false, value: null, reason: 'no_signal',
+    });
+  });
+
+  test('provider.displayName="Thumbtack S" wins even when aggregator-like (operator intent)', () => {
+    // Provider block displayName is operator authoritative — if they tagged
+    // the OP contact "Thumbtack S", honor that, don't filter it out.
+    const sigcoreConv = { provider: { displayName: 'Thumbtack S', contactId: 'X', company: 'Thumbtack' } };
+    const found = { participant_name: null };
+    expect(computeNameUpdate(sigcoreConv, found)).toEqual({
+      shouldUpdate: true, value: 'Thumbtack S', reason: 'set_from_sigcore',
+    });
+  });
+
+  test('real person wins over aggregator fallback', () => {
+    const sigcoreConv = {
+      provider: { displayName: null, contactId: 'X', company: 'Yelp' },
+      contactName: 'Jane Smith',
+      conversationName: 'Yelp',
+    };
+    const found = { participant_name: null };
+    expect(computeNameUpdate(sigcoreConv, found)).toEqual({
+      shouldUpdate: true, value: 'Jane Smith', reason: 'set_from_sigcore',
+    });
+  });
 });
 
 describe('classifyConversationSyncStatus', () => {

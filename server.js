@@ -8108,7 +8108,7 @@ function extractSigcoreParticipant(src) {
 
 // Shared — contact name patterns that represent platform/source aliases, not real people.
 // Used for classifying mappings into `aggregator` status + for skipping auto-lead creation.
-const AGGREGATOR_NAME_RE = /(thumbtack|thumtack|thumback|thumbtac|tumbtack|thambtack|thumntack|yelp|leadbridge|google|facebook|bark|groupon|instagram|angi|homeadvisor|voolt|\bsite\b|cold call|refrenc|reference|recommend)/i;
+const AGGREGATOR_NAME_RE = /(thumbtack|thumtack|thumback|thumbtac|tumbtack|thambtack|thumntack|yelp|leadbridge|google|facebook|bark|groupon|instagram|angi|homeadvisor|voolt|yellow ?pages|yellowpages|\bsite\b|cold call|refrenc|reference|recommend)/i;
 
 /**
  * Classify a participant mapping into one of 5 states based on CRM matches + name quality.
