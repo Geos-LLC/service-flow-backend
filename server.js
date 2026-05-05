@@ -50,6 +50,7 @@ const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
+const { computeCompanyUpdate, computeNameUpdate, classifyConversationSyncStatus } = require('./lib/op-conversation-update');
 const { classifyIdentity: aiClassifyIdentity } = require('./lib/identity-classifier');
 const OpenAI = require('openai').default || require('openai');
 const openaiClient = process.env.OPENAI_API_KEY
@@ -11877,6 +11878,124 @@ app.post('/api/identities/ambiguities/:id/abandon', authenticateToken, async (re
     logger.error(`[AbandonAmbig] err=${error?.message || error}`);
     res.status(500).json({ error: `Abandon failed: ${error?.message || 'unknown'}` });
   }
+});
+
+/**
+ * POST /api/op-contacts/refresh-and-sync
+ *
+ * One-shot: Sigcore /contacts/sync (await completion) → SF OP sync → return
+ * counts. The button in Settings → Leads should call this. Replaces the
+ * separate "Refresh from OpenPhone" + "Sync All" two-step.
+ *
+ * Returns immediately with { started, job_id }. Caller polls
+ * /api/op-contacts/refresh-and-sync/progress for live status.
+ */
+const refreshAndSyncProgress = {}; // userId → { phase, started_at, finished_at, error, counts }
+app.post('/api/op-contacts/refresh-and-sync', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  if (refreshAndSyncProgress[userId]?.phase &&
+      refreshAndSyncProgress[userId].phase !== 'done' &&
+      refreshAndSyncProgress[userId].phase !== 'error') {
+    return res.status(409).json({ error: 'already running', progress: refreshAndSyncProgress[userId] });
+  }
+  refreshAndSyncProgress[userId] = {
+    phase: 'starting', started_at: new Date().toISOString(), finished_at: null,
+    error: null, counts: null,
+  };
+  res.status(202).json({ started: true, started_at: refreshAndSyncProgress[userId].started_at });
+
+  setImmediate(async () => {
+    const p = refreshAndSyncProgress[userId];
+    try {
+      const { data: settings } = await supabase.from('communication_settings')
+        .select('sigcore_tenant_api_key').eq('user_id', userId).maybeSingle();
+      if (!settings?.sigcore_tenant_api_key) throw new Error('Sigcore not connected');
+      const sigcoreUrl = process.env.SIGCORE_API_URL || 'https://sigcore-production.up.railway.app';
+      const headers = { 'x-api-key': settings.sigcore_tenant_api_key, 'Content-Type': 'application/json' };
+
+      // Step 1 — kick off Sigcore /contacts/sync
+      p.phase = 'sigcore_sync_starting';
+      const startRes = await fetch(`${sigcoreUrl}/api/integrations/openphone/contacts/sync`, {
+        method: 'POST', headers, body: '{}',
+      });
+      if (!startRes.ok && startRes.status !== 202) {
+        throw new Error(`Sigcore /contacts/sync returned ${startRes.status}`);
+      }
+      p.phase = 'sigcore_sync_running';
+
+      // Step 2 — poll Sigcore status until completed/failed (max ~10 min)
+      let completed = false;
+      for (let i = 0; i < 200; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          const statusRes = await fetch(`${sigcoreUrl}/api/integrations/openphone/contacts/sync/status`, { headers });
+          if (!statusRes.ok) continue;
+          const j = await statusRes.json();
+          const s = j?.data?.state;
+          if (s === 'completed') { completed = true; p.sigcore_result = j.data.result; break; }
+          if (s === 'failed') throw new Error(`Sigcore sync failed: ${j.data.error}`);
+        } catch (e) { /* keep polling on transient errors */ }
+      }
+      if (!completed) throw new Error('Sigcore sync did not complete within 10 minutes');
+
+      // Step 3 — run SF Sync All (orchestrator, all sources)
+      p.phase = 'sf_sync_starting';
+      const sfBaseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+        : 'https://service-flow-backend-production-4568.up.railway.app';
+      const authToken = req.headers['authorization']; // bearer for self-call
+      const opSync = await fetch(`${sfBaseUrl}/api/communications/sync`, {
+        method: 'POST', headers: { 'Authorization': authToken, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (!opSync.ok && opSync.status !== 202) {
+        const txt = await opSync.text().catch(() => '');
+        throw new Error(`SF /communications/sync returned ${opSync.status}: ${txt.slice(0, 200)}`);
+      }
+      p.phase = 'sf_sync_running';
+
+      // Step 4 — poll SF OP sync until idle/done (max ~15 min)
+      for (let i = 0; i < 300; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          const sr = await fetch(`${sfBaseUrl}/api/communications/sync/progress`, {
+            headers: { 'Authorization': authToken },
+          });
+          if (!sr.ok) continue;
+          const j = await sr.json();
+          if (j?.status === 'idle' || j?.status === 'done' || j?.status === 'error') break;
+        } catch (e) { /* keep polling */ }
+      }
+
+      // Step 5 — count outcomes
+      const beforeStarted = p.started_at;
+      const { data: touched } = await supabase.from('communication_conversations')
+        .select('company, participant_name', { count: 'exact', head: false })
+        .eq('user_id', userId).eq('provider', 'openphone')
+        .gte('updated_at', beforeStarted);
+      const counts = {
+        rows_touched: touched?.length || 0,
+        with_company: (touched || []).filter(r => r.company != null && r.company !== '').length,
+        cleared_company: (touched || []).filter(r => r.company == null).length,
+        with_name: (touched || []).filter(r => r.participant_name != null && r.participant_name !== '').length,
+        cleared_name: (touched || []).filter(r => r.participant_name == null).length,
+      };
+      p.phase = 'done';
+      p.finished_at = new Date().toISOString();
+      p.counts = counts;
+      logger.log(`[RefreshAndSync] user=${userId} done counts=${JSON.stringify(counts)}`);
+    } catch (e) {
+      p.phase = 'error';
+      p.finished_at = new Date().toISOString();
+      p.error = e?.message || String(e);
+      logger.error(`[RefreshAndSync] user=${userId} failed: ${p.error}`);
+    }
+  });
+});
+
+app.get('/api/op-contacts/refresh-and-sync/progress', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  res.json(refreshAndSyncProgress[userId] || { phase: 'idle' });
 });
 
 /**
@@ -40205,17 +40324,18 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
       if (found) {
         const updates = { updated_at: new Date().toISOString() };
         if (lastActivity) updates.last_event_at = lastActivity;
-        if (contactName && contactName !== found.participant_name) updates.participant_name = contactName;
-        else if (contactDeletedInOp && found.participant_name != null) updates.participant_name = null;
+
+        // Use the extracted helpers — see lib/op-conversation-update.js for the
+        // full value-present / null / absent semantics. Tested in
+        // tests/op-conversation-update.test.js (21 regression cases).
+        const nameDecision = computeNameUpdate(conv, found, contactNameMap[participantPhone]);
+        if (nameDecision.shouldUpdate) updates.participant_name = nameDecision.value;
+
         if (!found.sigcore_conversation_id && sigcoreConvId) updates.sigcore_conversation_id = sigcoreConvId;
         if (!found.endpoint_phone) updates.endpoint_phone = endpointPhone;
-        // Phase 1 — legacy company kept during dual-read. Phase 4a will stop
-        // writing this. Honor explicit clears (Sigcore returns "" when operator
-        // deleted the Company tag in OpenPhone) — sigcoreCompany has been
-        // normalized to null in that case, and sigcoreCompanyHasSignal is true.
-        if (sigcoreCompanyHasSignal && sigcoreCompany !== found.company) {
-          updates.company = sigcoreCompany;
-        }
+
+        const companyDecision = computeCompanyUpdate(conv, found);
+        if (companyDecision.shouldUpdate) updates.company = companyDecision.value;
         // PR4 — participant mapping fields
         if (participantMappingId && participantMappingId !== found.participant_mapping_id) {
           updates.participant_mapping_id = participantMappingId;
