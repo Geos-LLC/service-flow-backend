@@ -1430,8 +1430,11 @@ module.exports = (supabase, logger) => {
 
         if (!existingMsg) {
           const direction = message.direction === 'inbound' || message.direction === 'in' ? 'in' : 'out'
+          // Source-account boundary (Phase 1) — inherit provider_account_id
+          // from the conversation upserted right above (resolvedAccountId).
           await supabase.from('communication_messages').insert({
             conversation_id: conv.id,
+            provider_account_id: conv.provider_account_id || resolvedAccountId || null,
             external_message_id: message.external_message_id,
             direction,
             channel,
@@ -1570,8 +1573,11 @@ module.exports = (supabase, logger) => {
                   if (existing) continue
 
                   const direction = msg.sender === 'customer' ? 'in' : 'out'
+                  // Source-account boundary (Phase 1) — every LB message
+                  // inherits the iterating account's provider_account_id.
                   await supabase.from('communication_messages').insert({
                     conversation_id: conv.id,
+                    provider_account_id: acct.id,
                     external_message_id: msgId,
                     direction,
                     channel,
