@@ -52,6 +52,18 @@ const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
 const { computeCompanyUpdate, computeNameUpdate, classifyConversationSyncStatus } = require('./lib/op-conversation-update');
 const { classifyIdentity: aiClassifyIdentity } = require('./lib/identity-classifier');
+const {
+  ensureOpenPhoneProviderAccount,
+  ensureWhatsappProviderAccount,
+  resolveOpenPhoneProviderAccountByPhoneNumberId,
+  resolveOpenPhoneProviderAccountByEndpointPhone,
+  resolveWhatsappProviderAccount,
+} = require('./lib/source-account');
+const {
+  loadDisconnectedAccountIds,
+  getProviderAccountStatus,
+  filterVisibleConversations,
+} = require('./lib/source-account-visibility');
 const OpenAI = require('openai').default || require('openai');
 const openaiClient = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -39517,10 +39529,20 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
       updated_at: new Date().toISOString()
     }, { onConflict: 'user_id' });
 
-    // 6. Register deterministic endpoint routes
+    // 6. Source-account boundary (Phase 1) — create one provider_accounts row
+    //    per OpenPhone phone number. Stamps `accountId` onto the phoneNumber
+    //    payload so `registerEndpointRoutes` can also wire provider_account_id
+    //    on communication_endpoint_routes.
+    const phoneNumbersForRouting = [];
+    for (const pn of phoneNumbers) {
+      const accountId = await ensureOpenPhoneProviderAccount(supabase, logger, userId, pn);
+      phoneNumbersForRouting.push(accountId ? { ...pn, accountId } : pn);
+    }
+
+    // 7. Register deterministic endpoint routes
     const workspace = await getOrCreateSfWorkspace(userId);
-    if (workspace?.id && phoneNumbers.length > 0) {
-      await registerEndpointRoutes(workspace.id, 'openphone', phoneNumbers, 'auto_connect');
+    if (workspace?.id && phoneNumbersForRouting.length > 0) {
+      await registerEndpointRoutes(workspace.id, 'openphone', phoneNumbersForRouting, 'auto_connect');
     }
 
     logger.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
@@ -39709,6 +39731,10 @@ async function handleWhatsAppWebhook(event, payload) {
         .eq('endpoint_phone', resolvedEndpointPhone || '').eq('participant_phone', participantPhone)
         .maybeSingle();
 
+      // Source-account boundary (Phase 1) — resolve WhatsApp provider_account_id
+      // for stamping. Best-effort: null is fine for legacy connections.
+      const waProviderAccountId = await resolveWhatsappProviderAccount(supabase, userId, resolvedEndpointPhone);
+
       if (existingConv) {
         conversation = existingConv;
       } else {
@@ -39717,6 +39743,7 @@ async function handleWhatsAppWebhook(event, payload) {
           sigcore_conversation_id: sigcoreConvId,
           endpoint_phone: resolvedEndpointPhone || '', participant_phone: participantPhone,
           participant_name: contactName,
+          provider_account_id: waProviderAccountId || null,
           last_preview: body.substring(0, 200),
           last_event_at: timestamp, unread_count: 1,
           conversation_type: isGroup ? 'group' : 'external_client',
@@ -39750,6 +39777,7 @@ async function handleWhatsAppWebhook(event, payload) {
       const isCall = msg.type === 'call' || /📞/.test(body);
       const msgData = {
         conversation_id: conversation.id,
+        provider_account_id: conversation.provider_account_id || waProviderAccountId || null,
         provider_message_id: externalMessageId,
         sigcore_message_id: sigcoreMessageId,
         direction: isFromMe ? 'out' : 'in',
@@ -39953,6 +39981,13 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         whParticipantPending = true;
       }
 
+      // Source-account boundary (Phase 1) — resolve OP provider_account_id
+      // from the endpoint phone so the new conversation inherits it. Best-effort:
+      // null is fine for legacy connections that pre-date the boundary.
+      const opWebhookProviderAccountId = await resolveOpenPhoneProviderAccountByEndpointPhone(
+        supabase, userId, ourEndpointPhone
+      );
+
       const { data: created, error: createErr } = await supabase.from('communication_conversations').insert({
         user_id: userId,
         sigcore_conversation_id: sigcoreConvId,
@@ -39965,6 +40000,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
         participant_mapping_id: whParticipantMappingId,
         participant_identity_id: whParticipantIdentityId,
         participant_pending: whParticipantPending,
+        provider_account_id: opWebhookProviderAccountId || null,
         last_preview: payload.body || (event.includes('call') ? 'Call' : ''),
         last_event_at: payload.createdAt || new Date().toISOString(),
         unread_count: isInbound ? 1 : 0,
@@ -40012,6 +40048,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 
               await supabase.from('communication_messages').insert({
                 conversation_id: conversation.id,
+                provider_account_id: conversation.provider_account_id || null,
                 sigcore_message_id: msg.id || null,
                 provider_message_id: msgId,
                 direction: dir, channel: 'sms', body: msg.body || '',
@@ -40034,7 +40071,9 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
               if (ex) continue;
               const callDir = (call.direction === 'incoming' || call.direction === 'in') ? 'in' : 'out';
               await supabase.from('communication_calls').insert({
-                conversation_id: conversation.id, provider_call_id: callId,
+                conversation_id: conversation.id,
+                provider_account_id: conversation.provider_account_id || null,
+                provider_call_id: callId,
                 direction: callDir, from_number: normalizePhone(call.fromNumber),
                 to_number: normalizePhone(call.toNumber),
                 duration_seconds: call.duration || 0, status: call.status || 'completed',
@@ -40076,6 +40115,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
 
       await supabase.from('communication_messages').insert({
         conversation_id: conversation.id,
+        provider_account_id: conversation.provider_account_id || null,
         sigcore_message_id: sigcoreMessageId,
         provider_message_id: payload.providerMessageId || null,
         direction: isInbound ? 'in' : 'out',
@@ -40113,6 +40153,7 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       }
       await supabase.from('communication_calls').insert({
         conversation_id: conversation.id,
+        provider_account_id: conversation.provider_account_id || null,
         sigcore_call_id: sigcoreCallId,
         provider_call_id: payload.providerCallId || null,
         direction: isInbound ? 'in' : 'out',
@@ -40455,6 +40496,14 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           } catch (e) { /* non-fatal — identity propagation is best-effort */ }
         }
       } else {
+        // Source-account boundary (Phase 1) — resolve OP provider_account_id
+        // by phoneNumberId (preferred — what sync has), falling back to
+        // the endpoint phone match. Best-effort: null is fine for legacy
+        // connections that pre-date the boundary.
+        const opSyncProviderAccountId =
+          (await resolveOpenPhoneProviderAccountByPhoneNumberId(supabase, userId, phoneNumberId))
+          || (await resolveOpenPhoneProviderAccountByEndpointPhone(supabase, userId, endpointPhone));
+
         const { data: created, error: convErr } = await supabase.from('communication_conversations').insert({
           user_id: userId, sigcore_conversation_id: sigcoreConvId,
           provider: 'openphone', channel: 'sms',
@@ -40464,6 +40513,7 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           participant_mapping_id: participantMappingId,
           participant_identity_id: participantIdentityId,
           participant_pending: participantPending,
+          provider_account_id: opSyncProviderAccountId || null,
           last_event_at: lastActivity, metadata: { phoneNumberId },
         }).select().single();
         if (convErr) return { synced: 0, messages: 0, error: true };
@@ -40526,7 +40576,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           }).eq('id', existingMsg.id);
         } else {
           await supabase.from('communication_messages').insert({
-            conversation_id: localConv.id, provider_message_id: msgId,
+            conversation_id: localConv.id,
+            provider_account_id: localConv.provider_account_id || null,
+            provider_message_id: msgId,
             direction, channel: 'sms', body,
             from_number: normalizePhone(msg.fromNumber), to_number: normalizePhone(msg.toNumber),
             sender_role: direction === 'in' ? 'customer' : 'agent',
@@ -40554,7 +40606,9 @@ async function runCommSync(userId, tenantKey, maxConversations = 0, skipSigcoreS
           }).eq('id', existingCall.id);
         } else {
           await supabase.from('communication_calls').insert({
-            conversation_id: localConv.id, provider_call_id: callId,
+            conversation_id: localConv.id,
+            provider_account_id: localConv.provider_account_id || null,
+            provider_call_id: callId,
             direction: callDir, from_number: normalizePhone(call.fromNumber),
             to_number: normalizePhone(call.toNumber),
             duration_seconds: call.duration || 0,
@@ -41072,8 +41126,22 @@ app.get('/api/communications/conversations', authenticateToken, async (req, res)
       query = query.or(`participant_name.ilike.%${search}%,participant_phone.ilike.%${search}%,participant_email.ilike.%${search}%,last_preview.ilike.%${search}%,company.ilike.%${search}%`);
     }
 
-    const { data, error } = await query.limit(100);
+    const { data: rawData, error } = await query.limit(100);
     if (error) return res.status(500).json({ error: 'Failed to fetch conversations' });
+
+    // Source-account boundary (Phase 4) — when flag enabled, drop rows
+    // whose source provider_account is not active. NULL provider_account_id
+    // stays visible (legacy + gmail/outlook). See lib/source-account-visibility.js.
+    let data = rawData || [];
+    if (isEnabled(FLAGS.SOURCE_ACCOUNT_BOUNDARY_ENFORCED)) {
+      const disconnected = await loadDisconnectedAccountIds(supabase, userId);
+      if (disconnected.size > 0) {
+        const before = data.length;
+        data = filterVisibleConversations(data, disconnected);
+        const dropped = before - data.length;
+        if (dropped > 0) logger.log(`[Boundary] Hid ${dropped} conv(s) with disconnected source for user ${userId}`);
+      }
+    }
 
     // Build endpoint phone → symbol map from cached phone numbers
     const settings = await getSigcoreSettings(userId);
@@ -41314,6 +41382,18 @@ app.get('/api/communications/conversations/:id', authenticateToken, async (req, 
       .eq('id', id).eq('user_id', userId).single();
     if (convErr || !conv) return res.status(404).json({ error: 'Conversation not found' });
 
+    // Source-account boundary (Phase 4) — when flag enabled, hide a
+    // conversation whose source provider_account is not active. The
+    // 404 here matches the list endpoint dropping the row: the data
+    // is "not available", not "you can't see it" (no 403).
+    if (isEnabled(FLAGS.SOURCE_ACCOUNT_BOUNDARY_ENFORCED) && conv.provider_account_id != null) {
+      const status = await getProviderAccountStatus(supabase, conv.provider_account_id);
+      if (status && status !== 'active') {
+        logger.log(`[Boundary] Detail 404 conv=${id} (account #${conv.provider_account_id} status=${status})`);
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+    }
+
     // Fetch messages — last N, with cursor for pagination
     let msgQuery = supabase.from('communication_messages')
       .select('*').eq('conversation_id', id).order('created_at', { ascending: false }).limit(limit);
@@ -41538,6 +41618,17 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
     const { data: conv } = await supabase.from('communication_conversations').select('*').eq('id', id).eq('user_id', userId).single();
     if (!conv) return res.status(404).json({ error: 'Conversation not found' });
 
+    // Source-account boundary (Phase 4) — refuse to send when the
+    // underlying source provider_account is not active. 409 matches the
+    // spec's machine-readable contract for the frontend composer.
+    if (isEnabled(FLAGS.SOURCE_ACCOUNT_BOUNDARY_ENFORCED) && conv.provider_account_id != null) {
+      const status = await getProviderAccountStatus(supabase, conv.provider_account_id);
+      if (status && status !== 'active') {
+        logger.log(`[Boundary] Send 409 conv=${id} (account #${conv.provider_account_id} status=${status})`);
+        return res.status(409).json({ reason: 'source_account_disconnected' });
+      }
+    }
+
     // Route connected-email conversations through the Gmail/Outlook provider.
     if (conv.channel === 'email' && (conv.provider === 'gmail' || conv.provider === 'outlook')) {
       if (!connectedEmail) return res.status(503).json({ error: 'Connected email not available' });
@@ -41583,6 +41674,7 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
         const sentMsg = sendRes.data || {};
         await supabase.from('communication_messages').insert({
           conversation_id: conv.id,
+          provider_account_id: conv.provider_account_id || null,
           external_message_id: sentMsg.externalMessageId || sentMsg.id || null,
           direction: 'out', channel: conv.channel, body: text.trim(),
           sender_role: 'agent', status: 'sent',
@@ -41652,6 +41744,7 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
         // Insert local message copy
         const { data: localMsg } = await supabase.from('communication_messages').insert({
           conversation_id: conv.id,
+          provider_account_id: conv.provider_account_id || null,
           provider_message_id: sentData.messageId || `wa_out_${Date.now()}`,
           direction: 'out', channel: 'whatsapp', body: text.trim(),
           from_number: conv.endpoint_phone, to_number: conv.participant_phone,
@@ -41706,6 +41799,7 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
     // Insert local copy
     const { data: localMsg } = await supabase.from('communication_messages').insert({
       conversation_id: conv.id,
+      provider_account_id: conv.provider_account_id || null,
       sigcore_message_id: sentMsg.id || null,
       provider_message_id: sentMsg.providerMessageId || null,
       direction: 'out', channel: 'sms', body: text.trim(),

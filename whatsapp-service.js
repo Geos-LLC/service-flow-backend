@@ -11,6 +11,10 @@
  */
 
 const express = require('express')
+const {
+  ensureWhatsappProviderAccount,
+  resolveWhatsappProviderAccount,
+} = require('./lib/source-account')
 
 // In-memory sync progress per user — shared with server.js for webhook progress tracking
 const waSyncProgress = {}
@@ -177,6 +181,12 @@ module.exports = (supabase, logger, sigcoreRequest) => {
           updated_at: new Date().toISOString(),
         }).eq('user_id', userId)
 
+        // ── Source-account boundary (Phase 1) — create provider_accounts row ──
+        // Reactivates the row on reconnect; safe no-op if no phone resolved.
+        if (phoneNumber) {
+          await ensureWhatsappProviderAccount(supabase, logger, userId, phoneNumber)
+        }
+
         // ── Register endpoint route for deterministic routing (Step A) ──
         if (phoneNumber) {
           const normalized = normalizePhone(phoneNumber)
@@ -282,6 +292,10 @@ module.exports = (supabase, logger, sigcoreRequest) => {
       const endpointPhone = normalizePhone(settings.whatsapp_phone_number)
       if (!endpointPhone) return res.status(400).json({ error: 'WhatsApp phone number not available. Reconnect WhatsApp.' })
 
+      // Source-account boundary (Phase 1) — resolve provider_account_id once
+      // for the whole sync run; null is fine for legacy connections.
+      const waProviderAccountId = await resolveWhatsappProviderAccount(supabase, userId, endpointPhone)
+
       // Init progress — preserve webhook-delivered counts if receiving phase was active
       const existing = waSyncProgress[userId]
       const webhookChats = (existing?.phase === 'receiving' && existing?.chats) || 0
@@ -368,6 +382,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
               user_id: userId, provider: 'whatsapp', channel: 'whatsapp',
               endpoint_phone: endpointPhone, participant_phone: participantPhone,
               participant_name: chat.name || null,
+              provider_account_id: waProviderAccountId || null,
               last_preview: chat.lastMessageAt ? '' : '',
               last_event_at: chat.lastMessageAt || new Date().toISOString(),
               unread_count: chat.unreadCount || 0,
@@ -507,6 +522,7 @@ module.exports = (supabase, logger, sigcoreRequest) => {
                   } else {
                     await supabase.from('communication_messages').insert({
                       conversation_id: sfConv.id,
+                      provider_account_id: waProviderAccountId || null,
                       sigcore_message_id: sigMsgId,
                       provider_message_id: provMsgId,
                       direction: dir, channel: 'whatsapp', body: msg.body || '',
