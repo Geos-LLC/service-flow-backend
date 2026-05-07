@@ -46,6 +46,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
+const { authenticateWebhook } = require('./lib/webhook-signature');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
@@ -39866,8 +39867,56 @@ async function handleWhatsAppWebhook(event, payload) {
   }
 }
 
-// POST /api/communications/webhooks/sigcore — receives events from Sigcore (NO auth middleware)
+// POST /api/communications/webhooks/sigcore — receives events from Sigcore.
+//
+// Auth (PR-2): when SIGCORE_WEBHOOK_HMAC_REQUIRED is on, we verify
+// X-Sigcore-Signature against the per-user webhook secret stored at
+// connect time (communication_settings.sigcore_webhook_secret). When OFF,
+// we still attempt verification but accept the request — same staged
+// rollout pattern as LB_INBOUND_HMAC_REQUIRED. The metadata.userId
+// legacy fallback at the routing layer is REMOVED unconditionally
+// regardless of the flag, since it accepts unsigned tenant claims.
 app.post('/api/communications/webhooks/sigcore', async (req, res) => {
+  const sigHeader = req.headers['x-sigcore-signature'] || req.headers['x-callio-signature'];
+  const tsHeader = req.headers['x-sigcore-timestamp'] || req.headers['x-callio-timestamp'];
+  const enforced = isEnabled(FLAGS.SIGCORE_WEBHOOK_HMAC_REQUIRED);
+
+  // ── HMAC verification ──
+  let verifiedUserId = null;
+  let verificationReason = null;
+
+  if (sigHeader && tsHeader) {
+    try {
+      const { data: candidates } = await supabase
+        .from('communication_settings')
+        .select('user_id, sigcore_webhook_secret')
+        .not('sigcore_webhook_secret', 'is', null);
+      const candidateRows = (candidates || []).map(c => ({
+        user_id: c.user_id,
+        secret: c.sigcore_webhook_secret,
+      }));
+      const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body);
+      const auth = authenticateWebhook({
+        signatureHeader: sigHeader,
+        timestampHeader: tsHeader,
+        rawBody,
+        candidates: candidateRows,
+      });
+      if (auth.ok) verifiedUserId = auth.candidate.user_id;
+      else verificationReason = auth.reason;
+    } catch (e) {
+      logger.error(`[Webhook] Sigcore verification error: ${e.message}`);
+      verificationReason = 'verification_error';
+    }
+  } else if (enforced) {
+    verificationReason = 'missing_signature_or_timestamp';
+  }
+
+  if (enforced && !verifiedUserId) {
+    logger.warn(`[Webhook] Sigcore rejected (enforced): ${verificationReason}`);
+    return res.status(401).json({ error: 'unauthorized', reason: verificationReason });
+  }
+
   // Return 200 immediately — process async
   res.status(200).json({ received: true });
 
@@ -39912,14 +39961,22 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
       logger.error(`[Webhook] AMBIGUOUS routing - event dropped`, { event, endpointId, phone: ourEndpointPhone, step: routeResult.step, candidates: routeResult.candidates?.length });
       return; // Do NOT auto-route ambiguous events
     } else {
-      // Legacy fallback (deprecated — will be removed after full migration)
-      if (payload.metadata?.userId) {
-        userId = parseInt(payload.metadata.userId);
-        logger.warn(`[Webhook] LEGACY FALLBACK - using metadata.userId=${userId}. Register endpoint routes to fix.`);
-      } else {
-        logger.warn('[Webhook] No route found and no metadata fallback', { event, endpointId, phone: ourEndpointPhone });
-        return;
-      }
+      // PR-2: metadata.userId fallback REMOVED. The payload-supplied userId
+      // was an unsigned claim — accepting it allowed any caller (when the
+      // signature wasn't enforced) to write into any tenant by setting
+      // metadata.userId. Tenant attribution now comes only from the
+      // deterministic endpoint route table (registered at connect time)
+      // or from the verified HMAC signature above.
+      logger.warn('[Webhook] No route found — event dropped', { event, endpointId, phone: ourEndpointPhone });
+      return;
+    }
+
+    // Defense in depth — if HMAC was verified, cross-check it agrees with
+    // the routing-derived userId. Catches a tenant signing an event with
+    // their secret but referencing another tenant's phone number.
+    if (verifiedUserId && userId !== verifiedUserId) {
+      logger.warn(`[Webhook] Sigcore cross-tenant attempt: signed_user=${verifiedUserId} routed_user=${userId} — dropping`);
+      return;
     }
 
     // Find or create conversation — deterministic key: endpoint_phone + participant_phone
