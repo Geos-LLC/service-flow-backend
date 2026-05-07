@@ -29318,10 +29318,10 @@ app.get('/api/places/autocomplete', async (req, res) => {
       return res.json({ predictions: [] });
     }
     
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
     
   
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ') {
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === '') {
       console.warn('Using provided Google API key - ensure it has Places API enabled');
     }
     
@@ -29357,7 +29357,7 @@ app.get('/api/places/details', async (req, res) => {
       return res.status(400).json({ error: 'place_id is required' });
     }
     
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
     
     
     const response = await axios.get(
@@ -34359,9 +34359,9 @@ app.post('/api/address/validate', async (req, res) => {
       return res.status(400).json({ error: 'Address is required' });
     }
 
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
     
-    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ') {
+    if (!GOOGLE_API_KEY || GOOGLE_API_KEY === '') {
       console.warn('Using provided Google API key - ensure it has Places API enabled');
     }
 
@@ -34429,7 +34429,7 @@ app.post('/api/address/validate', async (req, res) => {
       // If Google API fails, fall back to geocoding
       try {
         const geocodeResponse = await axios.get(
-          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(req.body.address)}&key=${process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ'}`
+          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(req.body.address)}&key=${process.env.GOOGLE_MAPS_API_KEY || ''}`
         );
         
         if (geocodeResponse.data.status === 'OK' && geocodeResponse.data.results && geocodeResponse.data.results.length > 0) {
@@ -34488,7 +34488,7 @@ app.post('/api/address/geocode', async (req, res) => {
       return res.status(400).json({ error: 'Address is required' });
     }
 
-    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyC_CrJWTsTHOTBd7TSzTuXOfutywZ2AyOQ';
+    const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
     
     const response = await axios.get(
       `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`
