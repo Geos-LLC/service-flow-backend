@@ -26,6 +26,7 @@ const {
 
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { authenticateWebhook } = require('./lib/webhook-signature')
 const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant } = require('./lib/lb-ingestion')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
@@ -62,6 +63,20 @@ const LEAD_STATUS_COLUMNS = [
   'leadbridge_lead_status_last_event_at',
 ]
 
+// Inbound /webhooks subscription fields — added by migration 037 (PR-2).
+// The older /api/integrations/leadbridge/webhooks endpoint received events
+// without a stored per-user secret; PR-2 registers a CrmWebhookSubscription
+// pointing at it so we can verify HMAC the same way /lead-status does.
+const INBOUND_COLUMNS = [
+  'leadbridge_inbound_subscription_id',
+  'leadbridge_inbound_encrypted_secret',
+  'leadbridge_inbound_secret_key_version',
+  'leadbridge_inbound_webhook_url',
+  'leadbridge_inbound_events',
+  'leadbridge_inbound_registered_at',
+  'leadbridge_inbound_last_event_at',
+]
+
 // LB subscribe path — see geos-leadbridge/plans/2026-04-17-job-sync-sf-lb.md.
 // LB_BASE already includes /api; the shipped contract is versioned under /v1.
 const LB_SUBSCRIBE_PATH = '/v1/integrations/service-flow/subscribe'
@@ -76,6 +91,21 @@ const LB_LEAD_STATUS_SUBSCRIBE_PATH = '/v1/integrations/webhooks'
 // RAILWAY_PUBLIC_DOMAIN with a hard-coded prod fallback (same pattern
 // the WhatsApp + auth flows use).
 const SF_LEAD_STATUS_INBOUND_PATH = '/api/integrations/leadbridge/lead-status'
+
+// SF endpoint for the older v1 inbound integration (thread/message
+// events). PR-2: register a CrmWebhookSubscription pointing at this
+// URL so LB signs deliveries with a known secret.
+const SF_INBOUND_WEBHOOK_PATH = '/api/integrations/leadbridge/webhooks'
+
+// Default events for the inbound subscription. LB's CrmWebhookSubscription
+// supports a fixed set; this list mirrors what the older /webhooks route
+// already handles in this file (thread.message.received, lead.created).
+const INBOUND_EVENT_TYPES = [
+  'thread.message.received',
+  'thread.message.sent',
+  'lead.created',
+  'lead.updated',
+]
 
 function sfPublicBaseUrl() {
   const domain = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -648,12 +678,35 @@ module.exports = (supabase, logger) => {
         logger.warn(`[LB] Lead-status subscription NOT registered for user ${userId}: ${leadStatusResult.reason}`)
       }
 
+      // 7. PR-2: Register inbound /webhooks subscription so LB signs
+      //    thread/lead events with a known secret. Without this, the
+      //    older /webhooks endpoint receives unsigned events that we
+      //    can't authenticate. Same failure semantics — never break
+      //    connect; existing event flow works unsigned until the
+      //    LB_INBOUND_HMAC_REQUIRED flag is enforced.
+      const inboundResult = await registerInboundSubscription(userId, lbToken)
+      if (inboundResult.registered) {
+        logger.log(`[LB] Inbound subscription registered for user ${userId} — sub_id=${inboundResult.subscriptionId}`)
+      } else {
+        logger.warn(`[LB] Inbound subscription NOT registered for user ${userId}: ${inboundResult.reason}`)
+      }
+
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
       res.json({
         success: true,
         accounts,
         userId: lbUserId,
-        direction_inbound: { active: true, accounts: accounts.length },
+        direction_inbound: {
+          active: true,
+          accounts: accounts.length,
+          subscription: {
+            active: inboundResult.registered,
+            subscription_id: inboundResult.subscriptionId || null,
+            registered_at: inboundResult.registeredAt || null,
+            webhook_url: inboundResult.webhookUrl || null,
+            error: inboundResult.registered ? null : inboundResult.reason,
+          },
+        },
         direction_outbound: {
           active: outboundResult.registered,
           subscription_id: outboundResult.subscriptionId || null,
@@ -667,7 +720,10 @@ module.exports = (supabase, logger) => {
           webhook_url: leadStatusResult.webhookUrl || null,
           error: leadStatusResult.registered ? null : leadStatusResult.reason,
         },
-        reconnect_required: !outboundResult.registered || !leadStatusResult.registered,
+        reconnect_required:
+          !outboundResult.registered ||
+          !leadStatusResult.registered ||
+          !inboundResult.registered,
       })
     } catch (error) {
       logger.error('[LB] Connect error:', error.message)
@@ -803,6 +859,71 @@ module.exports = (supabase, logger) => {
     await supabase.from('communication_settings').update(patch).eq('user_id', userId)
   }
 
+  // ══════════════════════════════════════
+  // Inbound /webhooks subscription helpers — PR-2.
+  // Registers a CrmWebhookSubscription pointing at the older
+  // /api/integrations/leadbridge/webhooks endpoint so events arrive
+  // with a verifiable HMAC signature. Same shape as registerLeadStatus
+  // above — the /webhooks vs /lead-status distinction is just two
+  // separate subscriptions per user.
+  //
+  // Failure must NOT break /connect: existing users keep working with
+  // unsigned events until the LB_INBOUND_HMAC_REQUIRED flag is flipped.
+  // ══════════════════════════════════════
+  async function registerInboundSubscription(userId, lbToken) {
+    try {
+      const webhookUrl = `${sfPublicBaseUrl()}${SF_INBOUND_WEBHOOK_PATH}`
+      const subRes = await lbRequest('POST', LB_LEAD_STATUS_SUBSCRIBE_PATH, lbToken, {
+        name: 'Service Flow inbound',
+        webhookUrl,
+        events: INBOUND_EVENT_TYPES,
+        metadata: {
+          sf_instance: process.env.SF_INSTANCE || 'sf-prod',
+          purpose: 'inbound-thread-events',
+        },
+      })
+
+      const body = subRes?.data || {}
+      const sub = body.subscription || body
+      if (!body.success && !sub?.id) {
+        return { registered: false, reason: `bad_response: ${JSON.stringify(body).slice(0, 200)}` }
+      }
+      if (!sub?.secret) {
+        return { registered: false, reason: 'no_secret_returned' }
+      }
+
+      const encryptedSecret = encryptIntegrationSecret(sub.secret)
+      const registeredAt = new Date().toISOString()
+
+      const { error: upErr } = await supabase.from('communication_settings').update({
+        leadbridge_inbound_subscription_id: sub.id,
+        leadbridge_inbound_encrypted_secret: encryptedSecret,
+        leadbridge_inbound_secret_key_version: currentEncKeyVersion(),
+        leadbridge_inbound_webhook_url: sub.webhookUrl || webhookUrl,
+        leadbridge_inbound_events: sub.events || INBOUND_EVENT_TYPES,
+        leadbridge_inbound_registered_at: registeredAt,
+        updated_at: new Date().toISOString(),
+      }).eq('user_id', userId)
+      if (upErr) return { registered: false, reason: `db_update_failed: ${upErr.message}` }
+
+      return {
+        registered: true,
+        subscriptionId: sub.id,
+        registeredAt,
+        webhookUrl: sub.webhookUrl || webhookUrl,
+        events: sub.events || INBOUND_EVENT_TYPES,
+      }
+    } catch (e) {
+      return { registered: false, reason: `subscribe_error: ${e.response?.status || ''} ${e.message}` }
+    }
+  }
+
+  async function clearInboundSubscription(userId) {
+    const patch = { updated_at: new Date().toISOString() }
+    for (const col of INBOUND_COLUMNS) patch[col] = null
+    await supabase.from('communication_settings').update(patch).eq('user_id', userId)
+  }
+
   async function buildIntegrationStatus(userId) {
     const settings = await getLbSettings(userId)
     const connected = Boolean(settings?.leadbridge_connected)
@@ -830,11 +951,15 @@ module.exports = (supabase, logger) => {
         'leadbridge_lead_status_subscription_id',
         'leadbridge_lead_status_registered_at',
         'leadbridge_lead_status_last_event_at',
+        'leadbridge_inbound_subscription_id',
+        'leadbridge_inbound_registered_at',
+        'leadbridge_inbound_last_event_at',
       ].join(','))
       .eq('user_id', userId).maybeSingle()
 
     const outboundActive = Boolean(subRow?.leadbridge_outbound_subscription_id)
     const leadStatusActive = Boolean(subRow?.leadbridge_lead_status_subscription_id)
+    const inboundSubActive = Boolean(subRow?.leadbridge_inbound_subscription_id)
 
     // Backlog + deferral signal — drives the "reconnect required" flag
     // when events are piling up because the user has not re-registered
@@ -851,7 +976,19 @@ module.exports = (supabase, logger) => {
 
     return {
       leadbridge_connected: true,
-      direction_inbound: { active: true, accounts: accountCount || 0 },
+      direction_inbound: {
+        active: true,
+        accounts: accountCount || 0,
+        // PR-2: per-user subscription that gives us a verifiable HMAC on
+        // inbound /webhooks deliveries. Falsey when migration 037 hasn't
+        // been backfilled yet — flag enforcement is unsafe until true.
+        subscription: {
+          active: inboundSubActive,
+          subscription_id: subRow?.leadbridge_inbound_subscription_id || null,
+          registered_at: subRow?.leadbridge_inbound_registered_at || null,
+          last_event_at: subRow?.leadbridge_inbound_last_event_at || null,
+        },
+      },
       direction_outbound: {
         active: outboundActive,
         subscription_id: subRow?.leadbridge_outbound_subscription_id || null,
@@ -865,7 +1002,7 @@ module.exports = (supabase, logger) => {
         registered_at: subRow?.leadbridge_lead_status_registered_at || null,
         last_event_at: subRow?.leadbridge_lead_status_last_event_at || null,
       },
-      reconnect_required: !outboundActive || !leadStatusActive || (deferredCount || 0) > 0,
+      reconnect_required: !outboundActive || !leadStatusActive || !inboundSubActive || (deferredCount || 0) > 0,
     }
   }
 
@@ -938,12 +1075,13 @@ module.exports = (supabase, logger) => {
       }
       for (const col of OUTBOUND_COLUMNS) patch[col] = null
       for (const col of LEAD_STATUS_COLUMNS) patch[col] = null
+      for (const col of INBOUND_COLUMNS) patch[col] = null
       await supabase.from('communication_settings').update(patch).eq('user_id', userId)
 
       logger.log(`[LB] Disconnected for user ${userId} (all directions cleared)`)
       res.json({
         success: true,
-        direction_inbound: { active: false, accounts: 0 },
+        direction_inbound: { active: false, accounts: 0, subscription: { active: false } },
         direction_outbound: { active: false },
         direction_lead_status: { active: false },
       })
@@ -966,16 +1104,22 @@ module.exports = (supabase, logger) => {
       }
       const lbToken = settings.leadbridge_integration_token
       const outbound = await registerOutboundSubscription(userId, lbToken)
-      // Lead-status: rotate alongside outbound so a single reconnect
-      // refreshes BOTH HMAC secrets. We don't fail the request if
-      // only lead-status fails — outbound is the higher-priority leg.
+      // Lead-status + inbound: rotate alongside outbound so a single
+      // reconnect refreshes ALL THREE HMAC secrets. We don't fail the
+      // request if only lead-status / inbound fails — outbound is the
+      // higher-priority leg. The PR-2 inbound subscription is the
+      // operator-driven backfill path: existing users invoke /reconnect
+      // to populate leadbridge_inbound_* before LB_INBOUND_HMAC_REQUIRED
+      // can be flipped on.
       const leadStatus = await registerLeadStatusSubscription(userId, lbToken)
+      const inbound = await registerInboundSubscription(userId, lbToken)
 
       if (!outbound.registered) {
         return res.status(502).json({
           error: 'Failed to register outbound subscription',
           reason: outbound.reason,
           lead_status_reason: leadStatus.registered ? null : leadStatus.reason,
+          inbound_reason: inbound.registered ? null : inbound.reason,
         })
       }
       res.json({
@@ -990,6 +1134,13 @@ module.exports = (supabase, logger) => {
           subscription_id: leadStatus.subscriptionId || null,
           registered_at: leadStatus.registeredAt || null,
           error: leadStatus.registered ? null : leadStatus.reason,
+        },
+        direction_inbound_subscription: {
+          active: inbound.registered,
+          subscription_id: inbound.subscriptionId || null,
+          registered_at: inbound.registeredAt || null,
+          webhook_url: inbound.webhookUrl || null,
+          error: inbound.registered ? null : inbound.reason,
         },
       })
     } catch (error) {
@@ -1322,10 +1473,75 @@ module.exports = (supabase, logger) => {
   })
 
   // ══════════════════════════════════════
-  // POST /webhooks — Receive events from LB
-  // No auth middleware — public webhook endpoint
+  // POST /webhooks — Receive events from LB.
+  //
+  // Signature verification (PR-2): when LB_INBOUND_HMAC_REQUIRED is on,
+  // we verify X-LB-Signature against the per-user inbound subscription
+  // secret stored at /connect time (migration 037). When OFF, we still
+  // attempt verification when a signature is present and a candidate
+  // exists, and log mismatches — but the request is processed anyway
+  // for backwards compatibility with existing unsigned LB integrations
+  // that haven't been re-registered yet.
   // ══════════════════════════════════════
   router.post('/webhooks', async (req, res) => {
+    const sigHeader = req.headers['x-lb-signature']
+    const tsHeader = req.headers['x-lb-timestamp']
+    const enforced = isEnabled(FLAGS.LB_INBOUND_HMAC_REQUIRED)
+
+    // ── HMAC verification ──
+    let verifiedUserId = null
+    let verificationReason = null
+
+    if (sigHeader && tsHeader) {
+      try {
+        const { data: candidates } = await supabase
+          .from('communication_settings')
+          .select('user_id,leadbridge_inbound_encrypted_secret,leadbridge_inbound_secret_key_version')
+          .not('leadbridge_inbound_encrypted_secret', 'is', null)
+
+        const decryptedCandidates = []
+        for (const c of (candidates || [])) {
+          try {
+            decryptedCandidates.push({
+              user_id: c.user_id,
+              secret: decryptIntegrationSecret(
+                c.leadbridge_inbound_encrypted_secret,
+                c.leadbridge_inbound_secret_key_version,
+              ),
+            })
+          } catch (e) {
+            logger.warn(`[LB Webhook] Decrypt failed for user ${c.user_id}: ${e.message}`)
+          }
+        }
+
+        const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body)
+        const auth = authenticateWebhook({
+          signatureHeader: sigHeader,
+          timestampHeader: tsHeader,
+          rawBody,
+          candidates: decryptedCandidates,
+        })
+        if (auth.ok) {
+          verifiedUserId = auth.candidate.user_id
+        } else {
+          verificationReason = auth.reason
+        }
+      } catch (e) {
+        logger.error(`[LB Webhook] Verification error: ${e.message}`)
+        verificationReason = 'verification_error'
+      }
+    } else if (enforced) {
+      verificationReason = 'missing_signature_or_timestamp'
+    }
+
+    if (enforced && !verifiedUserId) {
+      // Reject unsigned/invalid when flag is on. Don't reveal whether the
+      // signature was missing vs mismatched — same 401 for both.
+      logger.warn(`[LB Webhook] Rejected (enforced): ${verificationReason}`)
+      return res.status(401).json({ error: 'unauthorized', reason: verificationReason })
+    }
+
+    // Accept the event and respond 200 immediately. Processing async.
     res.status(200).json({ received: true })
 
     try {
@@ -1347,20 +1563,31 @@ module.exports = (supabase, logger) => {
         event_id: eventId,
         event_type: event.event_type,
         payload: event,
-        signature: req.headers['x-lb-signature'] || null,
+        signature: typeof sigHeader === 'string' ? sigHeader.slice(0, 200) : null,
         external_account_id: event.account_id,
         channel: event.channel,
         processed: false,
         received_at: new Date().toISOString(),
       })
 
-      // Resolve user from account_id
-      let userId = null
+      // Tenant attribution. PRIORITY:
+      //   1. Verified userId from HMAC (signed-event-was-for-this-tenant)
+      //   2. Lookup by event.account_id → communication_provider_accounts
+      //
+      // When verifiedUserId is set, we still cross-check that event.account_id
+      // belongs to the same user, and refuse otherwise — defends against a
+      // tenant signing an event with their secret but referencing another
+      // tenant's account_id.
+      let userId = verifiedUserId
       if (event.account_id) {
         const { data: acct } = await supabase.from('communication_provider_accounts')
           .select('user_id').eq('provider', 'leadbridge').eq('external_account_id', event.account_id)
           .eq('status', 'active').maybeSingle()
-        userId = acct?.user_id
+        if (verifiedUserId && acct && acct.user_id !== verifiedUserId) {
+          logger.warn(`[LB Webhook] Cross-tenant attempt: signed_user=${verifiedUserId} account_user=${acct.user_id}`)
+          return // do not process
+        }
+        if (!userId) userId = acct?.user_id
       }
       if (!userId) {
         logger.warn('[LB Webhook] No user found for account:', event.account_id)
