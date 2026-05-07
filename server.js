@@ -46,6 +46,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
+const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { authenticateWebhook } = require('./lib/webhook-signature');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
@@ -41914,17 +41915,72 @@ app.patch('/api/communications/conversations/:id', authenticateToken, async (req
 // ADMIN DASHBOARD
 // ============================================================
 
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'info@geos-ai.com';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'aspire5733Z!';
+// PR-3 admin auth hardening:
+//   - No hardcoded fallback credentials (operator MUST set both env vars)
+//   - Constant-time, length-safe compare via SHA-256 + timingSafeEqual
+//   - Per-IP rate limit on /api/admin/login (default 5 attempts / 15 min)
+//   - Configurable JWT TTL (default 30m, was hardcoded 24h)
+//   - Structured security log on every login surface event + gate block
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const ADMIN_JWT_TTL = process.env.ADMIN_JWT_TTL || '30m';
+const ADMIN_AUTH_CONFIGURED = Boolean(ADMIN_EMAIL && ADMIN_PASSWORD);
+
+if (!ADMIN_AUTH_CONFIGURED) {
+  logger.warn('[Admin Auth] ADMIN_EMAIL or ADMIN_PASSWORD not set — admin login is DISABLED until both env vars are configured.');
+}
+
+// Structured security log for any admin-auth surface event. Fields are
+// intentionally minimal — never include the candidate password or the
+// configured ADMIN_PASSWORD in any form.
+function logAdminSecurityEvent(req, kind, details = {}) {
+  const ip = (req.ip || req.headers['x-forwarded-for'] || 'unknown').toString().slice(0, 64);
+  const ua = (req.headers['user-agent'] || '').toString().slice(0, 200);
+  logger.warn(`[Admin Security] ${kind}`, { ip, ua, path: req.path, method: req.method, ...details });
+}
+
+// Per-IP brute-force protection on /api/admin/login. Defaults match the
+// PR-3 spec; both window and max are env-tunable.
+const adminLoginLimiter = rateLimit({
+  windowMs: parseInt(process.env.ADMIN_LOGIN_RATELIMIT_WINDOW_MS, 10) || 15 * 60 * 1000,
+  max: parseInt(process.env.ADMIN_LOGIN_RATELIMIT_MAX, 10) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_attempts' },
+  // Successful login does not count toward the limit, so a legitimate
+  // operator never exhausts the window. Brute-force protection still
+  // works because attacker guesses are all failures.
+  skipSuccessfulRequests: true,
+});
+
+// Endpoint gate using lib/admin-auth's pure factory, with logger wired in.
+function requireAdminFlag(flagName) {
+  return requireAdminFlagPure(flagName, { isEnabled, logSecurityEvent: logAdminSecurityEvent });
+}
 
 // Admin login — separate from SF user auth
-app.post('/api/admin/login', (req, res) => {
-  const { email, password } = req.body;
-  if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-    const token = jwt.sign({ admin: true, email }, JWT_SECRET, { expiresIn: '24h' });
-    return res.json({ token, email });
+app.post('/api/admin/login', adminLoginLimiter, (req, res) => {
+  const { email, password } = req.body || {};
+
+  if (!ADMIN_AUTH_CONFIGURED) {
+    logAdminSecurityEvent(req, 'login_attempted_unconfigured');
+    return res.status(503).json({ error: 'admin_auth_unconfigured' });
   }
-  res.status(401).json({ error: 'Invalid admin credentials' });
+
+  // Run BOTH compares unconditionally — same number of hashes +
+  // timingSafeEqual calls regardless of which field is wrong. Prevents
+  // leaking which of {email, password} mismatched.
+  const emailMatch = adminConstantTimeCompare(email, ADMIN_EMAIL);
+  const passwordMatch = adminConstantTimeCompare(password, ADMIN_PASSWORD);
+
+  if (!emailMatch || !passwordMatch) {
+    logAdminSecurityEvent(req, 'login_failed');
+    return res.status(401).json({ error: 'invalid_credentials' });
+  }
+
+  const token = jwt.sign({ admin: true, email: ADMIN_EMAIL }, JWT_SECRET, { expiresIn: ADMIN_JWT_TTL });
+  logAdminSecurityEvent(req, 'login_succeeded');
+  return res.json({ token, email: ADMIN_EMAIL });
 });
 
 // Admin auth middleware
@@ -41964,7 +42020,7 @@ app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
 
 // PUT /api/admin/global-settings — save Sigcore URL + workspace key
 // Uses communication_settings table (user_id=0 as global marker) since admin_global_settings may not exist
-app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
+app.put('/api/admin/global-settings', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_GLOBAL_SETTINGS), async (req, res) => {
   try {
     const { sigcoreUrl, sigcoreWorkspaceKey } = req.body;
     if (!sigcoreWorkspaceKey) return res.status(400).json({ error: 'Workspace API key is required' });
@@ -42001,7 +42057,7 @@ app.put('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/test-sigcore — test Sigcore connection with workspace key
-app.post('/api/admin/test-sigcore', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/test-sigcore', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_GLOBAL_SETTINGS), async (req, res) => {
   try {
     // Read from DB first, fall back to in-memory
     const { data: setting } = await supabase.from('communication_settings').select('*').eq('sigcore_tenant_id', 'global_workspace').maybeSingle();
@@ -42063,7 +42119,7 @@ app.get('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
 });
 
 // PUT /api/admin/sendgrid — save SendGrid API key + from email to DB
-app.put('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
+app.put('/api/admin/sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_SENDGRID_MUTATION), async (req, res) => {
   try {
     const { apiKey, fromEmail } = req.body;
     if (apiKey?.trim()) {
@@ -42085,7 +42141,7 @@ app.put('/api/admin/sendgrid', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/test-sendgrid — test SendGrid connectivity (uses DB-stored config)
-app.post('/api/admin/test-sendgrid', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/test-sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_SENDGRID_MUTATION), async (req, res) => {
   try {
     const { testEmail } = req.body;
     if (!testEmail) return res.status(400).json({ error: 'Test email required' });
@@ -42154,7 +42210,7 @@ app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
 });
 
 // POST /api/admin/run-migration — run a specific migration SQL
-app.post('/api/admin/run-migration', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/run-migration', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_RUN_MIGRATION), async (req, res) => {
   try {
     const { sql } = req.body;
     if (!sql) return res.status(400).json({ error: 'SQL is required' });
