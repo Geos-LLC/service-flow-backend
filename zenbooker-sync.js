@@ -1416,17 +1416,39 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
   // POST /sync — manual sync with options
   router.post('/sync', authenticateToken, async (req, res) => {
+    // T2.1 (2026-05-09): instrumentation. Pre-fix the catch was silent —
+    // the operator saw "Failed to start sync" with zero log lines reaching
+    // Loki, making the failure undiagnosable. Add an entry log + phase
+    // tracker so the catch can report exactly where in the route the
+    // exception fired. Phase string is also returned to the caller so the
+    // browser console shows it directly.
+    let phase = 'entry'
+    const userId = req.user?.userId ?? null
+    logger.log(`[Zenbooker] POST /sync entry — userId=${userId} body=${JSON.stringify(req.body || {}).slice(0, 200)}`)
     try {
-      const userId = req.user.userId
-      const { data: user } = await supabase.from('users').select('zenbooker_api_key, zenbooker_status').eq('id', userId).single()
+      if (!userId) {
+        // authenticateToken should have rejected, but belt-and-suspenders:
+        // surface this clearly rather than crashing on `req.user.userId`.
+        logger.error(`[Zenbooker] /sync rejected — req.user.userId missing despite authenticateToken pass`)
+        return res.status(401).json({ error: 'Invalid auth context', phase: 'entry' })
+      }
+      phase = 'load_user'
+      const { data: user, error: userErr } = await supabase.from('users').select('zenbooker_api_key, zenbooker_status').eq('id', userId).single()
+      if (userErr) {
+        logger.error(`[Zenbooker] /sync supabase users lookup failed for userId=${userId}: ${userErr.message || JSON.stringify(userErr)}`)
+        return res.status(500).json({ error: 'Failed to load user', phase, detail: userErr.message })
+      }
       if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
-        return res.status(400).json({ error: 'Zenbooker not connected' })
+        logger.log(`[Zenbooker] /sync rejected — userId=${userId} status=${user?.zenbooker_status || 'null'} hasKey=${!!user?.zenbooker_api_key}`)
+        return res.status(400).json({ error: 'Zenbooker not connected', phase: 'load_user', status: user?.zenbooker_status || null })
       }
 
+      phase = 'check_running'
       if (syncProgress[userId]?.status === 'running') {
-        return res.status(409).json({ error: 'Sync already in progress' })
+        return res.status(409).json({ error: 'Sync already in progress', phase, currentProgress: syncProgress[userId] })
       }
 
+      phase = 'parse_body'
       const { entity, maxItems, since, includeCancelled } = req.body || {}
       // entity: 'jobs', 'customers', 'services', 'team', 'territories', 'link_all', 'reconcile', or null (full)
       // maxItems: number limit
@@ -1688,11 +1710,26 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         }
       }
 
+      phase = 'kick_off'
       runSync()
       res.json({ message: 'Sync started' })
     } catch (err) {
-      logger.error(`[Zenbooker] Sync trigger error: ${err.message}`)
-      res.status(500).json({ error: 'Failed to start sync' })
+      // T2.1 (2026-05-09): log the FULL error context — phase, message, stack —
+      // and return diagnostic info to the caller so the browser console shows
+      // exactly where the route died. Pre-fix: only err.message logged + bare
+      // 500 returned, making the failure invisible in both Loki and DevTools.
+      const errMsg = err && err.message ? err.message : String(err)
+      const errStack = err && err.stack ? err.stack.split('\n').slice(0, 8).join('\n') : null
+      logger.error(`[Zenbooker] /sync trigger error at phase=${phase} userId=${userId}: ${errMsg}`)
+      if (errStack) logger.error(`[Zenbooker] /sync stack: ${errStack}`)
+      res.status(500).json({
+        error: 'Failed to start sync',
+        phase,
+        detail: errMsg,
+        // Stack only included for the operator's own user (admin diagnostic).
+        // Not strictly secret but no need to surface globally.
+        ...(req.user?.role === 'admin' || process.env.NODE_ENV !== 'production' ? { stack: errStack } : {}),
+      })
     }
   })
 
