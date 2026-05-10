@@ -331,6 +331,36 @@ describe('safeReconcileJobLedger — 142065 canonical case', () => {
     expect(out.applied.inserted[0]).toMatchObject({ type: 'tip', amount: 20 });
   });
 
+  test('H9. cancelled-job overlay → ledger reconciler sees ineligible, no new rows', async () => {
+    // Job 141934 case: ZB now says canceled=true. The endpoint will route the
+    // status flip through updateJobStatus separately, but it ALSO passes the
+    // would-be status='cancelled' as a jobOverride. computeIntendedRows must
+    // treat the job as ineligible (status not completed/paid) and produce no
+    // intended rows — even if the job has stale earning/tip rows on it, the
+    // safe-reconciler must NOT touch them (delete is forbidden in this path).
+    const shim = makeShim(fixture142065({
+      job: { status: 'completed' },   // SF current
+      cleaner_ledger: [{
+        id: 90400, user_id: 2, team_member_id: 2669, job_id: 142065,
+        type: 'earning', amount: 107.40, payout_batch_id: null,
+        effective_date: '2026-05-07', metadata: {},
+        note: 'Earning for job #142065',
+      }],
+    }));
+    const out = await safeReconcileJobLedger(shim, {
+      jobId: 142065, userId: 2,
+      jobOverrides: { status: 'cancelled' },  // would-be post-status-flip
+    });
+    expect(out.eligible).toBe(false);
+    expect(out.reason).toMatch(/job_status_not_completed/);
+    expect(out.applied.inserted).toEqual([]);
+    expect(out.applied.updated).toEqual([]);
+    // Existing earning row stays put — never deleted, never updated
+    const earning = shim._db.cleaner_ledger.find((r) => r.id === 90400);
+    expect(earning.amount).toBe(107.40);
+    expect(earning.payout_batch_id).toBe(null);
+  });
+
   test('H6. orphan existing unpaid row of type not in intended set → reported, untouched', async () => {
     const shim = makeShim(fixture142065({
       cleaner_ledger: [

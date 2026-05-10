@@ -11,6 +11,7 @@ const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
 const { mapJobFinancials, stripDiagnostics } = require('./lib/zenbooker-financial')
 const { safeReconcileJobLedger } = require('./lib/zenbooker-ledger-reconcile')
+const { mapJobLifecycle, stripLifecycleDiagnostics } = require('./lib/zenbooker-lifecycle')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -1814,7 +1815,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
 
       const { data: job } = await supabase.from('jobs')
-        .select('id, user_id, zenbooker_id, status, tip_amount')
+        .select('id, user_id, zenbooker_id, status, tip_amount, scheduled_date, start_time, end_time, is_recurring, invoice_status, payment_status')
         .eq('id', jobId).eq('user_id', userId).maybeSingle()
       if (!job) return res.status(404).json({ error: 'job_not_found' })
       if (!job.zenbooker_id) return res.status(400).json({ error: 'job_not_linked_to_zenbooker' })
@@ -1844,28 +1845,50 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
 
       const fin = stripDiagnostics(mapJobFinancials(zbJob, { existingSfTipAmount: job.tip_amount }))
-      const finBefore = {
-        service_price: null, total: null, tip_amount: null, additional_fees: null, duration: null,
-      }
-      const { data: jobBefore } = await supabase.from('jobs')
-        .select('service_price, total, total_amount, tip_amount, additional_fees, fees_breakdown, taxes, discount, duration')
-        .eq('id', jobId).single()
-      Object.assign(finBefore, jobBefore || {})
+      const lifecycleRaw = mapJobLifecycle(zbJob)
+      const lifecycle = stripLifecycleDiagnostics(lifecycleRaw)
 
-      let jobUpdateResult = { applied: false, changes: {} }
+      // Status is handled separately via updateJobStatus (preserves audit
+      // trail + outbox emission for LB-linked jobs). All other lifecycle
+      // fields go into the regular UPDATE alongside financials.
+      const { status: newStatus, ...lifecycleFields } = lifecycle
+
+      const { data: jobBefore } = await supabase.from('jobs')
+        .select('service_price, total, total_amount, tip_amount, additional_fees, fees_breakdown, taxes, discount, duration, status, scheduled_date, start_time, end_time, is_recurring, invoice_status, payment_status')
+        .eq('id', jobId).single()
+
+      const merged = { ...fin, ...lifecycleFields }
       const changes = {}
-      for (const k of Object.keys(fin)) {
+      for (const k of Object.keys(merged)) {
+        const before = jobBefore?.[k]
+        const after = merged[k]
         if (k === 'fees_breakdown') {
-          // JSON compare
-          if (JSON.stringify(jobBefore?.[k]) !== JSON.stringify(fin[k])) {
-            changes[k] = { before: jobBefore?.[k], after: fin[k] }
+          if (JSON.stringify(before) !== JSON.stringify(after)) {
+            changes[k] = { before, after }
           }
-        } else if (jobBefore?.[k] !== fin[k] && Math.abs((parseFloat(jobBefore?.[k]) || 0) - (parseFloat(fin[k]) || 0)) >= 0.01) {
-          changes[k] = { before: jobBefore?.[k], after: fin[k] }
+        } else if (k === 'is_recurring') {
+          if (Boolean(before) !== Boolean(after)) changes[k] = { before, after }
+        } else if (typeof after === 'string' || after == null && typeof before === 'string') {
+          // Date/string fields — exact compare
+          if (String(before || '') !== String(after || '')) {
+            changes[k] = { before, after }
+          }
+        } else if (before !== after && Math.abs((parseFloat(before) || 0) - (parseFloat(after) || 0)) >= 0.01) {
+          changes[k] = { before, after }
         }
       }
+
+      let jobUpdateResult = { applied: false, changes }
+      let statusUpdateResult = {
+        previousStatus: jobBefore?.status || null,
+        newStatus,
+        changed: false,
+        applied: false,
+      }
+
+      // Phase 1a: write non-status lifecycle + financial fields
       if (Object.keys(changes).length > 0 && !dryRun) {
-        const { error: updErr } = await supabase.from('jobs').update(fin).eq('id', jobId)
+        const { error: updErr } = await supabase.from('jobs').update(merged).eq('id', jobId)
         if (updErr) {
           logger.error(`[Zenbooker] reconcile-job ${jobId}: job update failed: ${updErr.message}`)
           return res.status(500).json({ error: 'job_update_failed', detail: updErr.message })
@@ -1875,17 +1898,65 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         jobUpdateResult = { applied: false, changes, dry_run: dryRun }
       }
 
+      // Phase 1b: route status change through the centralized service so
+      // status_history + outbox events fire correctly. Skip when ZB status
+      // already matches SF (no-op) or in dry-run.
+      if (newStatus && newStatus !== (jobBefore?.status || null)) {
+        statusUpdateResult.changed = true
+        if (!dryRun) {
+          try {
+            const result = await updateJobStatus(supabase, {
+              jobId,
+              userId,
+              newStatus,
+              source: 'system',
+              actor: { type: 'system', id: userId, display_name: 'reconcile-job (admin)' },
+            })
+            statusUpdateResult.applied = true
+            statusUpdateResult.outboundAction = result.outboundAction
+          } catch (e) {
+            logger.error(`[Zenbooker] reconcile-job ${jobId}: updateJobStatus failed: ${e.message}`)
+            return res.status(500).json({ error: 'status_update_failed', detail: e.message })
+          }
+        } else {
+          statusUpdateResult.applied = false
+          statusUpdateResult.dry_run = true
+        }
+      }
+
       // ── Phase 2: safe ledger reconcile ──
       // Pass the projected financial update as jobOverrides so dry-run computes
       // intended ledger amounts against the would-be post-update job state, not
       // against pre-update stale data. (In apply mode, the UPDATE has already run,
       // so the overlay matches what's in the DB; harmless either way.)
+      // We also overlay the would-be status so a job that's transitioning to
+      // 'cancelled' makes the reconciler treat it as ineligible (no new earning
+      // rows for cancelled jobs). Critically: even on cancel transition, this
+      // never DELETES paid/unpaid rows (per safeReconcileJobLedger contract).
       const ledgerResult = await safeReconcileJobLedger(supabase, {
         jobId, userId, dryRun,
-        jobOverrides: fin,
+        jobOverrides: { ...fin, ...(newStatus ? { status: newStatus } : {}) },
       })
 
-      logger.log(`[Zenbooker] reconcile-job ${jobId} ${dryRun ? '(dry-run)' : ''}: jobUpdated=${jobUpdateResult.applied} ledgerInserted=${ledgerResult.applied?.inserted?.length || 0} ledgerUpdated=${ledgerResult.applied?.updated?.length || 0} skippedPaid=${ledgerResult.skipped?.paid_rows_with_drift?.length || 0}`)
+      // Cancelled-job advisory: if status will become / is 'cancelled' and the
+      // job has earning/tip/incentive ledger rows, surface them — they're not
+      // auto-deleted by this endpoint (insert-only contract). Operator decides.
+      let cancellation_advisory = null
+      if (newStatus === 'cancelled') {
+        const { data: leftover } = await supabase
+          .from('cleaner_ledger')
+          .select('id, type, amount, payout_batch_id, effective_date')
+          .eq('job_id', jobId)
+          .in('type', ['earning', 'tip', 'incentive', 'cash_collected'])
+        if (leftover && leftover.length > 0) {
+          cancellation_advisory = {
+            note: 'Job is transitioning to cancelled in ZB but has completion-derived ledger rows. They are NOT auto-deleted by this endpoint. Operator review required.',
+            rows: leftover.map(r => ({ id: r.id, type: r.type, amount: parseFloat(r.amount), payout_batch_id: r.payout_batch_id, effective_date: r.effective_date })),
+          }
+        }
+      }
+
+      logger.log(`[Zenbooker] reconcile-job ${jobId} ${dryRun ? '(dry-run)' : ''}: jobUpdated=${jobUpdateResult.applied} statusChanged=${statusUpdateResult.changed} ledgerInserted=${ledgerResult.applied?.inserted?.length || 0} ledgerUpdated=${ledgerResult.applied?.updated?.length || 0} skippedPaid=${ledgerResult.skipped?.paid_rows_with_drift?.length || 0}`)
 
       res.json({
         ok: true,
@@ -1899,8 +1970,18 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           status: zbJob.invoice.status,
           adjustment_total: zbJob.invoice.adjustment_total,
         } : null,
+        zb_lifecycle: {
+          status_raw: lifecycleRaw._zb_status_raw,
+          canceled: lifecycleRaw._zb_canceled,
+          rescheduled: lifecycleRaw._zb_rescheduled,
+          start_date: zbJob?.start_date,
+          started_at: zbJob?.started_at,
+          completed_at: zbJob?.completed_at,
+        },
         job_update: jobUpdateResult,
+        status_update: statusUpdateResult,
         ledger_reconcile: ledgerResult,
+        cancellation_advisory,
       })
     } catch (err) {
       logger.error(`[Zenbooker] reconcile-job error: ${err.message}`)
