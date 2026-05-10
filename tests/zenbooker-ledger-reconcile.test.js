@@ -272,6 +272,65 @@ describe('safeReconcileJobLedger — 142065 canonical case', () => {
     expect(out.no_change).toHaveLength(2);
   });
 
+  test('H7. dry-run with jobOverrides (projected financial update) → intended ledger reflects post-fix amounts', async () => {
+    // Reproduces the exact bug caught on staging: SF still has service_price=199
+    // (not yet UPDATEd in dry-run mode), but the endpoint will write 179. Without
+    // jobOverrides, the ledger reconcile would compute intended=119.40 (matching
+    // the wrong existing row) and report no_change. WITH jobOverrides, it should
+    // compute intended=107.40 and a missing tip $20.
+    const shim = makeShim(fixture142065({
+      job: {
+        // Pre-update SF state: stale service_price + tip (this is the bug 142065 had)
+        service_price: 199, price: 199, total: 199, total_amount: 199,
+        tip_amount: 0, additional_fees: 5.37,
+      },
+      cleaner_ledger: [{
+        id: 90298, user_id: 2, team_member_id: 2669, job_id: 142065,
+        type: 'earning', amount: 119.40, payout_batch_id: null,
+        effective_date: '2026-05-07', metadata: { hours: 4, revenue: 199 },
+        note: 'Earning for job #142065',
+      }],
+    }));
+
+    const out = await safeReconcileJobLedger(shim, {
+      jobId: 142065, userId: 2, dryRun: true,
+      jobOverrides: {
+        service_price: 179, price: 179, total: 204.37, total_amount: 204.37,
+        tip_amount: 20,
+      },
+    });
+
+    // With overlay: intended earning is 179 × 60% = 107.40
+    expect(out.applied.updated).toHaveLength(1);
+    expect(out.applied.updated[0]).toMatchObject({
+      ledger_id: 90298, intended_amount: 107.40, previous_amount: 119.40, _dry_run: true,
+    });
+    // Tip row should be in inserted (missing now, $20 after overlay)
+    expect(out.applied.inserted).toHaveLength(1);
+    expect(out.applied.inserted[0]).toMatchObject({ type: 'tip', amount: 20, _dry_run: true });
+    expect(out.no_change).toEqual([]);
+    // No DB writes in dry-run
+    expect(shim._db.cleaner_ledger.find((r) => r.id === 90298).amount).toBe(119.40);
+  });
+
+  test('H8. without jobOverlay (no projected update) the dry-run uses live job data', async () => {
+    // Sanity check: when caller doesn't pass jobOverrides, behavior is unchanged.
+    const shim = makeShim(fixture142065({
+      job: { service_price: 179, tip_amount: 20 },
+      cleaner_ledger: [{
+        id: 90298, user_id: 2, team_member_id: 2669, job_id: 142065,
+        type: 'earning', amount: 107.40, payout_batch_id: null,
+        effective_date: '2026-05-07', metadata: {},
+        note: 'Earning for job #142065',
+      }],
+    }));
+    const out = await safeReconcileJobLedger(shim, { jobId: 142065, userId: 2, dryRun: true });
+    expect(out.applied.updated).toEqual([]);
+    expect(out.no_change).toHaveLength(1);
+    expect(out.applied.inserted).toHaveLength(1); // tip is missing
+    expect(out.applied.inserted[0]).toMatchObject({ type: 'tip', amount: 20 });
+  });
+
   test('H6. orphan existing unpaid row of type not in intended set → reported, untouched', async () => {
     const shim = makeShim(fixture142065({
       cleaner_ledger: [

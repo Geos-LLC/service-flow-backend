@@ -149,14 +149,45 @@ describe('mapJobFinancials — non-tip fields', () => {
     });
   });
 
-  test('empty invoice → SF prices not overwritten (subtotal 0 → keys omitted)', () => {
+  test('empty invoice → SF prices and fees not overwritten (no source signal)', () => {
     const zb = { id: 'x', invoice: {} };
     const out = mapJobFinancials(zb);
     expect('service_price' in out).toBe(false);
     expect('total' in out).toBe(false);
-    // But the always-present fields are still set
+    // Adjustment fields omitted because invoice doesn't include adjustment_total
+    // or adjustments_applied at all — we can't tell "no fees" from "field absent".
+    expect('additional_fees' in out).toBe(false);
+    expect('fees_breakdown' in out).toBe(false);
+    // Always-present fields still default to 0
     expect(out.taxes).toBe(0);
+  });
+
+  test('invoice from /jobs/:id (no adjustment_* fields) → fees omitted, SF preserved', () => {
+    // Real ZB /jobs/:id returns the invoice WITHOUT adjustment_total / adjustments_applied.
+    // The mapper must NOT clobber existing SF additional_fees/fees_breakdown to 0/null.
+    const zb = {
+      id: 'x', estimated_duration_seconds: 12600,
+      invoice: { subtotal: '179.00', total: '204.37', tip: '20.00', amount_paid: '204.37', tax_amount: '0.00', status: 'paid' },
+    };
+    const out = mapJobFinancials(zb);
+    expect(out.service_price).toBe(179);
+    expect(out.tip_amount).toBe(20);
+    expect('additional_fees' in out).toBe(false);
+    expect('fees_breakdown' in out).toBe(false);
+  });
+
+  test('invoice WITH adjustment_total: 0 (zero fees explicit) → writes 0', () => {
+    // When the source explicitly says "zero adjustments", we DO write 0 to clear stale values.
+    const zb = {
+      id: 'x',
+      invoice: {
+        subtotal: '100', total: '100', amount_paid: '100', tax_amount: '0',
+        adjustment_total: 0, adjustments_applied: [],
+      },
+    };
+    const out = mapJobFinancials(zb);
     expect(out.additional_fees).toBe(0);
+    expect(out.fees_breakdown).toBeNull(); // empty array → null per mapAdjustments
   });
 
   test('missing duration → key omitted (does not overwrite SF duration with 0)', () => {

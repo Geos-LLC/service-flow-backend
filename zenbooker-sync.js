@@ -1820,12 +1820,27 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       if (!job.zenbooker_id) return res.status(400).json({ error: 'job_not_linked_to_zenbooker' })
 
       // ── Phase 1: refresh job financials from ZB ──
+      // Dual fetch: /jobs/:id (status, timestamps, basic invoice) AND /invoices/:id
+      // (adjustment_total + adjustments_applied — these are NOT returned by /jobs/:id).
+      // Mirrors the same pattern used by runPaymentReconcile.
       let zbJob
       try {
         zbJob = await zbFetch(user.zenbooker_api_key, `/jobs/${job.zenbooker_id}`)
       } catch (e) {
-        logger.error(`[Zenbooker] reconcile-job ${jobId}: ZB fetch failed: ${e.message}`)
+        logger.error(`[Zenbooker] reconcile-job ${jobId}: ZB job fetch failed: ${e.message}`)
         return res.status(502).json({ error: 'zb_fetch_failed', detail: e.message })
+      }
+
+      // Merge the full invoice (with adjustment fields) onto zbJob.invoice when available.
+      if (zbJob?.invoice?.id) {
+        try {
+          const invoiceData = await zbFetch(user.zenbooker_api_key, `/invoices/${zbJob.invoice.id}`)
+          zbJob = { ...zbJob, invoice: { ...zbJob.invoice, ...invoiceData } }
+        } catch (e) {
+          // Non-fatal: fall through with whatever /jobs/:id gave us. mapJobFinancials
+          // will omit adjustment fields when they're absent (see preserve rule).
+          logger.warn(`[Zenbooker] reconcile-job ${jobId}: /invoices/${zbJob.invoice.id} fetch failed (non-fatal): ${e.message}`)
+        }
       }
 
       const fin = stripDiagnostics(mapJobFinancials(zbJob, { existingSfTipAmount: job.tip_amount }))
@@ -1861,7 +1876,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
 
       // ── Phase 2: safe ledger reconcile ──
-      const ledgerResult = await safeReconcileJobLedger(supabase, { jobId, userId, dryRun })
+      // Pass the projected financial update as jobOverrides so dry-run computes
+      // intended ledger amounts against the would-be post-update job state, not
+      // against pre-update stale data. (In apply mode, the UPDATE has already run,
+      // so the overlay matches what's in the DB; harmless either way.)
+      const ledgerResult = await safeReconcileJobLedger(supabase, {
+        jobId, userId, dryRun,
+        jobOverrides: fin,
+      })
 
       logger.log(`[Zenbooker] reconcile-job ${jobId} ${dryRun ? '(dry-run)' : ''}: jobUpdated=${jobUpdateResult.applied} ledgerInserted=${ledgerResult.applied?.inserted?.length || 0} ledgerUpdated=${ledgerResult.applied?.updated?.length || 0} skippedPaid=${ledgerResult.skipped?.paid_rows_with_drift?.length || 0}`)
 
