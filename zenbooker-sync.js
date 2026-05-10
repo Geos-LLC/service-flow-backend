@@ -9,6 +9,8 @@ const express = require('express')
 const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { mapJobFinancials, stripDiagnostics } = require('./lib/zenbooker-financial')
+const { safeReconcileJobLedger } = require('./lib/zenbooker-ledger-reconcile')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -324,7 +326,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     }))
   }
 
-  function mapJob(zb, userId, lookups) {
+  function mapJob(zb, userId, lookups, options = {}) {
     const { customerMap, serviceMap, teamMap, territoryMap } = lookups
     const status = zb.canceled ? 'cancelled' : (STATUS_MAP[(zb.status || '').toLowerCase()] || 'pending')
     const inv = zb.invoice || {}
@@ -343,6 +345,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       if (found) serviceId = found[1].id
     }
 
+    // Financial fields go through the centralized helper so every sync path
+    // (this mapper + handlePaymentEvent + runPaymentReconcile + reconcile-job
+    // endpoint) writes the same set with the same tip rule. Pass the existing
+    // SF tip amount (when available) so the preserve-SF rule fires correctly.
+    const financials = stripDiagnostics(mapJobFinancials(zb, {
+      existingSfTipAmount: options.existingSfTipAmount,
+    }))
+
     const mapped = {
       user_id: userId,
       customer_id: customerId,
@@ -352,22 +362,11 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       territory_id: territoryId,
       status,
       scheduled_date: zbDateToLocal(zb.start_date, zb.timezone),
-      duration: zb.estimated_duration_seconds ? Math.round(zb.estimated_duration_seconds / 60) : 0,
       service_address_street: addr.line1 || addr.formatted || '',
       service_address_city: addr.city || '',
       service_address_state: addr.state || '',
       service_address_zip: addr.postal_code || '',
-      price: parseFloat(inv.subtotal) || 0,
-      service_price: parseFloat(inv.subtotal) || 0,
-      total: parseFloat(inv.total) || 0,
-      total_amount: parseFloat(inv.total) || 0,
-      taxes: parseFloat(inv.tax_amount || inv.total_tax_amount) || 0,
-      discount: parseFloat(inv.discount_amount) || 0,
-      // Adjustments (Stripe processing fee, etc.) — sum to additional_fees and keep breakdown
-      additional_fees: parseFloat(inv.adjustment_total) || 0,
-      fees_breakdown: mapAdjustments(inv.adjustments_applied),
-      // Only set tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips with 0)
-      ...(parseFloat(inv.tip || inv.tip_amount) > 0 ? { tip_amount: parseFloat(inv.tip || inv.tip_amount) } : {}),
+      ...financials,
       invoice_status: inv.status === 'paid' ? 'paid' : (inv.status === 'unpaid' ? 'invoiced' : 'draft'),
       payment_status: inv.status === 'paid' ? 'paid' : (parseFloat(inv.amount_paid) > 0 ? 'partial' : null),
       is_recurring: zb.recurring === true,
@@ -869,7 +868,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     const teamMap = {}; (team || []).forEach(t => { teamMap[t.zenbooker_id] = t.id })
     const territoryMap = {}; (territories || []).forEach(t => { territoryMap[t.zenbooker_id] = t.id })
 
-    const mapped = mapJob(zbJob, userId, { customerMap, serviceMap, teamMap, territoryMap })
+    // Fetch the existing SF row first so the financial mapper can apply the
+    // preserve-SF tip rule (don't overwrite a non-zero manual tip with a
+    // computed implicit tip when ZB itself reports tip=0).
+    const { data: existing } = await supabase.from('jobs').select('id, status, tip_amount').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
+
+    const mapped = mapJob(zbJob, userId, { customerMap, serviceMap, teamMap, territoryMap }, {
+      existingSfTipAmount: existing?.tip_amount,
+    })
 
     // Sync customer if new (via upsert-with-adoption — dedups against existing SF-only customer by phone/email)
     if (zbJob.customer?.id && !customerMap[zbJob.customer.id]) {
@@ -879,8 +885,6 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         if (result.id) mapped.customer_id = result.id
       } catch { /* customer sync failed, continue without linking */ }
     }
-
-    const { data: existing } = await supabase.from('jobs').select('id, status').eq('user_id', userId).eq('zenbooker_id', data.id).maybeSingle()
     let jobId
     if (existing) {
       jobId = existing.id
@@ -1021,13 +1025,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     }
   }
 
-  async function handlePaymentEvent(eventType, data, userId) {
+  async function handlePaymentEvent(eventType, data, userId, apiKey) {
     if (!data?.job_id && !data?.invoice_id) return
     // Find job by zenbooker invoice/job reference
     const jobZbId = data.job_id || data.job?.id
     if (!jobZbId) return
 
-    const { data: job } = await supabase.from('jobs').select('id, customer_id, status').eq('user_id', userId).eq('zenbooker_id', jobZbId).maybeSingle()
+    const { data: job } = await supabase.from('jobs').select('id, customer_id, status, tip_amount').eq('user_id', userId).eq('zenbooker_id', jobZbId).maybeSingle()
     if (!job) return
 
     const update = {}
@@ -1051,6 +1055,30 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       update.invoice_status = 'paid'
       if (resolvedMethod) update.payment_method = resolvedMethod
       if (amount > 0) update.total_paid_amount = amount
+
+      // Refresh financial truth from ZB. ZB's invoice fields can change after
+      // payment (operator adds tip, edits subtotal, etc.) and ZB has no
+      // invoice.edited webhook — so payment events are our hook to re-pull.
+      // Use the webhook payload first; fall back to /jobs/:id when payload
+      // doesn't carry invoice subtotal/tip.
+      try {
+        const hasInvoiceFields = data?.subtotal != null || data?.tip != null || data?.total != null
+        let zbJobForFin = null
+        if (hasInvoiceFields) {
+          // Webhook is itself an invoice object — wrap so mapJobFinancials sees it
+          zbJobForFin = { invoice: data }
+        } else if (apiKey) {
+          // Refetch the job to get the current invoice. Skipped if no api key
+          // (test mode); refresh runs lazily in /reconcile-job/:jobId then.
+          zbJobForFin = await zbFetch(apiKey, `/jobs/${jobZbId}`).catch(() => null)
+        }
+        if (zbJobForFin) {
+          const fin = stripDiagnostics(mapJobFinancials(zbJobForFin, { existingSfTipAmount: job.tip_amount }))
+          Object.assign(update, fin)
+        }
+      } catch (finErr) {
+        logger.warn(`[Zenbooker] Financial refresh on ${eventType} for job ${job.id} failed: ${finErr.message}`)
+      }
 
       // Update job status FIRST so paid state reflects even if transaction insert fails
       await supabase.from('jobs').update(update).eq('id', job.id)
@@ -1202,12 +1230,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
           const jobUpdate = { invoice_status: 'paid', payment_status: 'paid' }
           if (catchMethod) jobUpdate.payment_method = catchMethod
-          // While we have the invoice in hand, also sync adjustments (processing fee, etc.)
-          const invAdjTotal = parseFloat(invoiceData.adjustment_total) || 0
-          if (invAdjTotal > 0) {
-            jobUpdate.additional_fees = invAdjTotal
-            jobUpdate.fees_breakdown = mapAdjustments(invoiceData.adjustments_applied)
-          }
+
+          // Refresh full financial truth from the invoice (subtotal, total,
+          // tip, additional_fees, taxes, discount, duration). The auto-sweep
+          // is the only path that reliably catches tip-after-payment edits
+          // since ZB doesn't fire an `invoice.edited` webhook. Pre-fix: only
+          // additional_fees was synced, leaving service_price/tip stale.
+          const { data: existingSfJob } = await supabase
+            .from('jobs')
+            .select('tip_amount')
+            .eq('id', job.id)
+            .maybeSingle()
+          const fin = stripDiagnostics(mapJobFinancials(
+            { ...zbJob, invoice: invoiceData },
+            { existingSfTipAmount: existingSfJob?.tip_amount },
+          ))
+          Object.assign(jobUpdate, fin)
+
           await supabase.from('jobs').update(jobUpdate).eq('id', job.id)
 
           await supabase.from('payment_reconcile_catches').insert({
@@ -1738,6 +1777,137 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     res.json(syncProgress[req.user.userId] || { status: 'idle' })
   })
 
+  // POST /reconcile-job/:jobId — admin-only single-job financial reconcile.
+  //
+  // Refreshes job financial fields (subtotal/total/tip/duration/fees) from
+  // ZB ground truth, then runs safeReconcileJobLedger to bring earning/tip/
+  // incentive/cash_collected ledger rows into agreement.
+  //
+  // Hard guarantees:
+  //   - Never calls rebuildJobLedger (no destructive delete-and-rebuild).
+  //   - Never mutates rows where payout_batch_id IS NOT NULL.
+  //   - Unpaid rows may be UPDATEd in place; missing rows INSERTed
+  //     idempotently on (job_id, team_member_id, type, effective_date).
+  //   - Paid drift is reported, not corrected.
+  //
+  // Query params:
+  //   ?dryRun=1  — compute the diff and return without writing
+  router.post('/reconcile-job/:jobId', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const role = (req.user?.role || '').toLowerCase()
+      const isAdminOrOwner = role === 'admin' || role === 'owner' || role === 'account owner' || role === 'manager'
+      if (!isAdminOrOwner) {
+        return res.status(403).json({ error: 'admin_only', detail: 'reconcile-job is admin-only' })
+      }
+
+      const jobId = parseInt(req.params.jobId, 10)
+      if (!Number.isFinite(jobId)) {
+        return res.status(400).json({ error: 'invalid_job_id' })
+      }
+      const dryRun = req.query.dryRun === '1' || req.query.dryRun === 'true'
+
+      const { data: user } = await supabase.from('users')
+        .select('zenbooker_api_key, zenbooker_status').eq('id', userId).single()
+      if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+        return res.status(400).json({ error: 'zenbooker_not_connected' })
+      }
+
+      const { data: job } = await supabase.from('jobs')
+        .select('id, user_id, zenbooker_id, status, tip_amount')
+        .eq('id', jobId).eq('user_id', userId).maybeSingle()
+      if (!job) return res.status(404).json({ error: 'job_not_found' })
+      if (!job.zenbooker_id) return res.status(400).json({ error: 'job_not_linked_to_zenbooker' })
+
+      // ── Phase 1: refresh job financials from ZB ──
+      // Dual fetch: /jobs/:id (status, timestamps, basic invoice) AND /invoices/:id
+      // (adjustment_total + adjustments_applied — these are NOT returned by /jobs/:id).
+      // Mirrors the same pattern used by runPaymentReconcile.
+      let zbJob
+      try {
+        zbJob = await zbFetch(user.zenbooker_api_key, `/jobs/${job.zenbooker_id}`)
+      } catch (e) {
+        logger.error(`[Zenbooker] reconcile-job ${jobId}: ZB job fetch failed: ${e.message}`)
+        return res.status(502).json({ error: 'zb_fetch_failed', detail: e.message })
+      }
+
+      // Merge the full invoice (with adjustment fields) onto zbJob.invoice when available.
+      if (zbJob?.invoice?.id) {
+        try {
+          const invoiceData = await zbFetch(user.zenbooker_api_key, `/invoices/${zbJob.invoice.id}`)
+          zbJob = { ...zbJob, invoice: { ...zbJob.invoice, ...invoiceData } }
+        } catch (e) {
+          // Non-fatal: fall through with whatever /jobs/:id gave us. mapJobFinancials
+          // will omit adjustment fields when they're absent (see preserve rule).
+          logger.warn(`[Zenbooker] reconcile-job ${jobId}: /invoices/${zbJob.invoice.id} fetch failed (non-fatal): ${e.message}`)
+        }
+      }
+
+      const fin = stripDiagnostics(mapJobFinancials(zbJob, { existingSfTipAmount: job.tip_amount }))
+      const finBefore = {
+        service_price: null, total: null, tip_amount: null, additional_fees: null, duration: null,
+      }
+      const { data: jobBefore } = await supabase.from('jobs')
+        .select('service_price, total, total_amount, tip_amount, additional_fees, fees_breakdown, taxes, discount, duration')
+        .eq('id', jobId).single()
+      Object.assign(finBefore, jobBefore || {})
+
+      let jobUpdateResult = { applied: false, changes: {} }
+      const changes = {}
+      for (const k of Object.keys(fin)) {
+        if (k === 'fees_breakdown') {
+          // JSON compare
+          if (JSON.stringify(jobBefore?.[k]) !== JSON.stringify(fin[k])) {
+            changes[k] = { before: jobBefore?.[k], after: fin[k] }
+          }
+        } else if (jobBefore?.[k] !== fin[k] && Math.abs((parseFloat(jobBefore?.[k]) || 0) - (parseFloat(fin[k]) || 0)) >= 0.01) {
+          changes[k] = { before: jobBefore?.[k], after: fin[k] }
+        }
+      }
+      if (Object.keys(changes).length > 0 && !dryRun) {
+        const { error: updErr } = await supabase.from('jobs').update(fin).eq('id', jobId)
+        if (updErr) {
+          logger.error(`[Zenbooker] reconcile-job ${jobId}: job update failed: ${updErr.message}`)
+          return res.status(500).json({ error: 'job_update_failed', detail: updErr.message })
+        }
+        jobUpdateResult = { applied: true, changes }
+      } else {
+        jobUpdateResult = { applied: false, changes, dry_run: dryRun }
+      }
+
+      // ── Phase 2: safe ledger reconcile ──
+      // Pass the projected financial update as jobOverrides so dry-run computes
+      // intended ledger amounts against the would-be post-update job state, not
+      // against pre-update stale data. (In apply mode, the UPDATE has already run,
+      // so the overlay matches what's in the DB; harmless either way.)
+      const ledgerResult = await safeReconcileJobLedger(supabase, {
+        jobId, userId, dryRun,
+        jobOverrides: fin,
+      })
+
+      logger.log(`[Zenbooker] reconcile-job ${jobId} ${dryRun ? '(dry-run)' : ''}: jobUpdated=${jobUpdateResult.applied} ledgerInserted=${ledgerResult.applied?.inserted?.length || 0} ledgerUpdated=${ledgerResult.applied?.updated?.length || 0} skippedPaid=${ledgerResult.skipped?.paid_rows_with_drift?.length || 0}`)
+
+      res.json({
+        ok: true,
+        job_id: jobId,
+        dry_run: dryRun,
+        zb_invoice: zbJob?.invoice ? {
+          subtotal: zbJob.invoice.subtotal,
+          tip: zbJob.invoice.tip,
+          total: zbJob.invoice.total,
+          amount_paid: zbJob.invoice.amount_paid,
+          status: zbJob.invoice.status,
+          adjustment_total: zbJob.invoice.adjustment_total,
+        } : null,
+        job_update: jobUpdateResult,
+        ledger_reconcile: ledgerResult,
+      })
+    } catch (err) {
+      logger.error(`[Zenbooker] reconcile-job error: ${err.message}`)
+      res.status(500).json({ error: 'reconcile_failed', detail: err.message })
+    }
+  })
+
   // DELETE /disconnect — clear API key, keep data
   router.delete('/disconnect', authenticateToken, async (req, res) => {
     try {
@@ -1786,7 +1956,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           } else if (event.startsWith('invoice_payment.') || event.startsWith('invoice.payment_')) {
             // Normalize event name: invoice.payment_recorded → invoice_payment.recorded
             const normalizedEvent = event.replace('invoice.payment_', 'invoice_payment.')
-            await handlePaymentEvent(normalizedEvent, data, user.id)
+            await handlePaymentEvent(normalizedEvent, data, user.id, user.zenbooker_api_key)
           } else if (event.startsWith('invoice.') && !event.startsWith('invoice_payment.')) {
             // Invoice updated/created — re-fetch the job to update prices
             const jobZbId = data.job_id || data.job?.id
