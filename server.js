@@ -18813,6 +18813,25 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
 });
 
 // Billing endpoints
+// PR-S1 — Owner-only role gate for /api/user/billing/* routes.
+//
+// Billing actions (subscription, payment-method, cancel) affect the
+// SaaS account itself. Team members must NOT be able to charge / cancel
+// on behalf of their employer's account. This middleware allows only
+// account owners (and admins) through; team-member JWTs get 403.
+//
+// Mirrors the pattern used at the user-availability write gate
+// (server.js:19630 area) so role classification is consistent.
+function requireBillingOwner(req, res, next) {
+  const role = String((req.user && req.user.role) || '').toLowerCase();
+  const isOwnerOrAdmin = role === 'account owner' || role === 'owner' || role === 'admin';
+  const isTeamMember = !!(req.user && req.user.teamMemberId);
+  if (!isOwnerOrAdmin || isTeamMember) {
+    return res.status(403).json({ error: 'billing_owner_only' });
+  }
+  next();
+}
+
 // PR-S1 — Billing-specific userId resolver.
 //
 // Returns the JWT's userId, and emits a warning log when the request body
@@ -18840,7 +18859,7 @@ function resolveBillingUserId(req) {
   return fromJwt;
 }
 
-app.get('/api/user/billing', authenticateToken, async (req, res) => {
+app.get('/api/user/billing', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = resolveBillingUserId(req);
     if (userId == null) return res.status(401).json({ error: 'authentication_required' });
@@ -18889,7 +18908,7 @@ app.get('/api/user/billing', authenticateToken, async (req, res) => {
 });
 
 // Create Stripe customer and setup intent
-app.post('/api/user/billing/setup-intent', authenticateToken, async (req, res) => {
+app.post('/api/user/billing/setup-intent', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = resolveBillingUserId(req);
     if (userId == null) return res.status(401).json({ error: 'authentication_required' });
@@ -18943,7 +18962,7 @@ app.post('/api/user/billing/setup-intent', authenticateToken, async (req, res) =
 });
 
 // Create Stripe subscription
-app.post('/api/user/billing/subscription', authenticateToken, async (req, res) => {
+app.post('/api/user/billing/subscription', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = resolveBillingUserId(req);
     if (userId == null) return res.status(401).json({ error: 'authentication_required' });
@@ -19043,7 +19062,7 @@ app.post('/api/user/billing/subscription', authenticateToken, async (req, res) =
 });
 
 // Get payment methods for a customer
-app.get('/api/user/billing/payment-methods', authenticateToken, async (req, res) => {
+app.get('/api/user/billing/payment-methods', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = resolveBillingUserId(req);
     if (userId == null) return res.status(401).json({ error: 'authentication_required' });
@@ -19079,7 +19098,7 @@ app.get('/api/user/billing/payment-methods', authenticateToken, async (req, res)
 });
 
 // Cancel subscription
-app.post('/api/user/billing/cancel-subscription', authenticateToken, async (req, res) => {
+app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = resolveBillingUserId(req);
     if (userId == null) return res.status(401).json({ error: 'authentication_required' });
