@@ -16368,6 +16368,23 @@ const bookingKoalaImportHandler = async (req, res) => {
             }
           }
 
+          // ── Writer-side date guard (Layer 1). Job 142078 surfaced this.
+          // Above blocks can produce values like "+045930-01-01" via
+          // new Date(badInput).toISOString().split('T')[0] (JS happily
+          // produces year-45930 dates for out-of-range inputs). The DB
+          // accepts them because `jobs.scheduled_date` is text. Reject
+          // anything outside year 2000-2100 here and skip the row.
+          if (scheduledDate != null && scheduledDate !== '') {
+            const dateCheck = validateScheduledDate(scheduledDate);
+            if (!dateCheck.ok) {
+              const msg = `Row ${i + 1}: Invalid scheduled_date "${scheduledDate}" — ${dateCheck.reason}. Skipping import.`;
+              console.error(msg);
+              results.jobs.errors.push(msg);
+              results.jobs.skipped++;
+              continue;
+            }
+          }
+
           // Parse status from Booking status
           let jobStatus = 'pending';
           const bookingStatus = job.status || job['Booking status'] || job['Status'];
@@ -17157,6 +17174,22 @@ const bookingKoalaImportHandler = async (req, res) => {
               return null;
             })()
           };
+
+          // ── Final pre-write date guard (defense-in-depth). Covers ALL three
+          // write paths below (update-by-external-id, update-on-duplicate,
+          // insert-new). Catches anything that mutated mappedJob.scheduled_date
+          // between the build step and the write. Same rule as the post-parse
+          // guard, second layer.
+          if (mappedJob && mappedJob.scheduled_date != null && mappedJob.scheduled_date !== '') {
+            const finalDateCheck = validateScheduledDate(mappedJob.scheduled_date);
+            if (!finalDateCheck.ok) {
+              const msg = `Row ${i + 1}: Pre-write date guard rejected scheduled_date "${mappedJob.scheduled_date}" — ${finalDateCheck.reason}. Skipping import.`;
+              console.error(msg);
+              results.jobs.errors.push(msg);
+              results.jobs.skipped++;
+              continue;
+            }
+          }
 
           // Check if we already detected a duplicate by external ID earlier
           if (existingJobIdForUpdate) {
