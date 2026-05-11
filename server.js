@@ -18813,10 +18813,38 @@ app.post('/api/user/profile-picture', authenticateToken, upload.single('profileP
 });
 
 // Billing endpoints
-app.get('/api/user/billing', async (req, res) => {
+// PR-S1 — Billing-specific userId resolver.
+//
+// Returns the JWT's userId, and emits a warning log when the request body
+// or query also includes a `userId` field whose value differs. Unlike the
+// stricter resolveAuthenticatedUserId() (which 403s on mismatch), this
+// helper is **warning-only** — legacy frontend payloads still send
+// `userId` redundantly, and we don't want to break them while the
+// frontend is updated to stop sending it.
+//
+// Any code reading the returned id is using the authenticated JWT value,
+// not the client-supplied one. Body/query userId is only ever inspected
+// for telemetry / IDOR-attempt detection.
+function resolveBillingUserId(req) {
+  const fromJwt = req.user && req.user.userId;
+  if (fromJwt === undefined || fromJwt === null) return null;
+  const jwtIdStr = String(fromJwt);
+  const sources = [];
+  if (req.body && req.body.userId !== undefined) sources.push(['body', String(req.body.userId)]);
+  if (req.query && req.query.userId !== undefined) sources.push(['query', String(req.query.userId)]);
+  for (const [src, value] of sources) {
+    if (value !== jwtIdStr) {
+      logger.warn(`[Billing IDOR] ${src}.userId="${value}" does not match JWT userId="${jwtIdStr}" — using JWT (cross-user attempt or stale client)`);
+    }
+  }
+  return fromJwt;
+}
+
+app.get('/api/user/billing', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.query;
-    
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
     const { data: billingInfo, error } = await supabase
       .from('user_billing')
       .select('plan_type, billing_cycle, next_billing_date')
@@ -18861,10 +18889,14 @@ app.get('/api/user/billing', async (req, res) => {
 });
 
 // Create Stripe customer and setup intent
-app.post('/api/user/billing/setup-intent', async (req, res) => {
+app.post('/api/user/billing/setup-intent', authenticateToken, async (req, res) => {
   try {
-    const { userId, email, name } = req.body;
-    
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+    // email/name are still accepted from the body (informational metadata on
+    // the Stripe customer); they don't grant access to anything cross-user.
+    const { email, name } = req.body || {};
+
     // Create or retrieve Stripe customer
     let customer;
     const { data: existingBilling } = await supabase
@@ -18911,10 +18943,12 @@ app.post('/api/user/billing/setup-intent', async (req, res) => {
 });
 
 // Create Stripe subscription
-app.post('/api/user/billing/subscription', async (req, res) => {
+app.post('/api/user/billing/subscription', authenticateToken, async (req, res) => {
   try {
-    const { userId, plan, paymentMethodId } = req.body;
-    
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+    const { plan, paymentMethodId } = req.body || {};
+
     // Get user's Stripe customer ID
     const { data: billingData, error: billingError } = await supabase
       .from('user_billing')
@@ -19009,10 +19043,11 @@ app.post('/api/user/billing/subscription', async (req, res) => {
 });
 
 // Get payment methods for a customer
-app.get('/api/user/billing/payment-methods', async (req, res) => {
+app.get('/api/user/billing/payment-methods', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.query;
-    
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
     const { data: billingData } = await supabase
       .from('user_billing')
       .select('stripe_customer_id')
@@ -19044,10 +19079,11 @@ app.get('/api/user/billing/payment-methods', async (req, res) => {
 });
 
 // Cancel subscription
-app.post('/api/user/billing/cancel-subscription', async (req, res) => {
+app.post('/api/user/billing/cancel-subscription', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.body;
-    
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
     const { data: billingData } = await supabase
       .from('user_billing')
       .select('stripe_subscription_id')
