@@ -33260,10 +33260,6 @@ app.post('/api/create-payment-intent', async (req, res) => {
 
     const stripe = require('stripe')(billingData.stripe_secret_key);
 
-    // Debug: Verify the Stripe account
-    console.log('🔍 Creating payment intent with secret key ending in:', billingData.stripe_secret_key.slice(-4));
-    console.log('🔍 User ID:', invoice.user_id);
-    
     // Verify the Stripe account is valid
     try {
       const account = await stripe.accounts.retrieve();
