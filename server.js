@@ -808,6 +808,19 @@ const teamMemberLoginLimiter = rateLimit({
   skipSuccessfulRequests: true,
 });
 
+// PR-S1 — public-endpoint limiter for /api/public/stripe-config/:invoiceId.
+// The endpoint must remain unauthenticated (customer payment pages hit it
+// without a session), so per-IP rate limit is the defense-in-depth control.
+// 30 req/min/IP is generous for a single customer loading a payment page;
+// well below any real-world legitimate usage pattern.
+const publicStripeConfigLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited' },
+});
+
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -31803,100 +31816,76 @@ app.get('/api/stripe/status', authenticateToken, async (req, res) => {
   }
 });
 
-// Get Stripe publishable key for public payment pages
-app.get('/api/public/stripe-config/:invoiceId', async (req, res) => {
+// Get Stripe publishable config for public customer-invoice payment pages.
+//
+// PR-S1 hardening:
+//   - Never loads `stripe_secret_key`. The pre-fix path read the secret
+//     just to call stripe.accounts.retrieve() for "verification" and then
+//     logged the last 4 characters of it — a real exposure risk on a
+//     public endpoint hit on every invoice page load.
+//   - Never logs any key (full, partial, or last-4) or any boolean
+//     derived from the secret key's presence.
+//   - Rate-limited via publicStripeConfigLimiter (30 req/min/IP) since
+//     the endpoint must stay public.
+//
+// Response shape is backward-compatible — existing frontend consumers
+// that read `publishableKey` and `connected` keep working. The new
+// optional fields `mode` and `connectAccountId` enable a future Connect
+// direct-charge frontend flow without another endpoint change.
+app.get('/api/public/stripe-config/:invoiceId', publicStripeConfigLimiter, async (req, res) => {
   try {
     const { invoiceId } = req.params;
-    
-    console.log('🔑 Getting Stripe config for invoice:', invoiceId);
-    
-    // Get the invoice to find the user
+
     const { data: invoice, error: invoiceError } = await supabase
       .from('invoices')
       .select('user_id')
       .eq('id', invoiceId)
       .single();
-    
+
     if (invoiceError || !invoice) {
-      console.error('❌ Invoice not found:', invoiceId, 'Error:', invoiceError);
       return res.status(404).json({ error: 'Invoice not found' });
     }
-    
-    console.log('🔍 Invoice found, user_id:', invoice.user_id);
-    
-    // Get user's Stripe credentials
-    const { data: userData, error: userError } = await supabase
+
+    // Read ONLY publishable-safe columns from users + user_billing.
+    // Deliberately omit stripe_secret_key from the SELECT.
+    const { data: userData } = await supabase
       .from('users')
-      .select('stripe_connect_status')
+      .select('stripe_connect_account_id, stripe_connect_status')
       .eq('id', invoice.user_id)
       .single();
-    
-    if (userError || !userData) {
-      console.error('❌ User not found for invoice:', invoiceId, 'Error:', userError);
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    console.log('🔍 User found, stripe_connect_status:', userData.stripe_connect_status);
-    
-    // Get user's Stripe publishable key (check if they have credentials even if status is not 'connected')
-    const { data: billingData, error: billingError } = await supabase
+
+    const { data: billingData } = await supabase
       .from('user_billing')
-      .select('stripe_publishable_key, stripe_secret_key')
+      .select('stripe_publishable_key')
       .eq('user_id', invoice.user_id)
       .single();
-    
-    console.log('🔍 Billing data:', { 
-      hasPublishableKey: !!billingData?.stripe_publishable_key,
-      hasSecretKey: !!billingData?.stripe_secret_key,
-      error: billingError 
-    });
-    
-    if (billingError || !billingData?.stripe_publishable_key) {
-      console.error('❌ Stripe publishable key not found for user:', invoice.user_id, 'Error:', billingError, 'Data:', billingData);
-      return res.status(400).json({ error: 'Stripe not configured' });
+
+    // Prefer Connect when active (Phase 2 target model).
+    if (userData?.stripe_connect_account_id && userData.stripe_connect_status === 'active') {
+      return res.json({
+        publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
+        connectAccountId: userData.stripe_connect_account_id,
+        mode: 'connect',
+        connected: true,
+      });
     }
-    
-    // Check if Stripe credentials are valid by testing the connection
-    if (!billingData.stripe_secret_key) {
-      console.error('❌ Stripe secret key not found for user:', invoice.user_id);
-      return res.status(400).json({ error: 'Stripe credentials incomplete' });
+
+    // Legacy Model B (tenant-direct-keys) — publishable key is safe to expose
+    // (Stripe publishable keys are designed for client-side use). This branch
+    // will go away when Model B is deprecated; until then it preserves the
+    // pre-PR-S1 contract for customer payment pages already in the wild.
+    if (billingData?.stripe_publishable_key) {
+      return res.json({
+        publishableKey: billingData.stripe_publishable_key,
+        mode: 'direct',
+        connected: true,
+      });
     }
-    
-    console.log('🔑 Stripe config retrieved for invoice:', invoiceId);
-    console.log('🔍 Publishable key ending in:', billingData.stripe_publishable_key.slice(-4));
-    console.log('🔍 Secret key ending in:', billingData.stripe_secret_key.slice(-4));
-    
-    // Verify the keys belong to the same Stripe account
-    try {
-      const stripe = require('stripe')(billingData.stripe_secret_key);
-      const account = await stripe.accounts.retrieve();
-      console.log('🔍 Stripe account ID for verification:', account.id);
-      
-      // Verify the keys are valid Stripe format
-      if (!billingData.stripe_publishable_key.startsWith('pk_test_') && !billingData.stripe_publishable_key.startsWith('pk_live_')) {
-        console.error('❌ Invalid publishable key format');
-        return res.status(400).json({ error: 'Invalid publishable key format' });
-      }
-      
-      if (!billingData.stripe_secret_key.startsWith('sk_test_') && !billingData.stripe_secret_key.startsWith('sk_live_')) {
-        console.error('❌ Invalid secret key format');
-        return res.status(400).json({ error: 'Invalid secret key format' });
-      }
-      
-      console.log('✅ Stripe key format verification passed');
-      
-      console.log('✅ Stripe account verification passed - keys belong to same account');
-    } catch (verifyError) {
-      console.error('❌ Stripe account verification failed:', verifyError.message);
-      return res.status(400).json({ error: 'Stripe account verification failed' });
-    }
-    
-    res.json({ 
-      publishableKey: billingData.stripe_publishable_key,
-      connected: true 
-    });
+
+    return res.status(400).json({ error: 'Stripe not configured' });
   } catch (error) {
-    console.error('❌ Error getting Stripe config:', error);
+    // Intentionally minimal logging — this endpoint is public and high-traffic.
+    console.error('[stripe-config] Failed to load config:', error?.message || error);
     res.status(500).json({ error: 'Failed to get Stripe configuration' });
   }
 });
