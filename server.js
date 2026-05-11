@@ -47,6 +47,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
+const { runStartupConfigAudit } = require('./lib/config-audit');
 const { authenticateWebhook } = require('./lib/webhook-signature');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
@@ -794,6 +795,18 @@ const apiLimiter = rateLimit({
   skipFailedRequests: false,
 });
 
+// PR-4 — dedicated team-member login limiter. Mirrors the PR-3 admin
+// login pattern (5 attempts / 15 min per IP, successful logins do not
+// consume the window). Defaults are env-tunable.
+const teamMemberLoginLimiter = rateLimit({
+  windowMs: parseInt(process.env.TEAM_LOGIN_RATELIMIT_WINDOW_MS, 10) || 15 * 60 * 1000,
+  max: parseInt(process.env.TEAM_LOGIN_RATELIMIT_MAX, 10) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_attempts' },
+  skipSuccessfulRequests: true,
+});
+
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -1213,6 +1226,38 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+/**
+ * PR-4 — derive the authenticated user id from the JWT only, refusing to
+ * trust any userId-shaped value in the request body or query. Returns the
+ * numeric id on success, or sends a 4xx response and returns null on
+ * mismatch / missing.
+ *
+ * Used by endpoints that previously took `userId` from the request body or
+ * query and queried Supabase by it — a textbook IDOR pattern. After PR-4,
+ * those endpoints derive the id from `req.user` (populated by
+ * authenticateToken) and reject any caller that supplied a different one,
+ * which makes the legacy-client breakage explicit instead of silent.
+ */
+function resolveAuthenticatedUserId(req, res) {
+  const fromJwt = req.user && (req.user.userId ?? req.user.id);
+  if (fromJwt === undefined || fromJwt === null) {
+    res.status(401).json({ error: 'authentication_required' });
+    return null;
+  }
+  const jwtIdStr = String(fromJwt);
+  const candidates = [];
+  if (req.body && req.body.userId !== undefined) candidates.push(['body', String(req.body.userId)]);
+  if (req.query && req.query.userId !== undefined) candidates.push(['query', String(req.query.userId)]);
+  for (const [src, value] of candidates) {
+    if (value !== jwtIdStr) {
+      logger.warn(`[Auth] ${src}.userId="${value}" does not match JWT userId="${jwtIdStr}" — rejecting (cross-user attempt or stale client)`);
+      res.status(403).json({ error: 'user_id_mismatch', message: 'Request userId does not match authenticated session. Do not send userId — it is derived from the JWT.' });
+      return null;
+    }
+  }
+  return fromJwt;
+}
 
 // Input validation helpers
 const validateEmail = (email) => {
@@ -1870,10 +1915,11 @@ app.get('/api/auth/google/callback', async (req, res) => {
 // Google OAuth endpoints
 app.post('/api/auth/google', async (req, res) => {
   try {
+    // PR-4: removed full-body + headers debug log. The previous block
+    // dumped the entire request — including idToken/accessToken/refreshToken
+    // and Authorization headers — into Loki on every Google OAuth attempt.
     console.log('🔍 Google OAuth request received');
-    console.log('🔍 Full request body:', JSON.stringify(req.body, null, 2));
-    console.log('🔍 Request headers:', req.headers);
-    
+
     // Handle nested structure from frontend
     let idToken, accessToken, refreshToken;
     
@@ -18949,6 +18995,15 @@ app.post('/api/user/billing/cancel-subscription', async (req, res) => {
 
 // Stripe webhook handler
 app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+  // PR-4: surface unconfigured state distinctly from signature mismatch so
+  // ops can tell "we are silently dropping all Stripe events" apart from
+  // "Stripe is sending us garbage". Without the secret, every legitimate
+  // event was previously rejected with 400 + an opaque "Webhook Error".
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
+    logger.error('[Stripe Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event without verification attempt');
+    return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
+  }
+
   const sig = req.headers['stripe-signature'];
   let event;
 
@@ -21693,60 +21748,10 @@ app.get('/api/territories/:id/analytics', async (req, res) => {
   }
 });
 
-// Service areas endpoints
-app.get('/api/user/service-areas', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get service areas settings
-      const [serviceAreasInfo] = await connection.query(
-        'SELECT enforce_service_area FROM user_service_areas WHERE user_id = ?',
-        [userId]
-      );
-      
-      // Get territories for this user
-      const [territories] = await connection.query(
-        'SELECT id, name, description, location, radius_miles, status FROM territories WHERE user_id = ? AND status = "active"',
-        [userId]
-      );
-      
-      const enforceServiceArea = serviceAreasInfo.length > 0 ? serviceAreasInfo[0].enforce_service_area === 1 : true;
-      
-      res.json({
-        enforceServiceArea: enforceServiceArea,
-        territories: territories
-      });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Get service areas error:', error);
-    res.status(500).json({ error: 'Failed to fetch service areas information' });
-  }
-});
-
-app.put('/api/user/service-areas', async (req, res) => {
-  try {
-    const { userId, enforceServiceArea, territories } = req.body;
-    const connection = await pool.getConnection();
-    
-    try {
-      await connection.query(
-        'INSERT INTO user_service_areas (user_id, enforce_service_area, territories, created_at) VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE enforce_service_area = ?, territories = ?, updated_at = NOW()',
-        [userId, enforceServiceArea ? 1 : 0, JSON.stringify(territories), enforceServiceArea ? 1 : 0, JSON.stringify(territories)]
-      );
-      
-      res.json({ message: 'Service areas updated successfully' });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Update service areas error:', error);
-    res.status(500).json({ error: 'Failed to update service areas' });
-  }
-});
+// PR-4 — service-areas (GET/PUT) MySQL endpoints removed.
+// These called pool.getConnection() which throws unconditionally and were
+// also unauthenticated; deleting outright rather than re-implementing
+// since no working frontend depends on them post-deletion.
 
 // Service templates endpoints
 app.get('/api/service-templates', async (req, res) => {
@@ -26298,7 +26303,7 @@ app.get('/api/staff-locations/:teamMemberId/history', authenticateToken, async (
 });
 
 // Team member authentication endpoints
-app.post('/api/team-members/login', async (req, res) => {
+app.post('/api/team-members/login', teamMemberLoginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
    
@@ -31058,201 +31063,19 @@ app.delete('/api/user/profile-picture', authenticateToken, async (req, res) => {
   }
 });
 
-// Update password endpoint
-app.put('/api/user/password', async (req, res) => {
-  try {
-    console.log('🔍 PUT /api/user/password called with body:', req.body);
-    const { userId, currentPassword, newPassword } = req.body;
-    
-    if (!userId || !currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'User ID, current password, and new password are required' });
-    }
+// PR-4 — duplicate dead-MySQL /api/user/password handler removed.
+// The live handler at line ~18556 (authenticateToken + bcrypt + Supabase)
+// shadowed this one in the Express route stack, so removal has no runtime
+// impact; the deletion just stops leaking req.body (incl. plaintext
+// passwords) into logs via the now-removed console.log.
 
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get current user to verify password
-      const [userData] = await connection.query(`
-        SELECT password FROM users WHERE id = ?
-      `, [userId]);
+// PR-4 — duplicate dead-MySQL /api/user/email handler removed (same
+// reasoning as the password handler above; live authenticated Supabase
+// version at ~18611 shadowed this).
 
-      if (userData.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // Verify current password (you'll need to implement password hashing)
-      // For now, we'll assume the password is stored as-is (not recommended for production)
-      if (userData[0].password !== currentPassword) {
-        return res.status(400).json({ error: 'Current password is incorrect' });
-      }
-
-      // Update password
-      await connection.query(`
-        UPDATE users SET password = ?, updated_at = NOW() WHERE id = ?
-      `, [newPassword, userId]);
-
-      res.json({ 
-        message: 'Password updated successfully'
-      });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error updating password:', error);
-    res.status(500).json({ error: 'Failed to update password' });
-  }
-});
-
-// Update email endpoint
-app.put('/api/user/email', async (req, res) => {
-  try {
-    const { userId, newEmail, password } = req.body;
-    
-    if (!userId || !newEmail || !password) {
-      return res.status(400).json({ error: 'User ID, new email, and password are required' });
-    }
-
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get current user to verify password
-      const [userData] = await connection.query(`
-        SELECT password FROM users WHERE id = ?
-      `, [userId]);
-
-      if (userData.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // Verify password
-      if (userData[0].password !== password) {
-        return res.status(400).json({ error: 'Password is incorrect' });
-      }
-
-      // Check if email already exists
-      const [existingEmail] = await connection.query(`
-        SELECT id FROM users WHERE email = ? AND id != ?
-      `, [newEmail, userId]);
-
-      if (existingEmail.length > 0) {
-        return res.status(400).json({ error: 'Email already exists' });
-      }
-
-      // Update email
-      await connection.query(`
-        UPDATE users SET email = ?, updated_at = NOW() WHERE id = ?
-      `, [newEmail, userId]);
-
-      res.json({ 
-        message: 'Email updated successfully',
-        email: newEmail
-      });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error updating email:', error);
-    res.status(500).json({ error: 'Failed to update email' });
-  }
-});
-
-// Branding API endpoints
-app.get('/api/user/branding', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-
-    const connection = await pool.getConnection();
-    
-    try {
-      // Get branding settings for the user
-      const [brandingData] = await connection.query(`
-        SELECT 
-          logo_url as logo,
-          show_logo_in_admin as showLogoInAdmin,
-          primary_color as primaryColor
-        FROM user_branding 
-        WHERE user_id = ?
-      `, [userId]);
-
-      if (brandingData.length > 0) {
-        const branding = brandingData[0];
-        // Ensure logo URL is complete
-        if (branding.logo && !branding.logo.startsWith('http')) {
-          branding.logo = `${UPLOAD_BASE_URL}${branding.logo}`;
-        }
-        res.json(branding);
-      } else {
-        // Return default branding if none exists
-        res.json({
-          logo: null,
-          showLogoInAdmin: false,
-          primaryColor: "#4CAF50"
-        });
-      }
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error fetching branding:', error);
-    res.status(500).json({ error: 'Failed to fetch branding settings' });
-  }
-});
-
-app.put('/api/user/branding', async (req, res) => {
-  try {
-    const { userId, logo, showLogoInAdmin, primaryColor } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-
-    const connection = await pool.getConnection();
-    
-    try {
-      // Check if branding record exists
-      const [existing] = await connection.query(`
-        SELECT id FROM user_branding WHERE user_id = ?
-      `, [userId]);
-
-      if (existing.length > 0) {
-        // Update existing record
-        await connection.query(`
-          UPDATE user_branding 
-          SET 
-            logo_url = ?,
-            show_logo_in_admin = ?,
-            primary_color = ?,
-            updated_at = NOW()
-          WHERE user_id = ?
-        `, [logo, showLogoInAdmin ? 1 : 0, primaryColor, userId]);
-      } else {
-        // Create new record
-        await connection.query(`
-          INSERT INTO user_branding (user_id, logo_url, show_logo_in_admin, primary_color)
-          VALUES (?, ?, ?, ?)
-        `, [userId, logo, showLogoInAdmin ? 1 : 0, primaryColor]);
-      }
-
-      res.json({ 
-        message: 'Branding settings updated successfully',
-        branding: {
-          logo,
-          showLogoInAdmin,
-          primaryColor
-        }
-      });
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error updating branding:', error);
-    res.status(500).json({ error: 'Failed to update branding settings' });
-  }
-});
+// PR-4 — branding (GET/PUT) MySQL endpoints removed (same reasoning as
+// service-areas: dead pool.getConnection() + unauthenticated). Any future
+// branding API must be reimplemented on Supabase with authenticateToken.
 
 // User Profile API endpoints - REMOVED DUPLICATE (using Supabase version above)
 
@@ -31272,15 +31095,12 @@ app.put('/api/user/branding', async (req, res) => {
 //   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 // );
-app.get('/api/user/notification-templates', async (req, res) => {
+app.get('/api/user/notification-templates', authenticateToken, async (req, res) => {
   try {
-    const { userId, templateType, notificationName } = req.query;
-    
-    console.log('🔍 Fetching notification templates:', { userId, templateType, notificationName });
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
+    // PR-4: userId derived from JWT only.
+    const userId = resolveAuthenticatedUserId(req, res);
+    if (userId === null) return;
+    const { templateType, notificationName } = req.query;
 
     let query = supabase
       .from('notification_templates')
@@ -31403,12 +31223,15 @@ app.get('/api/user/notification-templates', async (req, res) => {
   }
 });
 
-app.put('/api/user/notification-templates', async (req, res) => {
+app.put('/api/user/notification-templates', authenticateToken, async (req, res) => {
   try {
-    const { userId, templateType, notificationName, subject, content, isEnabled } = req.body;
-    
-    if (!userId || !templateType || !notificationName) {
-      return res.status(400).json({ error: 'User ID, template type, and notification name are required' });
+    // PR-4: userId derived from JWT only.
+    const userId = resolveAuthenticatedUserId(req, res);
+    if (userId === null) return;
+    const { templateType, notificationName, subject, content, isEnabled } = req.body;
+
+    if (!templateType || !notificationName) {
+      return res.status(400).json({ error: 'Template type and notification name are required' });
     }
 
     // Check if template exists
@@ -33827,12 +33650,15 @@ app.get('/api/user/notification-settings', authenticateToken, async (req, res) =
   }
 });
 
-app.put('/api/user/notification-settings', async (req, res) => {
+app.put('/api/user/notification-settings', authenticateToken, async (req, res) => {
   try {
-    const { userId, notificationType, emailEnabled, smsEnabled, pushEnabled } = req.body;
+    // PR-4: userId derived from JWT only.
+    const userId = resolveAuthenticatedUserId(req, res);
+    if (userId === null) return;
+    const { notificationType, emailEnabled, smsEnabled, pushEnabled } = req.body;
 
-    if (!userId || !notificationType) {
-      return res.status(400).json({ error: 'User ID and notification type are required' });
+    if (!notificationType) {
+      return res.status(400).json({ error: 'Notification type is required' });
     }
 
     // Check if setting exists
@@ -34074,13 +33900,12 @@ app.delete('/api/services/categories/:id', async (req, res) => {
   }
 });
 // Business Details API endpoints
-app.get('/api/user/business-details', async (req, res) => {
+app.get('/api/user/business-details', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.query;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
+    // PR-4: userId derived from JWT only. Body/query userId is rejected
+    // if present and different (handled by resolveAuthenticatedUserId).
+    const userId = resolveAuthenticatedUserId(req, res);
+    if (userId === null) return;
 
     // Get business details from users table
     const { data: userData, error } = await supabase
@@ -34123,13 +33948,13 @@ app.get('/api/user/business-details', async (req, res) => {
   }
 });
 
-app.put('/api/user/business-details', async (req, res) => {
+app.put('/api/user/business-details', authenticateToken, async (req, res) => {
   try {
-    const { userId, businessName, businessEmail, phone, email, firstName, lastName, timeFormat } = req.body;
-
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
+    // PR-4: userId derived from JWT only. Body userId is rejected if
+    // present and different (handled by resolveAuthenticatedUserId).
+    const userId = resolveAuthenticatedUserId(req, res);
+    if (userId === null) return;
+    const { businessName, businessEmail, phone, email, firstName, lastName, timeFormat } = req.body;
 
     const normalizedTimeFormat = timeFormat === '24h' ? '24h' : (timeFormat === '12h' ? '12h' : null);
 
@@ -34641,7 +34466,9 @@ app.use((err, req, res, _next) => {
   console.error('Error stack:', err.stack);
   console.error('Request URL:', req.url);
   console.error('Request method:', req.method);
-  console.error('Request headers:', req.headers);
+  // PR-4: removed `console.error('Request headers:', req.headers)` —
+  // that dumped Authorization headers (Bearer tokens) into Loki on every
+  // unhandled exception.
   
   // Handle CORS errors specifically
   if (err.message === 'Not allowed by CORS') {
@@ -34917,9 +34744,15 @@ app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res)
 // Stripe Connect webhook handler (optional - for account updates)
 app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   try {
+    // PR-4: see /api/webhook/stripe for the same gate rationale.
+    if (!process.env.STRIPE_WEBHOOK_SECRET) {
+      logger.error('[Stripe Connect Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event');
+      return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
+    }
+
     const sig = req.headers['stripe-signature'];
     const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-    
+
     let event;
     try {
       event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
@@ -37035,11 +36868,21 @@ app.post('/api/zillow/property', authenticateToken, async (req, res) => {
 
 // Start server
 if (require.main === module) {
+// PR-4 startup config audit — runs synchronously before listen so any
+// CRITICAL finding in production throws and Railway restarts the process
+// with the misconfiguration visible in boot logs.
+try {
+  runStartupConfigAudit({ env: process.env, logger });
+} catch (err) {
+  // Re-throw to abort startup. Caught and re-thrown so the stack trace
+  // includes this file, not just the helper.
+  logger.error(`[Config Audit] FATAL: ${err.message}`);
+  throw err;
+}
+
 app.listen(PORT, async () => {
   logger.log(`Serviceflow API server running on port ${PORT}`);
   logger.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
-  logger.log('Branding endpoints registered: /api/user/branding (GET, PUT)');
-  logger.log('Test endpoint available: /api/test-branding');
 
   // Initialize database schema
   try {
