@@ -1464,7 +1464,11 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     // browser console shows it directly.
     let phase = 'entry'
     const userId = req.user?.userId ?? null
-    logger.log(`[Zenbooker] POST /sync entry — userId=${userId} body=${JSON.stringify(req.body || {}).slice(0, 200)}`)
+    // PR-4: removed `body=${JSON.stringify(req.body).slice(0,200)}` from
+    // this log line — the Zenbooker sync POST body has historically carried
+    // raw API tokens when operators re-enter the integration key, which
+    // then ended up in Loki for the lifetime of the retention window.
+    logger.log(`[Zenbooker] POST /sync entry — userId=${userId}`)
     try {
       if (!userId) {
         // authenticateToken should have rejected, but belt-and-suspenders:
