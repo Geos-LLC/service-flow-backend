@@ -80,15 +80,25 @@ describe('POST /api/zenbooker/sync — instrumentation (T2.1, 2026-05-09)', () =
     expect(res.body.error).toBe('No token provided');
   });
 
-  it('logs an entry log on every authenticated POST (T2.1 — proves route is reached)', async () => {
+  it('logs an entry log on every authenticated POST (T2.1 — proves route is reached, but does NOT include request body)', async () => {
     const logger = makeLogger();
     const supabase = makeMockSupabase({ user: { zenbooker_api_key: 'k', zenbooker_status: 'connected' } });
     const app = makeApp({ supabase, logger });
-    await request(app).post('/api/zenbooker/sync').set('Authorization', `Bearer ${makeToken(42)}`).send({ entity: 'jobs' });
+    // Body contains a canary that previously got dumped into logs and would
+    // have been captured below. After PR-4 the entry log only carries
+    // userId; everything in `req.body` must NOT appear in logs because the
+    // Zenbooker re-auth flow used to put raw integration keys in this body.
+    await request(app)
+      .post('/api/zenbooker/sync')
+      .set('Authorization', `Bearer ${makeToken(42)}`)
+      .send({ entity: 'jobs', _canary: 'pr4-body-leak-canary' });
     const entryLog = logger._calls.log.find((m) => /POST \/sync entry/.test(m));
     expect(entryLog).toBeDefined();
     expect(entryLog).toContain('userId=42');
-    expect(entryLog).toContain('jobs');
+    // Negative assertions: neither the entity name nor the canary string
+    // should appear anywhere in the entry log.
+    expect(entryLog).not.toContain('jobs');
+    expect(entryLog).not.toContain('pr4-body-leak-canary');
   });
 
   it('returns 400 with phase=load_user when user is connected=null', async () => {
