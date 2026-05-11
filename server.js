@@ -47,6 +47,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
+const { validateScheduledDate } = require('./lib/import-date-guard');
 const { runStartupConfigAudit } = require('./lib/config-audit');
 const { authenticateWebhook } = require('./lib/webhook-signature');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
@@ -14534,7 +14535,26 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         };
         
         const scheduledDateString = buildScheduledDate();
-        
+
+        // ── Writer-side date guard (Layer 1). Job 142078 surfaced this.
+        // buildScheduledDate only warned on malformed input; values like
+        // "+045930-01-01" still slipped through and got persisted because
+        // `jobs.scheduled_date` is column type text. Reject any value outside
+        // year 2000-2100 here so it never reaches the DB.
+        // Note: scheduledDateString === null is permitted (means caller
+        // genuinely didn't provide a date) — only invalid non-null strings
+        // are rejected.
+        if (scheduledDateString != null && scheduledDateString !== '') {
+          const dateCheck = validateScheduledDate(scheduledDateString);
+          if (!dateCheck.ok) {
+            const msg = `Row ${i + 1}: Invalid scheduled_date "${scheduledDateString}" — ${dateCheck.reason}. Skipping import.`;
+            console.error(msg);
+            results.jobs.errors.push(msg);
+            results.jobs.skipped++;
+            continue;
+          }
+        }
+
         // Debug: Log the scheduled date being built (especially for updates)
         if (job.isUpdate || job.existingJobId) {
           console.log(`Row ${i + 1}: 📅 Building scheduled_date for UPDATE - job.scheduledDate: "${job.scheduledDate}", job.scheduledTime: "${job.scheduledTime}", scheduledDateString: "${scheduledDateString}"`);
@@ -15000,6 +15020,21 @@ app.post('/api/jobs/import', authenticateToken, async (req, res) => {
         let newJob = null;
         let insertError = null;
         
+        // ── Final pre-write date guard (defense-in-depth). The check above
+        // catches the buildScheduledDate output; this one catches the value
+        // about to hit the DB in case anything mutated jobData.scheduled_date
+        // between buildScheduledDate and here. Same rule, same response.
+        if (jobData && jobData.scheduled_date != null && jobData.scheduled_date !== '') {
+          const finalDateCheck = validateScheduledDate(jobData.scheduled_date);
+          if (!finalDateCheck.ok) {
+            const msg = `Row ${i + 1}: Pre-write date guard rejected scheduled_date "${jobData.scheduled_date}" — ${finalDateCheck.reason}. Skipping import.`;
+            console.error(msg);
+            results.jobs.errors.push(msg);
+            results.jobs.skipped++;
+            continue;
+          }
+        }
+
         try {
           if (isUpdate) {
             // UPDATE existing job
