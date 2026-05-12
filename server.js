@@ -30856,6 +30856,184 @@ app.post('/api/team-members/reset-password', async (req, res) => {
   }
 });
 
+// =====================================================================
+// Unified password reset flow — works for both owners (users) and
+// team_members. One email per matching account (owner + team_member rows
+// with the same address each get their own token-bearing email).
+// =====================================================================
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const RESET_GENERIC_RESPONSE = {
+  message: 'If an account with that email exists, password reset instructions have been sent.'
+};
+
+async function sendResetEmail({ to, firstName, accountLabel, token }) {
+  const frontendBase = process.env.FRONTEND_URL || 'https://www.service-flow.pro';
+  const resetUrl = `${frontendBase}/reset-password?token=${token}`;
+  return sgMail.send({
+    to,
+    from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+    subject: 'Reset your Service Flow password',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #2563eb;">Password Reset Request</h2>
+        <p>Hello ${firstName || 'there'},</p>
+        <p>You requested to reset the password for your <strong>${accountLabel}</strong> account on Service Flow.</p>
+        <p>Click the button below to choose a new password. This link expires in 1 hour.</p>
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${resetUrl}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
+        </div>
+        <p style="color: #6b7280; font-size: 13px;">If the button doesn't work, copy and paste this URL into your browser:<br/>${resetUrl}</p>
+        <p>If you didn't request this, you can safely ignore this email.</p>
+        <p>— Service Flow Team</p>
+      </div>
+    `
+  });
+}
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    const normalized = email.trim().toLowerCase();
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+
+    // 1. Owner account (users.email is UNIQUE — at most one row)
+    const { data: ownerRow } = await supabase
+      .from('users')
+      .select('id, first_name, email, business_name')
+      .ilike('email', normalized)
+      .maybeSingle();
+
+    if (ownerRow) {
+      const ownerToken = crypto.randomBytes(32).toString('hex');
+      const { error: ownerUpdateError } = await supabase
+        .from('users')
+        .update({ reset_token: ownerToken, reset_token_expires: expiresAt })
+        .eq('id', ownerRow.id);
+      if (!ownerUpdateError) {
+        try {
+          await sendResetEmail({
+            to: ownerRow.email,
+            firstName: ownerRow.first_name,
+            accountLabel: ownerRow.business_name ? `business owner (${ownerRow.business_name})` : 'business owner',
+            token: ownerToken
+          });
+        } catch (mailErr) {
+          console.error('forgot-password: failed to send owner reset email', mailErr);
+        }
+      } else {
+        console.error('forgot-password: failed to store owner reset token', ownerUpdateError);
+      }
+    }
+
+    // 2. Team-member accounts (email NOT unique — can match multiple rows
+    //    across different businesses). Each row gets its own token + email
+    //    so the user can pick the right account.
+    const { data: memberRows } = await supabase
+      .from('team_members')
+      .select('id, first_name, email, user_id, users(business_name)')
+      .ilike('email', normalized)
+      .eq('is_active', true);
+
+    for (const member of memberRows || []) {
+      const memberToken = crypto.randomBytes(32).toString('hex');
+      const { error: memberUpdateError } = await supabase
+        .from('team_members')
+        .update({ reset_token: memberToken, reset_token_expires: expiresAt })
+        .eq('id', member.id);
+      if (memberUpdateError) {
+        console.error('forgot-password: failed to store team member reset token', memberUpdateError);
+        continue;
+      }
+      try {
+        const businessName = member.users?.business_name;
+        await sendResetEmail({
+          to: member.email,
+          firstName: member.first_name,
+          accountLabel: businessName ? `team member at ${businessName}` : 'team member',
+          token: memberToken
+        });
+      } catch (mailErr) {
+        console.error('forgot-password: failed to send team member reset email', mailErr);
+      }
+    }
+
+    // Always return the same response to prevent email enumeration.
+    return res.json(RESET_GENERIC_RESPONSE);
+  } catch (err) {
+    console.error('forgot-password error:', err);
+    return res.json(RESET_GENERIC_RESPONSE);
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'Token and new password are required' });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Try owners first.
+    const { data: ownerRow } = await supabase
+      .from('users')
+      .select('id, reset_token_expires')
+      .eq('reset_token', token)
+      .maybeSingle();
+
+    if (ownerRow) {
+      if (!ownerRow.reset_token_expires || new Date(ownerRow.reset_token_expires).toISOString() < nowIso) {
+        return res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
+      }
+      const hashed = await bcrypt.hash(newPassword, 10);
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({ password: hashed, reset_token: null, reset_token_expires: null })
+        .eq('id', ownerRow.id);
+      if (updateError) {
+        console.error('reset-password: failed to update owner password', updateError);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+      return res.json({ message: 'Password updated successfully', accountType: 'owner' });
+    }
+
+    // Fall back to team members.
+    const { data: memberRow } = await supabase
+      .from('team_members')
+      .select('id, reset_token_expires')
+      .eq('reset_token', token)
+      .maybeSingle();
+
+    if (memberRow) {
+      if (!memberRow.reset_token_expires || new Date(memberRow.reset_token_expires).toISOString() < nowIso) {
+        return res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
+      }
+      const hashed = await bcrypt.hash(newPassword, 10);
+      const { error: updateError } = await supabase
+        .from('team_members')
+        .update({ password: hashed, reset_token: null, reset_token_expires: null })
+        .eq('id', memberRow.id);
+      if (updateError) {
+        console.error('reset-password: failed to update team member password', updateError);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+      return res.json({ message: 'Password updated successfully', accountType: 'team_member' });
+    }
+
+    return res.status(400).json({ error: 'Invalid or expired reset token' });
+  } catch (err) {
+    console.error('reset-password error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Add OPTIONS handler for test endpoint
 // OPTIONS handled by catch-all above
 
