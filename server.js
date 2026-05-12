@@ -30894,7 +30894,7 @@ async function sendResetEmail({ to, firstName, accountLabel, token }) {
       </div>
     `
   });
-  console.log(`[forgot-password] sent reset email to ${to} from ${fromEmail}, messageId=${result?.[0]?.headers?.['x-message-id'] || 'n/a'}`);
+  logger.log(`[forgot-password] sent reset email to ${to} from ${fromEmail}, messageId=${result?.[0]?.headers?.['x-message-id'] || 'n/a'}`);
   return result;
 }
 
@@ -30906,7 +30906,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
     const normalized = email.trim().toLowerCase();
     const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
-    console.log(`[forgot-password] request for ${normalized}`);
+    logger.log(`[forgot-password] request for ${normalized}`);
 
     // 1. Owner account (users.email is UNIQUE — at most one row)
     const { data: ownerRow } = await supabase
@@ -30915,7 +30915,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       .ilike('email', normalized)
       .maybeSingle();
 
-    console.log(`[forgot-password] owner match: ${ownerRow ? 'yes (id=' + ownerRow.id + ')' : 'no'}`);
+    logger.log(`[forgot-password] owner match: ${ownerRow ? 'yes (id=' + ownerRow.id + ')' : 'no'}`);
 
     if (ownerRow) {
       const ownerToken = crypto.randomBytes(32).toString('hex');
@@ -30948,7 +30948,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       .ilike('email', normalized)
       .eq('is_active', true);
 
-    console.log(`[forgot-password] team_member matches: ${(memberRows || []).length}`);
+    logger.log(`[forgot-password] team_member matches: ${(memberRows || []).length}`);
 
     for (const member of memberRows || []) {
       const memberToken = crypto.randomBytes(32).toString('hex');
