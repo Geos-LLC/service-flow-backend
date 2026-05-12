@@ -30870,9 +30870,14 @@ const RESET_GENERIC_RESPONSE = {
 async function sendResetEmail({ to, firstName, accountLabel, token }) {
   const frontendBase = process.env.FRONTEND_URL || 'https://www.service-flow.pro';
   const resetUrl = `${frontendBase}/reset-password?token=${token}`;
-  return sgMail.send({
+  // Use platform_settings (DB) for SendGrid config — the env fallbacks point
+  // at unverified senders. The verified sender is alerts@service-flow.pro.
+  const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
+  const fromEmail = (await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL')) || 'alerts@service-flow.pro';
+  if (apiKey) sgMail.setApiKey(apiKey);
+  const result = await sgMail.send({
     to,
-    from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
+    from: fromEmail,
     subject: 'Reset your Service Flow password',
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -30889,6 +30894,8 @@ async function sendResetEmail({ to, firstName, accountLabel, token }) {
       </div>
     `
   });
+  console.log(`[forgot-password] sent reset email to ${to} from ${fromEmail}, messageId=${result?.[0]?.headers?.['x-message-id'] || 'n/a'}`);
+  return result;
 }
 
 app.post('/api/auth/forgot-password', async (req, res) => {
@@ -30899,6 +30906,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     }
     const normalized = email.trim().toLowerCase();
     const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+    console.log(`[forgot-password] request for ${normalized}`);
 
     // 1. Owner account (users.email is UNIQUE — at most one row)
     const { data: ownerRow } = await supabase
@@ -30906,6 +30914,8 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       .select('id, first_name, email, business_name')
       .ilike('email', normalized)
       .maybeSingle();
+
+    console.log(`[forgot-password] owner match: ${ownerRow ? 'yes (id=' + ownerRow.id + ')' : 'no'}`);
 
     if (ownerRow) {
       const ownerToken = crypto.randomBytes(32).toString('hex');
@@ -30937,6 +30947,8 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       .select('id, first_name, email, user_id, users(business_name)')
       .ilike('email', normalized)
       .eq('is_active', true);
+
+    console.log(`[forgot-password] team_member matches: ${(memberRows || []).length}`);
 
     for (const member of memberRows || []) {
       const memberToken = crypto.randomBytes(32).toString('hex');
