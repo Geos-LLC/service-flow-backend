@@ -27988,86 +27988,15 @@ app.post('/api/payments/create-payment-intent', authenticateToken, async (req, r
   }
 });
 
-// Stripe Connect endpoints
-app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
-  try {
-    const { return_url, refresh_url } = req.body;
-    const userId = req.user.id;
-
-    // Create Stripe Connect account
-    const account = await stripe.accounts.create({
-      type: 'express',
-      country: 'US',
-      email: req.user.email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
-
-    // Store account ID in database
-    const { error: updateError } = await supabase
-      .from('user_billing')
-      .upsert({
-        user_id: userId,
-        stripe_connect_account_id: account.id,
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'user_id'
-      });
-
-    if (updateError) {
-      console.error('Error storing connect account:', updateError);
-      return res.status(500).json({ error: 'Failed to store account information' });
-    }
-
-    // Create account link for onboarding
-    const accountLink = await stripe.accountLinks.create({
-      account: account.id,
-      return_url,
-      refresh_url,
-      type: 'account_onboarding',
-    });
-
-    res.json({ url: accountLink.url });
-  } catch (error) {
-    console.error('Stripe Connect account creation error:', error);
-    res.status(500).json({ error: 'Failed to create Stripe Connect account' });
-  }
-});
-
-app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    // Get stored account ID
-    const { data: billingData, error: billingError } = await supabase
-      .from('user_billing')
-      .select('stripe_connect_account_id')
-      .eq('user_id', userId)
-      .limit(1);
-
-    if (billingError || !billingData?.[0]?.stripe_connect_account_id) {
-      return res.json({ connected: false });
-    }
-
-    const accountId = billingData[0].stripe_connect_account_id;
-
-    // Get account details from Stripe
-    const account = await stripe.accounts.retrieve(accountId);
-
-    res.json({
-      connected: true,
-      charges_enabled: account.charges_enabled,
-      payouts_enabled: account.payouts_enabled,
-      details_submitted: account.details_submitted,
-      requirements: account.requirements
-    });
-  } catch (error) {
-    console.error('Stripe Connect account status error:', error);
-    res.status(500).json({ error: 'Failed to get account status' });
-  }
-});
+// PR-S1.5: The original `// Stripe Connect endpoints` block lived here and
+// registered POST /api/stripe/connect/account-link + GET .../account-status.
+// Both used `req.user.id` (undefined — JWT carries `userId`) and wrote to
+// `user_billing.stripe_connect_account_id` (a column that does not exist).
+// Express first-match-wins made these the active handlers; both failed
+// silently in production and produced orphan Stripe Connect accounts on
+// every call. Deleted in favor of the correct registrations below
+// (lines ~34670+), which use req.user.userId and write users.stripe_connect_*.
+// See PR-S1.5 design + audit for details.
 
 app.post('/api/payments/confirm-payment', authenticateToken, async (req, res) => {
   try {
