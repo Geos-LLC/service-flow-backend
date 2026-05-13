@@ -2052,7 +2052,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
   router.post('/webhook', async (req, res) => {
     try {
       // P0.2 (Constitution §6.1) — webhook authentication.
-      // Flag OFF: observe-only; failed attempts logged but processing proceeds.
+      // Flag OFF: observe-only; every delivery logs an audit line so operators
+      // can read flag-on readiness from Loki BEFORE flipping the flag.
       // Flag ON: reject unsigned / unverified events with 4xx before any
       // database mutation occurs.
       const auth = authenticateZenbookerWebhook(req)
@@ -2060,13 +2061,18 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         logger.warn(`[Zenbooker] Webhook auth rejected: status=${auth.status} reason=${auth.reason} flag=${auth.flag}`)
         return res.status(auth.status).json({ error: 'webhook_auth_failed', reason: auth.reason })
       }
-      if (auth.attempted && auth.reason && auth.reason !== 'no_auth_attempted') {
-        // Soak-mode signal: an auth header was sent but verification failed.
-        // Logged for Loki count so operators can confirm signing works before
-        // flipping ZB_WEBHOOK_AUTH_REQUIRED on.
-        logger.warn(`[Zenbooker] Webhook auth attempted but invalid (flag off): reason=${auth.reason}`)
-      } else if (auth.mode) {
-        logger.log(`[Zenbooker] Webhook auth ok (mode=${auth.mode}, flag=${auth.flag})`)
+      // Always emit an auth-observation line. The single structured prefix
+      // [ZB-auth-observe] is the Loki query anchor for the flag-on readiness
+      // dashboard. Fields:
+      //   flag=on|off
+      //   mode=hmac|shared_secret|none  (what passed, or none if no header)
+      //   attempted=true|false          (did the request carry any auth header)
+      //   reason=...                    (only set when attempted but invalid)
+      const obs = `flag=${auth.flag} mode=${auth.mode || 'none'} attempted=${auth.attempted ? 'true' : 'false'}`
+      if (auth.attempted && auth.reason && auth.reason !== 'no_auth_attempted' && !auth.mode) {
+        logger.warn(`[ZB-auth-observe] ${obs} reason=${auth.reason}`)
+      } else {
+        logger.log(`[ZB-auth-observe] ${obs}`)
       }
 
       const { event, data, account_id } = req.body

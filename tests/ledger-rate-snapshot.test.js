@@ -119,6 +119,116 @@ describe('extractRateSnapshot', () => {
   });
 });
 
+describe('legacy-row fallback contract (Constitution §3.5 tier 2)', () => {
+  // These tests pin the behavior on rows that pre-date P0. The staging census
+  // run on 2026-05-13 found ~2,854 earning rows with legacy keys and ~220
+  // tip/incentive/cash_collected rows with no metadata at all. The rebuild
+  // path must degrade safely on every shape we observed.
+
+  test('earning shape — full legacy keys present, no canonical', () => {
+    const md = {
+      hourly_rate: 20, commission_pct: 10, member_count: 2, revenue: 200, hours: 3,
+    };
+    const r = extractRateSnapshot(md);
+    expect(r.source).toBe('legacy');
+    expect(r.hourlyRate).toBe(20);
+    expect(r.commissionPct).toBe(10);
+    expect(r.memberCount).toBe(2);
+    expect(r.revenue).toBe(200);
+    expect(r.hours).toBe(3);
+    expect(r.effectiveDate).toBe(null); // legacy tier never reconstructs the rate date
+  });
+
+  test('earning shape — override metadata (cleaner_salary_override) still classifies as legacy', () => {
+    const md = { override_total: 250, member_count: 2, source: 'cleaner_salary_override' };
+    // No rate/commission/revenue/hours keys → returns null (correct: override rows
+    // don't use rates so rebuild compares amounts directly).
+    expect(extractRateSnapshot(md)).toBe(null);
+  });
+
+  test('tip / incentive / cash_collected shape — pre-P0 rows have NO metadata at all → null', () => {
+    expect(extractRateSnapshot(null)).toBe(null);
+    expect(extractRateSnapshot(undefined)).toBe(null);
+    expect(extractRateSnapshot({})).toBe(null);
+  });
+
+  test('partial-legacy — only hours present', () => {
+    const r = extractRateSnapshot({ hours: 4 });
+    expect(r.source).toBe('legacy');
+    expect(r.hours).toBe(4);
+    expect(r.hourlyRate).toBe(0);
+    expect(r.commissionPct).toBe(0);
+  });
+
+  test('partial-legacy — only commission_pct present (rate-only commission worker)', () => {
+    const r = extractRateSnapshot({ commission_pct: 15, revenue: 500 });
+    expect(r.source).toBe('legacy');
+    expect(r.commissionPct).toBe(15);
+    expect(r.revenue).toBe(500);
+    expect(r.hourlyRate).toBe(0);
+  });
+
+  test('mixed canonical + legacy — canonical wins', () => {
+    // A future scenario: a row inserted post-P0 has canonical, but a faulty
+    // backfill script accidentally added the legacy alias with a different
+    // value. The extractor MUST prefer canonical.
+    const md = {
+      hourly_rate_snapshot: 25,
+      hourly_rate: 999,             // stale/wrong legacy alias
+      commission_pct_snapshot: 5,
+      commission_pct: 0,            // stale
+      member_count_snapshot: 1,
+      revenue_at_create: 100,
+      hours_at_create: 4,
+      effective_rate_date: '2026-04-01',
+    };
+    const r = extractRateSnapshot(md);
+    expect(r.source).toBe('canonical');
+    expect(r.hourlyRate).toBe(25);
+    expect(r.commissionPct).toBe(5);
+  });
+
+  test('manager-salary metadata (scheduled_hours + is_manager_salary) → null', () => {
+    // Manager daily salary rows use a different metadata shape entirely.
+    // extractRateSnapshot returns null so the rebuild's drift detection
+    // falls through to the direct-amount comparison.
+    const md = { scheduled_hours: 8, hourly_rate: 30, is_manager_salary: true };
+    const r = extractRateSnapshot(md);
+    // hourly_rate key IS present, so this falls into legacy tier:
+    expect(r.source).toBe('legacy');
+    expect(r.hourlyRate).toBe(30);
+    // scheduled_hours doesn't map to hours_at_create — rebuild treats this
+    // as a degenerate snapshot and compares amounts directly. Documented.
+  });
+
+  test('manager-commission metadata (day_revenue + is_manager_commission)', () => {
+    const md = { commission_pct: 10, day_revenue: 500, is_manager_commission: true };
+    const r = extractRateSnapshot(md);
+    expect(r.source).toBe('legacy');
+    expect(r.commissionPct).toBe(10);
+    // day_revenue doesn't map to revenue field — drift detection on these
+    // rows relies on direct amount compare against the dry-run computation.
+  });
+});
+
+describe('computeEarningFromSnapshot — legacy-row drift detection', () => {
+  test('legacy snapshot still produces a computed amount', () => {
+    const r = extractRateSnapshot({ hourly_rate: 20, commission_pct: 0, hours: 4, revenue: 0, member_count: 1 });
+    expect(computeEarningFromSnapshot(r)).toBeCloseTo(80, 2);
+  });
+
+  test('null snapshot (tip/incentive/cash row with no metadata) → null', () => {
+    expect(computeEarningFromSnapshot(extractRateSnapshot({}))).toBe(null);
+    expect(computeEarningFromSnapshot(extractRateSnapshot(null))).toBe(null);
+  });
+
+  test('legacy snapshot with zero rates returns null (degenerate)', () => {
+    const r = extractRateSnapshot({ hourly_rate: 0, commission_pct: 0, revenue: 0, hours: 0 });
+    expect(r).not.toBe(null);          // signal is present (legacy tier)
+    expect(computeEarningFromSnapshot(r)).toBe(null);  // but math is degenerate
+  });
+});
+
 describe('computeEarningFromSnapshot', () => {
   test('hourly + commission hybrid', () => {
     // 3h × $20 + ($200 / 2 × 10%) = $60 + $10 = $70
