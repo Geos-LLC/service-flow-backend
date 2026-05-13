@@ -34827,67 +34827,121 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
 });
 
 // Stripe Connect endpoints
+//
+// PR-S1.5: idempotent onboarding/account-link.
+//
+// Pre-fix, this handler called stripe.accounts.create() unconditionally on
+// every request, so any retry/double-click produced a fresh Connect account
+// while the previous one was orphaned. The 4 idempotency branches below
+// guarantee at most ONE Stripe Connect account per SF user.
+//
+// Response shape is stable across all branches: { url, accountId, status }.
+// The `url` field name preserves compatibility with future frontend code
+// (StripeConnectOnboarding.jsx reads response.data.url).
+//
+// Structured branch logs follow the form:
+//   [Connect account-link] branch=<CASE_*> userId=<n> accountId=<acct_*>
+//                          reused=<bool> created=<bool>
+// AccountLink URLs and any keys are NEVER logged.
 app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    // For Stripe Connect, we need to create a Connect App first
     const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-    
     if (!stripeSecretKey) {
-      return res.status(500).json({ 
-        error: 'Stripe not configured. Please contact support.' 
-      });
+      return res.status(500).json({ error: 'Stripe not configured. Please contact support.' });
     }
-    
-    // Create a Stripe Connect account for the user
     const stripe = require('stripe')(stripeSecretKey);
-    
-    // Create a Connect account
-    const account = await stripe.accounts.create({
-      type: 'express',
-      country: 'US',
-      email: req.user.email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
-    
-    // Create account link for onboarding
+
+    // 1. Read the user's current Connect state.
+    const { data: existing } = await supabase
+      .from('users')
+      .select('stripe_connect_account_id, stripe_connect_status')
+      .eq('id', userId)
+      .single();
+
+    let accountId = existing?.stripe_connect_account_id || null;
+    let status = null;
+    let branch = null;
+    let reused = false;
+    let created = false;
+
+    // 2. If we have a stored account_id, verify it's still valid on Stripe's
+    //    side. A previously-stored account may have been deleted from the
+    //    Stripe Dashboard (CASE 4) — in that case we must fall through to
+    //    CASE 1 and create a fresh one.
+    let stripeAccount = null;
+    if (accountId) {
+      try {
+        stripeAccount = await stripe.accounts.retrieve(accountId);
+      } catch (e) {
+        logger.warn(`[Connect account-link] stored accountId=${accountId} not retrievable from Stripe (${e.code || e.message}); will create fresh`);
+        accountId = null;
+      }
+    }
+
+    if (!accountId) {
+      // CASE 1 — no existing account (first onboarding) OR CASE 4 (existing
+      // account no longer valid on Stripe). Create a new one, persist it.
+      branch = stripeAccount === null && existing?.stripe_connect_account_id
+        ? 'CASE_4_RECREATE_INVALID'
+        : 'CASE_1_CREATE';
+      const newAccount = await stripe.accounts.create({
+        type: 'express',
+        country: 'US',
+        email: req.user.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+      });
+      accountId = newAccount.id;
+      status = 'pending';
+      created = true;
+
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({
+          stripe_connect_account_id: accountId,
+          stripe_connect_status: status,
+        })
+        .eq('id', userId);
+      if (updateError) {
+        logger.error(`[Connect account-link] failed to persist new accountId for userId=${userId}: ${updateError.message}`);
+        return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
+      }
+    } else {
+      // Existing account is valid on Stripe. Decide CASE 2 vs CASE 3 based
+      // on whether onboarding is complete (Stripe's `details_submitted` /
+      // `charges_enabled`).
+      reused = true;
+      const isActive = !!(stripeAccount && stripeAccount.charges_enabled);
+      status = isActive ? 'active' : 'pending';
+      branch = isActive ? 'CASE_3_ACCOUNT_UPDATE' : 'CASE_2_RESUME_PENDING';
+    }
+
+    // 3. Generate an AccountLink. Type depends on whether the account is
+    //    fully onboarded (account_update) or still needs onboarding
+    //    (account_onboarding). Each AccountLink is single-use and has a
+    //    short TTL on the Stripe side — a fresh one per request is normal.
+    const linkType = status === 'active' ? 'account_update' : 'account_onboarding';
     const accountLink = await stripe.accountLinks.create({
-      account: account.id,
+      account: accountId,
       refresh_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?refresh=true`,
       return_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?connected=true`,
-      type: 'account_onboarding',
+      type: linkType,
     });
-    
-    // Store the account ID in user's record
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ 
-        stripe_connect_account_id: account.id,
-        stripe_connect_status: 'pending'
-      })
-      .eq('id', userId);
-    
-    if (updateError) {
-      console.error('Error updating user Stripe Connect data:', updateError);
-      return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
-    }
-    
-    console.log('🔗 Stripe Connect account created for user:', userId, 'Account ID:', account.id);
-    
-    res.json({
-      success: true,
-      message: 'Stripe Connect account created',
-      accountId: account.id,
-      authUrl: accountLink.url
-    });
-    
+
+    // 4. Structured branch log — does NOT include the AccountLink URL or
+    //    any key material. Just the routing decision and id pair so we can
+    //    observe idempotency behavior in Loki.
+    logger.log(`[Connect account-link] branch=${branch} userId=${userId} accountId=${accountId} reused=${reused} created=${created} linkType=${linkType}`);
+
+    // 5. Stable response shape: { url, accountId, status }.
+    return res.json({ url: accountLink.url, accountId, status });
+
   } catch (error) {
-    console.error('Stripe Connect authorization error:', error);
-    res.status(500).json({ error: 'Failed to create Stripe Connect account: ' + error.message });
+    logger.error(`[Connect account-link] unexpected error for userId=${req.user?.userId}: ${error.message}`);
+    return res.status(500).json({ error: 'Failed to create Stripe Connect account: ' + error.message });
   }
 });
 
