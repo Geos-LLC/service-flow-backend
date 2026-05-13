@@ -32018,7 +32018,7 @@ app.get('/api/public/invoice/:invoiceId', async (req, res) => {
 });
 
 // Check if Stripe is connected
-app.get('/api/stripe/status', authenticateToken, async (req, res) => {
+app.get('/api/stripe/status', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
     
@@ -33676,7 +33676,7 @@ app.post('/api/payment-success', async (req, res) => {
 });
 
 // Stripe Payment Link API endpoints
-app.post('/api/stripe/create-payment-link', authenticateToken, async (req, res) => {
+app.post('/api/stripe/create-payment-link', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { jobId, amount, currency, customerEmail, customerName, description } = req.body;
     
@@ -35225,7 +35225,7 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
 });
 
 // Simple Stripe API Integration endpoints
-app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) => {
+app.post('/api/stripe/setup-credentials', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { publishableKey, secretKey } = req.body;
     const userId = req.user.userId;
@@ -35290,7 +35290,7 @@ app.post('/api/stripe/setup-credentials', authenticateToken, async (req, res) =>
   }
 });
 
-app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
+app.get('/api/stripe/test-connection', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
 
@@ -35323,7 +35323,7 @@ app.get('/api/stripe/test-connection', authenticateToken, async (req, res) => {
 });
 
 
-app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
+app.post('/api/stripe/create-invoice', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { customerId, amount, description, dueDate } = req.body;
     const userId = req.user.userId;
@@ -35360,7 +35360,7 @@ app.post('/api/stripe/create-invoice', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
+app.post('/api/stripe/send-invoice', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { invoiceId } = req.body;
     const userId = req.user.userId;
@@ -35391,7 +35391,7 @@ app.post('/api/stripe/send-invoice', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/stripe/create-payment-intent', authenticateToken, async (req, res) => {
+app.post('/api/stripe/create-payment-intent', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { amount, currency, customerId, metadata } = req.body;
     const userId = req.user.userId;
@@ -35427,7 +35427,7 @@ app.post('/api/stripe/create-payment-intent', authenticateToken, async (req, res
   }
 });
 
-app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, async (req, res) => {
+app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { paymentIntentId } = req.params;
     const userId = req.user.userId;
@@ -35458,7 +35458,7 @@ app.get('/api/stripe/payment-status/:paymentIntentId', authenticateToken, async 
   }
 });
 
-app.post('/api/stripe/create-customer', authenticateToken, async (req, res) => {
+app.post('/api/stripe/create-customer', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const { email, name, phone } = req.body;
     const userId = req.user.userId;
@@ -35493,7 +35493,7 @@ app.post('/api/stripe/create-customer', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/stripe/disconnect', authenticateToken, async (req, res) => {
+app.delete('/api/stripe/disconnect', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
 
