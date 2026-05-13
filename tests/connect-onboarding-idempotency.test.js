@@ -91,6 +91,18 @@ describe('PR-S1.5 — source invariants on Connect routes', () => {
     expect(offenders).toEqual([]);
   });
 
+  test('all 3 Connect routes are gated by requireBillingOwner (PR-S1.5)', () => {
+    // Backend gate is required even if the frontend hides the UI. Team-member
+    // JWTs must be rejected at the API. Reuses PR-S1's requireBillingOwner —
+    // the same middleware that protects /api/user/billing/*.
+    const routes = [
+      /app\.post\(\s*'\/api\/stripe\/connect\/account-link'\s*,\s*authenticateToken\s*,\s*requireBillingOwner\b/,
+      /app\.get\(\s*'\/api\/stripe\/connect\/account-status'\s*,\s*authenticateToken\s*,\s*requireBillingOwner\b/,
+      /app\.delete\(\s*'\/api\/stripe\/connect\/disconnect'\s*,\s*authenticateToken\s*,\s*requireBillingOwner\b/,
+    ];
+    routes.forEach((re) => expect(SERVER_SRC).toMatch(re));
+  });
+
   test('handler emits the 4 branch tags', () => {
     expect(SERVER_SRC).toMatch(/CASE_1_CREATE/);
     expect(SERVER_SRC).toMatch(/CASE_2_RESUME_PENDING/);
@@ -190,10 +202,23 @@ function buildHarness({ jwtSecret = 'test-secret', initialDbRow = null, stripeOv
     catch { return res.status(401).json({ error: 'Invalid token' }); }
   }
 
+  // requireBillingOwner shim — mirrors server.js:18825 exactly. Source-invariant
+  // test above asserts the production routes wire this middleware; this shim
+  // exercises the rejection/pass behavior under team-member vs owner JWTs.
+  function requireBillingOwner(req, res, next) {
+    const role = String((req.user && req.user.role) || '').toLowerCase();
+    const isOwnerOrAdmin = role === 'account owner' || role === 'owner' || role === 'admin';
+    const isTeamMember = !!(req.user && req.user.teamMemberId);
+    if (!isOwnerOrAdmin || isTeamMember) {
+      return res.status(403).json({ error: 'billing_owner_only' });
+    }
+    next();
+  }
+
   // Inlined harness handler mirroring the production handler logic.
   // Keep this in sync with server.js — the source-invariant tests above
   // assert the production handler emits the same branch tags and shape.
-  app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
+  app.post('/api/stripe/connect/account-link', authenticateToken, requireBillingOwner, async (req, res) => {
     try {
       const userId = req.user.userId;
       const stripe = recordingStripe;
@@ -245,6 +270,21 @@ function buildHarness({ jwtSecret = 'test-secret', initialDbRow = null, stripeOv
     }
   });
 
+  // Minimal account-status + disconnect mounts — same gate chain as production.
+  // Bodies are intentionally trivial: the gate-rejection tests don't reach the
+  // handler logic, so we only need a 200 path that asserts owner access.
+  app.get('/api/stripe/connect/account-status', authenticateToken, requireBillingOwner, (req, res) => {
+    return res.json({
+      connected: !!(dbRow && dbRow.stripe_connect_account_id),
+      accountId: dbRow?.stripe_connect_account_id || null,
+      status: dbRow?.stripe_connect_status || null,
+    });
+  });
+  app.delete('/api/stripe/connect/disconnect', authenticateToken, requireBillingOwner, (req, res) => {
+    dbRow = { ...(dbRow || {}), stripe_connect_account_id: null, stripe_connect_status: 'disconnected' };
+    return res.json({ disconnected: true });
+  });
+
   return {
     app,
     sign: (payload) => jwt.sign(payload, jwtSecret, { expiresIn: '5m' }),
@@ -254,10 +294,14 @@ function buildHarness({ jwtSecret = 'test-secret', initialDbRow = null, stripeOv
   };
 }
 
+// Helper — JWT shapes the production server expects.
+const ownerToken = (h, overrides = {}) => h.sign({ userId: 42, email: 'owner@test', role: 'account owner', ...overrides });
+const teamToken = (h, overrides = {}) => h.sign({ userId: 99, email: 'cleaner@test', role: 'cleaner', teamMemberId: 7, ...overrides });
+
 describe('PR-S1.5 — CASE_1_CREATE (no existing account)', () => {
   test('creates a new account, persists it, returns stable shape', async () => {
     const h = buildHarness({ initialDbRow: null });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const res = await request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({});
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('url');
@@ -280,7 +324,7 @@ describe('PR-S1.5 — CASE_2_RESUME_PENDING (existing pending account)', () => {
       initialDbRow: { stripe_connect_account_id: 'acct_existing_pending', stripe_connect_status: 'pending' },
       stripeOverrides: { retrieve: async (id) => ({ id, charges_enabled: false, details_submitted: false }) },
     });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const res = await request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({});
     expect(res.status).toBe(200);
     expect(res.body.accountId).toBe('acct_existing_pending');
@@ -299,7 +343,7 @@ describe('PR-S1.5 — CASE_3_ACCOUNT_UPDATE (existing active account)', () => {
       initialDbRow: { stripe_connect_account_id: 'acct_existing_active', stripe_connect_status: 'active' },
       stripeOverrides: { retrieve: async (id) => ({ id, charges_enabled: true, details_submitted: true }) },
     });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const res = await request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({});
     expect(res.body.accountId).toBe('acct_existing_active');
     expect(res.body.status).toBe('active');
@@ -321,7 +365,7 @@ describe('PR-S1.5 — CASE_4_RECREATE_INVALID (stored id no longer on Stripe)', 
         },
       },
     });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const res = await request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({});
     expect(res.body.accountId).not.toBe('acct_deleted_on_stripe');
     expect(res.body.accountId).toMatch(/^acct_/);
@@ -335,7 +379,7 @@ describe('PR-S1.5 — CASE_4_RECREATE_INVALID (stored id no longer on Stripe)', 
 describe('PR-S1.5 — reconnect-after-disconnect (DB row cleared by disconnect)', () => {
   test('after disconnect cleared the column, next click hits CASE_1_CREATE', async () => {
     const h = buildHarness({ initialDbRow: { stripe_connect_account_id: null, stripe_connect_status: 'disconnected' } });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const res = await request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({});
     expect(res.status).toBe(200);
     expect(res.body.accountId).toMatch(/^acct_/);
@@ -369,7 +413,7 @@ describe('PR-S1.5 — concurrent double-click regression doc test', () => {
         },
       },
     });
-    const token = h.sign({ userId: 42, email: 'op@test' });
+    const token = ownerToken(h);
     const [r1, r2] = await Promise.all([
       request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({}),
       request(h.app).post('/api/stripe/connect/account-link').set('Authorization', `Bearer ${token}`).send({}),
@@ -393,5 +437,100 @@ describe('PR-S1.5 — concurrent double-click regression doc test', () => {
     expect(r3.status).toBe(200);
     expect(h.stripeCalls.filter(c => c.op === 'create').length).toBe(stripeCallCountBefore3rdCall); // unchanged
     expect(h.log.some(l => /branch=CASE_(2|3)/.test(l))).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Section 3 — Tenant-owner gate behavior across all 3 Connect routes
+// (PR-S1.5 backend gate — frontend visibility is not sufficient)
+// ─────────────────────────────────────────────────────────────────
+
+describe('PR-S1.5 — tenant-owner gate on Connect routes', () => {
+  test('tenant account owner CAN POST /api/stripe/connect/account-link', async () => {
+    const h = buildHarness({ initialDbRow: null });
+    const res = await request(h.app)
+      .post('/api/stripe/connect/account-link')
+      .set('Authorization', `Bearer ${ownerToken(h)}`)
+      .send({});
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('accountId');
+  });
+
+  test('tenant account owner CAN GET /api/stripe/connect/account-status', async () => {
+    const h = buildHarness({ initialDbRow: { stripe_connect_account_id: 'acct_x', stripe_connect_status: 'active' } });
+    const res = await request(h.app)
+      .get('/api/stripe/connect/account-status')
+      .set('Authorization', `Bearer ${ownerToken(h)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ connected: true, accountId: 'acct_x', status: 'active' });
+  });
+
+  test('tenant account owner CAN DELETE /api/stripe/connect/disconnect', async () => {
+    const h = buildHarness({ initialDbRow: { stripe_connect_account_id: 'acct_x', stripe_connect_status: 'active' } });
+    const res = await request(h.app)
+      .delete('/api/stripe/connect/disconnect')
+      .set('Authorization', `Bearer ${ownerToken(h)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ disconnected: true });
+  });
+
+  test('admin role is accepted (tenant admin manages account settings)', async () => {
+    const h = buildHarness({ initialDbRow: null });
+    const res = await request(h.app)
+      .post('/api/stripe/connect/account-link')
+      .set('Authorization', `Bearer ${ownerToken(h, { role: 'admin', teamMemberId: undefined })}`)
+      .send({});
+    expect(res.status).toBe(200);
+  });
+
+  test('team member gets 403 on POST /api/stripe/connect/account-link', async () => {
+    const h = buildHarness({ initialDbRow: null });
+    const res = await request(h.app)
+      .post('/api/stripe/connect/account-link')
+      .set('Authorization', `Bearer ${teamToken(h)}`)
+      .send({});
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'billing_owner_only' });
+    // Gate rejects BEFORE handler runs — no Stripe calls, no branch logs.
+    expect(h.stripeCalls).toEqual([]);
+    expect(h.log.filter(l => l.includes('[Connect account-link]'))).toEqual([]);
+  });
+
+  test('team member gets 403 on GET /api/stripe/connect/account-status', async () => {
+    const h = buildHarness({ initialDbRow: { stripe_connect_account_id: 'acct_x', stripe_connect_status: 'active' } });
+    const res = await request(h.app)
+      .get('/api/stripe/connect/account-status')
+      .set('Authorization', `Bearer ${teamToken(h)}`);
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'billing_owner_only' });
+  });
+
+  test('team member gets 403 on DELETE /api/stripe/connect/disconnect', async () => {
+    const h = buildHarness({ initialDbRow: { stripe_connect_account_id: 'acct_x', stripe_connect_status: 'active' } });
+    const res = await request(h.app)
+      .delete('/api/stripe/connect/disconnect')
+      .set('Authorization', `Bearer ${teamToken(h)}`);
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'billing_owner_only' });
+    // Gate must NOT touch DB state.
+    expect(h.getDbRow()).toMatchObject({ stripe_connect_account_id: 'acct_x', stripe_connect_status: 'active' });
+  });
+
+  test('user with role but with teamMemberId set is still rejected (defense-in-depth)', async () => {
+    // Even if a future bug copies role="owner" onto a team-member token, the
+    // teamMemberId presence check catches it. Mirrors PR-S1's billing gate.
+    const h = buildHarness({ initialDbRow: null });
+    const tok = h.sign({ userId: 42, email: 'team@test', role: 'owner', teamMemberId: 7 });
+    const res = await request(h.app)
+      .post('/api/stripe/connect/account-link')
+      .set('Authorization', `Bearer ${tok}`)
+      .send({});
+    expect(res.status).toBe(403);
+  });
+
+  test('no token returns 401, not 403', async () => {
+    const h = buildHarness({ initialDbRow: null });
+    const res = await request(h.app).post('/api/stripe/connect/account-link').send({});
+    expect(res.status).toBe(401);
   });
 });

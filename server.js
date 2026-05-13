@@ -1153,6 +1153,8 @@ try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, cr
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
+let pushService = null; try { pushService = require('./push.service')(supabase, logger); app.use('/api/push', pushService); } catch (e) { console.log('Push module not loaded:', e.message); }
+let jobNotifications = null; try { jobNotifications = require('./job-notifications.service')(supabase, logger, notificationEmail, pushService); } catch (e) { console.log('Job notifications module not loaded:', e.message); }
 try { app.use('/api/paystubs', require('./paystub-service')(supabase, logger, notificationEmail)); } catch (e) { console.log('Paystub module not loaded:', e.message); }
 let jobExpenseRouter = null;
 try { jobExpenseRouter = require('./job-expense-service')(supabase, logger); app.use('/api', jobExpenseRouter); } catch (e) { console.log('Job expense module not loaded:', e.message); }
@@ -6802,6 +6804,12 @@ app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
     const previousStatus = job.status || 'pending';
     const now = new Date().toISOString();
 
+    // Snapshot assigned team members BEFORE we mutate anything — we notify them after the cancel succeeds.
+    let assignedMemberIdsForNotify = [];
+    if (jobNotifications) {
+      try { assignedMemberIdsForNotify = await jobNotifications.getAssignedMemberIds(jobId); } catch (_) {}
+    }
+
     // 1. Update job: set status=cancelled + cancellation fields.
     //    Routes through updateJobStatus so the LB outbox picks up the
     //    transition (when the job is LB-linked). Cancellation fields
@@ -6922,6 +6930,10 @@ app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
         console.error('[Cancel] Reimbursement error:', e.message);
         reimbursementResult = { error: e.message };
       }
+    }
+
+    if (jobNotifications && assignedMemberIdsForNotify.length > 0) {
+      jobNotifications.notifyCanceled(userId, jobId, assignedMemberIdsForNotify, { reason }).catch(() => {});
     }
 
     res.json({
@@ -7609,6 +7621,31 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       } catch (calendarError) {
         console.error('⚠️ Calendar sync failed (non-blocking):', calendarError);
         // Don't fail job update if calendar sync fails
+      }
+    }
+
+    // Detect reschedule (scheduled_date or scheduled_time changed) and notify assigned members.
+    // Compares pre-update snapshot (existingJob[0]) vs. updateDataToSend fields.
+    if (jobNotifications) {
+      try {
+        const before = existingJob[0] || {};
+        const dateChanged = updateDataToSend.scheduled_date !== undefined &&
+          String(updateDataToSend.scheduled_date || '') !== String(before.scheduled_date || '');
+        const timeChanged = updateDataToSend.scheduled_time !== undefined &&
+          String(updateDataToSend.scheduled_time || '') !== String(before.scheduled_time || '');
+        if (dateChanged || timeChanged) {
+          const memberIds = await jobNotifications.getAssignedMemberIds(parseInt(id));
+          if (memberIds.length > 0) {
+            jobNotifications.notifyRescheduled(userId, parseInt(id), memberIds, {
+              oldDate: before.scheduled_date,
+              oldTime: before.scheduled_time,
+              newDate: updateDataToSend.scheduled_date ?? before.scheduled_date,
+              newTime: updateDataToSend.scheduled_time ?? before.scheduled_time,
+            }).catch(() => {});
+          }
+        }
+      } catch (notifyErr) {
+        console.error('[PUT Job] reschedule notification error (non-blocking):', notifyErr.message);
       }
     }
 
@@ -29462,9 +29499,12 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
         console.error('Error creating team assignment:', insertError);
         return res.status(500).json({ error: 'Failed to create team assignment' });
       }
-      
+
      }
-      
+
+      if (jobNotifications && teamMemberId) {
+        jobNotifications.notifyAssigned(userId, parseInt(jobId), [parseInt(teamMemberId)]).catch(() => {});
+      }
       res.json({ message: 'Job assigned successfully' });
   } catch (error) {
     console.error('Job assignment error:', error);
@@ -29749,17 +29789,24 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
         }
       }
 
+      // Capture previously-assigned members so we only notify newly-added ones
+      const { data: priorAssignments } = await supabase
+        .from('job_team_assignments')
+        .select('team_member_id')
+        .eq('job_id', jobId);
+      const priorMemberIds = new Set((priorAssignments || []).map(r => Number(r.team_member_id)));
+
       // Remove existing assignments for this job
     const { error: deleteError } = await supabase
       .from('job_team_assignments')
       .delete()
       .eq('job_id', jobId);
-    
+
     if (deleteError) {
       console.error('Error deleting existing assignments:', deleteError);
       return res.status(500).json({ error: 'Failed to remove existing assignments' });
     }
-      
+
       // Create new assignments
     const assignments = teamMemberIds.map(memberId => {
         const isPrimary = Number(memberId) === Number(primaryMemberId) || (primaryMemberId === undefined && teamMemberIds.indexOf(memberId) === 0);
@@ -29805,6 +29852,16 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
 
     if (updateError) {
       console.error('Error updating job team_member_id:', updateError);
+    }
+
+    // Notify only newly-assigned members (not those already on the job)
+    if (jobNotifications) {
+      const newlyAssigned = teamMemberIds
+        .map(Number)
+        .filter((id) => !priorMemberIds.has(id));
+      if (newlyAssigned.length > 0) {
+        jobNotifications.notifyAssigned(userId, parseInt(jobId), newlyAssigned).catch(() => {});
+      }
     }
 
      res.json({
@@ -34843,7 +34900,12 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
 //   [Connect account-link] branch=<CASE_*> userId=<n> accountId=<acct_*>
 //                          reused=<bool> created=<bool>
 // AccountLink URLs and any keys are NEVER logged.
-app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
+//
+// PR-S1.5 (gate): Tenant-owner-only. Reuses requireBillingOwner from PR-S1 —
+// same semantics: role must be `account owner | owner | admin`, and the JWT
+// must not carry a teamMemberId. Team-member tokens get 403 here regardless
+// of frontend visibility. Mirrors gate at /api/user/billing/*.
+app.post('/api/stripe/connect/account-link', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
     const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
@@ -34990,7 +35052,8 @@ app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}),
 });
 
 // Check Stripe Connect account status
-app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res) => {
+// PR-S1.5 (gate): tenant-owner-only — see comment above on /account-link.
+app.get('/api/stripe/connect/account-status', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
     
@@ -35037,7 +35100,8 @@ app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res
 });
 
 // Disconnect Stripe Connect account
-app.delete('/api/stripe/connect/disconnect', authenticateToken, async (req, res) => {
+// PR-S1.5 (gate): tenant-owner-only — see comment above on /account-link.
+app.delete('/api/stripe/connect/disconnect', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
     const userId = req.user.userId;
     
