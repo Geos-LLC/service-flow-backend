@@ -54,7 +54,7 @@ async function queryLoki(token, query, start) {
   await fetch(`https://${LOKI_HOST}/api/org`, { headers: { Authorization: `Bearer ${token}` } });
 
   const start = ((Date.now() - HOURS * 60 * 60 * 1000) * 1e6).toString();
-  const j = await queryLoki(token, '{service_name="service-flow-backend"} |~ "\\[ZB-auth-observe\\]"', start);
+  const j = await queryLoki(token, '{service_name="service-flow-backend"} |~ "ZB-auth-observe"', start);
   const streams = j.data?.result || [];
 
   const counts = { total: 0, attempted: 0, would_pass: 0, would_reject: 0, by_mode: {}, by_reason: {}, flags: {} };
