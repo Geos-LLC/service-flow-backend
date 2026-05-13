@@ -27988,86 +27988,15 @@ app.post('/api/payments/create-payment-intent', authenticateToken, async (req, r
   }
 });
 
-// Stripe Connect endpoints
-app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
-  try {
-    const { return_url, refresh_url } = req.body;
-    const userId = req.user.id;
-
-    // Create Stripe Connect account
-    const account = await stripe.accounts.create({
-      type: 'express',
-      country: 'US',
-      email: req.user.email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
-
-    // Store account ID in database
-    const { error: updateError } = await supabase
-      .from('user_billing')
-      .upsert({
-        user_id: userId,
-        stripe_connect_account_id: account.id,
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'user_id'
-      });
-
-    if (updateError) {
-      console.error('Error storing connect account:', updateError);
-      return res.status(500).json({ error: 'Failed to store account information' });
-    }
-
-    // Create account link for onboarding
-    const accountLink = await stripe.accountLinks.create({
-      account: account.id,
-      return_url,
-      refresh_url,
-      type: 'account_onboarding',
-    });
-
-    res.json({ url: accountLink.url });
-  } catch (error) {
-    console.error('Stripe Connect account creation error:', error);
-    res.status(500).json({ error: 'Failed to create Stripe Connect account' });
-  }
-});
-
-app.get('/api/stripe/connect/account-status', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-
-    // Get stored account ID
-    const { data: billingData, error: billingError } = await supabase
-      .from('user_billing')
-      .select('stripe_connect_account_id')
-      .eq('user_id', userId)
-      .limit(1);
-
-    if (billingError || !billingData?.[0]?.stripe_connect_account_id) {
-      return res.json({ connected: false });
-    }
-
-    const accountId = billingData[0].stripe_connect_account_id;
-
-    // Get account details from Stripe
-    const account = await stripe.accounts.retrieve(accountId);
-
-    res.json({
-      connected: true,
-      charges_enabled: account.charges_enabled,
-      payouts_enabled: account.payouts_enabled,
-      details_submitted: account.details_submitted,
-      requirements: account.requirements
-    });
-  } catch (error) {
-    console.error('Stripe Connect account status error:', error);
-    res.status(500).json({ error: 'Failed to get account status' });
-  }
-});
+// PR-S1.5: The original `// Stripe Connect endpoints` block lived here and
+// registered POST /api/stripe/connect/account-link + GET .../account-status.
+// Both used `req.user.id` (undefined — JWT carries `userId`) and wrote to
+// `user_billing.stripe_connect_account_id` (a column that does not exist).
+// Express first-match-wins made these the active handlers; both failed
+// silently in production and produced orphan Stripe Connect accounts on
+// every call. Deleted in favor of the correct registrations below
+// (lines ~34670+), which use req.user.userId and write users.stripe_connect_*.
+// See PR-S1.5 design + audit for details.
 
 app.post('/api/payments/confirm-payment', authenticateToken, async (req, res) => {
   try {
@@ -30853,6 +30782,196 @@ app.post('/api/team-members/reset-password', async (req, res) => {
   } catch (error) {
     console.error('❌ Team member reset password error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// =====================================================================
+// Unified password reset flow — works for both owners (users) and
+// team_members. One email per matching account (owner + team_member rows
+// with the same address each get their own token-bearing email).
+// =====================================================================
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const RESET_GENERIC_RESPONSE = {
+  message: 'If an account with that email exists, password reset instructions have been sent.'
+};
+
+async function sendResetEmail({ to, firstName, accountLabel, token }) {
+  const frontendBase = process.env.FRONTEND_URL || 'https://www.service-flow.pro';
+  const resetUrl = `${frontendBase}/reset-password?token=${token}`;
+  // Use platform_settings (DB) for SendGrid config — the env fallbacks point
+  // at unverified senders. The verified sender is alerts@service-flow.pro.
+  const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
+  const fromEmail = (await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL')) || 'alerts@service-flow.pro';
+  if (apiKey) sgMail.setApiKey(apiKey);
+  const result = await sgMail.send({
+    to,
+    from: fromEmail,
+    subject: 'Reset your Service Flow password',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #2563eb;">Password Reset Request</h2>
+        <p>Hello ${firstName || 'there'},</p>
+        <p>You requested to reset the password for your <strong>${accountLabel}</strong> account on Service Flow.</p>
+        <p>Click the button below to choose a new password. This link expires in 1 hour.</p>
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${resetUrl}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
+        </div>
+        <p style="color: #6b7280; font-size: 13px;">If the button doesn't work, copy and paste this URL into your browser:<br/>${resetUrl}</p>
+        <p>If you didn't request this, you can safely ignore this email.</p>
+        <p>— Service Flow Team</p>
+      </div>
+    `
+  });
+  logger.log(`[forgot-password] sent reset email to ${to} from ${fromEmail}, messageId=${result?.[0]?.headers?.['x-message-id'] || 'n/a'}`);
+  return result;
+}
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    const normalized = email.trim().toLowerCase();
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+    logger.log(`[forgot-password] request for ${normalized}`);
+
+    // 1. Owner account (users.email is UNIQUE — at most one row)
+    const { data: ownerRow } = await supabase
+      .from('users')
+      .select('id, first_name, email, business_name')
+      .ilike('email', normalized)
+      .maybeSingle();
+
+    logger.log(`[forgot-password] owner match: ${ownerRow ? 'yes (id=' + ownerRow.id + ')' : 'no'}`);
+
+    if (ownerRow) {
+      const ownerToken = crypto.randomBytes(32).toString('hex');
+      const { error: ownerUpdateError } = await supabase
+        .from('users')
+        .update({ reset_token: ownerToken, reset_token_expires: expiresAt })
+        .eq('id', ownerRow.id);
+      if (!ownerUpdateError) {
+        try {
+          await sendResetEmail({
+            to: ownerRow.email,
+            firstName: ownerRow.first_name,
+            accountLabel: ownerRow.business_name ? `business owner (${ownerRow.business_name})` : 'business owner',
+            token: ownerToken
+          });
+        } catch (mailErr) {
+          console.error('forgot-password: failed to send owner reset email', mailErr);
+        }
+      } else {
+        console.error('forgot-password: failed to store owner reset token', ownerUpdateError);
+      }
+    }
+
+    // 2. Team-member accounts (email NOT unique — can match multiple rows
+    //    across different businesses). Each row gets its own token + email
+    //    so the user can pick the right account.
+    const { data: memberRows } = await supabase
+      .from('team_members')
+      .select('id, first_name, email, user_id, users(business_name)')
+      .ilike('email', normalized)
+      .eq('is_active', true);
+
+    logger.log(`[forgot-password] team_member matches: ${(memberRows || []).length}`);
+
+    for (const member of memberRows || []) {
+      const memberToken = crypto.randomBytes(32).toString('hex');
+      const { error: memberUpdateError } = await supabase
+        .from('team_members')
+        .update({ reset_token: memberToken, reset_token_expires: expiresAt })
+        .eq('id', member.id);
+      if (memberUpdateError) {
+        console.error('forgot-password: failed to store team member reset token', memberUpdateError);
+        continue;
+      }
+      try {
+        const businessName = member.users?.business_name;
+        await sendResetEmail({
+          to: member.email,
+          firstName: member.first_name,
+          accountLabel: businessName ? `team member at ${businessName}` : 'team member',
+          token: memberToken
+        });
+      } catch (mailErr) {
+        console.error('forgot-password: failed to send team member reset email', mailErr);
+      }
+    }
+
+    // Always return the same response to prevent email enumeration.
+    return res.json(RESET_GENERIC_RESPONSE);
+  } catch (err) {
+    console.error('forgot-password error:', err);
+    return res.json(RESET_GENERIC_RESPONSE);
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'Token and new password are required' });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Try owners first.
+    const { data: ownerRow } = await supabase
+      .from('users')
+      .select('id, reset_token_expires')
+      .eq('reset_token', token)
+      .maybeSingle();
+
+    if (ownerRow) {
+      if (!ownerRow.reset_token_expires || new Date(ownerRow.reset_token_expires).toISOString() < nowIso) {
+        return res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
+      }
+      const hashed = await bcrypt.hash(newPassword, 10);
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({ password: hashed, reset_token: null, reset_token_expires: null })
+        .eq('id', ownerRow.id);
+      if (updateError) {
+        console.error('reset-password: failed to update owner password', updateError);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+      return res.json({ message: 'Password updated successfully', accountType: 'owner' });
+    }
+
+    // Fall back to team members.
+    const { data: memberRow } = await supabase
+      .from('team_members')
+      .select('id, reset_token_expires')
+      .eq('reset_token', token)
+      .maybeSingle();
+
+    if (memberRow) {
+      if (!memberRow.reset_token_expires || new Date(memberRow.reset_token_expires).toISOString() < nowIso) {
+        return res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
+      }
+      const hashed = await bcrypt.hash(newPassword, 10);
+      const { error: updateError } = await supabase
+        .from('team_members')
+        .update({ password: hashed, reset_token: null, reset_token_expires: null })
+        .eq('id', memberRow.id);
+      if (updateError) {
+        console.error('reset-password: failed to update team member password', updateError);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+      return res.json({ message: 'Password updated successfully', accountType: 'team_member' });
+    }
+
+    return res.status(400).json({ error: 'Invalid or expired reset token' });
+  } catch (err) {
+    console.error('reset-password error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -34708,67 +34827,121 @@ app.delete('/api/twilio/connect/disconnect', authenticateToken, async (req, res)
 });
 
 // Stripe Connect endpoints
+//
+// PR-S1.5: idempotent onboarding/account-link.
+//
+// Pre-fix, this handler called stripe.accounts.create() unconditionally on
+// every request, so any retry/double-click produced a fresh Connect account
+// while the previous one was orphaned. The 4 idempotency branches below
+// guarantee at most ONE Stripe Connect account per SF user.
+//
+// Response shape is stable across all branches: { url, accountId, status }.
+// The `url` field name preserves compatibility with future frontend code
+// (StripeConnectOnboarding.jsx reads response.data.url).
+//
+// Structured branch logs follow the form:
+//   [Connect account-link] branch=<CASE_*> userId=<n> accountId=<acct_*>
+//                          reused=<bool> created=<bool>
+// AccountLink URLs and any keys are NEVER logged.
 app.post('/api/stripe/connect/account-link', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    // For Stripe Connect, we need to create a Connect App first
     const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-    
     if (!stripeSecretKey) {
-      return res.status(500).json({ 
-        error: 'Stripe not configured. Please contact support.' 
-      });
+      return res.status(500).json({ error: 'Stripe not configured. Please contact support.' });
     }
-    
-    // Create a Stripe Connect account for the user
     const stripe = require('stripe')(stripeSecretKey);
-    
-    // Create a Connect account
-    const account = await stripe.accounts.create({
-      type: 'express',
-      country: 'US',
-      email: req.user.email,
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
-    
-    // Create account link for onboarding
+
+    // 1. Read the user's current Connect state.
+    const { data: existing } = await supabase
+      .from('users')
+      .select('stripe_connect_account_id, stripe_connect_status')
+      .eq('id', userId)
+      .single();
+
+    let accountId = existing?.stripe_connect_account_id || null;
+    let status = null;
+    let branch = null;
+    let reused = false;
+    let created = false;
+
+    // 2. If we have a stored account_id, verify it's still valid on Stripe's
+    //    side. A previously-stored account may have been deleted from the
+    //    Stripe Dashboard (CASE 4) — in that case we must fall through to
+    //    CASE 1 and create a fresh one.
+    let stripeAccount = null;
+    if (accountId) {
+      try {
+        stripeAccount = await stripe.accounts.retrieve(accountId);
+      } catch (e) {
+        logger.warn(`[Connect account-link] stored accountId=${accountId} not retrievable from Stripe (${e.code || e.message}); will create fresh`);
+        accountId = null;
+      }
+    }
+
+    if (!accountId) {
+      // CASE 1 — no existing account (first onboarding) OR CASE 4 (existing
+      // account no longer valid on Stripe). Create a new one, persist it.
+      branch = stripeAccount === null && existing?.stripe_connect_account_id
+        ? 'CASE_4_RECREATE_INVALID'
+        : 'CASE_1_CREATE';
+      const newAccount = await stripe.accounts.create({
+        type: 'express',
+        country: 'US',
+        email: req.user.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+      });
+      accountId = newAccount.id;
+      status = 'pending';
+      created = true;
+
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({
+          stripe_connect_account_id: accountId,
+          stripe_connect_status: status,
+        })
+        .eq('id', userId);
+      if (updateError) {
+        logger.error(`[Connect account-link] failed to persist new accountId for userId=${userId}: ${updateError.message}`);
+        return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
+      }
+    } else {
+      // Existing account is valid on Stripe. Decide CASE 2 vs CASE 3 based
+      // on whether onboarding is complete (Stripe's `details_submitted` /
+      // `charges_enabled`).
+      reused = true;
+      const isActive = !!(stripeAccount && stripeAccount.charges_enabled);
+      status = isActive ? 'active' : 'pending';
+      branch = isActive ? 'CASE_3_ACCOUNT_UPDATE' : 'CASE_2_RESUME_PENDING';
+    }
+
+    // 3. Generate an AccountLink. Type depends on whether the account is
+    //    fully onboarded (account_update) or still needs onboarding
+    //    (account_onboarding). Each AccountLink is single-use and has a
+    //    short TTL on the Stripe side — a fresh one per request is normal.
+    const linkType = status === 'active' ? 'account_update' : 'account_onboarding';
     const accountLink = await stripe.accountLinks.create({
-      account: account.id,
+      account: accountId,
       refresh_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?refresh=true`,
       return_url: `${process.env.FRONTEND_URL}/settings/stripe-connect?connected=true`,
-      type: 'account_onboarding',
+      type: linkType,
     });
-    
-    // Store the account ID in user's record
-    const { error: updateError } = await supabase
-      .from('users')
-      .update({ 
-        stripe_connect_account_id: account.id,
-        stripe_connect_status: 'pending'
-      })
-      .eq('id', userId);
-    
-    if (updateError) {
-      console.error('Error updating user Stripe Connect data:', updateError);
-      return res.status(500).json({ error: 'Failed to store Stripe Connect data' });
-    }
-    
-    console.log('🔗 Stripe Connect account created for user:', userId, 'Account ID:', account.id);
-    
-    res.json({
-      success: true,
-      message: 'Stripe Connect account created',
-      accountId: account.id,
-      authUrl: accountLink.url
-    });
-    
+
+    // 4. Structured branch log — does NOT include the AccountLink URL or
+    //    any key material. Just the routing decision and id pair so we can
+    //    observe idempotency behavior in Loki.
+    logger.log(`[Connect account-link] branch=${branch} userId=${userId} accountId=${accountId} reused=${reused} created=${created} linkType=${linkType}`);
+
+    // 5. Stable response shape: { url, accountId, status }.
+    return res.json({ url: accountLink.url, accountId, status });
+
   } catch (error) {
-    console.error('Stripe Connect authorization error:', error);
-    res.status(500).json({ error: 'Failed to create Stripe Connect account: ' + error.message });
+    logger.error(`[Connect account-link] unexpected error for userId=${req.user?.userId}: ${error.message}`);
+    return res.status(500).json({ error: 'Failed to create Stripe Connect account: ' + error.message });
   }
 });
 
