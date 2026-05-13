@@ -35258,24 +35258,26 @@ app.post('/api/stripe/setup-credentials', authenticateToken, requireBillingOwner
       return res.status(400).json({ error: 'Publishable key and secret key are required' });
     }
 
-    // Validate Stripe credentials by testing them
-    try {
-      const testStripe = require('stripe')(secretKey);
-      const account = await testStripe.accounts.retrieve();
-      
-      // Verify the publishable key matches the account
-      if (!publishableKey.startsWith('pk_')) {
-        return res.status(400).json({ error: 'Invalid publishable key format' });
-      }
-      
-      console.log('✅ Stripe credentials validated successfully for account:', account.id);
-    } catch (stripeError) {
-      console.error('❌ Stripe credentials validation failed:', stripeError.message);
-      return res.status(400).json({ 
-        error: 'Invalid Stripe credentials. Please check your API keys and try again.',
-        details: stripeError.message 
+    // PR-S1.6: scope-aware validation that works for both standard sk_*
+    // keys AND restricted rk_* keys. Probes the four scopes SF's direct-
+    // key routes actually exercise (Customers, Invoices, PaymentIntents,
+    // PaymentLinks) so restricted keys with the right permissions pass
+    // even though they can't call accounts.retrieve(). Categorizes the
+    // failure into invalid_key / mode_mismatch / insufficient_permissions
+    // so the frontend can render a precise error. NEVER logs the key,
+    // prefix, suffix, or raw Stripe error text.
+    const { validateStripeCredentials } = require('./lib/stripe-credentials');
+    const validation = await validateStripeCredentials(publishableKey, secretKey);
+    if (!validation.ok) {
+      logger.warn(`[Stripe credentials] validation failed userId=${userId} code=${validation.code}`);
+      return res.status(400).json({
+        error: validation.code,
+        details: validation.details,
+        ...(validation.missing_permissions ? { missing_permissions: validation.missing_permissions } : {}),
+        ...(validation.mode_publishable ? { mode_publishable: validation.mode_publishable, mode_secret: validation.mode_secret } : {}),
       });
     }
+    logger.log(`[Stripe credentials] validation succeeded userId=${userId} mode=${validation.mode}`);
 
     // Store user's Stripe credentials securely
     const { error: updateError } = await supabase
@@ -35319,20 +35321,46 @@ app.get('/api/stripe/test-connection', authenticateToken, requireBillingOwner, a
     }
 
     const stripe = require('stripe')(billingData.stripe_secret_key);
-    const account = await stripe.accounts.retrieve();
+
+    // PR-S1.6: probe a required scope instead of accounts.retrieve() so
+    // restricted keys (rk_*) that lack Account read scope can still be
+    // tested. Customers list is in the minimum required scope set.
+    try {
+      await stripe.customers.list({ limit: 1 });
+    } catch (err) {
+      const { _internal } = require('./lib/stripe-credentials');
+      if (_internal.isAuthError(err)) {
+        return res.json({ connected: false, error: 'invalid_key' });
+      }
+      if (_internal.isPermissionError(err)) {
+        return res.json({ connected: false, error: 'insufficient_permissions' });
+      }
+      // Surface the error category only — never the raw message, which
+      // Stripe may embed key prefixes into.
+      logger.warn(`[Stripe test-connection] unexpected error type=${err?.type || 'unknown'}`);
+      return res.json({ connected: false, error: 'unknown_stripe_error' });
+    }
+
+    // Best-effort: include account_id / charges_enabled / payouts_enabled
+    // when the key supports accounts.retrieve(). Restricted keys without
+    // Account read scope simply get these fields omitted.
+    let account = null;
+    try { account = await stripe.accounts.retrieve(); } catch (_) { /* restricted key — fine */ }
 
     res.json({
       connected: true,
-      account_id: account.id,
-      charges_enabled: account.charges_enabled,
-      payouts_enabled: account.payouts_enabled
+      ...(account ? {
+        account_id: account.id,
+        charges_enabled: account.charges_enabled,
+        payouts_enabled: account.payouts_enabled,
+      } : {}),
     });
   } catch (error) {
-    if (error.type === 'StripeAuthenticationError') {
-      return res.json({ connected: false, error: 'Invalid Stripe credentials' });
-    }
-    console.error('Stripe connection test error:', error);
-    res.json({ connected: false, error: error.message });
+    // Outer catch — keep this minimal; the inner block above already
+    // categorizes Stripe-specific failures. Anything reaching here is a
+    // programming error (DB throws, etc.).
+    logger.error(`[Stripe test-connection] outer error: ${error?.message || 'unknown'}`);
+    res.json({ connected: false, error: 'internal_error' });
   }
 });
 
