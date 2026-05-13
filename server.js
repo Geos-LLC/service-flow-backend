@@ -19166,14 +19166,19 @@ app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBill
   }
 });
 
-// Stripe webhook handler
+// ─── Platform Billing webhook ─────────────────────────────────────
+// Receives platform-side events for THIS Service Flow account's own
+// Stripe subscriptions/invoices (customer.subscription.*, invoice.*).
+// Uses STRIPE_WEBHOOK_SECRET — the signing secret of the Platform
+// endpoint in Stripe Dashboard → Developers → Webhooks. Distinct from
+// the Connect endpoint below, which has its own signing secret.
 app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
   // PR-4: surface unconfigured state distinctly from signature mismatch so
   // ops can tell "we are silently dropping all Stripe events" apart from
-  // "Stripe is sending us garbage". Without the secret, every legitimate
-  // event was previously rejected with 400 + an opaque "Webhook Error".
+  // "Stripe is sending us garbage". PR-S1.7: message names the affected
+  // event domain (Platform Billing) so Loki readers can disambiguate.
   if (!process.env.STRIPE_WEBHOOK_SECRET) {
-    logger.error('[Stripe Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event without verification attempt');
+    logger.error('[Stripe Webhook] STRIPE_WEBHOOK_SECRET is not configured — Platform Billing events (customer.subscription.*, invoice.*) cannot be verified and will be rejected');
     return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
   }
 
@@ -35007,13 +35012,22 @@ app.post('/api/stripe/connect/account-link', authenticateToken, requireBillingOw
   }
 });
 
-// Stripe Connect webhook handler (optional - for account updates)
+// ─── Stripe Connect webhook ───────────────────────────────────────
+// Receives events about CONNECTED accounts (tenant Stripe Express
+// accounts onboarded via PR-S1.5 Connect flow): account.updated,
+// account.application.{authorized,deauthorized}, etc.
+// Stripe issues a SEPARATE signing secret for the Connect endpoint —
+// using the Platform secret here would silently reject every legitimate
+// Connect event. Equality between the two secrets is therefore a
+// misconfiguration; config-audit raises CRITICAL when they match.
 app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   try {
-    // PR-4: see /api/webhook/stripe for the same gate rationale.
-    if (!process.env.STRIPE_WEBHOOK_SECRET) {
-      logger.error('[Stripe Connect Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event');
-      return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
+    // PR-S1.7: Connect domain uses its own signing secret. Message names
+    // the affected event domain (Connect account events) so Loki readers
+    // can disambiguate from the Platform Billing webhook's findings.
+    if (!process.env.STRIPE_CONNECT_WEBHOOK_SECRET) {
+      logger.error('[Stripe Connect Webhook] STRIPE_CONNECT_WEBHOOK_SECRET is not configured — Connect account events (account.updated, account.application.*) cannot be verified and will be rejected');
+      return res.status(503).json({ error: 'stripe_connect_webhook_unconfigured' });
     }
 
     const sig = req.headers['stripe-signature'];
@@ -35021,7 +35035,7 @@ app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}),
 
     let event;
     try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_CONNECT_WEBHOOK_SECRET);
     } catch (err) {
       console.log(`Webhook signature verification failed.`, err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
