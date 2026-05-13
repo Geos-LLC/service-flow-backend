@@ -103,6 +103,33 @@ describe('PR-S1.5 — source invariants on Connect routes', () => {
     routes.forEach((re) => expect(SERVER_SRC).toMatch(re));
   });
 
+  test('all 10 direct-key Stripe routes are gated by requireBillingOwner (PR-S1.5 commit 4/4)', () => {
+    // The parallel direct-key Stripe integration (paste-an-sk_key flow) shares
+    // the same owner-only requirement. setup-credentials and disconnect are
+    // the most dangerous — without the gate, a team-member JWT could overwrite
+    // or wipe the tenant's Stripe credentials with a single curl.
+    const directKeyRoutes = [
+      ['post',   '/api/stripe/setup-credentials'],
+      ['get',    '/api/stripe/test-connection'],
+      ['get',    '/api/stripe/status'],
+      ['post',   '/api/stripe/create-invoice'],
+      ['post',   '/api/stripe/send-invoice'],
+      ['post',   '/api/stripe/create-payment-intent'],
+      ['get',    '/api/stripe/payment-status/:paymentIntentId'],
+      ['post',   '/api/stripe/create-customer'],
+      ['delete', '/api/stripe/disconnect'],
+      ['post',   '/api/stripe/create-payment-link'],
+    ];
+    directKeyRoutes.forEach(([verb, route]) => {
+      const re = new RegExp(
+        `app\\.${verb}\\(\\s*'${route.replace(/[/:]/g, m => '\\' + m)}'\\s*,\\s*authenticateToken\\s*,\\s*requireBillingOwner\\b`
+      );
+      if (!re.test(SERVER_SRC)) {
+        throw new Error(`Route ${verb.toUpperCase()} ${route} is NOT gated by requireBillingOwner`);
+      }
+    });
+  });
+
   test('handler emits the 4 branch tags', () => {
     expect(SERVER_SRC).toMatch(/CASE_1_CREATE/);
     expect(SERVER_SRC).toMatch(/CASE_2_RESUME_PENDING/);
@@ -532,5 +559,113 @@ describe('PR-S1.5 — tenant-owner gate on Connect routes', () => {
     const h = buildHarness({ initialDbRow: null });
     const res = await request(h.app).post('/api/stripe/connect/account-link').send({});
     expect(res.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Section 4 — Tenant-owner gate behavior across direct-key Stripe routes
+// (PR-S1.5 commit 4/4 — the parallel paste-an-sk_key integration)
+// ─────────────────────────────────────────────────────────────────
+
+// Lightweight harness that mounts ALL 10 direct-key routes behind the gate
+// with a no-op passthrough handler. Lets us test the gate in isolation per
+// route without mirroring each handler's body.
+function buildDirectKeyHarness({ jwtSecret = 'test-secret' } = {}) {
+  const app = express();
+  app.use(express.json());
+
+  function authenticateToken(req, res, next) {
+    const token = (req.headers['authorization'] || '').split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token' });
+    try { req.user = jwt.verify(token, jwtSecret); next(); }
+    catch { return res.status(401).json({ error: 'Invalid token' }); }
+  }
+  function requireBillingOwner(req, res, next) {
+    const role = String((req.user && req.user.role) || '').toLowerCase();
+    const isOwnerOrAdmin = role === 'account owner' || role === 'owner' || role === 'admin';
+    const isTeamMember = !!(req.user && req.user.teamMemberId);
+    if (!isOwnerOrAdmin || isTeamMember) {
+      return res.status(403).json({ error: 'billing_owner_only' });
+    }
+    next();
+  }
+  const ok = (req, res) => res.json({ ok: true, route: req.path, method: req.method });
+
+  const routes = [
+    ['post',   '/api/stripe/setup-credentials'],
+    ['get',    '/api/stripe/test-connection'],
+    ['get',    '/api/stripe/status'],
+    ['post',   '/api/stripe/create-invoice'],
+    ['post',   '/api/stripe/send-invoice'],
+    ['post',   '/api/stripe/create-payment-intent'],
+    ['get',    '/api/stripe/payment-status/:paymentIntentId'],
+    ['post',   '/api/stripe/create-customer'],
+    ['delete', '/api/stripe/disconnect'],
+    ['post',   '/api/stripe/create-payment-link'],
+  ];
+  for (const [verb, route] of routes) {
+    app[verb](route, authenticateToken, requireBillingOwner, ok);
+  }
+
+  return {
+    app,
+    routes,
+    sign: (payload) => jwt.sign(payload, jwtSecret, { expiresIn: '5m' }),
+  };
+}
+
+describe('PR-S1.5 — tenant-owner gate on direct-key Stripe routes', () => {
+  const cases = [
+    ['post',   '/api/stripe/setup-credentials',                 {}],
+    ['get',    '/api/stripe/test-connection',                   null],
+    ['get',    '/api/stripe/status',                            null],
+    ['post',   '/api/stripe/create-invoice',                    { customerId: 'cus_x', amount: 100, description: 't' }],
+    ['post',   '/api/stripe/send-invoice',                      { invoiceId: 'in_x' }],
+    ['post',   '/api/stripe/create-payment-intent',             { amount: 100, currency: 'usd' }],
+    ['get',    '/api/stripe/payment-status/pi_test_abc',        null],
+    ['post',   '/api/stripe/create-customer',                   { email: 'c@test' }],
+    ['delete', '/api/stripe/disconnect',                        null],
+    ['post',   '/api/stripe/create-payment-link',               { amount: 100 }],
+  ];
+
+  describe.each(cases)('%s %s', (verb, path, body) => {
+    test('tenant owner reaches handler (not 401, not 403)', async () => {
+      const h = buildDirectKeyHarness();
+      const tok = h.sign({ userId: 42, email: 'owner@test', role: 'account owner' });
+      const req = request(h.app)[verb](path).set('Authorization', `Bearer ${tok}`);
+      const res = body !== null ? await req.send(body) : await req;
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true });
+    });
+
+    test('team member gets 403 (billing_owner_only)', async () => {
+      const h = buildDirectKeyHarness();
+      const tok = h.sign({ userId: 99, email: 'team@test', role: 'cleaner', teamMemberId: 7 });
+      const req = request(h.app)[verb](path).set('Authorization', `Bearer ${tok}`);
+      const res = body !== null ? await req.send(body) : await req;
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ error: 'billing_owner_only' });
+    });
+  });
+
+  // Defense-in-depth: setup-credentials and disconnect are the most
+  // destructive — explicit asserts beyond the parameterized block.
+  test('team member CANNOT overwrite tenant credentials via setup-credentials', async () => {
+    const h = buildDirectKeyHarness();
+    const tok = h.sign({ userId: 99, role: 'cleaner', teamMemberId: 7 });
+    const res = await request(h.app)
+      .post('/api/stripe/setup-credentials')
+      .set('Authorization', `Bearer ${tok}`)
+      .send({ publishableKey: 'pk_attacker', secretKey: 'sk_attacker' });
+    expect(res.status).toBe(403);
+  });
+
+  test('team member CANNOT wipe tenant credentials via disconnect', async () => {
+    const h = buildDirectKeyHarness();
+    const tok = h.sign({ userId: 99, role: 'cleaner', teamMemberId: 7 });
+    const res = await request(h.app)
+      .delete('/api/stripe/disconnect')
+      .set('Authorization', `Bearer ${tok}`);
+    expect(res.status).toBe(403);
   });
 });
