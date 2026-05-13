@@ -270,7 +270,8 @@ describe('PR-4 / config-audit — inspectConfig', () => {
   test('clean env → 0 findings', () => {
     const { findings } = inspectConfig({
       JWT_SECRET: 'a'.repeat(64),
-      STRIPE_WEBHOOK_SECRET: 'whsec_x',
+      STRIPE_WEBHOOK_SECRET: 'whsec_platform_x',
+      STRIPE_CONNECT_WEBHOOK_SECRET: 'whsec_connect_y', // PR-S1.7: distinct from Platform
       ADMIN_EMAIL: 'a@b.c',
       ADMIN_PASSWORD: 'x'.repeat(40),
       SF_INTEGRATION_ENC_KEY: 'k'.repeat(44),

@@ -50,6 +50,12 @@ const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = req
 const { validateScheduledDate } = require('./lib/import-date-guard');
 const { runStartupConfigAudit } = require('./lib/config-audit');
 const { authenticateWebhook } = require('./lib/webhook-signature');
+const { buildRateSnapshot, extractRateSnapshot, computeEarningFromSnapshot } = require('./lib/ledger-snapshot');
+const {
+  COMPLETION_DERIVED_TYPES: LEDGER_COMPLETION_DERIVED_TYPES,
+  safeDeleteCompletionDerivedLedger,
+  recordLedgerDrift,
+} = require('./lib/ledger-immutability');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
@@ -6704,34 +6710,41 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // === LEDGER CLEANUP: Remove completion-derived entries when job leaves earnings status ===
+    // === LEDGER CLEANUP: Remove UNBATCHED completion-derived entries when job leaves earnings status ===
     // Covers: cancel, reschedule, reset to pending
     // Only deletes entries derived from completion (earning/tip/incentive/cash_collected).
     // reimbursement / expense_deduction / adjustment / payout entries are preserved —
     // those survive a status change (e.g. cancellation reimbursement must not be wiped).
-    const COMPLETION_DERIVED_TYPES = ['earning', 'tip', 'incentive', 'cash_collected'];
+    // Settled (payout_batch_id IS NOT NULL) rows are immutable by Constitution §3.1 —
+    // a status reset cannot retroactively erase paid earnings. Drift is audited via
+    // rebuildJobLedger; cleanup here uses safeDeleteCompletionDerivedLedger which
+    // skips settled rows and reports them for operator review.
+    const COMPLETION_DERIVED_TYPES = LEDGER_COMPLETION_DERIVED_TYPES;
     if (earningsStatuses.includes(previousStatus) && !earningsStatuses.includes(status)) {
       try {
-        const { data: deletedEntries, error: delErr } = await supabase.from('cleaner_ledger')
-          .delete()
-          .eq('job_id', parseInt(id))
-          .in('type', COMPLETION_DERIVED_TYPES)
-          .select('id');
-        if (delErr) console.error(`⚠️ Error removing ledger entries for ${status} job:`, delErr);
-        else console.log(`[Ledger] Removed ${deletedEntries?.length || 0} completion entries for job ${id} (${previousStatus} → ${status})`);
+        const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
+          jobId: parseInt(id),
+          types: COMPLETION_DERIVED_TYPES,
+          source: `status_change:${previousStatus}->${status}`,
+        });
+        console.log(`[Ledger] Removed ${deleted} unbatched completion entries for job ${id} (${previousStatus} → ${status})`);
+        if (skippedBatched.length > 0) {
+          console.warn(`[Ledger] Job ${id} status change to ${status} preserved ${skippedBatched.length} settled rows (Constitution §3.1) — compensating adjustment may be required.`);
+        }
       } catch (ledgerError) {
-        console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
+        console.error(`⚠️ Error removing ledger entries for ${status} job:`, ledgerError);
       }
     }
     // Also clean up if directly set to cancelled/rescheduled from non-earnings status (e.g. pending→cancelled)
     if ((status === 'cancelled' || status === 'rescheduled') && !earningsStatuses.includes(previousStatus)) {
       try {
-        await supabase.from('cleaner_ledger')
-          .delete()
-          .eq('job_id', parseInt(id))
-          .in('type', COMPLETION_DERIVED_TYPES);
+        await safeDeleteCompletionDerivedLedger(supabase, {
+          jobId: parseInt(id),
+          types: COMPLETION_DERIVED_TYPES,
+          source: `status_change_direct:${previousStatus}->${status}`,
+        });
       } catch (ledgerError) {
-        // Non-blocking — there may be no entries to delete
+        console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
       }
     }
 
@@ -6855,16 +6868,24 @@ app.post('/api/jobs/:id/cancel', authenticateToken, async (req, res) => {
       });
     } catch (e) { /* table may not exist */ }
 
-    // 3. Ledger cleanup: delete completion-derived entries (earning/tip/incentive/cash_collected).
-    //    Preserve reimbursement / adjustment / payout / expense_deduction rows.
-    const COMPLETION_DERIVED_TYPES = ['earning', 'tip', 'incentive', 'cash_collected'];
+    // 3. Ledger cleanup: delete UNBATCHED completion-derived entries
+    //    (earning/tip/incentive/cash_collected). Preserve reimbursement /
+    //    adjustment / payout / expense_deduction rows. Settled rows are
+    //    immutable (Constitution §3.1); the cancel API surfaces them for
+    //    operator review rather than silently retro-erasing paid earnings.
+    const COMPLETION_DERIVED_TYPES = LEDGER_COMPLETION_DERIVED_TYPES;
     try {
-      await supabase.from('cleaner_ledger')
-        .delete()
-        .eq('job_id', jobId)
-        .in('type', COMPLETION_DERIVED_TYPES);
+      const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
+        jobId,
+        types: COMPLETION_DERIVED_TYPES,
+        source: 'cancel_api',
+      });
+      if (skippedBatched.length > 0) {
+        console.warn(`[Cancel] Job ${jobId} cancel preserved ${skippedBatched.length} settled rows (Constitution §3.1). Operator must adjust via compensating entry if appropriate.`);
+      }
+      console.log(`[Cancel] Removed ${deleted} unbatched ledger rows for job ${jobId}`);
     } catch (e) {
-      console.error('[Cancel] Ledger cleanup error (non-blocking):', e.message);
+      console.error('[Cancel] Ledger cleanup error:', e.message);
     }
 
     // 4. Cleaner reimbursement (if requested) — goes through job_expenses approval flow.
@@ -19166,14 +19187,19 @@ app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBill
   }
 });
 
-// Stripe webhook handler
+// ─── Platform Billing webhook ─────────────────────────────────────
+// Receives platform-side events for THIS Service Flow account's own
+// Stripe subscriptions/invoices (customer.subscription.*, invoice.*).
+// Uses STRIPE_WEBHOOK_SECRET — the signing secret of the Platform
+// endpoint in Stripe Dashboard → Developers → Webhooks. Distinct from
+// the Connect endpoint below, which has its own signing secret.
 app.post('/api/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
   // PR-4: surface unconfigured state distinctly from signature mismatch so
   // ops can tell "we are silently dropping all Stripe events" apart from
-  // "Stripe is sending us garbage". Without the secret, every legitimate
-  // event was previously rejected with 400 + an opaque "Webhook Error".
+  // "Stripe is sending us garbage". PR-S1.7: message names the affected
+  // event domain (Platform Billing) so Loki readers can disambiguate.
   if (!process.env.STRIPE_WEBHOOK_SECRET) {
-    logger.error('[Stripe Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event without verification attempt');
+    logger.error('[Stripe Webhook] STRIPE_WEBHOOK_SECRET is not configured — Platform Billing events (customer.subscription.*, invoice.*) cannot be verified and will be rejected');
     return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
   }
 
@@ -23697,10 +23723,14 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
           .select('hourly_rate, commission_percentage, availability, salary_start_date, user_id')
           .eq('id', actualTeamMemberId).single();
         if (mgrInfo && parseFloat(mgrInfo.hourly_rate) > 0 && mgrInfo.availability) {
-          // Delete old salary entries
+          // Delete old UNBATCHED salary entries. Settled (paid) manager salary
+          // rows are immutable (Constitution §3.1) — rate change does not
+          // retroactively rewrite paid history. Future periods recompute
+          // from the new rate; past paid periods stay as-paid.
           await supabase.from('cleaner_ledger').delete()
             .eq('user_id', mgrInfo.user_id).eq('team_member_id', parseInt(actualTeamMemberId))
-            .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
+            .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true })
+            .is('payout_batch_id', null);
           // Rebuild
           const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
           const mgrStart = mgrInfo.salary_start_date ? String(mgrInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
@@ -24679,8 +24709,10 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
         .eq('id', memberId).single();
       const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
       if (mgrCheck && managerRoles.includes((mgrCheck.role || '').toLowerCase()) && parseFloat(mgrCheck.hourly_rate) > 0 && mgrCheck.availability) {
+        // Delete UNBATCHED only — Constitution §3.1 protects paid manager salary rows.
         await supabase.from('cleaner_ledger').delete()
-          .eq('user_id', mgrCheck.user_id).eq('team_member_id', parseInt(memberId)).is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
+          .eq('user_id', mgrCheck.user_id).eq('team_member_id', parseInt(memberId)).is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true })
+          .is('payout_batch_id', null);
         const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
         const mgrStart = mgrCheck.salary_start_date ? String(mgrCheck.salary_start_date).split('T')[0].split(' ')[0] : null;
         const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrCheck.user_id).order('scheduled_date', { ascending: true }).limit(1);
@@ -24950,12 +24982,15 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
         }
         d.setDate(d.getDate() + 1);
       }
-      // Apply stale salary updates
+      // Apply stale salary updates. The staleSalaryUpdates set was built with
+      // `!existing.payout_batch_id` (see L24938), but we add the SQL-level
+      // `.is('payout_batch_id', null)` guard as defense-in-depth so a future
+      // refactor can't silently regress the Constitution §3.1 immutability rule.
       for (const upd of staleSalaryUpdates) {
         if (upd._delete) {
-          await supabase.from('cleaner_ledger').delete().eq('id', upd.id);
+          await supabase.from('cleaner_ledger').delete().eq('id', upd.id).is('payout_batch_id', null);
         } else {
-          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id);
+          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id).is('payout_batch_id', null);
         }
       }
       if (staleSalaryUpdates.length > 0) {
@@ -25013,12 +25048,14 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
           staleUpdates.push({ id: existing.id, _delete: true });
         }
       }
-      // Apply stale updates
+      // Apply stale updates. Build-time check at L25004/L25016 only queues
+      // unbatched rows; the `.is('payout_batch_id', null)` clause below is
+      // defense-in-depth for Constitution §3.1.
       for (const upd of staleUpdates) {
         if (upd._delete) {
-          await supabase.from('cleaner_ledger').delete().eq('id', upd.id);
+          await supabase.from('cleaner_ledger').delete().eq('id', upd.id).is('payout_batch_id', null);
         } else {
-          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id);
+          await supabase.from('cleaner_ledger').update({ amount: upd.amount, note: upd.note, metadata: upd.metadata }).eq('id', upd.id).is('payout_batch_id', null);
         }
       }
       if (staleUpdates.length > 0) {
@@ -26058,10 +26095,12 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
     const managerRoles = ['account owner', 'owner', 'manager', 'admin', 'scheduler'];
     if (memberInfo && managerRoles.includes((memberInfo.role || '').toLowerCase()) && parseFloat(memberInfo.hourly_rate) > 0) {
       try {
-        // Delete old salary entries for this manager
+        // Delete old UNBATCHED salary entries for this manager — Constitution §3.1
+        // protects paid rows even when the manager's availability changes.
         await supabase.from('cleaner_ledger').delete()
           .eq('user_id', teamMember.user_id).eq('team_member_id', parseInt(id))
-          .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true });
+          .is('job_id', null).eq('type', 'earning').contains('metadata', { is_manager_salary: true })
+          .is('payout_batch_id', null);
 
         // Determine date range
         const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
@@ -35007,13 +35046,22 @@ app.post('/api/stripe/connect/account-link', authenticateToken, requireBillingOw
   }
 });
 
-// Stripe Connect webhook handler (optional - for account updates)
+// ─── Stripe Connect webhook ───────────────────────────────────────
+// Receives events about CONNECTED accounts (tenant Stripe Express
+// accounts onboarded via PR-S1.5 Connect flow): account.updated,
+// account.application.{authorized,deauthorized}, etc.
+// Stripe issues a SEPARATE signing secret for the Connect endpoint —
+// using the Platform secret here would silently reject every legitimate
+// Connect event. Equality between the two secrets is therefore a
+// misconfiguration; config-audit raises CRITICAL when they match.
 app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}), async (req, res) => {
   try {
-    // PR-4: see /api/webhook/stripe for the same gate rationale.
-    if (!process.env.STRIPE_WEBHOOK_SECRET) {
-      logger.error('[Stripe Connect Webhook] STRIPE_WEBHOOK_SECRET is not configured — rejecting event');
-      return res.status(503).json({ error: 'stripe_webhook_unconfigured' });
+    // PR-S1.7: Connect domain uses its own signing secret. Message names
+    // the affected event domain (Connect account events) so Loki readers
+    // can disambiguate from the Platform Billing webhook's findings.
+    if (!process.env.STRIPE_CONNECT_WEBHOOK_SECRET) {
+      logger.error('[Stripe Connect Webhook] STRIPE_CONNECT_WEBHOOK_SECRET is not configured — Connect account events (account.updated, account.application.*) cannot be verified and will be rejected');
+      return res.status(503).json({ error: 'stripe_connect_webhook_unconfigured' });
     }
 
     const sig = req.headers['stripe-signature'];
@@ -35021,7 +35069,7 @@ app.post('/api/stripe/connect/webhook', express.raw({type: 'application/json'}),
 
     let event;
     try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_CONNECT_WEBHOOK_SECRET);
     } catch (err) {
       console.log(`Webhook signature verification failed.`, err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -35244,24 +35292,26 @@ app.post('/api/stripe/setup-credentials', authenticateToken, requireBillingOwner
       return res.status(400).json({ error: 'Publishable key and secret key are required' });
     }
 
-    // Validate Stripe credentials by testing them
-    try {
-      const testStripe = require('stripe')(secretKey);
-      const account = await testStripe.accounts.retrieve();
-      
-      // Verify the publishable key matches the account
-      if (!publishableKey.startsWith('pk_')) {
-        return res.status(400).json({ error: 'Invalid publishable key format' });
-      }
-      
-      console.log('✅ Stripe credentials validated successfully for account:', account.id);
-    } catch (stripeError) {
-      console.error('❌ Stripe credentials validation failed:', stripeError.message);
-      return res.status(400).json({ 
-        error: 'Invalid Stripe credentials. Please check your API keys and try again.',
-        details: stripeError.message 
+    // PR-S1.6: scope-aware validation that works for both standard sk_*
+    // keys AND restricted rk_* keys. Probes the four scopes SF's direct-
+    // key routes actually exercise (Customers, Invoices, PaymentIntents,
+    // PaymentLinks) so restricted keys with the right permissions pass
+    // even though they can't call accounts.retrieve(). Categorizes the
+    // failure into invalid_key / mode_mismatch / insufficient_permissions
+    // so the frontend can render a precise error. NEVER logs the key,
+    // prefix, suffix, or raw Stripe error text.
+    const { validateStripeCredentials } = require('./lib/stripe-credentials');
+    const validation = await validateStripeCredentials(publishableKey, secretKey);
+    if (!validation.ok) {
+      logger.warn(`[Stripe credentials] validation failed userId=${userId} code=${validation.code}`);
+      return res.status(400).json({
+        error: validation.code,
+        details: validation.details,
+        ...(validation.missing_permissions ? { missing_permissions: validation.missing_permissions } : {}),
+        ...(validation.mode_publishable ? { mode_publishable: validation.mode_publishable, mode_secret: validation.mode_secret } : {}),
       });
     }
+    logger.log(`[Stripe credentials] validation succeeded userId=${userId} mode=${validation.mode}`);
 
     // Store user's Stripe credentials securely
     const { error: updateError } = await supabase
@@ -35305,20 +35355,46 @@ app.get('/api/stripe/test-connection', authenticateToken, requireBillingOwner, a
     }
 
     const stripe = require('stripe')(billingData.stripe_secret_key);
-    const account = await stripe.accounts.retrieve();
+
+    // PR-S1.6: probe a required scope instead of accounts.retrieve() so
+    // restricted keys (rk_*) that lack Account read scope can still be
+    // tested. Customers list is in the minimum required scope set.
+    try {
+      await stripe.customers.list({ limit: 1 });
+    } catch (err) {
+      const { _internal } = require('./lib/stripe-credentials');
+      if (_internal.isAuthError(err)) {
+        return res.json({ connected: false, error: 'invalid_key' });
+      }
+      if (_internal.isPermissionError(err)) {
+        return res.json({ connected: false, error: 'insufficient_permissions' });
+      }
+      // Surface the error category only — never the raw message, which
+      // Stripe may embed key prefixes into.
+      logger.warn(`[Stripe test-connection] unexpected error type=${err?.type || 'unknown'}`);
+      return res.json({ connected: false, error: 'unknown_stripe_error' });
+    }
+
+    // Best-effort: include account_id / charges_enabled / payouts_enabled
+    // when the key supports accounts.retrieve(). Restricted keys without
+    // Account read scope simply get these fields omitted.
+    let account = null;
+    try { account = await stripe.accounts.retrieve(); } catch (_) { /* restricted key — fine */ }
 
     res.json({
       connected: true,
-      account_id: account.id,
-      charges_enabled: account.charges_enabled,
-      payouts_enabled: account.payouts_enabled
+      ...(account ? {
+        account_id: account.id,
+        charges_enabled: account.charges_enabled,
+        payouts_enabled: account.payouts_enabled,
+      } : {}),
     });
   } catch (error) {
-    if (error.type === 'StripeAuthenticationError') {
-      return res.json({ connected: false, error: 'Invalid Stripe credentials' });
-    }
-    console.error('Stripe connection test error:', error);
-    res.json({ connected: false, error: error.message });
+    // Outer catch — keep this minimal; the inner block above already
+    // categorizes Stripe-specific failures. Anything reaching here is a
+    // programming error (DB throws, etc.).
+    logger.error(`[Stripe test-connection] outer error: ${error?.message || 'unknown'}`);
+    res.json({ connected: false, error: 'internal_error' });
   }
 });
 
@@ -37224,7 +37300,18 @@ function sumThirdPartyFees(feesBreakdown) {
 
 // Helper: Create ledger entries for a completed job
 // *** Mirrors Payroll endpoint logic exactly (Payroll = single source of truth) ***
-async function createLedgerEntriesForCompletedJob(jobId, userId) {
+//
+// Options (Synchronization Constitution §3.1, §3.5):
+//   - skipMemberTypePairs: Set<`${memberId}:${type}`>
+//       Skip inserting entries for any (member, type) pair in this set. Used by
+//       rebuildJobLedger to avoid duplicating settled (batched) rows.
+//   - dryRun: boolean
+//       If true, returns the computed entries array without writing. Used by
+//       drift detection to learn "what would the rebuild have produced?".
+async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
+  const { skipMemberTypePairs = null, dryRun = false } = options;
+  const shouldSkip = (memberId, type) =>
+    skipMemberTypePairs instanceof Set && skipMemberTypePairs.has(`${memberId}:${type}`);
   // Fetch job details (includes start_time/end_time for hours calc, total_paid_amount for overpayment/tip calc)
   const { data: job, error: jobError } = await supabase
     .from('jobs')
@@ -37244,17 +37331,20 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     return;
   }
 
-  // Check if earning entries already exist for this job (idempotency)
-  // Only check 'earning' type — cash_collected/payout entries may exist from separate flows
+  // Check if UNBATCHED earning entries already exist for this job (idempotency).
+  // Settled (payout_batch_id IS NOT NULL) rows are immutable by Constitution §3.1
+  // — they're handled separately via skipMemberTypePairs so a rebuild can re-create
+  // missing unbatched rows alongside surviving batched siblings.
   const { data: existingEntries } = await supabase
     .from('cleaner_ledger')
     .select('id')
     .eq('job_id', jobId)
     .in('type', ['earning', 'tip', 'incentive'])
+    .is('payout_batch_id', null)
     .limit(1);
 
-  if (existingEntries && existingEntries.length > 0) {
-    console.log(`Ledger: Entries already exist for job ${jobId}, skipping`);
+  if (existingEntries && existingEntries.length > 0 && !dryRun) {
+    console.log(`Ledger: Unbatched entries already exist for job ${jobId}, skipping`);
     return;
   }
 
@@ -37352,28 +37442,42 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       let metadata;
       const overrideTotal = job.cleaner_salary_override;
 
+      // Build canonical rate snapshot once per member (Constitution §3.5).
+      // This is embedded into every completion-derived row (earning/tip/incentive/
+      // cash_collected) so future rebuilds can recompute against the historical
+      // rates that were in effect when the row was created — not whatever the
+      // team_members table happens to say today.
+      const rateSnapshot = buildRateSnapshot({
+        hourlyRate,
+        commissionPct,
+        memberCount,
+        revenue: jobRevenue,
+        hours: hoursWorked,
+        effectiveDate,
+      });
+
       if (overrideTotal != null && parseFloat(overrideTotal) > 0) {
         // Manual per-job override: split the dollar amount evenly across
         // assigned non-manager members. Bypasses hours × rate + commission.
         earningAmount = parseFloat((parseFloat(overrideTotal) / memberCount).toFixed(2));
-        metadata = { override_total: parseFloat(overrideTotal), member_count: memberCount, source: 'cleaner_salary_override' };
+        metadata = { ...rateSnapshot, override_total: parseFloat(overrideTotal), source: 'cleaner_salary_override' };
       } else if (hourlyRate > 0 && commissionPct > 0) {
         // Hybrid: hourly (full hours) + commission (split revenue)
         const hourlyPay = hoursWorked * hourlyRate;
         const commissionPay = (jobRevenue / memberCount) * (commissionPct / 100);
         earningAmount = parseFloat((hourlyPay + commissionPay).toFixed(2));
-        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
+        metadata = { ...rateSnapshot };
       } else if (commissionPct > 0) {
         earningAmount = parseFloat(((jobRevenue / memberCount) * (commissionPct / 100)).toFixed(2));
-        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
+        metadata = { ...rateSnapshot };
       } else if (hourlyRate > 0) {
         earningAmount = parseFloat((hoursWorked * hourlyRate).toFixed(2));
-        metadata = { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount };
+        metadata = { ...rateSnapshot };
       }
       // No fallback: if worker has no hourly rate and no commission and
       // no override, earning = $0
 
-      if (earningAmount > 0) {
+      if (earningAmount > 0 && !shouldSkip(member.id, 'earning')) {
         ledgerEntries.push({
           user_id: userId,
           team_member_id: member.id,
@@ -37382,17 +37486,29 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
           amount: earningAmount,
           effective_date: effectiveDate,
           note: `Earning for job #${jobId}`,
-          metadata: metadata || { hours: hoursWorked, hourly_rate: hourlyRate, commission_pct: commissionPct, revenue: jobRevenue, member_count: memberCount },
+          metadata: metadata || { ...rateSnapshot },
           created_by: userId
         });
       }
     } // end if (!isManager)
 
+    // Rate snapshot for tip/incentive/cash_collected — these rows don't use
+    // rate math but the snapshot still pins memberCount/effective_date/revenue
+    // so a future rebuild can detect drift on settled rows (Constitution §3.5).
+    const splitSnapshot = buildRateSnapshot({
+      hourlyRate,
+      commissionPct,
+      memberCount,
+      revenue: jobRevenue,
+      hours: hoursWorked,
+      effectiveDate,
+    });
+
     // Tips: ONLY from job.tip_amount (overpayment is processing fee, not a tip)
     const jobTip = parseFloat(job.tip_amount) || 0;
     const memberTip = jobTip / Math.max(1, memberCount);
 
-    if (memberTip > 0) {
+    if (memberTip > 0 && !shouldSkip(member.id, 'tip')) {
       ledgerEntries.push({
         user_id: userId,
         team_member_id: member.id,
@@ -37401,6 +37517,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
         amount: parseFloat(memberTip.toFixed(2)),
         effective_date: effectiveDate,
         note: `Tip for job #${jobId}`,
+        metadata: { ...splitSnapshot, job_tip: jobTip },
         created_by: userId
       });
     }
@@ -37413,7 +37530,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     const memberIncentive = hasPerAssignmentIncentives
       ? assignmentIncentive
       : (jobIncentive > 0 ? parseFloat((jobIncentive / Math.max(1, memberCount)).toFixed(2)) : 0);
-    if (memberIncentive > 0) {
+    if (memberIncentive > 0 && !shouldSkip(member.id, 'incentive')) {
       ledgerEntries.push({
         user_id: userId,
         team_member_id: member.id,
@@ -37422,6 +37539,11 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
         amount: memberIncentive,
         effective_date: effectiveDate,
         note: `Incentive for job #${jobId}`,
+        metadata: {
+          ...splitSnapshot,
+          job_incentive: jobIncentive,
+          per_assignment: hasPerAssignmentIncentives ? assignmentIncentive : null,
+        },
         created_by: userId
       });
     }
@@ -37441,7 +37563,18 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
     if (totalCash > 0) {
       // Split cash among assigned members (whoever collected it)
       for (const member of teamMembers) {
+        if (shouldSkip(member.id, 'cash_collected')) continue;
         const memberShare = parseFloat((totalCash / memberCount).toFixed(2));
+        // Cash rows still snapshot member_count + effective_rate_date so a
+        // rebuild can detect cash-split drift on settled rows (Constitution §3.5).
+        const cashSnapshot = buildRateSnapshot({
+          hourlyRate: 0,
+          commissionPct: 0,
+          memberCount,
+          revenue: jobRevenue,
+          hours: 0,
+          effectiveDate,
+        });
         ledgerEntries.push({
           user_id: userId,
           team_member_id: member.id,
@@ -37450,6 +37583,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
           amount: -memberShare, // negative — offsets balance
           effective_date: effectiveDate,
           note: `Cash collected for job #${jobId}`,
+          metadata: { ...cashSnapshot, total_cash: totalCash, member_share: memberShare },
           created_by: userId
         });
       }
@@ -37457,8 +37591,10 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
   }
 
   // If no entries were generated for any member, create a $0 earning entry for the first active
-  // member so the job is tracked in the ledger (keeps job count in sync with Payroll)
-  if (ledgerEntries.length === 0 && teamMembers.length > 0) {
+  // member so the job is tracked in the ledger (keeps job count in sync with Payroll).
+  // Skip the placeholder when the only member would have been excluded by skipMemberTypePairs
+  // (a rebuild whose batched survivors already cover the job).
+  if (ledgerEntries.length === 0 && teamMembers.length > 0 && !shouldSkip(teamMembers[0].id, 'earning')) {
     ledgerEntries.push({
       user_id: userId,
       team_member_id: teamMembers[0].id,
@@ -37467,24 +37603,40 @@ async function createLedgerEntriesForCompletedJob(jobId, userId) {
       amount: 0,
       effective_date: effectiveDate,
       note: `Earning for job #${jobId}`,
-      metadata: { hours: 0, hourly_rate: 0, commission_pct: 0, revenue: 0, member_count: memberCount },
+      metadata: buildRateSnapshot({
+        hourlyRate: 0,
+        commissionPct: 0,
+        memberCount,
+        revenue: 0,
+        hours: 0,
+        effectiveDate,
+      }),
       created_by: userId
     });
+  }
+
+  // Dry-run: return the computed entries without writing. Used by drift
+  // detection so a rebuild can learn what the current job state WOULD have
+  // produced for settled rows (Constitution §3.3).
+  if (dryRun) {
+    return ledgerEntries;
   }
 
   // Batch insert all ledger entries (delete first to prevent duplicates from race conditions)
   if (ledgerEntries.length > 0) {
     // Re-check right before insert to handle concurrent webhook calls.
-    // Only check earning/tip/incentive — the rebuild path deletes those and leaves
-    // cash_collected/adjustment/reimbursement/payout alone, so those must NOT block reinsert.
+    // Filter on UNBATCHED only (Constitution §3.1) — settled rows aren't a
+    // race condition, they're permanent siblings the rebuild path is allowed
+    // to coexist with.
     const { data: raceCheck } = await supabase
       .from('cleaner_ledger')
       .select('id')
       .eq('job_id', jobId)
       .in('type', ['earning', 'tip', 'incentive'])
+      .is('payout_batch_id', null)
       .limit(1);
     if (raceCheck && raceCheck.length > 0) {
-      console.log(`Ledger: Entries already exist for job ${jobId} (race condition avoided), skipping`);
+      console.log(`Ledger: Unbatched entries already exist for job ${jobId} (race condition avoided), skipping`);
       return;
     }
 
@@ -37634,10 +37786,12 @@ async function syncJobIncentiveLedger(jobId, userId) {
       }
     } else {
       if (existing && !existing.payout_batch_id) {
+        // Constitution §3.1 defense-in-depth: explicit SQL-level batched guard.
         const { error: delErr } = await supabase
           .from('cleaner_ledger')
           .delete()
-          .eq('id', existing.id);
+          .eq('id', existing.id)
+          .is('payout_batch_id', null);
         if (delErr) {
           console.error(`[Incentive Sync] Delete failed for ledger ${existing.id}:`, delErr);
         }
@@ -37651,75 +37805,74 @@ async function syncJobIncentiveLedger(jobId, userId) {
 }
 
 /**
- * Rebuild ledger entries for a job while preserving existing payout_batch_id links.
+ * Rebuild completion-derived ledger entries for a job.
  *
- * Replaces the delete+createLedgerEntriesForCompletedJob pattern. When a completed
- * job is rebuilt (ZZB resync, inline edit, cash transaction arrival, etc.) the old
- * ledger rows get deleted. If any of those rows were linked to a *paid* batch, the
- * link is lost — the batch still has `total_amount` and was already paid out, but
- * the new rows come back with `payout_batch_id = NULL`. The paystub and payroll
- * then disagree with the actual payment.
+ * Constitution §3.1 / §3.3 contract:
+ *   - Settled rows (payout_batch_id IS NOT NULL) are NEVER deleted, updated,
+ *     or re-attached. They are immutable.
+ *   - When the rebuild would produce a different amount than a settled row
+ *     stores, a ledger_drift_detected audit row is emitted (§3.4). No mutation.
+ *   - Only unbatched rows are replaced with fresh computations using the
+ *     current job state and historical-rate snapshots (§3.5).
+ *   - Operator resolves any audited drift via a §3.6 compensating adjustment.
  *
- * This helper captures the `(team_member_id, type) -> payout_batch_id` map from
- * the old rows *before* deleting, runs the rebuild, and re-attaches the new rows.
- *
- * Safe to call even when no prior entries exist — it falls back to a plain rebuild.
+ * Safe to call repeatedly; idempotent on no-change inputs.
  */
-async function rebuildJobLedger(jobId, userId, { types = ['earning', 'tip', 'incentive', 'cash_collected'] } = {}) {
-  // 1. Capture batch linkage BEFORE delete.
-  const { data: oldEntries } = await supabase
+async function rebuildJobLedger(jobId, userId, { types = LEDGER_COMPLETION_DERIVED_TYPES, source = 'rebuildJobLedger' } = {}) {
+  // 1. Read existing rows so we can compare settled amounts to what the
+  //    rebuild would have computed.
+  const { data: existing } = await supabase
     .from('cleaner_ledger')
-    .select('team_member_id, type, payout_batch_id')
+    .select('id, user_id, team_member_id, job_id, type, amount, payout_batch_id, metadata, effective_date')
     .eq('job_id', jobId)
-    .in('type', types)
-    .not('payout_batch_id', 'is', null);
+    .in('type', types);
 
-  const batchMap = {};
-  for (const e of (oldEntries || [])) {
-    const key = `${e.team_member_id}:${e.type}`;
-    if (!batchMap[key]) batchMap[key] = e.payout_batch_id;
-  }
+  const batched = (existing || []).filter(r => r.payout_batch_id != null);
+  const skipMemberTypePairs = new Set(batched.map(r => `${r.team_member_id}:${r.type}`));
 
-  // 2. Delete old entries.
-  await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', types);
-
-  // 3. Rebuild via the standard path.
-  await createLedgerEntriesForCompletedJob(jobId, userId);
-
-  // 4. Re-attach batch links to the newly inserted rows.
-  if (Object.keys(batchMap).length > 0) {
-    const { data: newEntries } = await supabase
-      .from('cleaner_ledger')
-      .select('id, team_member_id, type')
-      .eq('job_id', jobId)
-      .in('type', types)
-      .is('payout_batch_id', null);
-
-    let reattached = 0;
-    for (const e of (newEntries || [])) {
-      const key = `${e.team_member_id}:${e.type}`;
-      const batchId = batchMap[key];
-      if (batchId) {
-        const { error: updErr } = await supabase
-          .from('cleaner_ledger')
-          .update({ payout_batch_id: batchId })
-          .eq('id', e.id);
-        if (!updErr) reattached++;
+  // 2. Drift detection (only when settled rows exist). Run createLedger in
+  //    dry-run mode WITHOUT any skip set so we see every entry it would have
+  //    produced, including those that overlap with settled rows.
+  if (batched.length > 0) {
+    try {
+      const computed = await createLedgerEntriesForCompletedJob(jobId, userId, { dryRun: true });
+      const computedByPair = new Map();
+      for (const e of (computed || [])) {
+        computedByPair.set(`${e.team_member_id}:${e.type}`, e);
       }
-    }
-    if (reattached > 0) {
-      console.log(`Ledger: Re-attached ${reattached} rebuilt entries for job ${jobId} to prior batch(es)`);
+      for (const row of batched) {
+        const desired = computedByPair.get(`${row.team_member_id}:${row.type}`);
+        if (!desired) continue;
+        await recordLedgerDrift(supabase, row, {
+          computedAmount: Number(desired.amount) || 0,
+          source,
+          reason: `rebuild for job ${jobId} would produce $${Number(desired.amount).toFixed(2)} for settled row paid $${Number(row.amount).toFixed(2)}`,
+          computedInputs: desired.metadata || null,
+        });
+      }
+    } catch (e) {
+      console.error(`[rebuildJobLedger] drift detection failed for job ${jobId}: ${e.message}`);
     }
   }
 
-  // 5. Late tip/incentive bump.
-  // If a tip or incentive arrives AFTER the job's earning was already paid out
-  // (e.g. customer pays + leaves a tip several days after the pay period closed),
-  // it would land in the closed period and be invisible until you look back at it.
-  // The cleaner won't see it in their current paystub. Bump effective_date to today
-  // so it lands in the current pay period and gets paid in the next batch.
-  // Only applies to tip/incentive — cash_collected uses a different rule (handled
-  // by attaching to the prior paid batch in the backfill flow).
+  // 3. Safe-delete unbatched only (Constitution §3.1).
+  try {
+    await safeDeleteCompletionDerivedLedger(supabase, { jobId, types, source });
+  } catch (e) {
+    console.error(`[rebuildJobLedger] safe delete failed for job ${jobId}: ${e.message}`);
+    return;
+  }
+
+  // 4. Insert fresh unbatched rows for (member, type) pairs NOT already held
+  //    by a settled row. This avoids duplicating earning/tip/incentive for the
+  //    same job (which would risk double-pay if effective_date stays in a
+  //    paid period). Operators resolve missed amounts via §3.6 adjustments.
+  await createLedgerEntriesForCompletedJob(jobId, userId, { skipMemberTypePairs });
+
+  // 5. Late tip/incentive bump (Constitution-aligned with §3.4 — corrections
+  //    happen in the current pay period, not retroactively into a closed one).
+  //    If a tip or incentive arrives AFTER the job's earning was already paid
+  //    out, bump effective_date to today so it lands in the current pay period.
   const todayStr = new Date().toISOString().split('T')[0];
   const { data: postRebuildEntries } = await supabase
     .from('cleaner_ledger')
@@ -38190,14 +38343,28 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
     let allMemberIds = (assignments || []).map(a => a.team_member_id);
     if (allMemberIds.length === 0 && job.team_member_id) allMemberIds = [job.team_member_id];
 
-    // Delete ALL cash_collected entries for this job (we'll rebuild them)
-    await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).eq('type', 'cash_collected');
+    // Delete UNBATCHED cash_collected entries for this job (we'll rebuild them).
+    // Settled rows survive — Constitution §3.1 — and the redistribute must
+    // skip (member) pairs that are already paid out, otherwise the new
+    // unbatched row alongside the paid one would mis-attribute cash already
+    // accounted for. Drift on settled rows is surfaced via the ledger_drift
+    // audit table for operator review.
+    const { skippedBatched: batchedCash } = await safeDeleteCompletionDerivedLedger(supabase, {
+      jobId,
+      types: ['cash_collected'],
+      source: 'cash_redistribution',
+    });
+    const batchedCashMembers = new Set(batchedCash.map(r => r.team_member_id));
+
+    if (batchedCash.length > 0) {
+      console.warn(`[Cash] Job ${jobId} redistribute preserved ${batchedCash.length} settled cash_collected rows. Members ${[...batchedCashMembers].join(',')} excluded from redistribution; operator must use compensating adjustment for any post-batch cash changes.`);
+    }
 
     const entries = [];
     if (totalCash > 0 && allMemberIds.length > 0) {
-      // Set the edited member's amount
+      // Set the edited member's amount (skip if member already has a settled row)
       const editedAmount = Math.min(parsedAmount, totalCash);
-      if (editedAmount > 0) {
+      if (editedAmount > 0 && !batchedCashMembers.has(teamMemberId)) {
         entries.push({
           user_id: userId, team_member_id: teamMemberId, job_id: jobId,
           type: 'cash_collected', amount: -editedAmount,
@@ -38208,9 +38375,9 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
         });
       }
 
-      // Distribute remainder to other members evenly
+      // Distribute remainder to other members evenly (exclude settled-row members)
       const remainder = totalCash - editedAmount;
-      const otherMembers = allMemberIds.filter(id => id !== teamMemberId);
+      const otherMembers = allMemberIds.filter(id => id !== teamMemberId && !batchedCashMembers.has(id));
       if (remainder > 0 && otherMembers.length > 0) {
         const perMember = parseFloat((remainder / otherMembers.length).toFixed(2));
         for (const mid of otherMembers) {
@@ -38230,7 +38397,7 @@ app.patch('/api/ledger/cash-collected/:jobId/:teamMemberId', authenticateToken, 
       await supabase.from('cleaner_ledger').insert(entries);
     }
 
-    res.json({ success: true });
+    res.json({ success: true, preserved_settled_rows: batchedCash.length });
   } catch (error) {
     console.error('Update cash collected error:', error);
     res.status(500).json({ error: 'Failed to update cash collected' });
@@ -39084,9 +39251,13 @@ app.post('/api/ledger/backfill', authenticateToken, async (req, res) => {
           const mgrSalaryStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
           const mgrEffectiveStart = mgrSalaryStart && (!rangeStart || mgrSalaryStart > rangeStart) ? mgrSalaryStart : rangeStart;
 
-          // Delete ALL existing manager entries for this member (salary + commission)
+          // Delete UNBATCHED manager entries (salary + commission) for this member.
+          // Settled rows are immutable per Constitution §3.1 — admin backfill cannot
+          // retroactively erase paid manager history. Future-period entries can be
+          // regenerated freely.
           await supabase.from('cleaner_ledger').delete()
-            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning');
+            .eq('user_id', userId).eq('team_member_id', mgr.id).is('job_id', null).eq('type', 'earning')
+            .is('payout_batch_id', null);
 
           // ── Manager commission: per-day entries based on daily revenue ──
           if (commissionPct > 0 && totalBusinessRevenue > 0) {

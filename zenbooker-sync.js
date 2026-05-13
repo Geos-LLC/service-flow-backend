@@ -12,6 +12,11 @@ const { FLAGS, isEnabled } = require('./lib/feature-flags')
 const { mapJobFinancials, stripDiagnostics } = require('./lib/zenbooker-financial')
 const { safeReconcileJobLedger } = require('./lib/zenbooker-ledger-reconcile')
 const { mapJobLifecycle, stripLifecycleDiagnostics } = require('./lib/zenbooker-lifecycle')
+const {
+  COMPLETION_DERIVED_TYPES: LEDGER_COMPLETION_DERIVED_TYPES,
+  safeDeleteCompletionDerivedLedger,
+} = require('./lib/ledger-immutability')
+const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -21,10 +26,12 @@ const syncProgress = {}
 module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger) => {
   const router = express.Router()
 
-  // Fallback when server.js doesn't pass rebuildJobLedger (older builds): do the
-  // plain delete+rebuild pattern so behavior matches the pre-helper era.
-  const rebuildLedger = rebuildJobLedger || (async (jobId, userId, { types = ['earning', 'tip', 'incentive', 'cash_collected'] } = {}) => {
-    await supabase.from('cleaner_ledger').delete().eq('job_id', jobId).in('type', types)
+  // Fallback when server.js doesn't pass rebuildJobLedger (older builds): use
+  // the immutability-safe delete helper so the fallback still preserves settled
+  // rows (Constitution §3.1). Insertion is delegated to createLedgerEntries which
+  // already filters unbatched siblings via its updated race-check.
+  const rebuildLedger = rebuildJobLedger || (async (jobId, userId, { types = LEDGER_COMPLETION_DERIVED_TYPES } = {}) => {
+    await safeDeleteCompletionDerivedLedger(supabase, { jobId, types, source: 'zenbooker_fallback_rebuild' })
     if (createLedgerEntriesForCompletedJob) await createLedgerEntriesForCompletedJob(jobId, userId)
   })
 
@@ -912,10 +919,26 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
       logger.log(`[Zenbooker] Job updated: ${data.id} (${eventType})`)
 
-      // Delete ledger entries when job is cancelled via Zenbooker webhook
+      // Delete UNBATCHED completion-derived ledger entries when job is
+      // cancelled via Zenbooker webhook. Reimbursement/adjustment/payout/
+      // expense_deduction survive (a cancellation reimbursement must not be
+      // wiped). Settled rows are immutable (Constitution §3.1) — paid past
+      // earnings are not retro-erased; operator handles via compensating
+      // adjustment if needed.
       if (mapped.status === 'cancelled') {
-        await supabase.from('cleaner_ledger').delete().eq('job_id', existing.id)
-        logger.log(`[Zenbooker] Ledger entries removed for cancelled job ${existing.id}`)
+        try {
+          const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
+            jobId: existing.id,
+            types: LEDGER_COMPLETION_DERIVED_TYPES,
+            source: 'zb_webhook_cancel',
+          })
+          logger.log(`[Zenbooker] Removed ${deleted} unbatched ledger entries for cancelled job ${existing.id}`)
+          if (skippedBatched.length > 0) {
+            logger.warn(`[Zenbooker] Cancel preserved ${skippedBatched.length} settled rows on job ${existing.id} (Constitution §3.1) — compensating adjustment may be required.`)
+          }
+        } catch (e) {
+          logger.error(`[Zenbooker] Cancel ledger cleanup failed for job ${existing.id}: ${e.message}`)
+        }
       }
     } else {
       // First-time insert — status ships with the row directly.
@@ -1618,10 +1641,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
               const update = {}
               if (sfJob.status !== zbStatus) {
                 update.status = zbStatus
-                // Remove ledger entries when job is cancelled
+                // Remove UNBATCHED completion-derived ledger entries when job
+                // transitions to cancelled. Preserved types + settled rows match
+                // the webhook-cancel rule above (Constitution §3.1).
                 if (zbStatus === 'cancelled' && sfJob.status !== 'cancelled') {
-                  await supabase.from('cleaner_ledger').delete().eq('job_id', sfJob.id)
-                  logger.log(`[Zenbooker] Reconcile: removed ledger for cancelled job ${sfJob.id}`)
+                  try {
+                    const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
+                      jobId: sfJob.id,
+                      types: LEDGER_COMPLETION_DERIVED_TYPES,
+                      source: 'zb_reconcile_cancel',
+                    })
+                    logger.log(`[Zenbooker] Reconcile: removed ${deleted} unbatched ledger entries for cancelled job ${sfJob.id}`)
+                    if (skippedBatched.length > 0) {
+                      logger.warn(`[Zenbooker] Reconcile cancel preserved ${skippedBatched.length} settled rows on job ${sfJob.id} (Constitution §3.1).`)
+                    }
+                  } catch (e) {
+                    logger.error(`[Zenbooker] Reconcile cancel ledger cleanup failed for job ${sfJob.id}: ${e.message}`)
+                  }
                 }
               }
               if (sfJob.invoice_status !== zbInvoiceStatus) update.invoice_status = zbInvoiceStatus
@@ -2015,6 +2051,30 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
   // POST /webhook — receives ALL Zenbooker webhook events
   router.post('/webhook', async (req, res) => {
     try {
+      // P0.2 (Constitution §6.1) — webhook authentication.
+      // Flag OFF: observe-only; every delivery logs an audit line so operators
+      // can read flag-on readiness from Loki BEFORE flipping the flag.
+      // Flag ON: reject unsigned / unverified events with 4xx before any
+      // database mutation occurs.
+      const auth = authenticateZenbookerWebhook(req)
+      if (!auth.ok) {
+        logger.warn(`[Zenbooker] Webhook auth rejected: status=${auth.status} reason=${auth.reason} flag=${auth.flag}`)
+        return res.status(auth.status).json({ error: 'webhook_auth_failed', reason: auth.reason })
+      }
+      // Always emit an auth-observation line. The single structured prefix
+      // [ZB-auth-observe] is the Loki query anchor for the flag-on readiness
+      // dashboard. Fields:
+      //   flag=on|off
+      //   mode=hmac|shared_secret|none  (what passed, or none if no header)
+      //   attempted=true|false          (did the request carry any auth header)
+      //   reason=...                    (only set when attempted but invalid)
+      const obs = `flag=${auth.flag} mode=${auth.mode || 'none'} attempted=${auth.attempted ? 'true' : 'false'}`
+      if (auth.attempted && auth.reason && auth.reason !== 'no_auth_attempted' && !auth.mode) {
+        logger.warn(`[ZB-auth-observe] ${obs} reason=${auth.reason}`)
+      } else {
+        logger.log(`[ZB-auth-observe] ${obs}`)
+      }
+
       const { event, data, account_id } = req.body
       if (!event || !data) {
         return res.status(400).json({ error: 'Missing event or data' })
