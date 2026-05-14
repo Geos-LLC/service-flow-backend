@@ -41662,10 +41662,23 @@ app.get('/api/communications/media/:sigcoreMessageId', authenticateToken, async 
     if (!msg) return res.status(404).json({ error: 'Not found' });
 
     const { data: conv } = await supabase.from('communication_conversations')
-      .select('id, user_id')
+      .select('id, user_id, provider_account_id')
       .eq('id', msg.conversation_id)
       .maybeSingle();
     if (!conv || conv.user_id !== userId) return res.status(404).json({ error: 'Not found' });
+
+    // Source-account boundary (Constitution §1.3 / §6.5 / P1.1) — when the
+    // flag is enforced and the message's source account is no longer active,
+    // refuse to serve the media. Mirrors the detail endpoint's 404 behavior
+    // (matching list visibility), not 403 — disconnected media is "not
+    // available", not "you're not authorized".
+    if (isEnabled(FLAGS.SOURCE_ACCOUNT_BOUNDARY_ENFORCED) && conv.provider_account_id != null) {
+      const status = await getProviderAccountStatus(supabase, conv.provider_account_id);
+      if (status && status !== 'active') {
+        logger.log(`[Boundary] Media 404 conv=${conv.id} sigcoreMsg=${sigcoreMessageId} (account #${conv.provider_account_id} status=${status})`);
+        return res.status(404).json({ error: 'Not found' });
+      }
+    }
 
     // Resolve tenant key
     const settings = await getSigcoreSettings(userId);
