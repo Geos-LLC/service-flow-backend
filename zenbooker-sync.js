@@ -17,6 +17,7 @@ const {
   safeDeleteCompletionDerivedLedger,
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
+const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -672,10 +673,20 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         await supabase.from('transactions').update(updateData).eq('id', existingByZbId.id)
         // Also update job payment_method if we have a real name (fixes "custom" from invoice fallback)
         if (sfJob?.id && resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
-          await supabase.from('jobs').update({
+          const { error: pmErr } = await supabase.from('jobs').update({
             payment_method: resolvedPaymentMethod,
             payment_status: 'paid',
-          }).eq('id', sfJob.id).catch(() => {})
+          }).eq('id', sfJob.id)
+          if (pmErr) {
+            await markDirty(supabase, {
+              userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
+              operation: 'transaction_payment_method', error: pmErr, logger,
+              context: { source: 'syncTransactions:update_by_zb_id', resolved_method: resolvedPaymentMethod },
+            })
+          } else {
+            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on tx sync update' })
+            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'payment_status_update', note: 'resolved on tx sync update' })
+          }
         }
         // If payment_method changed (e.g. "custom"/"other" → "cash"), rebuild ledger so
         // cash_collected entries get created. Without this, payroll over-pays cleaners.
@@ -692,10 +703,19 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           await supabase.from('transactions').update(txData).eq('id', manual[0].id)
           // Also update job payment_method
           if (resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
-            await supabase.from('jobs').update({
+            const { error: pmErr } = await supabase.from('jobs').update({
               payment_method: resolvedPaymentMethod,
               payment_status: 'paid',
-            }).eq('id', sfJob.id).catch(() => {})
+            }).eq('id', sfJob.id)
+            if (pmErr) {
+              await markDirty(supabase, {
+                userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
+                operation: 'transaction_payment_method', error: pmErr, logger,
+                context: { source: 'syncTransactions:adopt_manual', resolved_method: resolvedPaymentMethod },
+              })
+            } else {
+              await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on manual-tx adoption' })
+            }
           }
           // Adopting a manual tx with a different payment_method requires ledger rebuild
           if (manual[0].payment_method !== txData.payment_method) {
@@ -713,10 +733,19 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         if (sfJob?.id) jobsNeedingLedgerRebuild.add(sfJob.id)
         // Also update the job's payment_method + payment_status
         if (sfJob?.id && resolvedPaymentMethod) {
-          await supabase.from('jobs').update({
+          const { error: pmErr } = await supabase.from('jobs').update({
             payment_method: resolvedPaymentMethod,
             payment_status: 'paid',
-          }).eq('id', sfJob.id).catch(() => {})
+          }).eq('id', sfJob.id)
+          if (pmErr) {
+            await markDirty(supabase, {
+              userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
+              operation: 'transaction_payment_method', error: pmErr, logger,
+              context: { source: 'syncTransactions:after_insert', resolved_method: resolvedPaymentMethod },
+            })
+          } else {
+            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on new-tx insert' })
+          }
         }
       }
     }
@@ -729,8 +758,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         try {
           await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
           ledgerRebuilt++
+          await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'ledger_rebuild', note: 'resolved after tx sync' })
         } catch (e) {
-          logger.error(`[Zenbooker] Ledger rebuild after tx sync failed for job ${jobId}: ${e.message}`)
+          await markDirty(supabase, {
+            userId, sfJobId: jobId, zenbookerId: null,
+            operation: 'ledger_rebuild', error: e, logger,
+            context: { source: 'syncTransactions:rebuild_loop' },
+          })
         }
       }
       logger.log(`[Zenbooker] Rebuilt ledger for ${ledgerRebuilt} jobs with new transactions`)
@@ -890,8 +924,27 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       try {
         const zbCustomer = await zbFetch(apiKey, `/customers/${zbJob.customer.id}`)
         const result = await upsertCustomerFromZB(userId, zbCustomer)
-        if (result.id) mapped.customer_id = result.id
-      } catch { /* customer sync failed, continue without linking */ }
+        if (result.id) {
+          mapped.customer_id = result.id
+          // If we resolved the customer this time, clear any prior dirty
+          // marker on the same job. The mark is keyed on the ZB job id
+          // because the SF job id may not exist yet on first insert.
+          await resolveDirty(supabase, {
+            userId, sfJobId: existing?.id, zenbookerId: data.id,
+            operation: 'customer_link', note: 'resolved on subsequent webhook',
+          })
+        }
+      } catch (custErr) {
+        await markDirty(supabase, {
+          userId,
+          sfJobId: existing?.id ?? null,
+          zenbookerId: data.id,
+          operation: 'customer_link',
+          error: custErr,
+          logger,
+          context: { zb_customer_id: zbJob.customer.id, source: 'handleJobEvent' },
+        })
+      }
     }
     let jobId
     if (existing) {
@@ -1020,13 +1073,29 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             // Update job payment method — but skip bare "custom" (let syncTransactions resolve it)
             const jobPaymentMethod = fallbackMethod !== 'custom' ? fallbackMethod : null
             if (jobPaymentMethod) {
-              await supabase.from('jobs').update({
+              const { error: pmErr } = await supabase.from('jobs').update({
                 payment_method: jobPaymentMethod,
                 payment_status: 'paid',
-              }).eq('id', jobId).catch(() => {})
+              }).eq('id', jobId)
+              if (pmErr) {
+                await markDirty(supabase, {
+                  userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
+                  operation: 'payment_status_update', error: pmErr, logger,
+                  context: { source: 'handleJobEvent:fallback_tx', resolved_method: jobPaymentMethod },
+                })
+              } else {
+                await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'payment_status_update', note: 'resolved on fallback tx flow' })
+              }
             } else {
               // Still mark as paid even if we can't resolve the method name yet
-              await supabase.from('jobs').update({ payment_status: 'paid' }).eq('id', jobId).catch(() => {})
+              const { error: psErr } = await supabase.from('jobs').update({ payment_status: 'paid' }).eq('id', jobId)
+              if (psErr) {
+                await markDirty(supabase, {
+                  userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
+                  operation: 'payment_status_update', error: psErr, logger,
+                  context: { source: 'handleJobEvent:fallback_tx_no_method' },
+                })
+              }
             }
             logger.log(`[Zenbooker] Fallback tx created for job ${jobId}: ${fallbackMethod} $${zbt.amount}`)
           }
@@ -1042,8 +1111,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         try {
           await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
           logger.log(`[Zenbooker] Ledger entries rebuilt for job ${jobId} (${eventType})`)
+          await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'ledger_rebuild', note: `resolved on handleJobEvent ${eventType}` })
         } catch (ledgerErr) {
-          logger.error(`[Zenbooker] Ledger rebuild failed for job ${jobId}: ${ledgerErr.message}`)
+          await markDirty(supabase, {
+            userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
+            operation: 'ledger_rebuild', error: ledgerErr, logger,
+            context: { source: 'handleJobEvent', event_type: eventType },
+          })
         }
       }
     }
@@ -1094,7 +1168,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         } else if (apiKey) {
           // Refetch the job to get the current invoice. Skipped if no api key
           // (test mode); refresh runs lazily in /reconcile-job/:jobId then.
-          zbJobForFin = await zbFetch(apiKey, `/jobs/${jobZbId}`).catch(() => null)
+          try {
+            zbJobForFin = await zbFetch(apiKey, `/jobs/${jobZbId}`)
+            await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'zb_job_fetch', note: 'resolved on refresh fetch' })
+          } catch (fetchErr) {
+            zbJobForFin = null
+            await markDirty(supabase, {
+              userId, sfJobId: job.id, zenbookerId: jobZbId,
+              operation: 'zb_job_fetch', error: fetchErr, logger,
+              context: { source: 'handlePaymentEvent:financial_refresh', event_type: eventType },
+            })
+          }
         }
         if (zbJobForFin) {
           const fin = stripDiagnostics(mapJobFinancials(zbJobForFin, { existingSfTipAmount: job.tip_amount }))
@@ -1138,10 +1222,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         const { data: cashTxCheck } = await supabase.from('transactions')
           .select('id').eq('job_id', job.id).eq('status', 'completed').ilike('payment_method', 'cash').limit(1)
         if (cashTxCheck && cashTxCheck.length > 0) {
-          await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }).catch(err => {
-            logger.error(`[Zenbooker] Ledger rebuild after cash payment failed for job ${job.id}: ${err.message}`)
-          })
-          logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
+          try {
+            await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
+            logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
+            await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'ledger_rebuild', note: 'resolved after cash-payment rebuild' })
+          } catch (rebuildErr) {
+            await markDirty(supabase, {
+              userId, sfJobId: job.id, zenbookerId: jobZbId,
+              operation: 'ledger_rebuild', error: rebuildErr, logger,
+              context: { source: 'handlePaymentEvent:cash_path', event_type: eventType },
+            })
+          }
         }
       }
     } else if (eventType === 'invoice_payment.voided') {
@@ -1160,7 +1251,16 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       }
       // Rebuild ledger (cash_collected may need to be removed)
       if (createLedgerEntriesForCompletedJob) {
-        try { await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }) } catch (_) {}
+        try {
+          await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
+          await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'ledger_rebuild', note: 'resolved on voided-tx rebuild' })
+        } catch (rebuildErr) {
+          await markDirty(supabase, {
+            userId, sfJobId: job.id, zenbookerId: jobZbId,
+            operation: 'ledger_rebuild', error: rebuildErr, logger,
+            context: { source: 'handlePaymentEvent:voided_tx' },
+          })
+        }
       }
     }
   }
@@ -1227,7 +1327,16 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             catchAmount += parseFloat(t.amount) || 0
             firstZbTxId = firstZbTxId || t.id
             let full = t
-            try { full = await zbFetch(apiKey, `/transactions/${t.id}`) } catch (_) {}
+            try {
+              full = await zbFetch(apiKey, `/transactions/${t.id}`)
+              await resolveDirty(supabase, { userId, sfJobId: job.id, zenbookerId: t.id, operation: 'zb_tx_fetch', note: 'resolved on reconcile sweep' })
+            } catch (txFetchErr) {
+              await markDirty(supabase, {
+                userId, sfJobId: job.id, zenbookerId: t.id,
+                operation: 'zb_tx_fetch', error: txFetchErr, logger,
+                context: { source: 'runPaymentReconcile:tx_method_resolution' },
+              })
+            }
             const realName = full.custom_payment_method_name || full.payment_method
             if (realName && !GENERIC_METHOD.has(String(realName).toLowerCase())) {
               catchMethod = catchMethod || realName
@@ -1284,7 +1393,16 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
           // Rebuild ledger so cash_collected entries get created for cash payments
           if (createLedgerEntriesForCompletedJob) {
-            try { await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] }) } catch (_) {}
+            try {
+              await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
+              await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'ledger_rebuild', note: 'resolved on reconcile rebuild' })
+            } catch (rebuildErr) {
+              await markDirty(supabase, {
+                userId, sfJobId: job.id, zenbookerId: job.zenbooker_id,
+                operation: 'ledger_rebuild', error: rebuildErr, logger,
+                context: { source: 'runPaymentReconcile:rebuild_after_catch' },
+              })
+            }
           }
 
           payments_caught++
@@ -1365,6 +1483,45 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     } catch (e) {
       logger.error(`[AutoReconcile] log endpoint error: ${e.message}`)
       res.status(500).json({ error: 'Failed to load reconcile log' })
+    }
+  })
+
+  // GET /sync-dirty — list zb_sync_dirty rows for the current tenant.
+  // P1.2 operator surface. Tenant-scoped (user_id from authenticateToken);
+  // no admin endpoint here — admins can query the table directly.
+  router.get('/sync-dirty', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const includeResolved = req.query.includeResolved === 'true'
+      const limit = Math.min(parseInt(req.query.limit) || 100, 500)
+      const operation = req.query.operation || null
+
+      let q = supabase.from('zb_sync_dirty')
+        .select('id, sf_job_id, zenbooker_id, operation, error_class, error_message, retryable, attempts, first_seen_at, last_seen_at, resolved_at, resolved_by, resolution_note, context')
+        .eq('user_id', userId)
+        .order('last_seen_at', { ascending: false })
+        .limit(limit)
+      if (!includeResolved) q = q.is('resolved_at', null)
+      if (operation) q = q.eq('operation', operation)
+
+      const { data, error } = await q
+      if (error) {
+        logger.error(`[ZB-dirty] list endpoint failed: ${error.message}`)
+        return res.status(500).json({ error: 'Failed to load dirty rows' })
+      }
+
+      // Summary view for operators.
+      const summary = (data || []).reduce((acc, r) => {
+        acc.total++
+        if (!r.resolved_at) acc.unresolved++
+        acc.by_operation[r.operation] = (acc.by_operation[r.operation] || 0) + 1
+        return acc
+      }, { total: 0, unresolved: 0, by_operation: {} })
+
+      res.json({ summary, rows: data || [] })
+    } catch (e) {
+      logger.error(`[ZB-dirty] list endpoint crashed: ${e.message}`)
+      res.status(500).json({ error: 'Failed to load dirty rows' })
     }
   })
 
@@ -1759,8 +1916,13 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
                 try {
                   await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive'] })
                   ledgerRebuilt++
+                  await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'ledger_rebuild', note: 'resolved on full-sync reconcile' })
                 } catch (e) {
-                  logger.error(`[Zenbooker] Ledger rebuild error job ${jobId}: ${e.message}`)
+                  await markDirty(supabase, {
+                    userId, sfJobId: jobId, zenbookerId: null,
+                    operation: 'ledger_rebuild', error: e, logger,
+                    context: { source: 'fullSync:reconcile_multi_jobs' },
+                  })
                 }
                 if (ledgerRebuilt % 50 === 0) {
                   syncProgress[userId] = { ...syncProgress[userId], phase: `Rebuilding ledger (${ledgerRebuilt}/${multiJobIds.length})`, progress: 80 + Math.round((ledgerRebuilt / multiJobIds.length) * 15) }
