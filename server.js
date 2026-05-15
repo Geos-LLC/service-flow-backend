@@ -14,7 +14,8 @@ const validator = require('validator');
 const PDFDocument = require('pdfkit');
 
 // Nodemailer removed - using SendGrid only
-const sgMail = require('@sendgrid/mail');
+// P1.5 — @sendgrid/mail is required by notification-email.service.js only.
+// All sends in this file route through notificationEmail.* methods.
 
 // Mock pool for MySQL endpoints that aren't used
 const pool = {
@@ -57,6 +58,7 @@ const {
   recordLedgerDrift,
 } = require('./lib/ledger-immutability');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
+const { resolveWhatsAppStatusTenant } = require('./lib/whatsapp-status-tenant-resolver');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
@@ -99,14 +101,14 @@ process.on('unhandledRejection', (reason) => {
 
 // Email configuration - SendGrid only
 
-// SendGrid configuration - Use environment variable for security
+// SendGrid configuration — the env var key is still loaded for any downstream
+// reads (notification-email.service.js falls back to it when platform_settings
+// is empty), but setApiKey is called inside the service before each send so
+// no module-init step is required here.
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-if (SENDGRID_API_KEY) {
-  sgMail.setApiKey(SENDGRID_API_KEY);
-} else {
-  console.log('⚠️ SENDGRID_API_KEY environment variable not set');
+if (!SENDGRID_API_KEY) {
+  console.log('⚠️ SENDGRID_API_KEY environment variable not set (platform_settings is the primary source)');
 }
-console.log('✅ SendGrid configured for team member emails');
 console.log('✅ SendGrid API key present:', SENDGRID_API_KEY ? 'Yes' : 'No');
 if (SENDGRID_API_KEY) {
   console.log('✅ SendGrid API key length:', SENDGRID_API_KEY.length);
@@ -666,97 +668,10 @@ cron.schedule('0 7 * * *', async () => {
   }
 });
 
-// SendEmail function using SendGrid
-async function sendEmail({ to, subject, html, text }) {
-  console.log('📧 Sending email via SendGrid...');
-  console.log('📧 To:', to);
-  console.log('📧 Subject:', subject);
-  
-  // Check if SendGrid is configured
-  if (!SENDGRID_API_KEY) {
-    console.error('❌ SendGrid API key not configured');
-    throw new Error('SendGrid API key not configured. Please set SENDGRID_API_KEY environment variable.');
-  }
-  
-  try {
-    const msg = {
-      to,
-      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
-      subject,
-      html,
-      text
-    };
-    
-    console.log('📧 SendGrid message prepared:', { to, subject, from: msg.from });
-    const result = await sgMail.send(msg);
-    console.log('✅ Email sent successfully via SendGrid');
-    return { messageId: result[0].headers['x-message-id'] };
-  } catch (error) {
-    console.error('❌ SendGrid error:', error);
-    if (error.code === 401) {
-      console.error('❌ The SendGrid API key is invalid or expired');
-      console.error('❌ Please check your SendGrid API key configuration');
-      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.', { cause: error });
-    }
-    if (error.code === 403) {
-      console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
-      console.error('❌ Make sure your SendGrid API key has mail.send permissions');
-      console.error('❌ Verify your sender email is verified in SendGrid');
-      throw new Error('SendGrid API key lacks permissions. Please check your SendGrid account settings.', { cause: error });
-    }
-    throw error;
-  }
-}
-
-// SendGrid email service only
-async function sendTeamMemberEmail({ to, subject, html, text }) {
-  console.log('📧 Attempting to send team member email via SendGrid to:', to);
-  
-  // Check if SendGrid is configured
-  if (!SENDGRID_API_KEY) {
-    console.error('❌ SendGrid API key not configured');
-    throw new Error('SendGrid API key not configured. Please set SENDGRID_API_KEY environment variable.');
-  }
-  
-  try {
-    const msg = {
-      to,
-      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
-      subject,
-      html,
-      text
-    };
-    
-    console.log('📧 SendGrid email options:', { to, subject, from: msg.from });
-    
-    const response = await sgMail.send(msg);
-    console.log('✅ SendGrid email sent successfully:', response[0].statusCode);
-    return response;
-  } catch (error) {
-    console.error('❌ SendGrid email sending error:', error);
-    console.error('❌ SendGrid error details:', {
-      message: error.message,
-      code: error.code,
-      response: error.response?.body
-    });
-    
-    // Provide specific error messages for common issues
-    if (error.code === 401) {
-      console.error('❌ SendGrid 401 Unauthorized - Invalid API key');
-      console.error('❌ The SendGrid API key is invalid or expired');
-      console.error('❌ Please check your SendGrid API key configuration');
-      throw new Error('SendGrid API key is invalid. Please check your SENDGRID_API_KEY environment variable.', { cause: error });
-    }
-    if (error.code === 403) {
-      console.error('❌ SendGrid 403 Forbidden - Check your API key and permissions');
-      console.error('❌ Make sure your SendGrid API key has mail.send permissions');
-      console.error('❌ Verify your sender email is verified in SendGrid');
-      throw new Error('SendGrid API key invalid or insufficient permissions. Please check your SendGrid configuration.', { cause: error });
-    } else {
-      throw new Error(`SendGrid email failed: ${error.message}`, { cause: error });
-    }
-  }
-}
+// P1.5 — sendEmail() and sendTeamMemberEmail() helpers removed. They were
+// inline sgMail.send wrappers, never called from anywhere (verified via grep
+// before deletion). All email sends now route through notification-email.service.js
+// (notificationEmail.sendCustomerEmail / .sendInternalEmail / .sendAdminTestEmail).
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -5922,20 +5837,20 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                 smsNotifications
               });
               
-              // Send email notification if customer has email and email notifications are enabled
+              // Send email notification if customer has email and email notifications are enabled.
+              // P1.5 — routed through notificationEmail.sendCustomerEmail (was inline sgMail.send).
               if (hasEmail && emailNotifications) {
-                const msg = {
-                  to: customerData.email,
-                  from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-                  subject: subject,
-                  html: htmlContent,
-                  text: textContent
-                };
-
                 try {
-                  await sgMail.send(msg);
+                  await notificationEmail.sendCustomerEmail(req.user.userId, {
+                    to: customerData.email,
+                    toName: customerName,
+                    subject,
+                    html: htmlContent,
+                    text: textContent,
+                    emailType: 'appointment_confirmation_auto',
+                  });
                   console.log('✅ Automatic job confirmation email sent successfully to:', customerData.email);
-                  
+
                   // Update job with confirmation status
                   await supabase
                     .from('jobs')
@@ -5945,10 +5860,10 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                       confirmation_email: customerData.email
                     })
                     .eq('id', result.id);
-                  
+
                 } catch (sendError) {
                   console.error('❌ Error sending automatic confirmation email:', sendError);
-                  
+
                   // Update job with failed confirmation status
                   await supabase
                     .from('jobs')
@@ -6595,20 +6510,20 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
             textContent = `Hi ${customerName},\n\nYour appointment has been cancelled.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nWe apologize for any inconvenience. Please contact us to reschedule.\n\nBest regards,\n${businessName}`;
           }
 
-          // Send email notification if enabled
+          // Send email notification if enabled.
+          // P1.5 — routed through notificationEmail.sendCustomerEmail.
           if (emailNotifications && jobData.customers.email) {
-            const msg = {
-              to: jobData.customers.email,
-              from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-              subject: subject,
-              html: htmlContent,
-              text: textContent
-            };
-
             try {
-              await sgMail.send(msg);
+              await notificationEmail.sendCustomerEmail(req.user.userId, {
+                to: jobData.customers.email,
+                toName: customerName,
+                subject,
+                html: htmlContent,
+                text: textContent,
+                emailType: `appointment_status_${status}`,
+              });
               console.log(`✅ Automatic ${status} email notification sent successfully to:`, jobData.customers.email);
-              
+
               // Update job with notification status
               await supabase
                 .from('jobs')
@@ -6618,10 +6533,10 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
                   confirmation_email: jobData.customers.email
                 })
                 .eq('id', id);
-              
+
             } catch (sendError) {
               console.error(`❌ Error sending automatic ${status} email notification:`, sendError);
-              
+
               // Update job with failed notification status
               await supabase
                 .from('jobs')
@@ -30844,31 +30759,33 @@ app.post('/api/team-members/reset-password', async (req, res) => {
       return res.status(500).json({ error: 'Failed to generate reset token' });
     }
     
-    // Send reset email
+    // Send reset email — P1.5: routed via notificationEmail.sendInternalEmail
+    // with bypassToggle so a tenant who disabled internal notifications can
+    // still get their team back into the system.
     const resetUrl = `${process.env.FRONTEND_URL || 'https://www.service-flow.pro'}/team-member/reset-password?token=${resetToken}`;
-    
-    const emailContent = {
-      to: email,
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.com',
-      subject: 'Reset Your Team Member Password',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <h2 style="color: #2563eb;">Password Reset Request</h2>
-          <p>Hello ${teamMember.first_name},</p>
-          <p>You requested to reset your password for your team member account.</p>
-          <p>Click the button below to reset your password:</p>
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${resetUrl}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
-          </div>
-          <p>This link will expire in 1 hour.</p>
-          <p>If you didn't request this password reset, please ignore this email.</p>
-          <p>Best regards,<br>Service Flow Team</p>
-        </div>
-      `
-    };
-    
+
     try {
-      await sgMail.send(emailContent);
+      await notificationEmail.sendInternalEmail(teamMember.user_id, {
+        to: email,
+        toName: teamMember.first_name,
+        subject: 'Reset Your Team Member Password',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2563eb;">Password Reset Request</h2>
+            <p>Hello ${teamMember.first_name},</p>
+            <p>You requested to reset your password for your team member account.</p>
+            <p>Click the button below to reset your password:</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${resetUrl}" style="background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Reset Password</a>
+            </div>
+            <p>This link will expire in 1 hour.</p>
+            <p>If you didn't request this password reset, please ignore this email.</p>
+            <p>Best regards,<br>Service Flow Team</p>
+          </div>
+        `,
+        emailType: 'password_reset_team_member',
+        bypassToggle: true,
+      });
       res.json({ message: 'Password reset instructions sent to your email' });
     } catch (emailError) {
       console.error('❌ Error sending reset email:', emailError);
@@ -30892,17 +30809,18 @@ const RESET_GENERIC_RESPONSE = {
   message: 'If an account with that email exists, password reset instructions have been sent.'
 };
 
-async function sendResetEmail({ to, firstName, accountLabel, token }) {
+// P1.5 — sendResetEmail now routes through notificationEmail.sendInternalEmail
+// (bypassToggle=true since this is a security email; tenant must not be able to
+// disable their own password recovery). userId is the tenant owner — for an
+// owner reset, that's the user being reset; for a team-member reset, it's the
+// team_member's tenant owner.
+async function sendResetEmail({ userId, to, firstName, accountLabel, token }) {
   const frontendBase = process.env.FRONTEND_URL || 'https://www.service-flow.pro';
   const resetUrl = `${frontendBase}/reset-password?token=${token}`;
-  // Use platform_settings (DB) for SendGrid config — the env fallbacks point
-  // at unverified senders. The verified sender is alerts@service-flow.pro.
-  const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
-  const fromEmail = (await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL')) || 'alerts@service-flow.pro';
-  if (apiKey) sgMail.setApiKey(apiKey);
-  const result = await sgMail.send({
+
+  const result = await notificationEmail.sendInternalEmail(userId, {
     to,
-    from: fromEmail,
+    toName: firstName || null,
     subject: 'Reset your Service Flow password',
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -30917,9 +30835,11 @@ async function sendResetEmail({ to, firstName, accountLabel, token }) {
         <p>If you didn't request this, you can safely ignore this email.</p>
         <p>— Service Flow Team</p>
       </div>
-    `
+    `,
+    emailType: 'password_reset',
+    bypassToggle: true,
   });
-  logger.log(`[forgot-password] sent reset email to ${to} from ${fromEmail}, messageId=${result?.[0]?.headers?.['x-message-id'] || 'n/a'}`);
+  logger.log(`[forgot-password] sent reset email to ${to}, messageId=${result?.messageId || 'n/a'}`);
   return result;
 }
 
@@ -30951,6 +30871,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       if (!ownerUpdateError) {
         try {
           await sendResetEmail({
+            userId: ownerRow.id,
             to: ownerRow.email,
             firstName: ownerRow.first_name,
             accountLabel: ownerRow.business_name ? `business owner (${ownerRow.business_name})` : 'business owner',
@@ -30988,6 +30909,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       try {
         const businessName = member.users?.business_name;
         await sendResetEmail({
+          userId: member.user_id,
           to: member.email,
           firstName: member.first_name,
           accountLabel: businessName ? `team member at ${businessName}` : 'team member',
@@ -31710,27 +31632,18 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
       })}.\n\nService: ${serviceName}\nLocation: ${serviceAddress}\n\nPlease arrive on time. If you need to reschedule, please contact us as soon as possible.\n\nBest regards,\nYour Service Team`;
     }
 
-    // Send email using SendGrid
-    const msg = {
-      to: customerEmail,
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-      subject: subject,
-      html: htmlContent,
-      text: textContent
-    };
-
-    console.log('📧 SendGrid message details:', {
-      to: msg.to,
-      from: msg.from,
-      subject: msg.subject,
-      hasHtml: !!msg.html,
-      hasText: !!msg.text
-    });
-
+    // P1.5 — routed through notificationEmail.sendCustomerEmail.
     try {
-      await sgMail.send(msg);
+      await notificationEmail.sendCustomerEmail(req.user.userId, {
+        to: customerEmail,
+        toName: customerName,
+        subject,
+        html: htmlContent,
+        text: textContent,
+        emailType: notificationType === 'confirmation' ? 'appointment_confirmation' : 'appointment_reminder',
+      });
       console.log('✅ Appointment notification sent successfully');
-      
+
       // Update job confirmation or reminder status
       if (jobId) {
         try {
@@ -31762,11 +31675,11 @@ app.post('/api/send-appointment-notification', authenticateToken, async (req, re
           // Don't fail the email send if status update fails
         }
       }
-      
-      res.json({ 
-        success: true, 
+
+      res.json({
+        success: true,
         message: `${notificationType === 'confirmation' ? 'Confirmation' : 'Reminder'} sent successfully`,
-        email: customerEmail 
+        email: customerEmail
       });
     } catch (sendError) {
       console.error('❌ SendGrid send error:', sendError);
@@ -31849,47 +31762,38 @@ app.post('/api/send-custom-message', authenticateToken, async (req, res) => {
     `;
     const textContent = `Hi ${customerName},\n\n${message}\n\nBest regards,\nYour Service Team`;
 
-    // Send email using SendGrid
-    const msg = {
-      to: customerEmail,
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@service-flow.pro',
-      subject: subject,
-      html: htmlContent,
-      text: textContent
-    };
-
-    console.log('📧 SendGrid message details:', {
-      to: msg.to,
-      from: msg.from,
-      subject: msg.subject,
-      hasHtml: !!msg.html,
-      hasText: !!msg.text
-    });
-
+    // P1.5 — routed through notificationEmail.sendCustomerEmail.
     try {
-      await sgMail.send(msg);
+      await notificationEmail.sendCustomerEmail(req.user.userId, {
+        to: customerEmail,
+        toName: customerName,
+        subject,
+        html: htmlContent,
+        text: textContent,
+        emailType: 'custom_message',
+      });
       console.log('✅ Custom message sent successfully');
-      
-      res.json({ 
-        success: true, 
+
+      res.json({
+        success: true,
         message: 'Custom message sent successfully',
-        email: customerEmail 
+        email: customerEmail
       });
     } catch (sendError) {
       console.error('❌ SendGrid send error:', sendError);
       console.error('❌ Error code:', sendError.code);
       console.error('❌ Error response:', sendError.response?.body);
-      
+
       if (sendError.code === 403) {
-        return res.status(500).json({ 
+        return res.status(500).json({
           error: 'SendGrid configuration error. Please verify the sender email address in SendGrid.',
           details: 'The from email address must be verified in your SendGrid account.'
         });
       }
-      
+
       throw sendError;
     }
-    
+
   } catch (error) {
     console.error('❌ Error sending custom message:', error);
     res.status(500).json({ error: 'Failed to send custom message' });
@@ -31900,27 +31804,18 @@ app.post('/api/send-custom-message', authenticateToken, async (req, res) => {
 app.post('/api/test-sendgrid', authenticateToken, async (req, res) => {
   try {
     const { testEmail } = req.body;
-    
+
     if (!testEmail) {
       return res.status(400).json({ error: 'Test email is required' });
     }
 
     console.log('🧪 Testing SendGrid with email:', testEmail);
-    console.log('🧪 SendGrid API Key configured:', !!SENDGRID_API_KEY);
-    console.log('🧪 From email:', process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes');
-
-    const msg = {
-      to: testEmail,
-      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
-      subject: 'Test Email from Service Flow',
-      html: '<h1>Test Email</h1><p>This is a test email to verify SendGrid configuration.</p>',
-      text: 'Test Email - This is a test email to verify SendGrid configuration.'
-    };
 
     try {
-    const result = await sgMail.send(msg);
+    // P1.5 — routed through notificationEmail.sendTestEmail (tenant-scoped).
+    const result = await notificationEmail.sendTestEmail(req.user.userId, testEmail);
     console.log('✅ Test email sent successfully:', result);
-    
+
     res.json({ message: 'Test email sent successfully', result });
     } catch (sendError) {
       console.error('❌ SendGrid test error:', sendError);
@@ -33336,41 +33231,21 @@ app.post('/api/send-receipt-email', async (req, res) => {
       </html>
     `;
     
-    // Send email using SendGrid
-    const msg = {
+    // P1.5 — routed through notificationEmail.sendCustomerEmail.
+    try {
+    await notificationEmail.sendCustomerEmail(req.user.userId, {
       to: customerEmail,
-      from: fromEmail,
       subject: `Payment Receipt - ${businessName}`,
       html: receiptHtml,
-      text: `
-        Payment Receipt - ${businessName}
-        
-        Amount: $${(amount / 100).toFixed(2)}
-        Transaction ID: ${paymentIntentId}
-        Invoice: #INV-${invoice.id}
-        Service: ${invoice.jobs?.service_name || 'Service'}
-        Date: ${new Date().toLocaleDateString()}
-        
-        Thank you for your payment!
-      `
-    };
-    
-    console.log('📧 SendGrid message details:', {
-      to: msg.to,
-      from: msg.from,
-      subject: msg.subject,
-      hasHtml: !!msg.html,
-      hasText: !!msg.text
+      text: `Payment Receipt - ${businessName}\n\nAmount: $${(amount / 100).toFixed(2)}\nTransaction ID: ${paymentIntentId}\nInvoice: #INV-${invoice.id}\nService: ${invoice.jobs?.service_name || 'Service'}\nDate: ${new Date().toLocaleDateString()}\n\nThank you for your payment!`,
+      emailType: 'payment_receipt',
     });
-    
-    try {
-    await sgMail.send(msg);
     console.log('✅ Receipt email sent successfully');
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       message: 'Receipt email sent successfully',
-      email: customerEmail 
+      email: customerEmail
     });
     } catch (sendError) {
       console.error('❌ SendGrid send error:', sendError);
@@ -33852,20 +33727,17 @@ app.post('/api/send-invoice-email', authenticateToken, async (req, res) => {
     console.log('📧 Include payment link:', includePaymentLink);
     console.log('📧 Job ID:', jobId);
 
-    // Send email using SendGrid
-    const msg = {
+    // P1.5 — routed through notificationEmail.sendCustomerEmail.
+    const result = await notificationEmail.sendCustomerEmail(req.user.userId, {
       to: customerEmail,
-      from: process.env.SENDGRID_FROM_EMAIL || 'info@spotless.homes',
+      toName: customerName,
       subject: `You have a new invoice from ${req.user.business_name || 'Your Business'}`,
       html: invoiceHtml,
-      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}${includePaymentLink ? `\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`
-    };
+      text: `Hi ${customerName},\n\nPlease find your invoice for the recent service.\n\nAmount Due: $${amount.toFixed(2)}\nService: ${serviceName}\nDate: ${new Date(serviceDate).toLocaleDateString()}${includePaymentLink ? `\n\nPay online: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/public/invoice/${invoiceId || jobId}` : ''}\n\nWe appreciate your business.\n\nThank you for choosing our services!`,
+      emailType: 'invoice',
+    });
+    console.log('✅ Invoice email sent successfully via notification service:', result?.messageId);
 
-    console.log('📧 SendGrid message prepared:', { to: msg.to, from: msg.from, subject: msg.subject });
-    
-    const result = await sgMail.send(msg);
-    console.log('✅ Invoice email sent successfully via SendGrid:', result);
-    
     res.json({ message: 'Invoice email sent successfully' });
   } catch (error) {
     console.error('❌ Error sending invoice email:', error);
@@ -39926,7 +39798,7 @@ app.put('/api/communications/settings/preferences', authenticateToken, async (re
 // ── Phase 3: Webhook Ingestion from Sigcore ──
 
 // ── WhatsApp webhook handler ──
-async function handleWhatsAppWebhook(event, payload) {
+async function handleWhatsAppWebhook(event, payload, verifiedUserId = null) {
   try {
     if (event === 'whatsapp.message.inbound') {
       // Extract from Sigcore webhook payload structure
@@ -40115,34 +39987,68 @@ async function handleWhatsAppWebhook(event, payload) {
       }
 
     } else if (event === 'whatsapp.status.change') {
-      // Update connection status
+      // P1.4 (Constitution §0 P3 / §6.10) — tenant-scoped status change.
+      // The pre-P1.4 handler did a global scan and updated an arbitrary
+      // WhatsApp-connected user's row. Now: resolve the tenant via HMAC
+      // userId (primary), then deterministic routing (secondary), then a
+      // phone-claim lookup (tertiary). Cross-tenant mismatches drop the
+      // event with a structured audit log; no global fallback exists.
       const status = payload.status;
       const isConnected = status === 'ready';
       const phoneNumber = payload.phoneNumber ? normalizePhone(payload.phoneNumber) : null;
-      // Find user with WhatsApp connected or the target user
-      const { data: settings } = await supabase.from('communication_settings')
-        .select('user_id, whatsapp_connected')
-        .or('whatsapp_connected.eq.true,whatsapp_phone_number.neq.null')
-        .limit(1).maybeSingle();
 
-      if (settings) {
-        const updateFields = {
-          whatsapp_connected: isConnected,
-          updated_at: new Date().toISOString(),
-        };
-        // Save phone number on reconnect, clear on disconnect
-        if (isConnected && phoneNumber) {
-          updateFields.whatsapp_phone_number = phoneNumber;
-          updateFields.whatsapp_connected_at = new Date().toISOString();
-        } else if (!isConnected) {
-          updateFields.whatsapp_phone_number = null;
-          updateFields.whatsapp_connected_at = null;
-        }
-        await supabase.from('communication_settings').update(updateFields).eq('user_id', settings.user_id);
-        logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}, phone=${phoneNumber}) for user ${settings.user_id}`);
-        // Note: Sigcore no longer wipes on reconnect — it upserts by providerMessageId.
-        // SF must not wipe either, otherwise we lose history Sigcore won't re-send.
+      // Structured audit log — single [WhatsApp-status] anchor for Loki.
+      const audit = (outcome, extras = {}) => {
+        const parts = [
+          '[WhatsApp-status]',
+          `outcome=${outcome}`,
+          `status=${status}`,
+          `phone=${phoneNumber || 'null'}`,
+          `verified_user_id=${verifiedUserId == null ? 'null' : verifiedUserId}`,
+        ];
+        for (const [k, v] of Object.entries(extras)) parts.push(`${k}=${v}`);
+        logger.log(parts.join(' '));
+      };
+
+      const r = await resolveWhatsAppStatusTenant(supabase, {
+        verifiedUserId,
+        phoneNumber,
+        resolveEndpointRoute,
+      });
+
+      if (!r.ok) {
+        // Includes cross_tenant_mismatch, phone_claim_ambiguous, no_tenant.
+        audit(r.outcome, r);
+        return;
       }
+
+      const updateFields = {
+        whatsapp_connected: isConnected,
+        updated_at: new Date().toISOString(),
+      };
+      // Save phone number on reconnect, clear on disconnect
+      if (isConnected && phoneNumber) {
+        updateFields.whatsapp_phone_number = phoneNumber;
+        updateFields.whatsapp_connected_at = new Date().toISOString();
+      } else if (!isConnected) {
+        updateFields.whatsapp_phone_number = null;
+        updateFields.whatsapp_connected_at = null;
+      }
+      // Tenant-scoped UPDATE — only this user's row.
+      const { error: updErr } = await supabase.from('communication_settings')
+        .update(updateFields)
+        .eq('user_id', r.userId);
+      if (updErr) {
+        audit('error_update_failed', { user_id: r.userId, error: updErr.message });
+        return;
+      }
+      audit('applied', {
+        user_id: r.userId,
+        connected: isConnected,
+        resolution_path: r.resolutionPath,
+      });
+      // Note: Sigcore no longer wipes on reconnect — it upserts by providerMessageId.
+      // SF must not wipe either, otherwise we lose history Sigcore won't re-send.
     }
   } catch (error) {
     // WhatsApp failures must NOT break OpenPhone/LB webhook processing
@@ -40211,8 +40117,10 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
     logger.log(`[Webhook] Sigcore event: ${event} | from=${payload.fromNumber||payload.from_number||payload.conversation?.participantPhone} to=${payload.toNumber||payload.to_number} phoneNumberId=${payload.phoneNumberId||payload.endpoint_id} convId=${payload.conversationId||payload.conversation?.id}`);
 
     // ── WhatsApp events — separate handling path ──
+    // verifiedUserId from the HMAC step above is forwarded so the status
+    // handler (P1.4) can scope by tenant instead of doing a global scan.
     if (event.startsWith('whatsapp.')) {
-      await handleWhatsAppWebhook(event, payload);
+      await handleWhatsAppWebhook(event, payload, verifiedUserId);
       return;
     }
 
@@ -42420,7 +42328,8 @@ app.put('/api/admin/sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_
     if (apiKey?.trim()) {
       await setPlatformSetting('sendgrid_api_key', apiKey.trim());
       process.env.SENDGRID_API_KEY = apiKey.trim();
-      sgMail.setApiKey(apiKey.trim());
+      // P1.5 — no setApiKey here; notification-email.service.js calls it
+      // inside each send via resolveConfig (DB-first, env-fallback).
       logger.log('[Admin] SendGrid API key saved to DB');
     }
     if (fromEmail?.trim()) {
@@ -42436,34 +42345,117 @@ app.put('/api/admin/sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_
 });
 
 // POST /api/admin/test-sendgrid — test SendGrid connectivity (uses DB-stored config)
+// P1.5 — routed through notificationEmail.sendAdminTestEmail (the last raw
+// sgMail.send call moved into the centralized service).
 app.post('/api/admin/test-sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.ENABLE_ADMIN_SENDGRID_MUTATION), async (req, res) => {
   try {
     const { testEmail } = req.body;
     if (!testEmail) return res.status(400).json({ error: 'Test email required' });
 
-    const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY');
-    const fromEmail = await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL') || 'info@spotless.homes';
-
-    if (!apiKey) return res.status(400).json({ error: 'SendGrid API key not configured. Save it first.' });
-
-    sgMail.setApiKey(apiKey);
-    logger.log(`[Admin Test] Sending test to ${testEmail} from ${fromEmail}`);
-
-    const result = await sgMail.send({
-      to: testEmail,
-      from: fromEmail,
-      subject: 'SendGrid Test — Service Flow Admin',
-      html: `<h2>SendGrid is working</h2><p>This test email confirms your SendGrid configuration is correct.</p><p><strong>From:</strong> ${fromEmail}</p>`,
-      text: `SendGrid is working. This test email confirms your SendGrid configuration is correct. From: ${fromEmail}`,
-    });
-    logger.log(`[Admin Test] Sent successfully, message ID: ${result?.[0]?.headers?.['x-message-id']}`);
-    res.json({ success: true, fromEmail, messageId: result?.[0]?.headers?.['x-message-id'] || null });
+    const result = await notificationEmail.sendAdminTestEmail(testEmail);
+    res.json({ success: true, fromEmail: result.fromEmail, messageId: result.messageId });
   } catch (error) {
     logger.error('Admin SendGrid test error:', error.message, error.response?.body);
     const code = error.code || error.response?.statusCode;
     if (code === 401) return res.status(400).json({ error: 'Invalid API key (401 Unauthorized)' });
     if (code === 403) return res.status(400).json({ error: 'API key lacks permissions or sender not verified in SendGrid (403 Forbidden). Verify the FROM address in SendGrid > Settings > Sender Authentication.' });
     res.status(500).json({ error: error.response?.body?.errors?.[0]?.message || error.message || 'Test failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// P1.6 — unified delivery_log operator surface
+// ════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/delivery-log — operator view (cross-tenant), admin-auth.
+// Filters (all optional, AND-combined):
+//   ?user_id=<n>             tenant filter
+//   ?source_system=<x>       e.g. 'service_flow'
+//   ?destination_system=<x>  e.g. 'leadbridge'
+//   ?channel=<x>             'email' | 'webhook' | ...
+//   ?direction=<x>           'outbound' | 'inbound'
+//   ?status=<x>[,<y>...]     comma-separated list
+//   ?event_type_prefix=<x>   e.g. 'email.' or 'zb_inbound.'
+//   ?correlation_id=<x>      single-event drilldown
+//   ?since=<iso>             >= created_at
+//   ?until=<iso>             <= created_at
+//   ?limit=N (max 500)
+//   ?offset=N
+app.get('/api/admin/delivery-log', authenticateAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = parseInt(req.query.offset) || 0;
+
+    let q = supabase.from('delivery_log')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (req.query.user_id) q = q.eq('user_id', parseInt(req.query.user_id));
+    if (req.query.source_system) q = q.eq('source_system', String(req.query.source_system));
+    if (req.query.destination_system) q = q.eq('destination_system', String(req.query.destination_system));
+    if (req.query.channel) q = q.eq('channel', String(req.query.channel));
+    if (req.query.direction) q = q.eq('delivery_direction', String(req.query.direction));
+    if (req.query.correlation_id) q = q.eq('correlation_id', String(req.query.correlation_id));
+    if (req.query.event_type_prefix) q = q.like('event_type', `${req.query.event_type_prefix}%`);
+    if (req.query.status) {
+      const statuses = String(req.query.status).split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) q = q.eq('status', statuses[0]);
+      else if (statuses.length > 1) q = q.in('status', statuses);
+    }
+    if (req.query.since) q = q.gte('created_at', String(req.query.since));
+    if (req.query.until) q = q.lte('created_at', String(req.query.until));
+
+    const { data, count, error } = await q;
+    if (error) {
+      logger.error('[DeliveryLog admin] query error:', error.message);
+      return res.status(500).json({ error: 'Failed to load delivery log' });
+    }
+    res.json({ rows: data || [], total: count || 0, limit, offset });
+  } catch (e) {
+    logger.error('[DeliveryLog admin] crashed:', e.message);
+    res.status(500).json({ error: 'Failed to load delivery log' });
+  }
+});
+
+// GET /api/delivery-log — tenant-scoped self-service. authenticateToken.
+// Same filters as admin variant, but user_id is forced to req.user.userId
+// so a tenant cannot view another tenant's rows.
+app.get('/api/delivery-log', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = parseInt(req.query.offset) || 0;
+
+    let q = supabase.from('delivery_log')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId)             // ALWAYS scoped, ignored if caller sets user_id
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (req.query.source_system) q = q.eq('source_system', String(req.query.source_system));
+    if (req.query.destination_system) q = q.eq('destination_system', String(req.query.destination_system));
+    if (req.query.channel) q = q.eq('channel', String(req.query.channel));
+    if (req.query.direction) q = q.eq('delivery_direction', String(req.query.direction));
+    if (req.query.correlation_id) q = q.eq('correlation_id', String(req.query.correlation_id));
+    if (req.query.event_type_prefix) q = q.like('event_type', `${req.query.event_type_prefix}%`);
+    if (req.query.status) {
+      const statuses = String(req.query.status).split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) q = q.eq('status', statuses[0]);
+      else if (statuses.length > 1) q = q.in('status', statuses);
+    }
+    if (req.query.since) q = q.gte('created_at', String(req.query.since));
+    if (req.query.until) q = q.lte('created_at', String(req.query.until));
+
+    const { data, count, error } = await q;
+    if (error) {
+      logger.error('[DeliveryLog tenant] query error:', error.message);
+      return res.status(500).json({ error: 'Failed to load delivery log' });
+    }
+    res.json({ rows: data || [], total: count || 0, limit, offset });
+  } catch (e) {
+    logger.error('[DeliveryLog tenant] crashed:', e.message);
+    res.status(500).json({ error: 'Failed to load delivery log' });
   }
 });
 

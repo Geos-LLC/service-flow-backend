@@ -14,6 +14,7 @@
 
 const sgMail = require('@sendgrid/mail')
 const express = require('express')
+const { logDelivery } = require('./lib/delivery-log')
 
 // In-memory rate limit tracking: { userId: { count, windowStart } }
 const rateLimits = {}
@@ -101,7 +102,9 @@ module.exports = (supabase, logger) => {
     }
   }
 
-  /** Log email send result to notification_email_logs */
+  /** Log email send result to notification_email_logs AND delivery_log (P1.6 dual-write).
+   *  notification_email_logs remains the canonical per-tenant email viewer source;
+   *  delivery_log is the unified cross-system audit surface. */
   async function logSend(userId, { emailType, recipientEmail, recipientName, subject, status, providerMessageId, errorMessage, metadata }) {
     try {
       await supabase.from('notification_email_logs').insert({
@@ -120,6 +123,27 @@ module.exports = (supabase, logger) => {
     } catch (e) {
       logger.error('[NotificationEmail] Log insert failed:', e.message)
     }
+    // P1.6 unified delivery audit — never throws, never blocks the send.
+    await logDelivery(supabase, {
+      userId,
+      sourceSystem: 'service_flow',
+      destinationSystem: 'sendgrid',
+      channel: 'email',
+      eventType: `email.${emailType || 'unknown'}`,
+      correlationId: providerMessageId || null,
+      deliveryDirection: 'outbound',
+      status,
+      provider: 'sendgrid',
+      providerMessageId: providerMessageId || null,
+      errorMessage: errorMessage || null,
+      context: {
+        recipient_email: recipientEmail,
+        recipient_name: recipientName || null,
+        subject: subject || null,
+        email_type: emailType,
+        ...(metadata || {}),
+      },
+    }, logger)
   }
 
   /** Send with retry (up to 2 retries on 5xx/timeout) */
@@ -207,19 +231,22 @@ module.exports = (supabase, logger) => {
   /**
    * Send an internal/team notification email.
    * @param {number} userId - Tenant owner user ID
-   * @param {object} opts - { to, toName, subject, html, text, emailType, attachments }
-   * emailType is REQUIRED (e.g. 'team_invite', 'team_welcome', 'paystub', 'admin_new_member')
+   * @param {object} opts - { to, toName, subject, html, text, emailType, attachments, bypassToggle }
+   * emailType is REQUIRED (e.g. 'team_invite', 'team_welcome', 'paystub', 'admin_new_member', 'password_reset')
    * attachments (optional) - array of { content (base64 string), filename, type, disposition }
+   * bypassToggle (optional) - set true ONLY for security/account emails (e.g. password reset)
+   *                           that must deliver even if the tenant disabled internal notifications.
+   *                           Default false.
    */
-  async function sendInternalEmail(userId, { to, toName, subject, html, text, emailType, attachments }) {
+  async function sendInternalEmail(userId, { to, toName, subject, html, text, emailType, attachments, bypassToggle = false }) {
     if (!emailType) throw new Error('emailType is required for all notification sends')
     if (!to) throw new Error('Recipient email (to) is required')
 
     const settings = await getSettings(userId)
     const config = await resolveConfig(settings)
 
-    // Check tenant toggle
-    if (settings && !settings.use_for_internal_notifications) {
+    // Check tenant toggle — bypassed for security emails per opts.
+    if (!bypassToggle && settings && !settings.use_for_internal_notifications) {
       throw new Error('Internal email notifications are disabled in settings.')
     }
 
@@ -318,6 +345,39 @@ module.exports = (supabase, logger) => {
         status: 'failed', errorMessage: error.message,
       })
 
+      throw error
+    }
+  }
+
+  /**
+   * Platform-level test send used by /api/admin/test-sendgrid.
+   * NOT tenant-scoped: uses platform_settings (no per-tenant from/replyto).
+   * P1.5 — keeps raw sgMail.send confined to this service.
+   */
+  async function sendAdminTestEmail(testEmail) {
+    if (!testEmail) throw new Error('Test email address is required')
+
+    const apiKey = await getPlatformSetting('sendgrid_api_key', 'SENDGRID_API_KEY')
+    const fromEmail = (await getPlatformSetting('sendgrid_from_email', 'SENDGRID_FROM_EMAIL')) || 'info@spotless.homes'
+    if (!apiKey) throw new Error('SendGrid API key not configured. Save it first.')
+
+    sgMail.setApiKey(apiKey)
+
+    const msg = {
+      to: testEmail,
+      from: fromEmail,
+      subject: 'SendGrid Test — Service Flow Admin',
+      html: `<h2>SendGrid is working</h2><p>This test email confirms your SendGrid configuration is correct.</p><p><strong>From:</strong> ${fromEmail}</p>`,
+      text: `SendGrid is working. This test email confirms your SendGrid configuration is correct. From: ${fromEmail}`,
+    }
+
+    try {
+      const result = await sendWithRetry(msg)
+      const messageId = result?.[0]?.headers?.['x-message-id'] || null
+      logger.log(`[NotificationEmail] Admin test sent to ${testEmail} from ${fromEmail} (msg: ${messageId})`)
+      return { status: 'sent', messageId, fromEmail }
+    } catch (error) {
+      logger.error(`[NotificationEmail] Admin test failed to ${testEmail}: ${error.message}`)
       throw error
     }
   }
@@ -430,6 +490,7 @@ module.exports = (supabase, logger) => {
   router.sendCustomerEmail = sendCustomerEmail
   router.sendInternalEmail = sendInternalEmail
   router.sendTestEmail = sendTestEmail
+  router.sendAdminTestEmail = sendAdminTestEmail
   router.getSettings = getSettings
 
   return router
