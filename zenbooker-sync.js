@@ -18,6 +18,7 @@ const {
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
+const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -666,86 +667,69 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       // Resolve the real payment method name (custom_payment_method_name has the actual name like "Zelle BofA")
       const resolvedPaymentMethod = zbt.custom_payment_method_name || zbt.payment_method
 
-      // Check if already synced by zenbooker_id → update
-      const { data: existingByZbId } = await supabase.from('transactions').select('id, payment_method').eq('zenbooker_id', zbt.id).maybeSingle()
-      if (existingByZbId) {
-        const { zenbooker_id: _, created_at: __, ...updateData } = txData
-        await supabase.from('transactions').update(updateData).eq('id', existingByZbId.id)
-        // Also update job payment_method if we have a real name (fixes "custom" from invoice fallback)
-        if (sfJob?.id && resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
-          const { error: pmErr } = await supabase.from('jobs').update({
-            payment_method: resolvedPaymentMethod,
-            payment_status: 'paid',
-          }).eq('id', sfJob.id)
-          if (pmErr) {
-            await markDirty(supabase, {
-              userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
-              operation: 'transaction_payment_method', error: pmErr, logger,
-              context: { source: 'syncTransactions:update_by_zb_id', resolved_method: resolvedPaymentMethod },
-            })
-          } else {
-            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on tx sync update' })
-            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'payment_status_update', note: 'resolved on tx sync update' })
-          }
-        }
-        // If payment_method changed (e.g. "custom"/"other" → "cash"), rebuild ledger so
-        // cash_collected entries get created. Without this, payroll over-pays cleaners.
-        if (sfJob?.id && existingByZbId.payment_method !== txData.payment_method) {
-          jobsNeedingLedgerRebuild.add(sfJob.id)
-        }
-        updated++; continue
-      }
+      // P1.3 — single atomic write covers all three branches (update-by-zb-id,
+      // adopt-manual, new insert). The RPC's tx-upsert logic handles the
+      // dedup ladder server-side; jobs UPDATE only fires if a real method
+      // is resolved (matching the original "skip bare 'custom'" rule).
+      const wantsJobUpdate = sfJob?.id && resolvedPaymentMethod && resolvedPaymentMethod !== 'custom'
+      const jobUpdates = wantsJobUpdate
+        ? { payment_method: resolvedPaymentMethod, payment_status: 'paid' }
+        : null
 
-      // Check if manually added (same job_id, no zenbooker_id) → adopt and update
+      // Pre-check existing tx so we can decide whether this iteration counts
+      // as updated/created/skipped + whether ledger rebuild is needed.
+      // The RPC is still authoritative for the dedup; this pre-check is just
+      // for diagnostics + ledger-rebuild trigger.
+      const { data: preExisting } = sfJob?.id
+        ? await supabase.from('transactions').select('id, payment_method').eq('zenbooker_id', zbt.id).maybeSingle()
+        : { data: null }
+      const priorMethod = preExisting?.payment_method ?? null
+
+      const atomicResult = await applyAtomicPaymentWrites(supabase, {
+        userId,
+        sfJobId: sfJob?.id ?? null,
+        jobUpdates,
+        txDataArray: [{
+          job_id: sfJob?.id || null,
+          customer_id: sfCustomerId,
+          amount: txData.amount,
+          payment_method: txData.payment_method,
+          payment_intent_id: txData.payment_intent_id,
+          status: txData.status,
+          notes: txData.notes,
+          zenbooker_id: txData.zenbooker_id,
+          created_at: txData.created_at,
+        }],
+        logger,
+      })
+
+      if (!atomicResult.ok) {
+        if (sfJob?.id) {
+          await markDirty(supabase, {
+            userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
+            operation: 'transaction_payment_method', error: atomicResult.error, logger,
+            context: { source: 'syncTransactions:atomic_rollback', resolved_method: resolvedPaymentMethod },
+          })
+        }
+        errors++
+        continue
+      }
+      const action = atomicResult.result?.tx_actions?.[0]?.action || 'no_tx'
+      if (action === 'inserted') created++
+      else if (action === 'updated_by_zb_id' || action === 'adopted') updated++
+      else skipped++
+
+      if (wantsJobUpdate) {
+        await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: `resolved via atomic ${action}` })
+        await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'payment_status_update', note: `resolved via atomic ${action}` })
+      }
+      // Ledger-rebuild triggers — same intent as pre-P1.3 but driven from the atomic result.
       if (sfJob?.id) {
-        const { data: manual } = await supabase.from('transactions').select('id, payment_method').eq('job_id', sfJob.id).is('zenbooker_id', null).limit(1)
-        if (manual && manual.length > 0) {
-          await supabase.from('transactions').update(txData).eq('id', manual[0].id)
-          // Also update job payment_method
-          if (resolvedPaymentMethod && resolvedPaymentMethod !== 'custom') {
-            const { error: pmErr } = await supabase.from('jobs').update({
-              payment_method: resolvedPaymentMethod,
-              payment_status: 'paid',
-            }).eq('id', sfJob.id)
-            if (pmErr) {
-              await markDirty(supabase, {
-                userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
-                operation: 'transaction_payment_method', error: pmErr, logger,
-                context: { source: 'syncTransactions:adopt_manual', resolved_method: resolvedPaymentMethod },
-              })
-            } else {
-              await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on manual-tx adoption' })
-            }
-          }
-          // Adopting a manual tx with a different payment_method requires ledger rebuild
-          if (manual[0].payment_method !== txData.payment_method) {
-            jobsNeedingLedgerRebuild.add(sfJob.id)
-          }
-          updated++; continue
-        }
-      }
-
-      const { error } = await supabase.from('transactions').insert(txData)
-      if (error) { logger.error(`[Zenbooker] Transaction insert error ${zbt.id}: ${JSON.stringify(error)}`); errors++ }
-      else {
-        created++
-        // New transaction — mark job for ledger rebuild (important for cash payments)
-        if (sfJob?.id) jobsNeedingLedgerRebuild.add(sfJob.id)
-        // Also update the job's payment_method + payment_status
-        if (sfJob?.id && resolvedPaymentMethod) {
-          const { error: pmErr } = await supabase.from('jobs').update({
-            payment_method: resolvedPaymentMethod,
-            payment_status: 'paid',
-          }).eq('id', sfJob.id)
-          if (pmErr) {
-            await markDirty(supabase, {
-              userId, sfJobId: sfJob.id, zenbookerId: zbt.id,
-              operation: 'transaction_payment_method', error: pmErr, logger,
-              context: { source: 'syncTransactions:after_insert', resolved_method: resolvedPaymentMethod },
-            })
-          } else {
-            await resolveDirty(supabase, { userId, sfJobId: sfJob.id, operation: 'transaction_payment_method', note: 'resolved on new-tx insert' })
-          }
+        const newMethod = txData.payment_method
+        if (action === 'inserted') {
+          jobsNeedingLedgerRebuild.add(sfJob.id)
+        } else if ((action === 'updated_by_zb_id' || action === 'adopted') && priorMethod !== newMethod) {
+          jobsNeedingLedgerRebuild.add(sfJob.id)
         }
       }
     }
@@ -1046,16 +1030,25 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           const zbTxs = invoiceData?.transactions || []
           for (const zbt of zbTxs) {
             if (zbt.status !== 'succeeded') continue
-            // Dedup by zenbooker transaction ID
+            // Dedup by zenbooker transaction ID (atomic helper also dedupes, but checking here lets us skip the RPC when unchanged)
             const { data: existing } = await supabase.from('transactions')
               .select('id').eq('zenbooker_id', zbt.id).maybeSingle()
             if (existing) continue
             // Invoice endpoint lacks custom_payment_method_name — use what we have,
             // but don't write bare "custom" to the job (syncTransactions will resolve it)
             const fallbackMethod = zbt.custom_payment_method_name || zbt.payment_method || 'other'
-            try {
-              const { error: fbTxErr } = await supabase.from('transactions').insert({
-                user_id: userId,
+            const jobPaymentMethod = fallbackMethod !== 'custom' ? fallbackMethod : null
+
+            // P1.3 — atomic: tx INSERT + job UPDATE in one Postgres function.
+            // Replaces the pre-P1.3 two-step (insert tx, then update job) which
+            // could leave a paid-job-with-no-tx state on partial failure.
+            const fallbackJobUpdate = jobPaymentMethod
+              ? { payment_method: jobPaymentMethod, payment_status: 'paid' }
+              : { payment_status: 'paid' }
+            const atomicResult = await applyAtomicPaymentWrites(supabase, {
+              userId, sfJobId: jobId,
+              jobUpdates: fallbackJobUpdate,
+              txDataArray: [{
                 job_id: jobId,
                 customer_id: mapped.customer_id || null,
                 amount: parseFloat(zbt.amount) || 0,
@@ -1065,39 +1058,19 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
                 notes: zbt.memo || 'Synced from Zenbooker on job completion',
                 zenbooker_id: zbt.id,
                 created_at: zbt.payment_date || zbt.created,
+              }],
+              logger,
+            })
+            if (!atomicResult.ok) {
+              await markDirty(supabase, {
+                userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
+                operation: 'payment_status_update', error: atomicResult.error, logger,
+                context: { source: 'handleJobEvent:fallback_tx_atomic_rollback', zb_tx_id: zbt.id, fallback_method: fallbackMethod },
               })
-              if (fbTxErr) logger.warn(`[Zenbooker] Fallback tx insert error: ${JSON.stringify(fbTxErr)}`)
-            } catch (e) {
-              logger.warn(`[Zenbooker] Fallback tx insert threw: ${e.message}`)
+              continue
             }
-            // Update job payment method — but skip bare "custom" (let syncTransactions resolve it)
-            const jobPaymentMethod = fallbackMethod !== 'custom' ? fallbackMethod : null
-            if (jobPaymentMethod) {
-              const { error: pmErr } = await supabase.from('jobs').update({
-                payment_method: jobPaymentMethod,
-                payment_status: 'paid',
-              }).eq('id', jobId)
-              if (pmErr) {
-                await markDirty(supabase, {
-                  userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
-                  operation: 'payment_status_update', error: pmErr, logger,
-                  context: { source: 'handleJobEvent:fallback_tx', resolved_method: jobPaymentMethod },
-                })
-              } else {
-                await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'payment_status_update', note: 'resolved on fallback tx flow' })
-              }
-            } else {
-              // Still mark as paid even if we can't resolve the method name yet
-              const { error: psErr } = await supabase.from('jobs').update({ payment_status: 'paid' }).eq('id', jobId)
-              if (psErr) {
-                await markDirty(supabase, {
-                  userId, sfJobId: jobId, zenbookerId: data?.id ?? null,
-                  operation: 'payment_status_update', error: psErr, logger,
-                  context: { source: 'handleJobEvent:fallback_tx_no_method' },
-                })
-              }
-            }
-            logger.log(`[Zenbooker] Fallback tx created for job ${jobId}: ${fallbackMethod} $${zbt.amount}`)
+            await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'payment_status_update', note: 'resolved on fallback tx atomic flow' })
+            logger.log(`[Zenbooker] Fallback tx created (atomic) for job ${jobId}: ${fallbackMethod} $${zbt.amount}`)
           }
         } catch (invErr) {
           // Non-fatal — invoice fetch might fail or not exist yet
@@ -1188,31 +1161,46 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         logger.warn(`[Zenbooker] Financial refresh on ${eventType} for job ${job.id} failed: ${finErr.message}`)
       }
 
-      // Update job status FIRST so paid state reflects even if transaction insert fails
-      await supabase.from('jobs').update(update).eq('id', job.id)
-      logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} marked paid ($${amount} ${resolvedMethod || `raw=${rawMethod || 'none'}, leaving payment_method untouched`})`)
-
-      // Create transaction record if none exists. Use the real ZB transaction id from nested
-      // transactions when present — lets syncTransactions later dedup + resolve the method.
+      // P1.3 — single atomic write: jobs UPDATE + transactions UPSERT inside
+      // one Postgres function. If either step fails the whole transaction
+      // rolls back, so the invariant `payment_status='paid' ⟺ tx exists`
+      // is preserved. Pre-P1.3 these were two separate awaits with a partial
+      // commit window between them.
       const zbTxId = data.transaction_id || nestedTx?.id || (data.id && !Array.isArray(data.transactions) ? data.id : null)
       const { data: existingTx } = await supabase.from('transactions')
         .select('id').eq('job_id', job.id).eq('status', 'completed').limit(1)
+      const txArray = []
       if (!existingTx || existingTx.length === 0) {
-        try {
-          const { error: txErr } = await supabase.from('transactions').insert({
-            user_id: userId, job_id: job.id, customer_id: job.customer_id,
-            amount,
-            // Store raw method (even 'custom') on the transaction so syncTransactions can upgrade it later
-            payment_method: rawMethod || 'other',
-            payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
-            status: 'completed', notes: 'Payment synced from Zenbooker',
-            zenbooker_id: zbTxId || null
-          })
-          if (txErr) logger.error(`[Zenbooker] Transaction insert error: ${JSON.stringify(txErr)}`)
-          else logger.log(`[Zenbooker] Transaction created for job ${job.id} ($${amount} ${rawMethod || 'other'})`)
-        } catch (e) {
-          logger.error(`[Zenbooker] Transaction insert threw: ${e.message}`)
-        }
+        txArray.push({
+          job_id: job.id,
+          customer_id: job.customer_id,
+          amount,
+          // Store raw method (even 'custom') on the transaction so syncTransactions can upgrade it later
+          payment_method: rawMethod || 'other',
+          payment_intent_id: zbTxId ? `zb_${zbTxId}` : `zb_webhook_${Date.now()}`,
+          status: 'completed',
+          notes: 'Payment synced from Zenbooker',
+          zenbooker_id: zbTxId || null,
+        })
+      }
+
+      const atomicResult = await applyAtomicPaymentWrites(supabase, {
+        userId, sfJobId: job.id, jobUpdates: update, txDataArray: txArray, logger,
+      })
+      if (!atomicResult.ok) {
+        // P1.2 contract — surface the failure as a dirty row so the operator
+        // can replay. Both writes (jobs + transactions) rolled back together;
+        // no partial state remains.
+        await markDirty(supabase, {
+          userId, sfJobId: job.id, zenbookerId: jobZbId,
+          operation: 'payment_status_update', error: atomicResult.error, logger,
+          context: { source: 'handlePaymentEvent:atomic_rollback', event_type: eventType, tx_count: txArray.length },
+        })
+      } else {
+        const txAction = atomicResult.result?.tx_actions?.[0]?.action || 'no_tx'
+        logger.log(`[Zenbooker] Payment ${eventType}: job ${job.id} atomic-paid ($${amount} ${resolvedMethod || `raw=${rawMethod || 'none'}`} tx_action=${txAction})`)
+        await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'payment_status_update', note: 'resolved via atomic payment write' })
+        await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'transaction_payment_method', note: 'resolved via atomic payment write' })
       }
 
       // Rebuild ledger if any cash transaction now exists for this job. The webhook may
@@ -1320,9 +1308,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           const invoiceData = await zbFetch(apiKey, `/invoices/${inv.id}`)
           const zbTxs = (invoiceData.transactions || []).filter(t => t.status === 'succeeded')
 
+          // P1.3 — collect resolved tx data first; commit ALL txs + the
+          // job update in ONE atomic RPC call. Pre-P1.3 this loop did N
+          // separate INSERTs followed by a separate jobs UPDATE — three+
+          // partial-commit windows. Now: rollback-as-a-unit.
           let catchAmount = 0
           let catchMethod = null
           let firstZbTxId = null
+          const reconcileTxArray = []
           for (const t of zbTxs) {
             catchAmount += parseFloat(t.amount) || 0
             firstZbTxId = firstZbTxId || t.id
@@ -1341,24 +1334,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             if (realName && !GENERIC_METHOD.has(String(realName).toLowerCase())) {
               catchMethod = catchMethod || realName
             }
-            const { data: existingTx } = await supabase
-              .from('transactions').select('id').eq('zenbooker_id', full.id).maybeSingle()
-            if (existingTx) continue
-            try {
-              const { error: insErr } = await supabase.from('transactions').insert({
-                user_id: userId, job_id: job.id, customer_id: job.customer_id,
-                amount: parseFloat(full.amount) || 0,
-                payment_method: realName || 'other',
-                payment_intent_id: full.stripe_transaction_id || `zb_${full.id}`,
-                status: 'completed',
-                notes: 'Caught by auto-reconcile',
-                zenbooker_id: full.id,
-                created_at: full.payment_date || full.created
-              })
-              if (insErr) logger.warn(`[AutoReconcile] Tx insert err job ${job.id}: ${JSON.stringify(insErr)}`)
-            } catch (e) {
-              logger.warn(`[AutoReconcile] Tx insert threw job ${job.id}: ${e.message}`)
-            }
+            reconcileTxArray.push({
+              job_id: job.id,
+              customer_id: job.customer_id,
+              amount: parseFloat(full.amount) || 0,
+              payment_method: realName || 'other',
+              payment_intent_id: full.stripe_transaction_id || `zb_${full.id}`,
+              status: 'completed',
+              notes: 'Caught by auto-reconcile',
+              zenbooker_id: full.id,
+              created_at: full.payment_date || full.created,
+            })
           }
 
           const jobUpdate = { invoice_status: 'paid', payment_status: 'paid' }
@@ -1380,9 +1366,26 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           ))
           Object.assign(jobUpdate, fin)
 
-          await supabase.from('jobs').update(jobUpdate).eq('id', job.id)
+          // ── Atomic financial commit: jobs UPDATE + N tx upserts ──
+          const reconcileAtomic = await applyAtomicPaymentWrites(supabase, {
+            userId, sfJobId: job.id, jobUpdates: jobUpdate, txDataArray: reconcileTxArray, logger,
+          })
+          if (!reconcileAtomic.ok) {
+            await markDirty(supabase, {
+              userId, sfJobId: job.id, zenbookerId: job.zenbooker_id,
+              operation: 'payment_status_update', error: reconcileAtomic.error, logger,
+              context: { source: 'runPaymentReconcile:atomic_rollback', tx_count: reconcileTxArray.length, catch_amount: catchAmount },
+            })
+            errors++
+            errorDetails.push(`job ${job.id}: atomic reconcile rolled back: ${reconcileAtomic.error?.message || 'unknown'}`)
+            continue
+          }
+          await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'payment_status_update', note: 'resolved via reconcile atomic write' })
 
-          await supabase.from('payment_reconcile_catches').insert({
+          // Audit row goes OUTSIDE the atomic block — it's a forensic
+          // record, not part of the financial invariant. A failure here
+          // surfaces via [ZB-dirty] only (no financial state at risk).
+          const { error: catchErr } = await supabase.from('payment_reconcile_catches').insert({
             run_id: runId, user_id: userId, job_id: job.id,
             zb_invoice_id: inv.id,
             zb_transaction_id: firstZbTxId,
@@ -1390,6 +1393,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             payment_method: catchMethod,
             notes: `Invoice paid in ZB ($${inv.amount_paid}) — no webhook received`
           })
+          if (catchErr) logger.warn(`[AutoReconcile] Audit insert failed for job ${job.id}: ${catchErr.message}`)
 
           // Rebuild ledger so cash_collected entries get created for cash payments
           if (createLedgerEntriesForCompletedJob) {
