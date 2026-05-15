@@ -1125,7 +1125,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       update.payment_status = 'paid'
       update.invoice_status = 'paid'
       if (resolvedMethod) update.payment_method = resolvedMethod
-      if (amount > 0) update.total_paid_amount = amount
+      // (`total_paid_amount` removed — never existed in jobs schema; was a silent no-op.)
 
       // Refresh financial truth from ZB. ZB's invoice fields can change after
       // payment (operator adds tip, edits subtotal, etc.) and ZB has no

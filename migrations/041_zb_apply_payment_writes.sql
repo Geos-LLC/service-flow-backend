@@ -70,7 +70,9 @@ BEGIN
       payment_status     = COALESCE(p_job_updates->>'payment_status',                       payment_status),
       invoice_status     = COALESCE(p_job_updates->>'invoice_status',                       invoice_status),
       payment_method     = COALESCE(p_job_updates->>'payment_method',                       payment_method),
-      total_paid_amount  = COALESCE((p_job_updates->>'total_paid_amount')::numeric,         total_paid_amount),
+      -- `total_paid_amount` historically referenced in JS but never existed
+      -- in the jobs schema; removed from the whitelist so the function can
+      -- compile. If you need a paid-amount field, add a real column first.
       service_price      = COALESCE((p_job_updates->>'service_price')::numeric,             service_price),
       price              = COALESCE((p_job_updates->>'price')::numeric,                     price),
       total              = COALESCE((p_job_updates->>'total')::numeric,                     total),
