@@ -153,6 +153,23 @@ async function updateJobStatus(supabase, {
   const { error: updErr } = await upd
   if (updErr) throw updErr
 
+  // Status-history row (best-effort, never blocks the status write).
+  // The frontend tooltip on the chevron progress bar (StatusHistoryTooltip)
+  // reads this table to show "Job <status> by <person> at <time>" on hover.
+  // Without this insert, steps past "Scheduled" had no row to display.
+  try {
+    await supabase.from('job_status_history').insert({
+      job_id: jobId,
+      status: newStatus,
+      previous_status: previousStatus,
+      changed_by: actor?.display_name || (source === 'leadbridge' ? 'LeadBridge' : 'Staff'),
+      changed_by_type: source,
+      changed_at: now,
+    })
+  } catch (histErr) {
+    console.warn('[updateJobStatus] history insert failed (non-blocking):', histErr.message)
+  }
+
   // Decide + persist outbox row (no-op if outbound disabled / unlinked / loop).
   let outboundAction = 'disabled'
   try {
