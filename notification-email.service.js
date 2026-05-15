@@ -14,6 +14,7 @@
 
 const sgMail = require('@sendgrid/mail')
 const express = require('express')
+const { logDelivery } = require('./lib/delivery-log')
 
 // In-memory rate limit tracking: { userId: { count, windowStart } }
 const rateLimits = {}
@@ -101,7 +102,9 @@ module.exports = (supabase, logger) => {
     }
   }
 
-  /** Log email send result to notification_email_logs */
+  /** Log email send result to notification_email_logs AND delivery_log (P1.6 dual-write).
+   *  notification_email_logs remains the canonical per-tenant email viewer source;
+   *  delivery_log is the unified cross-system audit surface. */
   async function logSend(userId, { emailType, recipientEmail, recipientName, subject, status, providerMessageId, errorMessage, metadata }) {
     try {
       await supabase.from('notification_email_logs').insert({
@@ -120,6 +123,27 @@ module.exports = (supabase, logger) => {
     } catch (e) {
       logger.error('[NotificationEmail] Log insert failed:', e.message)
     }
+    // P1.6 unified delivery audit — never throws, never blocks the send.
+    await logDelivery(supabase, {
+      userId,
+      sourceSystem: 'service_flow',
+      destinationSystem: 'sendgrid',
+      channel: 'email',
+      eventType: `email.${emailType || 'unknown'}`,
+      correlationId: providerMessageId || null,
+      deliveryDirection: 'outbound',
+      status,
+      provider: 'sendgrid',
+      providerMessageId: providerMessageId || null,
+      errorMessage: errorMessage || null,
+      context: {
+        recipient_email: recipientEmail,
+        recipient_name: recipientName || null,
+        subject: subject || null,
+        email_type: emailType,
+        ...(metadata || {}),
+      },
+    }, logger)
   }
 
   /** Send with retry (up to 2 retries on 5xx/timeout) */

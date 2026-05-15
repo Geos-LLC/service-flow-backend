@@ -42363,6 +42363,102 @@ app.post('/api/admin/test-sendgrid', authenticateAdmin, requireAdminFlag(FLAGS.E
   }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// P1.6 — unified delivery_log operator surface
+// ════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/delivery-log — operator view (cross-tenant), admin-auth.
+// Filters (all optional, AND-combined):
+//   ?user_id=<n>             tenant filter
+//   ?source_system=<x>       e.g. 'service_flow'
+//   ?destination_system=<x>  e.g. 'leadbridge'
+//   ?channel=<x>             'email' | 'webhook' | ...
+//   ?direction=<x>           'outbound' | 'inbound'
+//   ?status=<x>[,<y>...]     comma-separated list
+//   ?event_type_prefix=<x>   e.g. 'email.' or 'zb_inbound.'
+//   ?correlation_id=<x>      single-event drilldown
+//   ?since=<iso>             >= created_at
+//   ?until=<iso>             <= created_at
+//   ?limit=N (max 500)
+//   ?offset=N
+app.get('/api/admin/delivery-log', authenticateAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = parseInt(req.query.offset) || 0;
+
+    let q = supabase.from('delivery_log')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (req.query.user_id) q = q.eq('user_id', parseInt(req.query.user_id));
+    if (req.query.source_system) q = q.eq('source_system', String(req.query.source_system));
+    if (req.query.destination_system) q = q.eq('destination_system', String(req.query.destination_system));
+    if (req.query.channel) q = q.eq('channel', String(req.query.channel));
+    if (req.query.direction) q = q.eq('delivery_direction', String(req.query.direction));
+    if (req.query.correlation_id) q = q.eq('correlation_id', String(req.query.correlation_id));
+    if (req.query.event_type_prefix) q = q.like('event_type', `${req.query.event_type_prefix}%`);
+    if (req.query.status) {
+      const statuses = String(req.query.status).split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) q = q.eq('status', statuses[0]);
+      else if (statuses.length > 1) q = q.in('status', statuses);
+    }
+    if (req.query.since) q = q.gte('created_at', String(req.query.since));
+    if (req.query.until) q = q.lte('created_at', String(req.query.until));
+
+    const { data, count, error } = await q;
+    if (error) {
+      logger.error('[DeliveryLog admin] query error:', error.message);
+      return res.status(500).json({ error: 'Failed to load delivery log' });
+    }
+    res.json({ rows: data || [], total: count || 0, limit, offset });
+  } catch (e) {
+    logger.error('[DeliveryLog admin] crashed:', e.message);
+    res.status(500).json({ error: 'Failed to load delivery log' });
+  }
+});
+
+// GET /api/delivery-log — tenant-scoped self-service. authenticateToken.
+// Same filters as admin variant, but user_id is forced to req.user.userId
+// so a tenant cannot view another tenant's rows.
+app.get('/api/delivery-log', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = parseInt(req.query.offset) || 0;
+
+    let q = supabase.from('delivery_log')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId)             // ALWAYS scoped, ignored if caller sets user_id
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (req.query.source_system) q = q.eq('source_system', String(req.query.source_system));
+    if (req.query.destination_system) q = q.eq('destination_system', String(req.query.destination_system));
+    if (req.query.channel) q = q.eq('channel', String(req.query.channel));
+    if (req.query.direction) q = q.eq('delivery_direction', String(req.query.direction));
+    if (req.query.correlation_id) q = q.eq('correlation_id', String(req.query.correlation_id));
+    if (req.query.event_type_prefix) q = q.like('event_type', `${req.query.event_type_prefix}%`);
+    if (req.query.status) {
+      const statuses = String(req.query.status).split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) q = q.eq('status', statuses[0]);
+      else if (statuses.length > 1) q = q.in('status', statuses);
+    }
+    if (req.query.since) q = q.gte('created_at', String(req.query.since));
+    if (req.query.until) q = q.lte('created_at', String(req.query.until));
+
+    const { data, count, error } = await q;
+    if (error) {
+      logger.error('[DeliveryLog tenant] query error:', error.message);
+      return res.status(500).json({ error: 'Failed to load delivery log' });
+    }
+    res.json({ rows: data || [], total: count || 0, limit, offset });
+  } catch (e) {
+    logger.error('[DeliveryLog tenant] crashed:', e.message);
+    res.status(500).json({ error: 'Failed to load delivery log' });
+  }
+});
+
 // GET /api/admin/users — list all users with subscription + comms status
 app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
   try {

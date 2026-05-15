@@ -17,6 +17,7 @@ const {
   safeDeleteCompletionDerivedLedger,
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
+const { logDelivery } = require('./lib/delivery-log')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
 
@@ -2225,6 +2226,21 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       const auth = authenticateZenbookerWebhook(req)
       if (!auth.ok) {
         logger.warn(`[Zenbooker] Webhook auth rejected: status=${auth.status} reason=${auth.reason} flag=${auth.flag}`)
+        // P1.6 — audit auth-rejected inbound deliveries (no userId scope; this
+        // is platform-edge observability before tenant resolution).
+        await logDelivery(supabase, {
+          userId: null,
+          sourceSystem: 'zenbooker',
+          destinationSystem: 'service_flow',
+          channel: 'webhook',
+          eventType: 'zb_inbound.auth_rejected',
+          deliveryDirection: 'inbound',
+          status: 'rejected',
+          responseCode: auth.status,
+          provider: 'zenbooker',
+          errorMessage: auth.reason || 'webhook_auth_failed',
+          context: { auth_reason: auth.reason, auth_flag: auth.flag },
+        }, logger)
         return res.status(auth.status).json({ error: 'webhook_auth_failed', reason: auth.reason })
       }
       // Always emit an auth-observation line. The single structured prefix
@@ -2261,6 +2277,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
       // Process for each connected user (typically just one)
       for (const user of users) {
+        const startTs = Date.now()
+        let outcome = 'sent'
+        let handlerErr = null
         try {
           if (event.startsWith('job.')) {
             await handleJobEvent(event, data, user.id, user.zenbooker_api_key)
@@ -2296,7 +2315,31 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           }
         } catch (err) {
           logger.error(`[Zenbooker] Webhook handler error for user ${user.id}: ${err.message}`)
+          outcome = 'failed'
+          handlerErr = err
         }
+        // P1.6 — unified inbound delivery audit. One row per (user, event)
+        // pair. Idempotency on the correlation_id (ZB event id) means a
+        // replayed webhook can be detected at the audit layer.
+        await logDelivery(supabase, {
+          userId: user.id,
+          sourceSystem: 'zenbooker',
+          destinationSystem: 'service_flow',
+          channel: 'webhook',
+          eventType: `zb_inbound.${event}`,
+          correlationId: data?.id || data?.job_id || data?.job?.id || null,
+          deliveryDirection: 'inbound',
+          status: outcome,
+          latencyMs: Date.now() - startTs,
+          provider: 'zenbooker',
+          error: handlerErr,
+          context: {
+            event,
+            zb_account_id: account_id || null,
+            auth_mode: auth.mode || 'none',
+            auth_flag: auth.flag,
+          },
+        }, logger)
       }
 
       res.json({ ok: true })

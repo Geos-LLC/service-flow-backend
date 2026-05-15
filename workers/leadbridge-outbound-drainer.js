@@ -25,6 +25,7 @@ const {
   OUTBOUND_ENABLED,
   OUTBOUND_DRY_RUN,
 } = require('../services/lb-outbound-delivery')
+const { logDelivery } = require('../lib/delivery-log')
 
 const TICK_MS = parseInt(process.env.LEADBRIDGE_OUTBOUND_TICK_MS || '5000', 10)
 const BATCH_SIZE = parseInt(process.env.LEADBRIDGE_OUTBOUND_BATCH_SIZE || '50', 10)
@@ -140,7 +141,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
         defer_reason: 'no_outbound_subscription',
         last_error: 'no_outbound_subscription: exceeded max defer attempts',
       })
-      logLine(logger, { row, to: 'dlq', result: null, attempts, note: 'no_outbound_subscription' })
+      logLine(supabase, logger, { row, to: 'dlq', result: null, attempts, note: 'no_outbound_subscription' })
     } else {
       const wait = deferBackoff(attempts)
       await transition(supabase, row.id, {
@@ -151,7 +152,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
         claimed_by: null,
         claimed_until: null,
       })
-      logLine(logger, { row, to: 'pending', result: 'deferred_no_subscription', attempts })
+      logLine(supabase, logger, { row, to: 'pending', result: 'deferred_no_subscription', attempts })
     }
     return
   }
@@ -173,6 +174,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       last_error: `decrypt_failed: ${e.message}`,
     })
     logger.error(`[LB Outbound] Decrypt failed for user ${row.user_id}: ${e.message}`)
+    logLine(supabase, logger, { row, to: 'dlq', result: 'decrypt_failed', attempts })
     return
   }
 
@@ -207,7 +209,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       last_error: null,
     })
     await touchLastEventAt(supabase, row.user_id)
-    logLine(logger, { row, to: 'sent', result: 'dry_run', attempts: (row.attempts || 0) + 1 })
+    logLine(supabase, logger, { row, to: 'sent', result: 'dry_run', attempts: (row.attempts || 0) + 1 })
     return
   }
 
@@ -232,7 +234,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
   const attempts = (row.attempts || 0) + 1
   if (networkErr) {
     await retryOrDlq(supabase, row, attempts, `network: ${networkErr.code || networkErr.message}`)
-    logLine(logger, { row, to: attempts > NETWORK_MAX_ATTEMPTS ? 'dlq' : 'pending', result: 'network_error', attempts })
+    logLine(supabase, logger, { row, to: attempts > NETWORK_MAX_ATTEMPTS ? 'dlq' : 'pending', result: 'network_error', attempts })
     return
   }
 
@@ -249,7 +251,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       last_error: null,
     })
     await touchLastEventAt(supabase, row.user_id)
-    logLine(logger, { row, to: 'sent', result: body?.result || 'applied', attempts })
+    logLine(supabase, logger, { row, to: 'sent', result: body?.result || 'applied', attempts })
     return
   }
 
@@ -264,7 +266,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       last_error: null,
     })
     await touchLastEventAt(supabase, row.user_id)
-    logLine(logger, { row, to: 'sent', result: 'duplicate', attempts })
+    logLine(supabase, logger, { row, to: 'sent', result: 'duplicate', attempts })
     return
   }
 
@@ -276,7 +278,7 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       terminal_at: nowIso(),
       last_error: typeof body === 'string' ? body : (body?.error || '422'),
     })
-    logLine(logger, { row, to: 'skipped_unmapped_status', result: '422', attempts })
+    logLine(supabase, logger, { row, to: 'skipped_unmapped_status', result: '422', attempts })
     return
   }
 
@@ -289,13 +291,13 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
       terminal_at: nowIso(),
       last_error: `http ${status}: ${typeof body === 'string' ? body : JSON.stringify(body).slice(0, 300)}`,
     })
-    logLine(logger, { row, to: 'dlq', result: String(status), attempts })
+    logLine(supabase, logger, { row, to: 'dlq', result: String(status), attempts })
     return
   }
 
   // 429 / 5xx / anything else — retryable.
   await retryOrDlq(supabase, row, attempts, `http ${status}: ${typeof body === 'string' ? body : JSON.stringify(body).slice(0, 300)}`)
-  logLine(logger, { row, to: attempts > NETWORK_MAX_ATTEMPTS ? 'dlq' : 'pending', result: String(status), attempts })
+  logLine(supabase, logger, { row, to: attempts > NETWORK_MAX_ATTEMPTS ? 'dlq' : 'pending', result: String(status), attempts })
 }
 
 async function retryOrDlq(supabase, row, attempts, errorMessage) {
@@ -349,7 +351,7 @@ function verbForState(to, result) {
   return to
 }
 
-function logLine(logger, { row, to, result, attempts, note }) {
+function logLine(supabase, logger, { row, to, result, attempts, note }) {
   const verb = verbForState(to, result)
   logger.log(
     `[SF → LB] ${verb} event=${row.event_id} job=${row.sf_job_id} user=${row.user_id}` +
@@ -357,6 +359,37 @@ function logLine(logger, { row, to, result, attempts, note }) {
     ` attempts=${attempts}` +
     (note ? ` note=${note}` : '')
   )
+  // P1.6 — dual-write unified delivery_log. `supabase` is optional so tests
+  // that call logLine directly don't have to provide a client; the helper
+  // itself is guarded (never throws).
+  if (!supabase) return
+  let status
+  if (to === 'sent' && result === 'duplicate') status = 'duplicate'
+  else if (to === 'sent') status = 'sent'
+  else if (to === 'dlq') status = 'failed'
+  else if (to === 'skipped_unmapped_status') status = 'rejected'
+  else if (to === 'pending') return // interim retry — skip to avoid spam
+  else status = 'failed'
+  // Fire and forget — the call is already wrapped in its own try/catch.
+  logDelivery(supabase, {
+    userId: row.user_id,
+    sourceSystem: 'service_flow',
+    destinationSystem: 'leadbridge',
+    channel: 'webhook',
+    eventType: `lb_outbound.${row.payload_json?.event || 'unknown'}`,
+    correlationId: row.event_id,
+    deliveryDirection: 'outbound',
+    status,
+    retryCount: attempts || 0,
+    provider: 'leadbridge',
+    errorMessage: (status === 'failed' || status === 'rejected') ? (row.last_error || note || result || null) : null,
+    context: {
+      sf_job_id: row.sf_job_id || null,
+      to_state: to,
+      result: result || null,
+      note: note || null,
+    },
+  }, logger).catch(() => {})
 }
 
 /**
