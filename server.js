@@ -57,6 +57,7 @@ const {
   recordLedgerDrift,
 } = require('./lib/ledger-immutability');
 const { shouldOpenPhoneCreateLead } = require('./lib/openphone-ingestion');
+const { resolveWhatsAppStatusTenant } = require('./lib/whatsapp-status-tenant-resolver');
 const { findCrmMatchByPhone } = require('./lib/openphone-crm-match');
 const { runIdentityBackfill } = require('./lib/identity-backfill');
 const { classifyIdentitySource } = require('./lib/identity-source-classifier');
@@ -39926,7 +39927,7 @@ app.put('/api/communications/settings/preferences', authenticateToken, async (re
 // ── Phase 3: Webhook Ingestion from Sigcore ──
 
 // ── WhatsApp webhook handler ──
-async function handleWhatsAppWebhook(event, payload) {
+async function handleWhatsAppWebhook(event, payload, verifiedUserId = null) {
   try {
     if (event === 'whatsapp.message.inbound') {
       // Extract from Sigcore webhook payload structure
@@ -40115,34 +40116,68 @@ async function handleWhatsAppWebhook(event, payload) {
       }
 
     } else if (event === 'whatsapp.status.change') {
-      // Update connection status
+      // P1.4 (Constitution §0 P3 / §6.10) — tenant-scoped status change.
+      // The pre-P1.4 handler did a global scan and updated an arbitrary
+      // WhatsApp-connected user's row. Now: resolve the tenant via HMAC
+      // userId (primary), then deterministic routing (secondary), then a
+      // phone-claim lookup (tertiary). Cross-tenant mismatches drop the
+      // event with a structured audit log; no global fallback exists.
       const status = payload.status;
       const isConnected = status === 'ready';
       const phoneNumber = payload.phoneNumber ? normalizePhone(payload.phoneNumber) : null;
-      // Find user with WhatsApp connected or the target user
-      const { data: settings } = await supabase.from('communication_settings')
-        .select('user_id, whatsapp_connected')
-        .or('whatsapp_connected.eq.true,whatsapp_phone_number.neq.null')
-        .limit(1).maybeSingle();
 
-      if (settings) {
-        const updateFields = {
-          whatsapp_connected: isConnected,
-          updated_at: new Date().toISOString(),
-        };
-        // Save phone number on reconnect, clear on disconnect
-        if (isConnected && phoneNumber) {
-          updateFields.whatsapp_phone_number = phoneNumber;
-          updateFields.whatsapp_connected_at = new Date().toISOString();
-        } else if (!isConnected) {
-          updateFields.whatsapp_phone_number = null;
-          updateFields.whatsapp_connected_at = null;
-        }
-        await supabase.from('communication_settings').update(updateFields).eq('user_id', settings.user_id);
-        logger.log(`[WhatsApp] Status change → ${status} (connected=${isConnected}, phone=${phoneNumber}) for user ${settings.user_id}`);
-        // Note: Sigcore no longer wipes on reconnect — it upserts by providerMessageId.
-        // SF must not wipe either, otherwise we lose history Sigcore won't re-send.
+      // Structured audit log — single [WhatsApp-status] anchor for Loki.
+      const audit = (outcome, extras = {}) => {
+        const parts = [
+          '[WhatsApp-status]',
+          `outcome=${outcome}`,
+          `status=${status}`,
+          `phone=${phoneNumber || 'null'}`,
+          `verified_user_id=${verifiedUserId == null ? 'null' : verifiedUserId}`,
+        ];
+        for (const [k, v] of Object.entries(extras)) parts.push(`${k}=${v}`);
+        logger.log(parts.join(' '));
+      };
+
+      const r = await resolveWhatsAppStatusTenant(supabase, {
+        verifiedUserId,
+        phoneNumber,
+        resolveEndpointRoute,
+      });
+
+      if (!r.ok) {
+        // Includes cross_tenant_mismatch, phone_claim_ambiguous, no_tenant.
+        audit(r.outcome, r);
+        return;
       }
+
+      const updateFields = {
+        whatsapp_connected: isConnected,
+        updated_at: new Date().toISOString(),
+      };
+      // Save phone number on reconnect, clear on disconnect
+      if (isConnected && phoneNumber) {
+        updateFields.whatsapp_phone_number = phoneNumber;
+        updateFields.whatsapp_connected_at = new Date().toISOString();
+      } else if (!isConnected) {
+        updateFields.whatsapp_phone_number = null;
+        updateFields.whatsapp_connected_at = null;
+      }
+      // Tenant-scoped UPDATE — only this user's row.
+      const { error: updErr } = await supabase.from('communication_settings')
+        .update(updateFields)
+        .eq('user_id', r.userId);
+      if (updErr) {
+        audit('error_update_failed', { user_id: r.userId, error: updErr.message });
+        return;
+      }
+      audit('applied', {
+        user_id: r.userId,
+        connected: isConnected,
+        resolution_path: r.resolutionPath,
+      });
+      // Note: Sigcore no longer wipes on reconnect — it upserts by providerMessageId.
+      // SF must not wipe either, otherwise we lose history Sigcore won't re-send.
     }
   } catch (error) {
     // WhatsApp failures must NOT break OpenPhone/LB webhook processing
@@ -40211,8 +40246,10 @@ app.post('/api/communications/webhooks/sigcore', async (req, res) => {
     logger.log(`[Webhook] Sigcore event: ${event} | from=${payload.fromNumber||payload.from_number||payload.conversation?.participantPhone} to=${payload.toNumber||payload.to_number} phoneNumberId=${payload.phoneNumberId||payload.endpoint_id} convId=${payload.conversationId||payload.conversation?.id}`);
 
     // ── WhatsApp events — separate handling path ──
+    // verifiedUserId from the HMAC step above is forwarded so the status
+    // handler (P1.4) can scope by tenant instead of doing a global scan.
     if (event.startsWith('whatsapp.')) {
-      await handleWhatsAppWebhook(event, payload);
+      await handleWhatsAppWebhook(event, payload, verifiedUserId);
       return;
     }
 
