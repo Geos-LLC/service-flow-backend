@@ -14,6 +14,21 @@ This runbook is operator-fast-reference. It does not explain WHY; it explains WH
 - Phase B turns on `ZB_OUTBOUND_ENABLED=true` for one pilot tenant, behind a producer-side feature flag. Drainer starts but `ZB_OUTBOUND_GLOBAL_FREEZE=false` enables real outbound traffic.
 - All queries in this runbook are tenant-scoped where the tenant id matters. Replace `<USER_ID>` with the operator-of-record's `users.id`.
 
+### 0.1 Pilot tenant + quota posture (Phase B week 1)
+
+Pilot tenant is **`user_id=2`** (`sayapingeorge@gmail.com`) — see [phase-b-pilot-tenant.md](./phase-b-pilot-tenant.md). Operator-of-record is the same.
+
+Quota posture (PC14 Option B) is a **conservative cap pending ZB support's Q9 reply**:
+
+| Variable | Phase B value | Rationale |
+|---|---|---|
+| `ZB_OUTBOUND_BATCH_SIZE` | `5` | Caps theoretical max at 60/min (well under any plausible per-tenant ZB rate limit) |
+| `ZB_OUTBOUND_TICK_MS` | `5000` | Unchanged from default |
+| `ZB_OUTBOUND_DRY_RUN` | `true` for days 1-3, `false` for days 4-7 | Dry-run soak before live mode |
+| `ZB_OUTBOUND_GLOBAL_FREEZE` | `true` defensively at deploy; operator flips to `false` when ready | Defense-in-depth |
+
+**429 monitoring is mandatory during week 1.** Run §1's daily smoke + [phase-b-pilot-tenant.md §2.6](./phase-b-pilot-tenant.md#26-week-1-monitoring-requirement). If 429s appear, follow the §2.7 escalation table in that doc.
+
 ---
 
 ## 1. Daily smoke check
@@ -147,7 +162,7 @@ SELECT last_error, count(*)
 | `http 401` | Auth misconfigured. Pause; do not retry. Check `users.zenbooker_api_key` for the affected tenant. Resolve and re-arm. |
 | `http 404: object with this id does not exist` | The target ZB resource was deleted upstream after the command was queued. Mark `cancelled` (§3.5); the producer's intent is now meaningless. |
 | `network: ECONNRESET` / `network: ETIMEDOUT` | Transient. Already retried up to 5 attempts. Re-arm (§3.4); if it fails again, escalate ZB-side. |
-| `http 429` | Rate-limited. Check pilot tenant ZB quota (PC14). Reduce drainer batch size or freeze until usage normalizes. |
+| `http 429` | Rate-limited. **First occurrence:** auto-retry handles it (no action). **5+ in 1 hour:** reduce `ZB_OUTBOUND_BATCH_SIZE` from `5` to `2`. **Hitting DLQ:** freeze + contact ZB support per [phase-b-pilot-tenant.md §2.7](./phase-b-pilot-tenant.md#27-escalation-path-if-429-appears). |
 | `phase_a_scaffolding` | Stale rows from Phase A scaffolding period. Check the `requested_at` timestamp; safe to DELETE manually if pre-Phase-B. |
 
 ### 3.3 Inspect a single failed row
