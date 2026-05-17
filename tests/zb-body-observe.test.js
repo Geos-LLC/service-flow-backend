@@ -12,25 +12,29 @@
 
 const { observe, isWithinWindow, clearCache, CACHE_TTL_MS } = require('../lib/zb-body-observe');
 
-function makeSupabase({ setting = null, updateError = null, fetchError = null } = {}) {
+// `mode = 'text' | 'object'` — production stores text (JSON-serialized
+// string) in platform_settings.value, so we default to text. The
+// object mode is kept for forward compatibility if the column ever
+// becomes jsonb.
+function makeSupabase({ setting = null, updateError = null, fetchError = null, mode = 'text' } = {}) {
   let current = setting;
+  const encode = (v) => (mode === 'text' && v != null ? JSON.stringify(v) : v);
+  const decode = (v) => (mode === 'text' && typeof v === 'string' ? JSON.parse(v) : v);
   return {
     from: jest.fn(() => ({
       select: jest.fn(() => ({
         eq: jest.fn(() => ({
-          maybeSingle: jest.fn(async () => fetchError ? { error: fetchError } : { data: current ? { value: current } : null }),
+          maybeSingle: jest.fn(async () => fetchError ? { error: fetchError } : { data: current != null ? { value: encode(current) } : null }),
         })),
       })),
       update: jest.fn((patch) => ({
-        eq: jest.fn(() => ({
-          gt: jest.fn(async () => {
-            if (updateError) return { error: updateError };
-            if (current && current.remaining > 0) {
-              current = patch.value;
-            }
-            return { error: null };
-          }),
-        })),
+        eq: jest.fn(async () => {
+          if (updateError) return { error: updateError };
+          if (current && current.remaining > 0) {
+            current = decode(patch.value);
+          }
+          return { error: null };
+        }),
       })),
     })),
   };
