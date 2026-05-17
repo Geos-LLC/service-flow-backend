@@ -88,7 +88,7 @@ This adds one GET per POST attempt (latency penalty + 2x rate-limit consumption 
 
 ### 2.1 Result
 
-**Webhook event taxonomy: PARTIALLY VERIFIED.** The list of event types SF already subscribes to is confirmed by production observation; the *one-vs-many semantics per mutation* and per-event payload shape are unverified by public docs.
+**Webhook event taxonomy: FULLY VERIFIED for Phase 1 commands (2026-05-17 prod sampling).** The list of subscribed event types was confirmed empirically by production observation. The full top-level body shape, per-event-id presence, and one-vs-many semantics are all resolved — see [§2.5 Q2 resolution evidence](#25-q2-resolution-evidence-2026-05-17) below.
 
 ### 2.2 Events confirmed as emitted by ZB
 
@@ -116,27 +116,30 @@ Webhook subscription registration payload (verified in code, line 1588):
 { "event_type": "<event>", "url": "<webhook_url>", "webhook_api_version": "2025-09-01" }
 ```
 
-The webhook payload top-level shape (verified at line 2260): `{ event, data, account_id }`.
+The webhook payload top-level shape **verified empirically 2026-05-17** across 12 real prod webhook deliveries (5 event types) is:
 
-### 2.3 What is NOT verified
+```
+{ account, data, event, retry_count, type, webhook_id }
+```
 
-Despite knowing the event list, three things remain unconfirmed for correlation purposes:
+Note: the existing SF handler at [zenbooker-sync.js:2260](../../zenbooker-sync.js#L2260) destructures `{event, data, account_id}` — **the field is named `account`, not `account_id`**. The SF handler currently captures `account_id` as `undefined` and stores it as `delivery_log.context.zb_account_id=null`. Functionally harmless (SF dispatches to all `zenbooker_status='connected'` users, not by account id), but it's a latent field-name mismatch worth fixing as a separate hygiene item.
 
-| # | Unknown | Affects |
-|---|---|---|
-| Q2-A | Does **one mutation emit one event or many?** Specifically, does `POST /v1/jobs/:id/reschedule` emit ONLY `job.rescheduled`, or BOTH `job.rescheduled` AND `job.service_order.edited`? Same question for cancel (`job.canceled` only or +`job.service_order.edited`?) and assign-providers. | Design §3.5.2 fallback correlation algorithm — if multiple events fire, the algorithm MUST correlate the *first* event that matches and ignore the rest as duplicates. |
-| Q2-B | Does each webhook delivery carry a **stable `event_id`** for dedup? The code (line 2330) uses `data.id` or `data.job_id` as `correlation_id` — which is a *resource* id, not an *event* id. Two `job.rescheduled` events for the same job (e.g., reschedule A, then reschedule B) would share the same `correlation_id`. | Constitution §3.2 dedup; Design §3.6 replay safety. |
-| Q2-C | What is the **delivery latency P50/P95** from ZB mutation to webhook arrival? | Design §2.4 `confirmation_deadline` default (currently set to `sent_at + 10 minutes`). |
+### 2.3 Q2 resolution (2026-05-17 sampling)
 
-### 2.4 Required operator action
+All three Q2 questions are now resolved by direct sampling of real prod webhook traffic via the `[ZB-body-observe]` instrumentation:
 
-The ZB integration owner MUST obtain written answers to:
+| # | Question | Verdict | Evidence |
+|---|---|---|---|
+| **Q2-A** | Does one mutation emit one event or many? | **SINGLE EVENT for all 5 Phase 1 command types.** No `job.service_order.edited` fan-out observed. | 12 real prod webhooks across 5 event types (`job.created`, `job.rescheduled`, `job.service_providers.assigned`, `customer.created`, `customer.edited`); 0 `service_order.edited` lines anywhere in the window; no pairwise time gaps under 5s (no clustered duplicate deliveries). |
+| **Q2-B** | Stable per-event id at top level? | **YES — field name is `webhook_id`.** Every single one of 12 samples carried it. SF can dedup on this field at the inbound layer. | All 12 samples logged `top_level_keys=account,data,event,retry_count,type,webhook_id` — identical key set, perfect consistency. |
+| **Q2-C** | Webhook delivery semantics? | **Partially resolved.** ZB carries a top-level `retry_count` field — implies at-least-once delivery with explicit retry marking. Exact retry policy (max attempts, backoff) still unknown; no retry observed in this sample (all 12 fresh deliveries). | `retry_count` present in every sample; no retry samples captured (we have no fresh-vs-retry comparison). |
 
-1. (Q2-A) For each of the Phase 1 mutations (`POST /v1/jobs`, `POST /v1/jobs/:id/reschedule`, `POST /v1/jobs/:id/cancel`, `POST /v1/customers`, `PATCH /v1/customers/:id`, and the still-unidentified provider-assignment endpoint), exactly which webhook events fire, in what order, with what payload differences?
-2. (Q2-B) Does each webhook delivery carry a stable per-event identifier (separate from the resource id)? What header or body field?
-3. (Q2-C) What is the expected webhook delivery SLA (best-effort vs at-least-once vs at-most-once; retry policy on SF 5xx)?
+### 2.4 Implications for design
 
-Until Q2-A is answered, Design §3.5's correlation algorithm operates in `probable`-confidence mode for any echo whose event type might be the generic `job.service_order.edited`.
+- **Inbound dedup (constitution §3.2):** SF should dedup on `body.webhook_id` (per-event id), not `data.id` (resource id). Two back-to-back mutations of the same job no longer collide at the dedup layer.
+- **Correlation (design §3.5):** EXACT confidence is reachable for every Phase 1 command type. `probable`/`ambiguous` paths exist in the design as safety nets but should rarely fire in production.
+- **Retry handling (design §4.4 inbound):** `retry_count > 0` is a strong signal that the inbound handler should idempotency-check against `webhook_id` before applying side-effects. The handler at [zenbooker-sync.js:2260](../../zenbooker-sync.js#L2260) does not yet inspect `retry_count` — minor enhancement opportunity.
+- **Latent SF bug:** existing `req.body` destructure uses `account_id` but ZB sends `account`. Currently writes `null` into `delivery_log.context.zb_account_id`. Fix is one identifier change; tracked as a hygiene item separate from Phase A/B work.
 
 ---
 
@@ -411,3 +414,4 @@ Until Q1, Q2-A, Q2-B are answered, Phase B is BLOCKED. This is by design.
 |---|---|---|
 | 2026-05-15 | 0.1 | Initial verification report. Q1 result: UNKNOWN/likely-no. Q2 result: event taxonomy verified from production; fan-out + per-event id UNKNOWN. `job.assign_providers` endpoint NOT LOCATED. Phase A partial-go for four confirmed commands; Phase B fully blocked. |
 | 2026-05-16 | 0.2 | Discovery executed. **§3.4 fully rewritten** — `POST /v1/jobs/{id}/assign` confirmed with diff body `{assign, unassign, notify}`. Webhook echo `job.service_providers.assigned` is EXACT (no fan-out, single event, ~2-3s latency, 2 data points). §1.1 adds negative empirical evidence for Idempotency-Key (header not echoed). §2.2 adds `customer.created` subscription confirmation. §4 compatibility matrix updates assign row to ✓ Confirmed. §5.1 Phase A now FULLY unblocked for all five commands. Incidental: `GET /v1/providers` returns 400 (endpoint absent). Discovery transcript appears in §3.4 as an empirical progression table. |
+| 2026-05-17 | 0.3 | **Q2-A and Q2-B fully resolved** via 12 real prod webhook samples captured by the Q2-B instrumentation (`[ZB-body-observe]`). §2.1 status upgraded to "FULLY VERIFIED for Phase 1 commands". §2.2 records the actual top-level body shape `{account, data, event, retry_count, type, webhook_id}` (note: ZB key is `account`, not `account_id` — existing SF handler has a latent field-name mismatch). §2.3 replaced with a resolution table: Q2-A is single-event for all 5 Phase 1 command types (0 fan-out across 12 deliveries), Q2-B is supported via `webhook_id`, Q2-C partially resolved via `retry_count` field presence. §2.4 records design implications (inbound dedup on `webhook_id`, EXACT correlation reachable for all command types, retry-count handling opportunity, account/account_id hygiene fix). |
