@@ -18,6 +18,7 @@ const {
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
 const { observe: zbBodyObserve } = require('./lib/zb-body-observe')
+const { correlateInboundEcho, isCorrelatable } = require('./lib/zb-outbound-correlation')
 const { logDelivery } = require('./lib/delivery-log')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
@@ -2323,6 +2324,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
           } else {
             logger.log(`[Zenbooker] Unhandled event: ${event}`)
+          }
+          // Phase B outbound correlation — after the existing inbound
+          // dispatch completes, check whether this echo confirms any open
+          // SF→ZB command. Phase B scope: only job.created → job.create.
+          // Other event types short-circuit inside isCorrelatable.
+          if (isCorrelatable(event)) {
+            try {
+              await correlateInboundEcho(supabase, {
+                userId: user.id,
+                event,
+                data,
+                webhookId: req.body && req.body.webhook_id,
+                logger,
+              })
+            } catch (cErr) {
+              logger.warn(`[Zenbooker] correlation (non-blocking) failed: ${cErr.message}`)
+            }
           }
         } catch (err) {
           logger.error(`[Zenbooker] Webhook handler error for user ${user.id}: ${err.message}`)

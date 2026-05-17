@@ -5673,6 +5673,20 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         id: userId,
         display_name: null,
       }).catch((e) => console.warn('[LB Outbound] Insert emit skipped:', e?.message));
+
+      // Phase B: ZB outbound producer hook for job.create. Gated by
+      // ZB_OUTBOUND_ENABLED + per-tenant opt-in in platform_settings.
+      // NEVER throws — failure to enqueue MUST NOT break job creation.
+      try {
+        const { maybeEmitJobCreateCommand } = require('./lib/zb-outbound-producer');
+        maybeEmitJobCreateCommand(supabase, result, {
+          type: 'account_owner',
+          id: userId,
+          display_name: null,
+        }).catch((e) => console.warn('[ZB Outbound producer] hook failed:', e?.message));
+      } catch (zbErr) {
+        console.warn('[ZB Outbound producer] require failed:', zbErr?.message);
+      }
       
             // Verify customer exists and get customer data
       let customerData = null;
