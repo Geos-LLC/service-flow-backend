@@ -2258,7 +2258,11 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         logger.log(`[ZB-auth-observe] ${obs}`)
       }
 
-      const { event, data, account_id } = req.body
+      // Q2-B sampling (2026-05-17) confirmed ZB sends the field as `account`,
+      // not `account_id`. The earlier `account_id` destructure was a latent
+      // field-name mismatch that resolved to undefined and wrote null into
+      // delivery_log.context.zb_account_id. Renamed to match the wire shape.
+      const { event, data, account } = req.body
       if (!event || !data) {
         return res.status(400).json({ error: 'Missing event or data' })
       }
@@ -2272,7 +2276,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       logger.log(`[Zenbooker] Webhook received: ${event} | data keys: ${Object.keys(data || {}).join(',')} | data.id: ${data?.id || 'MISSING'} | data.job_id: ${data?.job_id || 'none'}`)
 
       // Find the user by checking who has this Zenbooker connection
-      // (account_id from webhook payload can help if multiple users)
+      // (`account` from webhook payload can help if multiple users)
       const { data: users } = await supabase
         .from('users')
         .select('id, zenbooker_api_key')
@@ -2342,7 +2346,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           error: handlerErr,
           context: {
             event,
-            zb_account_id: account_id || null,
+            zb_account_id: account || null,
             auth_mode: auth.mode || 'none',
             auth_flag: auth.flag,
           },
