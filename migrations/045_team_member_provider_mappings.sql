@@ -8,7 +8,7 @@
 
 CREATE TABLE IF NOT EXISTS team_member_provider_mappings (
   id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id               UUID NOT NULL,
+  user_id               BIGINT NOT NULL,
   sf_team_member_id     TEXT NOT NULL,
   zenbooker_provider_id TEXT,
   mapping_source        TEXT NOT NULL,    -- 'zb_sync' | 'manual_link' | 'sf_originated'

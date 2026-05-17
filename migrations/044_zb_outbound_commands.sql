@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS zb_outbound_commands (
   -- identity
   id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   event_id                 TEXT NOT NULL UNIQUE,
-  user_id                  UUID NOT NULL,
+  user_id                  BIGINT NOT NULL,
 
   -- target
   command_type             TEXT NOT NULL,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS zb_outbound_commands (
   confirmation_deadline    TIMESTAMPTZ,
 
   -- audit
-  requested_by_user_id     UUID,
+  requested_by_user_id     BIGINT,
   requested_by_actor       JSONB NOT NULL DEFAULT '{}'::jsonb,
 
   -- diagnostics
@@ -129,7 +129,7 @@ CREATE OR REPLACE FUNCTION zb_outbound_claim_due(
 RETURNS TABLE (
   id              UUID,
   event_id        TEXT,
-  user_id         UUID,
+  user_id         BIGINT,
   command_type    TEXT,
   sf_job_id       TEXT,
   sf_customer_id  TEXT,
