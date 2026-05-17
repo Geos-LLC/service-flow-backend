@@ -44,6 +44,7 @@ const {
   maybeEmitInsertEvent,
 } = require('./services/job-status-service');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
+const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
@@ -1071,6 +1072,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
@@ -37259,6 +37261,17 @@ app.listen(PORT, async () => {
     startLbOutboundDrainer({ supabase, logger });
   } catch (e) {
     logger.error(`[LB Outbound] Failed to start drainer: ${e.message}`);
+  }
+
+  // Start the ZB outbound drainer (Phase A scaffolding). No-ops at
+  // process start if ZB_OUTBOUND_ENABLED is not 'true'. When started,
+  // tick acquires advisory lock + runs stale-lease sweep, then
+  // short-circuits with `frozen` while ZB_OUTBOUND_GLOBAL_FREEZE is
+  // 'true' (design §17). No HTTP traffic to ZB possible from Phase A.
+  try {
+    startZbOutboundDrainer({ supabase, logger });
+  } catch (e) {
+    logger.error(`[ZB Outbound] Failed to start drainer: ${e.message}`);
   }
 });
 } // end if (require.main === module)

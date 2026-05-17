@@ -247,7 +247,7 @@ Rationale: reconcile is observed-state-only. The producer side of the system is 
 CREATE TABLE zb_outbound_commands (
   -- identity
   id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  event_id               TEXT NOT NULL UNIQUE,         -- uuidv7, the Idempotency-Key sent to ZB
+  event_id               TEXT NOT NULL UNIQUE,         -- uuidv7. Sent as Idempotency-Key header IF Q1 resolves to "supported" (currently assumed unsupported — primary retry-safety lives in §3.6.1 pre-flight check). Always required as a stable internal correlation id regardless of Q1 outcome.
   user_id                BIGINT NOT NULL,              -- tenant scope (constitution §6.10)
 
   -- target
@@ -421,9 +421,38 @@ A command in `ambiguous_pending_review`:
 
 Every step in the path is replay-safe:
 - DB insert is idempotent via the `(user_id, command_type, sf_job_id, intent_hash, bucket)` constraint.
-- ZB API call carries `Idempotency-Key: <event_id>`. ZB MUST treat duplicate keys as no-op or 200 (we verify in §11).
+- ZB API call retry safety is provided by the **drainer pre-flight fingerprint check** (§3.6.1) — this is the **primary** mechanism. The `Idempotency-Key: <event_id>` header is sent on every request as defense-in-depth, but the design does NOT assume ZB honors it. See [zb-api-verification.md §1](./zb-api-verification.md) — Q1 is currently UNKNOWN and is assumed UNSUPPORTED until ZB confirms otherwise.
 - Inbound webhook is already deduped by `zenbooker_id`/`event_id` (existing behavior — constitution §4.4).
 - Correlation step is keyed on `intent_hash`, so a re-confirmed command is a no-op.
+
+### 3.6.1 Pre-flight fingerprint check — primary retry-safety mechanism
+
+Until Q1 resolves to "supported", the drainer's retry-safety primitive is a pre-flight GET against ZB before any retried POST/PATCH. This is **mandatory whenever `attempts >= 1`** (i.e., the row was previously claimed and is being processed again, either after a network failure or after a stale-lease sweep).
+
+Procedure (per send attempt on a row with `attempts >= 1`):
+
+1. Drainer issues `GET /v1/jobs/{zenbooker_id}` (or the corresponding customer GET) to ZB.
+2. Computes the canonical fingerprint over the field set defined for `source_revision` (§6.7).
+3. Compares the live fingerprint against TWO references:
+   - `source_revision` — the world state when the command was queued.
+   - `expected_post_revision` — the intended world state, computed by overlaying `payload_json` onto `source_revision`.
+4. Decision tree:
+   - **Live == `source_revision`:** the prior POST did not land (request never reached ZB, or was rejected before mutation). POST/PATCH proceeds normally with `Idempotency-Key: <event_id>` header attached.
+   - **Live == `expected_post_revision`:** the prior POST already succeeded; the response was lost on the wire. Transition `state='sent'`, set `sent_at=now()`, set `confirmation_deadline=now()+grace`, and do NOT re-POST. Correlation will close from the eventual echo.
+   - **Live matches neither:** the world has drifted (manager edit, simultaneous outbound command, partial application). Transition `state='conflict'` per §6.3 trigger #1.
+
+Cost:
+- One extra GET per retried attempt. Skipped entirely on the happy path (`attempts == 0`).
+- Worst case (5 attempts before DLQ): up to 5 extra GETs. At Phase B target volume (<100 commands/day/tenant) this is negligible.
+- Adds ~200ms latency on retried commands.
+
+Limitations:
+- Does NOT protect against a request ZB partially processed and later undid (e.g., a reschedule applied then internally rolled back). That requires the §2.4 reconcile loop.
+- Does NOT eliminate the value of sending the `Idempotency-Key` header — the header costs ~36 bytes per request and provides automatic upgrade if/when Q1 resolves to "supported." The header is sent unconditionally; the design simply does not rely on it.
+
+When Q1 resolves:
+- If **"supported"**: no functional change. Pre-flight stays (cheap, defense-in-depth). The §11 idempotency test gains a sub-case validating ZB-side dedup; otherwise nothing moves.
+- If **"not supported"**: no functional change either. The design already operates correctly. Only the §13 Q1 status and §18 PC1 status update from "Pending" to "Resolved (no)."
 
 ### 3.7 Command origin metadata
 
@@ -451,7 +480,7 @@ Exactly five command types are permitted in Phase 1. Adding a sixth requires an 
 |---|---|---|---|---|
 | `job.create` | SF creates a new booking that should also live in ZB | `POST /v1/jobs` | `customer_id`, `service_id`, `start_date`, `assigned_providers[]`, `price`, `notes?` | `job.created` webhook (or synchronous response if reliable) |
 | `job.reschedule` | SF user changes `scheduled_date` of an existing ZB-linked job | `PATCH /v1/jobs/:id` | `start_date` | `job.rescheduled` |
-| `job.assign_providers` | SF user changes the team assignment | `PATCH /v1/jobs/:id/providers` (or `PATCH /v1/jobs/:id`) | `assigned_providers[]` (zenbooker provider ids) | `job.service_providers.assigned` |
+| `job.assign_providers` | SF user changes the team assignment | `POST /v1/jobs/:id/assign` (confirmed via [discovery 2026-05-16](./zb-api-verification.md#L236)) | `{ "assign": [provider_ids], "unassign": [provider_ids], "notify": bool }` — **diff, not replacement** per §4.4 | `job.service_providers.assigned` — **EXACT** correlation (single event, no fan-out, ~2-3s latency — 2 data points) |
 | `job.cancel` | SF user cancels a ZB-linked job | `POST /v1/jobs/:id/cancel` | `cancellation_reason?` | `job.canceled` |
 | `customer.upsert` | Internal — only emitted by `job.create` when the linked customer has no `zenbooker_id` | `POST /v1/customers` | `name`, `phone`, `email?`, `address?` | Synchronous response; `customer.edited` may follow |
 
@@ -482,6 +511,36 @@ Every command MUST pass these checks before insert; failure → row inserted in 
 5. Provider mapping: every team member referenced MUST have `zenbooker_id`. Else: `skipped_precondition` with `unmapped_provider` + list of unmapped member ids.
 6. Settled-batch guard: target job MUST NOT have any `cleaner_ledger` row with `payout_batch_id IS NOT NULL`. Else: `skipped_precondition` with `settled_immutable`.
 7. Status pushability: for `job.cancel`/`job.reschedule`, current `jobs.status` MUST be in a pushable set (`scheduled`, `confirmed`, `pending`, `late`, `en-route`, `started` — NOT `completed`, `cancelled`).
+
+### 4.4 Diff semantics for list-shaped command bodies (invariant)
+
+**Invariant.** Commands that mutate list-shaped ZB resource fields MUST be modeled as **state-transition diffs** — `{add: [...], remove: [...], notify}` — NOT as **replacement arrays**.
+
+Today this invariant applies to exactly one Phase 1 command: `job.assign_providers`, whose `payload_json` carries `{assign, unassign, notify}` — the wire body ZB itself requires per [zb-api-verification.md §3.4](./zb-api-verification.md). Any future command that mutates a list-shaped ZB field MUST also use diff semantics.
+
+**Why diff, not replacement.** The replacement model would force every producer to read-then-compute-then-write the full array, opening a clobber window:
+
+- Operator X reads `[A, B]`, removes B, sends `[A]`.
+- Operator Y reads `[A, B]` concurrently, removes A, sends `[B]`.
+- Whoever lands second wins; the first's edit is lost.
+
+The §3.6.1 pre-flight check would `conflict` the second operator, but only after burning the round-trip — and the conflict would surface as "drift" rather than as the actual concurrent-edit it is. Worse, two legitimately disjoint edits (X removes B, Y removes C from `[A, B, C]`) would race even though they don't intersect.
+
+The diff model is intent-precise. Operator X says "remove B." Operator Y says "remove A." ZB applies both; the result is `[]` if both succeed, or `[C]`, etc. — composing correctly without coordination. Two operators each removing the same provider produce one effective removal (ZB handles the no-op tolerantly per the verification doc; either 200 or 422, never clobber).
+
+**Implications for SF outbound:**
+
+| Concern | How diff semantics resolve it |
+|---|---|
+| `payload_json` schema | `{ "assign": ["<provider_id>", ...], "unassign": ["<provider_id>", ...], "notify": bool }` for `job.assign_providers`. Same shape for future list-mutating commands. |
+| `intent_hash` (§3.2) | Computed over the **projected post-mutation state** (sorted `assigned_providers[]`), NOT over the diff itself. Two different diffs that converge to the same target hash to the same intent — making §3.5 EXACT correlation possible against the echo's resulting array. The producer computes post-state by applying the diff to the known pre-state at queue time. |
+| `source_revision` (§6.7) | Unchanged — computed over current sorted `assigned_providers[]`. Pre-flight (§3.6.1) compares live ZB state to `source_revision` before sending; if drift is detected (e.g., `unassign` targets a provider already removed by a manager edit), the command goes to `conflict`. |
+| Correlation (§3.5) | EXACT for `job.assign_providers` per discovery. The echo's `assigned_providers[]` (sorted) hashes against the queued `intent_hash`. |
+| Supersession (§6.8) within `field_group='assignment'` | Unchanged. Newer assign command supersedes older one in same field-group. Each command carries its own self-contained diff — no merging needed. |
+
+**Future scope.** If `customer.upsert` or any new command introduces a list-shaped field (e.g., `customer.addresses`, `customer.tags`), this invariant applies — model as `{add, remove, notify?}`, not as a flat replacement.
+
+**What does NOT change.** §1 ownership model (ZB remains canonical for `assigned_providers[]` during the hybrid period); §3.1 queue schema (`payload_json` is JSONB, the diff shape is enforced at the producer layer via a §11 contract test); §3.6.1 pre-flight check (still mandatory for retries — diff just makes the conflict signal cleaner).
 
 ---
 
@@ -599,7 +658,7 @@ A `pending` command that has been idle past a `stale_after` window (default 24h)
 | Command | Fields in fingerprint |
 |---|---|
 | `job.reschedule` | `start_date`, `status`, `canceled` |
-| `job.assign_providers` | `assigned_providers[]` (sorted), `status`, `canceled` |
+| `job.assign_providers` | `assigned_providers[]` (sorted, IDs only) of the **resulting** post-mutation state computed by applying the diff to the known pre-state; plus `status`, `canceled`. Wire payload is `{assign, unassign, notify}` per §4.4; the fingerprint is over the projected post-state so different diffs that converge to the same final state collapse to the same `intent_hash`. |
 | `job.cancel` | `status`, `canceled` |
 | `job.create` | n/a (no pre-existing resource) |
 | `customer.upsert` | n/a (or `phone+email` for upsert-by-key flow) |
@@ -786,9 +845,9 @@ This section is the contract: every numbered guarantee here maps to a §11 test.
 | # | Guarantee | Mechanism |
 |---|---|---|
 | I1 | Duplicate command insert is a no-op | Application-side dedup on `(user_id, command_type, sf_job_id, intent_hash, bucket)` → returns existing row; DB UNIQUE on `event_id` is the secondary safety. |
-| I2 | Duplicate POST to ZB after network timeout is no-op | `Idempotency-Key: <event_id>` header on every retry. ZB must treat duplicates as idempotent (see §12 open question). |
+| I2 | Duplicate POST to ZB after network timeout is no-op | **Primary:** drainer pre-flight fingerprint check (§3.6.1) — detects "prior POST already landed" via `live == expected_post_revision` and short-circuits to `sent` without re-POSTing. **Secondary (defense-in-depth):** `Idempotency-Key: <event_id>` header is sent on every request and is honored if/when Q1 resolves to "supported." The guarantee does NOT depend on the header. |
 | I3 | Duplicate webhook does not re-confirm | Inbound dedup on ZB `event_id` is unchanged (existing). Correlation step on already-`confirmed` command is no-op. |
-| I4 | Retry after timeout never produces double mutation in ZB | Same as I2. Plus, drainer's pre-flight fetch returns ZB's *post-mutation* fingerprint, which matches intent — drainer sees it and short-circuits to `sent`/`confirmed` rather than POSTing again. |
+| I4 | Retry after timeout never produces double mutation in ZB | Drainer pre-flight fetch (§3.6.1) returns ZB's *post-mutation* fingerprint which matches `expected_post_revision` — drainer short-circuits to `sent` rather than re-POSTing. Idempotency-Key header is sent as defense-in-depth; the guarantee does NOT depend on it. |
 | I5 | Network partition between POST and ack | Row stays `sending` with lease. Lease expires → returned to `pending` → next drainer claim. Pre-flight detects the mutation already landed (fingerprint matches intent) → marks `sent` without re-POSTing. |
 | I6 | Partial failure (POST sent, response lost) | Same as I5. |
 | I7 | Two replicas claim the same row | Impossible — `FOR UPDATE SKIP LOCKED` + per-row lease (`claimed_by`, `claimed_until`). |
@@ -912,7 +971,7 @@ Required suites. Each suite ships with the phase that introduces the surface.
 | `zb-outbound-queue.test.js` | A | RPC lock/claim/sweep correctness; lease expiry; tenant scoping (one tenant's queue cannot claim another's row). |
 | `zb-outbound-dedup.test.js` | A | Duplicate insert collapses; UNIQUE on `event_id` enforced; bucket logic. |
 | `zb-outbound-drainer-network.test.js` | B | Mocked ZB API; 200/4xx/5xx/timeout/connection-reset transitions; backoff schedule correctness. |
-| `zb-outbound-idempotency.test.js` | B | Same `event_id` POSTed twice (simulated network retry) — Idempotency-Key header present; mocked ZB returns same 200. |
+| `zb-outbound-idempotency.test.js` | B | Two required sub-tests: **(a) Pre-flight short-circuit (primary, §3.6.1):** mocked ZB returns `expected_post_revision` fingerprint on the retry GET; drainer marks `state='sent'` without re-POSTing. **(b) Header presence (forward compat):** every outbound request carries `Idempotency-Key: <event_id>` with a stable value across retries — header presence is verified even though ZB-side dedup is not assumed. A future "Q1 supported" answer enables a third sub-test asserting ZB returns the same response body on replay. |
 | `zb-outbound-correlation.test.js` | B | Webhook with matching `zenbooker_id+intent_hash` confirms a `sent` command; mismatched echo → `conflict`. |
 | `zb-outbound-replay.test.js` | B | Duplicate webhook does not re-confirm or flap state. |
 | `zb-outbound-conflict-race.test.js` | C | Pre-flight detects fingerprint drift; drainer transitions to `conflict` without POSTing. |
@@ -957,9 +1016,12 @@ These MUST be resolved before the corresponding phase ships.
 
 | # | Question | Blocks |
 |---|---|---|
-| Q1 | Does the Zenbooker public API honor an `Idempotency-Key` header (and on which endpoints)? If not, what's the documented retry-safety contract? | Phase B |
-| Q2 | What exact ZB webhook event types fire on each Phase-1 mutation? Specifically: does a PATCH job emit `job.service_order.edited` *and* `job.rescheduled`, or only one? Correlation expects a specific echo per command type (§3.5). | Phase B |
-| Q3 | Are there ZB endpoints for `PATCH /v1/jobs/:id/providers` and `POST /v1/jobs/:id/cancel` specifically, or does everything go through a generic `PATCH /v1/jobs/:id`? | Phase B/C |
+| Q1 | Does the Zenbooker public API honor an `Idempotency-Key` header (and on which endpoints)? **Assumed UNSUPPORTED.** Five discovery requests carried distinct Idempotency-Keys on `POST /v1/jobs/{id}/assign`; ZB did NOT echo any key back and did not surface idempotency-related response headers. This is negative empirical evidence (not a true replay test) — design remains intact via §3.6.1 pre-flight. A "supported" reply is a free defense-in-depth upgrade; "not supported" matches the operating assumption. | Phase B (informational only — no longer a hard stop) |
+| Q2-A | For each Phase 1 mutation, do multiple webhook events fire or just one? **Partially resolved.** For `job.assign_providers`: confirmed SINGLE event (`job.service_providers.assigned`), zero fan-out to `job.service_order.edited`, 2/2 mutations during discovery. For `job.reschedule`, `job.cancel`, `job.create`, `customer.upsert`: STILL UNKNOWN — discovery did not exercise these endpoints. | Phase B for the other four command types |
+| Q2-B | Does ZB include a stable per-event identifier (separate from resource id) in webhook deliveries? **Still UNKNOWN.** The SF inbound handler destructures `{event, data, account_id}` from the body and logs only `data`'s keys; the top-level body may carry an `event_id` / `delivery_id` that SF currently ignores. Resolution requires either a one-line handler instrumentation change OR a ZB support reply. | Phase B for all command types |
+| Q3 | Endpoint for changing `assigned_providers[]` on an existing job? **RESOLVED 2026-05-16.** `POST /v1/jobs/{id}/assign` with body `{assign, unassign, notify}` — see [zb-api-verification.md §3.4](./zb-api-verification.md#L236) for full discovery transcript. | (resolved) |
+| (Q2 was split into Q2-A and Q2-B above — see those rows for current status.) |  |
+| (Q3 above — RESOLVED 2026-05-16.) |  |
 | Q4 | What is ZB's stated per-tenant API rate limit? | Phase C |
 | Q5 | Does ZB return a synchronous job/customer object body on create, and is the returned id stable (or are there later edits that replace it)? Determines whether `job.create` correlation needs a webhook at all, or can confirm synchronously. | Phase B |
 | Q6 | What is the policy when a job exists in ZB but its `assigned_providers[]` references a provider that ZB has soft-deleted? Does our command get a 422 or a 200 with silent drop? | Phase C |
@@ -1032,6 +1094,10 @@ This section is the contract for what production must expose. Without these metr
 | `zb_outbound_dlq_size_gauge` | Gauge | `{user_id}` | Periodic scan |
 | `zb_outbound_ambiguous_pending_gauge` | Gauge | `{user_id}` | Periodic scan |
 | `zb_outbound_global_freeze_active` | Gauge | (no labels) | Per drainer tick — see §17 |
+| `zb_outbound_response_api_version` | Counter | `{command_type, api_version}` | Per response: `x-zenbooker-api-version` header. Currently `1`. Increment per send to detect silent ZB API version drift; alert if a non-baseline value appears. |
+| `zb_outbound_webhook_events_per_mutation` | Histogram | `{command_type}` | Distinct webhook event types fired in a tight post-send window (default 60s) for a successful mutation. Baseline expectation per [zb-api-verification.md](./zb-api-verification.md): `job.assign_providers` → 1; others → unknown (sampling will establish baseline as those command types ship). |
+| `zb_outbound_webhook_fan_out_observed` | Counter | `{command_type, primary_event, secondary_event}` | Increments when a mutation produces >1 distinct webhook event types. For `job.assign_providers` this counter is expected to stay at zero per discovery; non-zero is an alertable signal that the verified ZB contract has changed. |
+| `zb_outbound_webhook_arrival_latency_seconds` | Histogram | `{command_type, echo_event_type}` | Time from ZB API ack (`sent_at`) to inbound webhook arrival timestamp at SF. Distinct from `zb_outbound_confirmation_latency_seconds` (which measures end-to-end queue → confirmed). Discovery observed ~2-3s for `job.assign_providers` (n=2). |
 
 ### 16.2 Histograms
 
@@ -1082,6 +1148,9 @@ This section is the contract for what production must expose. Without these metr
 | Confirmation latency P95 | P95 > 15m for any `command_type` | warning | Inspect ZB webhook delivery health; correlate with ZB-side incidents. |
 | Confirm-timeout auto-resolve rate | < 80% over 7-day window | warning | Investigate why reconcile is not converging; likely a webhook subscription drift. |
 | Supersession-chain depth | > 5 supersessions for same job in <60s | warning | Probable UI bug or runaway automation; check `origin` distribution. |
+| ZB webhook fan-out observed for `job.assign_providers` | `zb_outbound_webhook_fan_out_observed{command_type="job.assign_providers"}` > 0 | warning | Discovery established single-event echo as the contract. Non-zero indicates ZB has changed behavior (or our 2-sample evidence missed a fan-out case). Re-validate Q2-A. |
+| ZB API version drift | `zb_outbound_response_api_version{api_version != "1"}` > 0 | informational | ZB has updated its API. Verify webhook payload compatibility before continuing. |
+| Webhook arrival latency P95 > 60s for `job.assign_providers` | over 24h window | warning | Discovery observed 2-3s P50; sustained higher latency means ZB webhook delivery is degraded — `confirmation_deadline` may need to be widened or freeze considered. |
 | **Reconcile-origin commands count** | **> 0 at any time** | **critical** | **§2.5 invariant violated — page on-call immediately.** |
 | Confirmation never observed | `sent_at < now() - 24h` AND `state IN ('sent','confirm_timeout')` | warning | Investigate ZB webhook delivery to SF. |
 | ZB outbound frozen for > 4h (§17) | freeze active duration | informational | Page operator only if unplanned; expected during maintenance. |
@@ -1165,8 +1234,11 @@ Phase 1 is global-only. A future Phase D extension MAY introduce per-tenant free
 
 | # | Precondition | Status | Owner | Type | Notes |
 |---|---|---|---|---|---|
-| PC1 | Open question **Q1** resolved (does ZB honor `Idempotency-Key`?) | Pending | Backend lead | **Hard stop** | Determines whether retry idempotency relies on the header (preferred) or only on the drainer's pre-flight fingerprint check (fallback). If fallback, §3.6, §6.8.4, §8.I2, and §8.I4 must be amended. |
-| PC2 | Open question **Q2** resolved (deterministic vs generic ZB webhook event types per Phase-1 mutation) | Pending | Backend lead | **Hard stop** | Determines whether §3.5's `exact` correlation is reachable for each command type, or whether `probable` is the realistic ceiling. If the latter, the §3.5.3 ambiguity-review UI is on the critical path of Phase B, not Phase D. |
+| PC1 | Open question **Q1** resolved (does ZB honor `Idempotency-Key`?) | Pending — **assumed UNSUPPORTED** (2026-05-15; reinforced 2026-05-16 by negative empirical evidence) | Backend lead | **Soft stop** | Design assumes UNSUPPORTED per [zb-api-verification.md §1](./zb-api-verification.md). Retry-safety lives in §3.6.1. Discovery sent 5 requests with distinct Idempotency-Keys to `POST /v1/jobs/{id}/assign`; ZB echoed none of them. Still informational — "supported" would be a free upgrade. |
+| PC2a (Q2-A — assign) | Webhook fan-out for `job.assign_providers`: single event vs multiple? | **RESOLVED 2026-05-16** — single event (`job.service_providers.assigned`), no fan-out, 2/2 mutations verified | Discovery | — | EXACT correlation confidence established. See [zb-api-verification.md §3.4](./zb-api-verification.md#L236). |
+| PC2a (Q2-A — other command types) | Webhook fan-out for `job.reschedule`, `job.cancel`, `job.create`, `customer.upsert`: single or multiple? | Pending | Backend lead → ZB support | **Hard stop** for the affected command types | Resolution determines whether §3.5's EXACT correlation is reachable per command type, or whether `probable`-confidence path is the realistic ceiling. Discovery cannot easily test these without expanding scope. |
+| PC2b (Q2-B) | Does ZB carry a stable per-event identifier in webhook deliveries? | Pending — STILL UNKNOWN | Backend lead | **Hard stop** | SF inbound handler currently dedups on resource id (`data.id`), which collides on back-to-back mutations of the same job. A separate event-level id (e.g., `body.event_id` or `X-Webhook-Delivery-Id` header) would resolve dedup safely. Resolution paths: (a) one-line SF handler instrumentation to log full body keys, OR (b) ZB support reply. |
+| PC2c (Q3 — assign endpoint) | Endpoint for mutating `assigned_providers[]`? | **RESOLVED 2026-05-16** — `POST /v1/jobs/{id}/assign` with diff body `{assign, unassign, notify}` | Discovery | — | Phase A schema for `job.assign_providers` unblocked. See [zb-api-verification.md §3.4](./zb-api-verification.md#L236) and [zb-outbound-command-confirmation.md §4.4](#44-diff-semantics-for-list-shaped-command-bodies-invariant). |
 | PC3 | Global outbound freeze switch (§17) designed: env var + `platform_settings` row + status endpoint + audit shape | **Done** (this doc) | — | — | §17. |
 | PC4 | Supersession semantics (§6.8) finalized: states, transitions, audit, replay behavior | **Done** (this doc) | — | — | §6.8. Implementation MUST mirror exactly. |
 | PC5 | Ambiguity correlation rules (§3.5.1–§3.5.3) finalized | **Done** (this doc) | — | — | Includes confidence levels and fallback algorithm. |
@@ -1195,3 +1267,5 @@ Implementation approval proceeds via the constitution §12 amendment process onc
 |---|---|---|
 | 2026-05-14 | 0.1 (proposal) | Initial draft for review. |
 | 2026-05-14 | 0.2 (proposal) | Refinement amendments before implementation approval. Added: §2.5 reconcile-convergence-only invariant; §3.5.1–§3.5.3 correlation confidence levels, fallback algorithm, ambiguous-review behavior; §3.7 command origin metadata (`user` / `automation` / `api` / `reconcile` / `migration`); §6.8 supersession rules (supersedable states, audit, replay, reconcile interactions); §6.9 field-group incompatibility matrix and precedence order; §6.10 upstream terminal-state invalidation (distinct from `conflict`); §16 observability + alert thresholds + soak gates; §17 global outbound freeze switch (distinct from kill switch); §18 implementation preconditions. New states in §2.2: `cancelled_superseded`, `invalidated_by_upstream_terminal_state`, `ambiguous_pending_review`. New schema columns in §3.1: `field_group`, `superseded_by_command_id`, `supersedes_command_id`, `invalidation_reason`, `correlation_confidence`, `origin`. New index `idx_zb_outbound_field_group_open`. |
+| 2026-05-15 | 0.3 (proposal) | Q1 (Idempotency-Key) reset to **assumed UNSUPPORTED** pending ZB support reply. §3.6 replay-safety bullets rewritten to make the drainer pre-flight fingerprint check the **primary** retry-safety mechanism, with Idempotency-Key downgraded to defense-in-depth (sent unconditionally, never relied upon). Added §3.6.1 specifying the pre-flight procedure, decision tree, cost, and limitations. §8.I2 + §8.I4 rewritten to match. §11 `zb-outbound-idempotency.test.js` split into two required sub-tests (pre-flight short-circuit + header-presence forward-compat). §13 Q1 and §18 PC1 downgraded from hard stop to soft stop; design is now intact regardless of which way Q1 resolves. Cross-links added to new companion docs [zb-api-verification.md](./zb-api-verification.md), [zb-support-questions.md](./zb-support-questions.md), and [zb-provider-assignment-discovery.md](./zb-provider-assignment-discovery.md). |
+| 2026-05-16 | 0.4 (proposal) | **Discovery integration.** `job.assign_providers` endpoint resolved to `POST /v1/jobs/{id}/assign` with diff body `{assign, unassign, notify}`. **New §4.4 invariant**: list-shaped mutations MUST be modeled as state-transition diffs, not replacement arrays — rationale + implications for `intent_hash`/`source_revision`/correlation/supersession. §4.1 command row + §6.7 fingerprint row updated to reflect diff semantics. §13 Q rows: Q2 split into Q2-A (partially resolved for assign, still blocked for other command types) and Q2-B (still blocked — event-level id unknown); Q3 marked RESOLVED with endpoint reference; Q1 annotated with negative empirical evidence from discovery (5 distinct Idempotency-Keys sent, none echoed). §16 new metrics: `zb_outbound_response_api_version`, `zb_outbound_webhook_events_per_mutation`, `zb_outbound_webhook_fan_out_observed`, `zb_outbound_webhook_arrival_latency_seconds`; new alerts: assign fan-out, API version drift, arrival-latency P95. §18 PC2 split into PC2a (Q2-A; resolved-for-assign + still-blocked-for-others), PC2b (Q2-B), PC2c (Q3 — RESOLVED). |
