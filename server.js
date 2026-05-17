@@ -48,6 +48,7 @@ const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
+const pastCleaningsMap = require('./lib/public-past-cleanings-map');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
 const { runStartupConfigAudit } = require('./lib/config-audit');
@@ -738,6 +739,19 @@ const teamMemberLoginLimiter = rateLimit({
 const publicStripeConfigLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited' },
+});
+
+// Public marketing widget limiter (issue #3 — Past Cleanings Map).
+// Endpoint is unauthenticated and embedded in third-party iframes, so
+// per-IP rate limit is the only defense against scraping/abuse.
+// 60/min/IP comfortably covers a single visitor reloading the embedding
+// page; well above legitimate iframe-refresh patterns.
+const publicWidgetLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'rate_limited' },
@@ -32198,6 +32212,144 @@ app.get('/api/public/stripe-config/:invoiceId', publicStripeConfigLimiter, async
     console.error('[stripe-config] Failed to load config:', error?.message || error);
     res.status(500).json({ error: 'Failed to get Stripe configuration' });
   }
+});
+
+// Public Past Cleanings Map Widget (issue #3).
+//
+// GET /api/public/widgets/past-cleanings-map/:tenantPublicId
+//
+// Returns sanitized completed-job pins suitable for an embeddable
+// marketing map. tenantPublicId resolves to a user via business_slug.
+// Privacy + tenancy guarantees are enforced in lib/public-past-cleanings-map.js;
+// this handler is responsible only for tenant lookup, the SELECT (filtered
+// to completed jobs for that tenant), and feature-flag gating.
+app.get('/api/public/widgets/past-cleanings-map/:tenantPublicId', publicWidgetLimiter, async (req, res) => {
+  const { tenantPublicId } = req.params;
+  try {
+    if (!isEnabled(FLAGS.PUBLIC_CLEANINGS_MAP_WIDGET_ENABLED)) {
+      return res.json(pastCleaningsMap.disabledResponse(tenantPublicId));
+    }
+    if (!tenantPublicId || typeof tenantPublicId !== 'string') {
+      return res.status(400).json({ error: 'tenantPublicId required' });
+    }
+
+    const slug = tenantPublicId.toLowerCase();
+    const { data: tenant, error: tenantErr } = await supabase
+      .from('users')
+      .select('id')
+      .eq('business_slug', slug)
+      .maybeSingle();
+    if (tenantErr || !tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const opts = pastCleaningsMap.parseOptions({
+      range: req.query.range,
+      maxPins: req.query.maxPins,
+    });
+
+    let query = supabase
+      .from('jobs')
+      .select('id, status, scheduled_date, service_name, service_address_city, service_address_zip, service_address_lat, service_address_lng')
+      .eq('user_id', tenant.id)
+      .eq('status', 'completed')
+      .not('service_address_lat', 'is', null)
+      .not('service_address_lng', 'is', null)
+      .order('scheduled_date', { ascending: false })
+      // Pull a bounded multiple so date-range filter has headroom but
+      // we never scan unbounded rows. parseOptions clamps maxPins to
+      // HARD_MAX_PINS (1000), so the SELECT is capped at 4000.
+      .limit(opts.maxPins * 4);
+
+    if (opts.rangeDays != null) {
+      const cutoff = new Date(Date.now() - opts.rangeDays * 24 * 60 * 60 * 1000).toISOString();
+      query = query.gte('scheduled_date', cutoff);
+    }
+
+    const { data: jobs, error: jobsErr } = await query;
+    if (jobsErr) {
+      console.error('[past-cleanings-map] jobs query failed:', jobsErr?.message || jobsErr);
+      return res.status(500).json({ error: 'Failed to load widget data' });
+    }
+
+    const body = pastCleaningsMap.buildResponse({
+      jobs: jobs || [],
+      options: { range: req.query.range, maxPins: req.query.maxPins },
+      tenantPublicId: slug,
+    });
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.json(body);
+  } catch (err) {
+    console.error('[past-cleanings-map] unexpected error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to load widget data' });
+  }
+});
+
+// Embeddable iframe page for the Past Cleanings Map widget.
+// Renders a minimal HTML page that fetches the public JSON endpoint
+// and plots pins via Leaflet (CDN). The HTML is intentionally inline
+// and dependency-free on the server side — embedders just point
+// <iframe src="…/widgets/past-cleanings-map/:tenantPublicId"></iframe>
+// and the page handles the rest.
+app.get('/widgets/past-cleanings-map/:tenantPublicId', publicWidgetLimiter, (req, res) => {
+  const tenantPublicId = String(req.params.tenantPublicId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  const range = String(req.query.range || '').replace(/[^a-zA-Z0-9]/g, '');
+  const maxPins = String(req.query.maxPins || '').replace(/[^0-9]/g, '');
+  const qs = [];
+  if (range) qs.push(`range=${encodeURIComponent(range)}`);
+  if (maxPins) qs.push(`maxPins=${encodeURIComponent(maxPins)}`);
+  const apiPath = `/api/public/widgets/past-cleanings-map/${encodeURIComponent(tenantPublicId)}${qs.length ? `?${qs.join('&')}` : ''}`;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('X-Frame-Options', 'ALLOWALL');
+  res.set('Content-Security-Policy', "frame-ancestors *");
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Past Cleanings</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+  html,body,#map{height:100%;margin:0;padding:0;font-family:system-ui,sans-serif}
+  .sf-empty{display:flex;align-items:center;justify-content:center;height:100%;color:#666;font-size:14px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+(function(){
+  var apiPath = ${JSON.stringify(apiPath)};
+  fetch(apiPath, { credentials: 'omit' }).then(function(r){ return r.json(); }).then(function(data){
+    var pins = (data && data.pins) || [];
+    if (!data || !data.enabled || pins.length === 0) {
+      document.getElementById('map').outerHTML = '<div class="sf-empty">No cleanings to display yet.</div>';
+      return;
+    }
+    var map = L.map('map');
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    var group = L.featureGroup();
+    pins.forEach(function(p){
+      var m = L.circleMarker([p.lat, p.lng], { radius: 6, color: '#2e7d32', fillColor: '#66bb6a', fillOpacity: 0.85, weight: 1 });
+      var lines = [];
+      if (p.serviceType) lines.push(String(p.serviceType));
+      if (p.city) lines.push(String(p.city));
+      if (p.completedMonth) lines.push('Completed ' + String(p.completedMonth));
+      if (lines.length) m.bindPopup(lines.join('<br>'));
+      group.addLayer(m);
+    });
+    group.addTo(map);
+    map.fitBounds(group.getBounds().pad(0.2));
+  }).catch(function(){
+    document.getElementById('map').outerHTML = '<div class="sf-empty">Map temporarily unavailable.</div>';
+  });
+})();
+</script>
+</body>
+</html>`);
 });
 
 // Helper endpoint to fix Stripe key mismatches
