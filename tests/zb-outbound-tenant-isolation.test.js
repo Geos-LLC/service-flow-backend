@@ -55,7 +55,9 @@ describe('tenant scope guards in operator router', () => {
 
 describe('schema-level isolation', () => {
   test('zb_outbound_commands.user_id is NOT NULL', () => {
-    expect(MIG_044).toMatch(/user_id\s+UUID\s+NOT NULL/);
+    // BIGINT matches SF schema (users.id / team_members.user_id are INTEGER;
+    // BIGINT is a forward-compatible superset).
+    expect(MIG_044).toMatch(/user_id\s+BIGINT\s+NOT NULL/);
   });
 
   test('team_member_provider_mappings has unique (user_id, zenbooker_provider_id)', () => {
@@ -80,6 +82,6 @@ describe('claim RPC does NOT cross tenants implicitly', () => {
     // The RPC returns user_id so the application layer can route per
     // tenant. Tenant isolation is enforced by the application (drainer
     // calls supabase-side API keys per row.user_id).
-    expect(MIG_044).toMatch(/RETURNS TABLE[\s\S]*user_id\s+UUID/);
+    expect(MIG_044).toMatch(/RETURNS TABLE[\s\S]*user_id\s+BIGINT/);
   });
 });
