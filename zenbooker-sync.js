@@ -17,6 +17,7 @@ const {
   safeDeleteCompletionDerivedLedger,
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
+const { observe: zbBodyObserve } = require('./lib/zb-body-observe')
 const { logDelivery } = require('./lib/delivery-log')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
@@ -2261,6 +2262,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       if (!event || !data) {
         return res.status(400).json({ error: 'Missing event or data' })
       }
+
+      // Q2-B instrumentation — top-level body KEY observation only.
+      // Sample up to 50 deliveries OR 24h, whichever first. NEVER throws.
+      // Auto-disable is intrinsic to the helper (see lib/zb-body-observe.js).
+      // Activation: INSERT into platform_settings key='zb_body_observe'.
+      const _bodyObs = await zbBodyObserve(supabase, req.body, { eventType: event, logger })
 
       logger.log(`[Zenbooker] Webhook received: ${event} | data keys: ${Object.keys(data || {}).join(',')} | data.id: ${data?.id || 'MISSING'} | data.job_id: ${data?.job_id || 'none'}`)
 

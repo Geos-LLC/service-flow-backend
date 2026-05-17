@@ -351,7 +351,7 @@ describe('P1.6 — surfaces wired in this round', () => {
     expect(ZB_SYNC).toMatch(/require\(['"]\.\/lib\/delivery-log['"]\)/);
     const whIdx = ZB_SYNC.indexOf("router.post('/webhook'");
     expect(whIdx).toBeGreaterThan(0);
-    const block = ZB_SYNC.slice(whIdx, whIdx + 6000);
+    const block = ZB_SYNC.slice(whIdx, whIdx + 7000);
     // Auth-rejected path logs
     expect(block).toMatch(/zb_inbound\.auth_rejected/);
     // Per-user processing logs

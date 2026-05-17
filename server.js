@@ -44,6 +44,7 @@ const {
   maybeEmitInsertEvent,
 } = require('./services/job-status-service');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
+const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
@@ -1071,6 +1072,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
@@ -31219,6 +31221,149 @@ app.post('/api/jobs/:jobId/notes/attachments', authenticateToken, attachmentUplo
   }
 });
 
+// ──────────────────────────────────────────────────────────────
+// Customer Files — per-customer photo/document library backing the
+// Files tab on /customer/:id. Storage lives in the `job-attachments`
+// bucket; this table is the metadata index. Files can optionally be
+// linked to a specific job via `job_id`.
+// ──────────────────────────────────────────────────────────────
+
+// List files for a customer
+app.get('/api/customers/:customerId/files', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const customerId = parseInt(req.params.customerId, 10);
+    if (!Number.isFinite(customerId)) {
+      return res.status(400).json({ error: 'Invalid customer id' });
+    }
+
+    // Verify the customer belongs to this user
+    const { data: customer, error: custErr } = await supabase
+      .from('customers')
+      .select('id, user_id')
+      .eq('id', customerId)
+      .eq('user_id', userId)
+      .single();
+    if (custErr || !customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const { data: files, error } = await supabase
+      .from('customer_files')
+      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at')
+      .eq('customer_id', customerId)
+      .is('deleted_at', null)
+      .order('uploaded_at', { ascending: false })
+      .limit(500);
+
+    if (error) {
+      console.error('Error listing customer files:', error);
+      return res.status(500).json({ error: 'Failed to list files' });
+    }
+
+    res.json({ files: files || [] });
+  } catch (error) {
+    console.error('Error in GET /customers/:id/files:', error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// Upload one or more files for a customer
+app.post(
+  '/api/customers/:customerId/files',
+  authenticateToken,
+  attachmentUpload.array('files', 10),
+  async (req, res) => {
+    try {
+      const userId = req.user.userId;
+      const customerId = parseInt(req.params.customerId, 10);
+      if (!Number.isFinite(customerId)) {
+        return res.status(400).json({ error: 'Invalid customer id' });
+      }
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+
+      const { data: customer, error: custErr } = await supabase
+        .from('customers')
+        .select('id, user_id')
+        .eq('id', customerId)
+        .eq('user_id', userId)
+        .single();
+      if (custErr || !customer) {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+
+      const jobId = req.body?.jobId ? parseInt(req.body.jobId, 10) : null;
+      const bucket = BUCKETS.JOB_ATTACHMENTS || BUCKETS.SERVICE_IMAGES;
+      const uploaded = [];
+
+      for (const file of req.files) {
+        try {
+          const result = await uploadToStorage(file, bucket, `customer-${customerId}`);
+          const url = result.imageUrl || result.fileUrl || result.url;
+          const { data: row, error: insertErr } = await supabase
+            .from('customer_files')
+            .insert({
+              user_id: userId,
+              customer_id: customerId,
+              job_id: Number.isFinite(jobId) ? jobId : null,
+              filename: file.originalname,
+              file_url: url,
+              mime_type: file.mimetype,
+              size_bytes: file.size,
+              uploaded_by: userId,
+            })
+            .select()
+            .single();
+          if (insertErr) {
+            console.error('Error inserting customer_files row:', insertErr);
+            continue;
+          }
+          uploaded.push(row);
+        } catch (uploadErr) {
+          console.error('Error uploading customer file:', uploadErr);
+        }
+      }
+
+      res.json({ files: uploaded });
+    } catch (error) {
+      console.error('Error in POST /customers/:id/files:', error);
+      res.status(500).json({ error: 'Failed to upload files' });
+    }
+  }
+);
+
+// Soft-delete a customer file
+app.delete('/api/customers/:customerId/files/:fileId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const customerId = parseInt(req.params.customerId, 10);
+    const fileId = parseInt(req.params.fileId, 10);
+    if (!Number.isFinite(customerId) || !Number.isFinite(fileId)) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+
+    const { data, error } = await supabase
+      .from('customer_files')
+      .update({ deleted_at: new Date().toISOString() })
+      .eq('id', fileId)
+      .eq('customer_id', customerId)
+      .eq('user_id', userId)
+      .is('deleted_at', null)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting customer file:', error);
+    res.status(500).json({ error: 'Failed to delete file' });
+  }
+});
+
 // Remove profile picture endpoint
 app.delete('/api/user/profile-picture', authenticateToken, async (req, res) => {
   try {
@@ -37116,6 +37261,17 @@ app.listen(PORT, async () => {
     startLbOutboundDrainer({ supabase, logger });
   } catch (e) {
     logger.error(`[LB Outbound] Failed to start drainer: ${e.message}`);
+  }
+
+  // Start the ZB outbound drainer (Phase A scaffolding). No-ops at
+  // process start if ZB_OUTBOUND_ENABLED is not 'true'. When started,
+  // tick acquires advisory lock + runs stale-lease sweep, then
+  // short-circuits with `frozen` while ZB_OUTBOUND_GLOBAL_FREEZE is
+  // 'true' (design §17). No HTTP traffic to ZB possible from Phase A.
+  try {
+    startZbOutboundDrainer({ supabase, logger });
+  } catch (e) {
+    logger.error(`[ZB Outbound] Failed to start drainer: ${e.message}`);
   }
 });
 } // end if (require.main === module)
