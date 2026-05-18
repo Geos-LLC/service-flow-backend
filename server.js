@@ -19072,6 +19072,49 @@ app.get('/api/user/billing/payment-methods', authenticateToken, requireBillingOw
   }
 });
 
+// List billing invoices (subscription receipts for the tenant)
+app.get('/api/user/billing/invoices', authenticateToken, requireBillingOwner, async (req, res) => {
+  try {
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
+    const { data: billingData } = await supabase
+      .from('user_billing')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (!billingData?.[0]?.stripe_customer_id) {
+      return res.json({ invoices: [] });
+    }
+
+    const list = await stripe.invoices.list({
+      customer: billingData[0].stripe_customer_id,
+      limit: 24,
+    });
+
+    res.json({
+      invoices: list.data.map((inv) => ({
+        id:           inv.id,
+        number:       inv.number,
+        status:       inv.status,
+        amount_paid:  inv.amount_paid,
+        amount_due:   inv.amount_due,
+        currency:     inv.currency,
+        created:      inv.created,
+        period_start: inv.period_start,
+        period_end:   inv.period_end,
+        hosted_url:   inv.hosted_invoice_url,
+        pdf_url:      inv.invoice_pdf,
+        description:  inv.description || (inv.lines?.data?.[0]?.description ?? null),
+      })),
+    });
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
 // Cancel subscription
 app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
