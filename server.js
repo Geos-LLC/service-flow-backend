@@ -5345,6 +5345,32 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       bookingWarnings = validation.warnings || [];
     }
 
+    // Auto-territory resolution. Runs only when operator left the
+    // territory dropdown empty. Override-safe (explicit values pass
+    // through). On any inferred/ambiguous/no-match result a warning is
+    // pushed into bookingWarnings so the operator sees what was filled
+    // (or why it stayed empty). NEVER throws.
+    let resolvedTerritory = territory;
+    try {
+      const { resolveTerritory } = require('./lib/territory-resolver');
+      const tr = await resolveTerritory(supabase, {
+        user_id: userId,
+        customer_id: customerId,
+        service_address_city: serviceAddress && serviceAddress.city,
+        currentTerritory: territory,
+        logger,
+      });
+      if (tr.territory && (!territory || !String(territory).trim())) {
+        resolvedTerritory = tr.territory;
+      }
+      if (tr.warning) {
+        bookingWarnings.push(tr.warning);
+      }
+      logger.log(`[Territory resolver] sf_job_create user_id=${userId} customer_id=${customerId} confidence=${tr.confidence} source=${tr.source} territory=${tr.territory == null ? 'null' : tr.territory}`);
+    } catch (terrErr) {
+      logger.warn(`[Territory resolver] failed (non-blocking): ${terrErr && terrErr.message}`);
+    }
+
     // Process modifiers and intake questions to calculate final price and duration
     const finalPrice = parseFloat(price) || 0;
     let finalDuration = parseFloat(duration) || 0;
@@ -5605,7 +5631,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         total: finalTotal,
         total_amount: finalTotal,
         payment_method: paymentMethod,
-        territory: territory,
+        territory: resolvedTerritory,
         is_recurring: recurringJob,
         recurring_frequency: recurringFrequency || null, // Save null if empty, not empty string
         next_billing_date: (recurringJob && recurringFrequency) ? (() => {
