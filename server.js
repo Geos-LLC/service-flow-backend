@@ -19115,6 +19115,66 @@ app.get('/api/user/billing/invoices', authenticateToken, requireBillingOwner, as
   }
 });
 
+// Usage this period — aggregated tallies for the Billing page's
+// "Usage this period" card. Returns counts that are cheap to compute;
+// metrics we don't track yet (like API calls) are returned as null so
+// the frontend can fall back to "Unlimited" / "—".
+app.get('/api/user/billing/usage', authenticateToken, requireBillingOwner, async (req, res) => {
+  try {
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
+    // Current calendar month window (UTC). Matches the "May 1 – 31" copy.
+    const now = new Date();
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const end   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString();
+
+    const [teamRes, jobsRes, filesRes] = await Promise.allSettled([
+      // Active team members for this owner
+      supabase
+        .from('team_members')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .eq('is_active', true),
+      // Jobs scheduled this month
+      supabase
+        .from('jobs')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .gte('scheduled_date', start)
+        .lt('scheduled_date', end),
+      // Customer files — sum size_bytes
+      supabase
+        .from('customer_files')
+        .select('size_bytes')
+        .eq('user_id', userId)
+        .is('deleted_at', null),
+    ]);
+
+    const teamCount = teamRes.status === 'fulfilled' ? (teamRes.value?.count ?? 0) : 0;
+    const jobCount  = jobsRes.status === 'fulfilled' ? (jobsRes.value?.count ?? 0) : 0;
+    const storageBytes =
+      filesRes.status === 'fulfilled' && Array.isArray(filesRes.value?.data)
+        ? filesRes.value.data.reduce((s, r) => s + (Number(r.size_bytes) || 0), 0)
+        : 0;
+
+    // SMS / API call counts aren't tracked per-user yet — surface null
+    // so the UI renders "Unlimited" / "—" rather than misleading zeros.
+    res.json({
+      periodStart: start,
+      periodEnd:   end,
+      activeTeams: teamCount,
+      jobsThisMonth: jobCount,
+      smsSent: null,
+      storageBytes,
+      apiCalls: null,
+    });
+  } catch (error) {
+    console.error('Get usage error:', error);
+    res.status(500).json({ error: 'Failed to fetch usage' });
+  }
+});
+
 // Cancel subscription
 app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
