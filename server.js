@@ -34181,7 +34181,16 @@ app.get('/api/user/business-details', authenticateToken, async (req, res) => {
         first_name,
         last_name,
         business_slug,
-        time_format
+        time_format,
+        tagline,
+        industry,
+        business_type,
+        website,
+        support_email,
+        location,
+        timezone,
+        currency,
+        logo_url
       `)
       .eq('id', userId)
       .limit(1);
@@ -34192,15 +34201,25 @@ app.get('/api/user/business-details', authenticateToken, async (req, res) => {
     }
 
     if (userData && userData.length > 0) {
+      const u = userData[0];
       res.json({
-        businessName: userData[0].business_name || '',
-        businessEmail: userData[0].business_email || '',
-        phone: userData[0].phone || '',
-        email: userData[0].email || '',
-        firstName: userData[0].first_name || '',
-        lastName: userData[0].last_name || '',
-        businessSlug: userData[0].business_slug || '',
-        timeFormat: userData[0].time_format || '12h'
+        businessName: u.business_name || '',
+        businessEmail: u.business_email || '',
+        phone: u.phone || '',
+        email: u.email || '',
+        firstName: u.first_name || '',
+        lastName: u.last_name || '',
+        businessSlug: u.business_slug || '',
+        timeFormat: u.time_format || '12h',
+        tagline: u.tagline || '',
+        industry: u.industry || '',
+        businessType: u.business_type || '',
+        website: u.website || '',
+        supportEmail: u.support_email || '',
+        location: u.location || '',
+        timezone: u.timezone || '',
+        currency: u.currency || '',
+        logoUrl: u.logo_url || ''
       });
     } else {
       res.status(404).json({ error: 'User not found' });
@@ -34217,20 +34236,36 @@ app.put('/api/user/business-details', authenticateToken, async (req, res) => {
     // present and different (handled by resolveAuthenticatedUserId).
     const userId = resolveAuthenticatedUserId(req, res);
     if (userId === null) return;
-    const { businessName, businessEmail, phone, email, firstName, lastName, timeFormat } = req.body;
+    const {
+      businessName, businessEmail, phone, email, firstName, lastName, timeFormat,
+      tagline, industry, businessType, website, supportEmail,
+      location, timezone, currency, logoUrl,
+    } = req.body;
 
     const normalizedTimeFormat = timeFormat === '24h' ? '24h' : (timeFormat === '12h' ? '12h' : null);
 
-    const updateData = {
-      business_name: businessName,
-      business_email: businessEmail,
-      phone,
-      email,
-      first_name: firstName,
-      last_name: lastName,
-      updated_at: new Date().toISOString(),
-      ...(normalizedTimeFormat ? { time_format: normalizedTimeFormat } : {})
+    // Only include fields that were actually sent in the body — `undefined`
+    // would otherwise wipe existing values for tenants on stale builds.
+    const updateData = { updated_at: new Date().toISOString() };
+    const setIfPresent = (key, value) => {
+      if (value !== undefined) updateData[key] = value;
     };
+    setIfPresent('business_name', businessName);
+    setIfPresent('business_email', businessEmail);
+    setIfPresent('phone', phone);
+    setIfPresent('email', email);
+    setIfPresent('first_name', firstName);
+    setIfPresent('last_name', lastName);
+    setIfPresent('tagline', tagline);
+    setIfPresent('industry', industry);
+    setIfPresent('business_type', businessType);
+    setIfPresent('website', website);
+    setIfPresent('support_email', supportEmail);
+    setIfPresent('location', location);
+    setIfPresent('timezone', timezone);
+    setIfPresent('currency', currency);
+    setIfPresent('logo_url', logoUrl);
+    if (normalizedTimeFormat) updateData.time_format = normalizedTimeFormat;
 
     const { error: updateError } = await supabase
       .from('users')
@@ -34245,12 +34280,9 @@ app.put('/api/user/business-details', authenticateToken, async (req, res) => {
     res.json({
       message: 'Business details updated successfully',
       businessDetails: {
-        businessName,
-        businessEmail,
-        phone,
-        email,
-        firstName,
-        lastName,
+        businessName, businessEmail, phone, email, firstName, lastName,
+        tagline, industry, businessType, website, supportEmail,
+        location, timezone, currency, logoUrl,
         ...(normalizedTimeFormat ? { timeFormat: normalizedTimeFormat } : {})
       }
     });
