@@ -5677,13 +5677,16 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // Phase B: ZB outbound producer hook for job.create. Gated by
       // ZB_OUTBOUND_ENABLED + per-tenant opt-in in platform_settings.
       // NEVER throws — failure to enqueue MUST NOT break job creation.
+      // Pass the server's structured logger so producer + emitQueued
+      // metric lines reach Loki (Day-1 P8 fix — bare console.log from
+      // fire-and-forget promise was getting lost).
       try {
         const { maybeEmitJobCreateCommand } = require('./lib/zb-outbound-producer');
         maybeEmitJobCreateCommand(supabase, result, {
           type: 'account_owner',
           id: userId,
           display_name: null,
-        }).catch((e) => console.warn('[ZB Outbound producer] hook failed:', e?.message));
+        }, { logger }).catch((e) => console.warn('[ZB Outbound producer] hook failed:', e?.message));
       } catch (zbErr) {
         console.warn('[ZB Outbound producer] require failed:', zbErr?.message);
       }
