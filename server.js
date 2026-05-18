@@ -19282,6 +19282,21 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch payment settings' });
     }
     
+    const DEFAULT_ACCEPTED = {
+      card:             true,
+      ach:              true,
+      apple_google_pay: true,
+      afterpay:         false,
+      cash:             true,
+    };
+    const DEFAULT_AUTOMATION = {
+      autoChargeOnCompletion:  true,
+      saveCardsForRecurring:   true,
+      retryFailedPayments:     true,
+      allowTipping:            false,
+      emailReceiptAutomatically: true,
+    };
+
     if (!settings || settings.length === 0) {
       // Return default settings
       return res.json({
@@ -19296,7 +19311,12 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
         paymentProcessor: null,
         paymentProcessorConnected: false,
         tipCalculationMode: 'automatic',
-        paymentTypeFees: {}
+        paymentTypeFees: {},
+        acceptedMethods: DEFAULT_ACCEPTED,
+        payoutFrequency: 'daily_t2',
+        minimumPayout: 100,
+        statementDescriptor: '',
+        automation: DEFAULT_AUTOMATION,
       });
     }
 
@@ -19313,7 +19333,12 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
       paymentProcessor: setting.payment_processor,
       paymentProcessorConnected: setting.payment_processor_connected === true,
       tipCalculationMode: setting.tip_calculation_mode || 'automatic',
-      paymentTypeFees: setting.payment_type_fees || {}
+      paymentTypeFees: setting.payment_type_fees || {},
+      acceptedMethods: { ...DEFAULT_ACCEPTED, ...(setting.accepted_methods || {}) },
+      payoutFrequency: setting.payout_frequency || 'daily_t2',
+      minimumPayout: setting.minimum_payout != null ? Number(setting.minimum_payout) : 100,
+      statementDescriptor: setting.statement_descriptor || '',
+      automation: { ...DEFAULT_AUTOMATION, ...(setting.automation || {}) },
     });
   } catch (error) {
     console.error('Get payment settings error:', error);
@@ -19336,7 +19361,12 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       paymentProcessor,
       paymentProcessorConnected,
       tipCalculationMode,
-      paymentTypeFees
+      paymentTypeFees,
+      acceptedMethods,
+      payoutFrequency,
+      minimumPayout,
+      statementDescriptor,
+      automation,
     } = req.body;
 
     // Check if settings exist
@@ -19351,24 +19381,32 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to check existing settings' });
     }
 
+    // Only include keys that were actually sent so partial updates
+    // don't wipe untouched fields.
+    const payload = { tip_calculation_mode: tipCalculationMode || 'automatic' };
+    const setIfPresent = (k, v) => { if (v !== undefined) payload[k] = v; };
+    setIfPresent('online_booking_tips',       onlineBookingTips);
+    setIfPresent('invoice_payment_tips',      invoicePaymentTips);
+    setIfPresent('show_service_prices',       showServicePrices);
+    setIfPresent('show_service_descriptions', showServiceDescriptions);
+    setIfPresent('payment_due_days',          paymentDueDays);
+    setIfPresent('payment_due_unit',          paymentDueUnit);
+    setIfPresent('default_memo',              defaultMemo);
+    setIfPresent('invoice_footer',            invoiceFooter);
+    setIfPresent('payment_processor',         paymentProcessor);
+    setIfPresent('payment_processor_connected', paymentProcessorConnected);
+    setIfPresent('payment_type_fees',         paymentTypeFees);
+    setIfPresent('accepted_methods',          acceptedMethods);
+    setIfPresent('payout_frequency',          payoutFrequency);
+    setIfPresent('minimum_payout',            minimumPayout);
+    setIfPresent('statement_descriptor',      statementDescriptor);
+    setIfPresent('automation',                automation);
+
     if (existingSettings) {
       // Update existing settings
       const { error: updateError } = await supabase
         .from('user_payment_settings')
-        .update({
-          online_booking_tips: onlineBookingTips,
-          invoice_payment_tips: invoicePaymentTips,
-          show_service_prices: showServicePrices,
-          show_service_descriptions: showServiceDescriptions,
-          payment_due_days: paymentDueDays,
-          payment_due_unit: paymentDueUnit,
-          default_memo: defaultMemo,
-          invoice_footer: invoiceFooter,
-          payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected,
-          tip_calculation_mode: tipCalculationMode || 'automatic',
-          payment_type_fees: paymentTypeFees || {}
-        })
+        .update(payload)
         .eq('user_id', userId);
 
       if (updateError) {
@@ -19379,21 +19417,7 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       // Insert new settings
       const { error: insertError } = await supabase
         .from('user_payment_settings')
-        .insert({
-          user_id: userId,
-          online_booking_tips: onlineBookingTips,
-          invoice_payment_tips: invoicePaymentTips,
-          show_service_prices: showServicePrices,
-          show_service_descriptions: showServiceDescriptions,
-          payment_due_days: paymentDueDays,
-          payment_due_unit: paymentDueUnit,
-          default_memo: defaultMemo,
-          invoice_footer: invoiceFooter,
-          payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected,
-          tip_calculation_mode: tipCalculationMode || 'automatic',
-          payment_type_fees: paymentTypeFees || {}
-        });
+        .insert({ user_id: userId, ...payload });
 
       if (insertError) {
         console.error('Error creating payment settings:', insertError);
