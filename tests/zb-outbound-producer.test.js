@@ -13,6 +13,9 @@ const {
   parseSettingValue,
   buildZbBody,
   resolveZbLinkage,
+  checkLedgerDrift,
+  checkZbSyncDirty,
+  maybeEmitJobCreateCommand,
   clearCache,
   SETTING_KEY,
 } = require('../lib/zb-outbound-producer');
@@ -200,5 +203,269 @@ describe('resolveZbLinkage — fail-fast on missing linkage', () => {
     expect(r.service_zb_id).toBe('svc_y');
     expect(r.territory_zb_id).toBe('terr_z');
     expect(r.team_member_zb_ids).toEqual([]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// PC16 / Amendment A — P0/P1 hard gate: drift + dirty refuse enqueue.
+// See docs/architecture/phase-b-readiness-v3.md §3 PC16.
+// ────────────────────────────────────────────────────────────────────
+
+// Minimal mock that returns the chain shape used by checkLedgerDrift /
+// checkZbSyncDirty: .from(tbl).select().eq().eq().is().limit() → {data, error}.
+function makeDriftDirtySupabase({ data = [], error = null } = {}) {
+  return {
+    from: jest.fn(() => ({
+      select: jest.fn(() => ({
+        eq: jest.fn(() => ({
+          eq: jest.fn(() => ({
+            is: jest.fn(() => ({
+              limit: jest.fn(async () => ({ data, error })),
+            })),
+          })),
+        })),
+      })),
+    })),
+  };
+}
+
+describe('checkLedgerDrift', () => {
+  test('unresolved row present → found=true with row_id', async () => {
+    const sup = makeDriftDirtySupabase({ data: [{ id: 4242 }] });
+    const r = await checkLedgerDrift(sup, 2, 142206);
+    expect(r.found).toBe(true);
+    expect(r.row_id).toBe(4242);
+  });
+
+  test('empty array → found=false', async () => {
+    const sup = makeDriftDirtySupabase({ data: [] });
+    const r = await checkLedgerDrift(sup, 2, 142206);
+    expect(r.found).toBe(false);
+    expect(r.row_id).toBeNull();
+  });
+
+  test('supabase error → fail-open (found=false) + logs', async () => {
+    const sup = makeDriftDirtySupabase({ error: { message: 'db hiccup' } });
+    const logger = { error: jest.fn() };
+    const r = await checkLedgerDrift(sup, 2, 142206, logger);
+    expect(r.found).toBe(false);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/ledger_drift_detected.*db hiccup/));
+  });
+
+  test('thrown exception → fail-open (found=false) + logs', async () => {
+    const sup = { from: jest.fn(() => { throw new Error('boom'); }) };
+    const logger = { error: jest.fn() };
+    const r = await checkLedgerDrift(sup, 2, 142206, logger);
+    expect(r.found).toBe(false);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/threw.*boom/));
+  });
+});
+
+describe('checkZbSyncDirty', () => {
+  test('unresolved row present → found=true with row_id', async () => {
+    const sup = makeDriftDirtySupabase({ data: [{ id: 99 }] });
+    const r = await checkZbSyncDirty(sup, 2, 142206);
+    expect(r.found).toBe(true);
+    expect(r.row_id).toBe(99);
+  });
+
+  test('empty array → found=false', async () => {
+    const sup = makeDriftDirtySupabase({ data: [] });
+    const r = await checkZbSyncDirty(sup, 2, 142206);
+    expect(r.found).toBe(false);
+    expect(r.row_id).toBeNull();
+  });
+
+  test('supabase error → fail-open (found=false) + logs', async () => {
+    const sup = makeDriftDirtySupabase({ error: { message: 'db hiccup' } });
+    const logger = { error: jest.fn() };
+    const r = await checkZbSyncDirty(sup, 2, 142206, logger);
+    expect(r.found).toBe(false);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/zb_sync_dirty.*db hiccup/));
+  });
+
+  test('thrown exception → fail-open (found=false) + logs', async () => {
+    const sup = { from: jest.fn(() => { throw new Error('boom'); }) };
+    const logger = { error: jest.fn() };
+    const r = await checkZbSyncDirty(sup, 2, 142206, logger);
+    expect(r.found).toBe(false);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/threw.*boom/));
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// End-to-end producer behavior with the new PC16 gate wired in.
+// Uses a flexible mock that routes by table name and pretends gates
+// 1–4 succeed by default so each test isolates the PC16 surface.
+// ────────────────────────────────────────────────────────────────────
+
+function makeProducerSupabase({ drift = [], dirty = [], capturedInsert = {} } = {}) {
+  // Tables we need to satisfy: platform_settings, customers, services,
+  // territories, team_members, ledger_drift_detected, zb_sync_dirty,
+  // zb_outbound_commands.
+  const happyCustomer = { id: 100, zenbooker_id: 'cust_x', first_name: 'A', last_name: 'B' };
+  const happyService = { id: 7, zenbooker_id: 'svc_y', name: 'Std' };
+  const happyTerritory = { id: 1, zenbooker_id: 'terr_z', name: 'Tampa' };
+  const insertCapture = capturedInsert;
+
+  return {
+    from: jest.fn((tbl) => {
+      // platform_settings (readOptInList): .from('platform_settings').select('value').eq('key', ...).maybeSingle()
+      if (tbl === 'platform_settings') {
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              maybeSingle: jest.fn(async () => ({ data: { value: '{"user_ids":[2]}' } })),
+            })),
+          })),
+        };
+      }
+      // resolveZbLinkage: customers/services/territories — .select().eq().eq().maybeSingle()
+      if (tbl === 'customers' || tbl === 'services' || tbl === 'territories') {
+        const row = tbl === 'customers' ? happyCustomer
+          : tbl === 'services' ? happyService
+          : happyTerritory;
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              eq: jest.fn(() => ({
+                maybeSingle: jest.fn(async () => ({ data: row })),
+              })),
+            })),
+          })),
+        };
+      }
+      // team_members: .select().eq('user_id', ...).in('id', [...])
+      if (tbl === 'team_members') {
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              in: jest.fn(async () => ({ data: [] })),
+            })),
+          })),
+        };
+      }
+      // drift + dirty: .select().eq().eq().is().limit()
+      if (tbl === 'ledger_drift_detected') {
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              eq: jest.fn(() => ({
+                is: jest.fn(() => ({
+                  limit: jest.fn(async () => ({ data: drift, error: null })),
+                })),
+              })),
+            })),
+          })),
+        };
+      }
+      if (tbl === 'zb_sync_dirty') {
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              eq: jest.fn(() => ({
+                is: jest.fn(() => ({
+                  limit: jest.fn(async () => ({ data: dirty, error: null })),
+                })),
+              })),
+            })),
+          })),
+        };
+      }
+      // zb_outbound_commands insert path. Two shapes used:
+      //  - producer happy path: .from(...).insert(row).select(...).single()
+      //  - insertSkippedRow:    .from(...).insert(row)  (no .select chain)
+      if (tbl === 'zb_outbound_commands') {
+        return {
+          insert: jest.fn((row) => {
+            // Capture the row whether or not .select() is chained.
+            insertCapture.row = row;
+            const chain = Promise.resolve({ error: null });
+            chain.select = () => ({
+              single: jest.fn(async () => ({
+                data: { id: 'fake-uuid', event_id: row.event_id || 'fake-event', state: row.state || 'pending' },
+                error: null,
+              })),
+            });
+            return chain;
+          }),
+        };
+      }
+      return {};
+    }),
+  };
+}
+
+const baseLiveSfJob = {
+  id: 142210,
+  user_id: 2,
+  customer_id: 100,
+  service_id: 7,
+  territory: 'Tampa',
+  scheduled_date: '2026-05-21 13:30:00',
+  duration: 120,
+  service_address_street: '1 Main',
+  service_address_city: 'Tampa',
+  service_address_state: 'FL',
+  service_address_zip: '33602',
+};
+
+describe('maybeEmitJobCreateCommand — PC16 P0/P1 gate', () => {
+  beforeEach(() => {
+    process.env.ZB_OUTBOUND_ENABLED = 'true';
+    clearCache();
+  });
+  afterAll(() => { delete process.env.ZB_OUTBOUND_ENABLED; });
+
+  test('unresolved ledger_drift_detected → skipped_precondition with defer_reason=ledger_drift', async () => {
+    const capture = {};
+    const sup = makeProducerSupabase({ drift: [{ id: 4242 }], capturedInsert: capture });
+    const r = await maybeEmitJobCreateCommand(sup, baseLiveSfJob, { type: 'system' });
+    expect(r.action).toBe('skipped_precondition');
+    expect(r.defer_reason).toBe('ledger_drift');
+    expect(capture.row.state).toBe('skipped_precondition');
+    expect(capture.row.defer_reason).toBe('ledger_drift');
+    expect(capture.row.last_error).toMatch(/ledger_drift_detected row #4242/);
+    expect(capture.row.terminal_at).toBeTruthy();
+  });
+
+  test('unresolved zb_sync_dirty → skipped_precondition with defer_reason=zb_sync_dirty', async () => {
+    const capture = {};
+    const sup = makeProducerSupabase({ dirty: [{ id: 99 }], capturedInsert: capture });
+    const r = await maybeEmitJobCreateCommand(sup, baseLiveSfJob, { type: 'system' });
+    expect(r.action).toBe('skipped_precondition');
+    expect(r.defer_reason).toBe('zb_sync_dirty');
+    expect(capture.row.state).toBe('skipped_precondition');
+    expect(capture.row.defer_reason).toBe('zb_sync_dirty');
+    expect(capture.row.last_error).toMatch(/zb_sync_dirty row #99/);
+    expect(capture.row.terminal_at).toBeTruthy();
+  });
+
+  test('no drift, no dirty → enqueue proceeds (pending row inserted)', async () => {
+    const capture = {};
+    const sup = makeProducerSupabase({ drift: [], dirty: [], capturedInsert: capture });
+    const r = await maybeEmitJobCreateCommand(sup, baseLiveSfJob, { type: 'system' });
+    expect(r.action).toBe('queued');
+    expect(capture.row.state).toBe('pending');
+    expect(capture.row.defer_reason).toBeFalsy();
+  });
+
+  test('drift takes precedence over dirty when both present', async () => {
+    const capture = {};
+    const sup = makeProducerSupabase({ drift: [{ id: 4242 }], dirty: [{ id: 99 }], capturedInsert: capture });
+    const r = await maybeEmitJobCreateCommand(sup, baseLiveSfJob, { type: 'system' });
+    expect(r.defer_reason).toBe('ledger_drift');
+    expect(capture.row.defer_reason).toBe('ledger_drift');
+  });
+
+  test('skipped row carries field_group=create + origin=user (visible in /status aggregates)', async () => {
+    const capture = {};
+    const sup = makeProducerSupabase({ drift: [{ id: 4242 }], capturedInsert: capture });
+    await maybeEmitJobCreateCommand(sup, baseLiveSfJob, { type: 'system', id: 1 });
+    expect(capture.row.field_group).toBe('create');
+    expect(capture.row.origin).toBe('user');
+    expect(capture.row.user_id).toBe(2);
+    expect(capture.row.sf_job_id).toBe(String(baseLiveSfJob.id));
+    expect(capture.row.command_type).toBe('job.create');
   });
 });
