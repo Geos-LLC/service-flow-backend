@@ -509,8 +509,14 @@ Every command MUST pass these checks before insert; failure → row inserted in 
 3. Tenant scope: target job/customer/team member MUST belong to `user_id`. Else: hard reject 403 at the API boundary (does not insert).
 4. `zenbooker_id` linkage: target ZB resource must have a `zenbooker_id`. Else: for `job.create` it's expected null; for other commands, `skipped_precondition` with reason `missing_zenbooker_id`.
 5. Provider mapping: every team member referenced MUST have `zenbooker_id`. Else: `skipped_precondition` with `unmapped_provider` + list of unmapped member ids.
-6. Settled-batch guard: target job MUST NOT have any `cleaner_ledger` row with `payout_batch_id IS NOT NULL`. Else: `skipped_precondition` with `settled_immutable`.
-7. Status pushability: for `job.cancel`/`job.reschedule`, current `jobs.status` MUST be in a pushable set (`scheduled`, `confirmed`, `pending`, `late`, `en-route`, `started` — NOT `completed`, `cancelled`).
+6. **P0/P1 hard gate (PC16, added 2026-05-19, Amendment A):** Target SF job MUST NOT have an unresolved `ledger_drift_detected` row (`resolved_at IS NULL`). Else: `skipped_precondition` with `defer_reason='ledger_drift'` and `last_error` pointing to the offending row id. Constitution §P0 immutability boundary.
+7. **P0/P1 hard gate (PC16, added 2026-05-19, Amendment A):** Target SF job MUST NOT have an unresolved `zb_sync_dirty` row (`resolved_at IS NULL`). Else: `skipped_precondition` with `defer_reason='zb_sync_dirty'` and `last_error` pointing to the offending row id. Constitution §P1 loud-failure boundary.
+8. Settled-batch guard: target job MUST NOT have any `cleaner_ledger` row with `payout_batch_id IS NOT NULL`. Else: `skipped_precondition` with `settled_immutable`.
+9. Status pushability: for `job.cancel`/`job.reschedule`, current `jobs.status` MUST be in a pushable set (`scheduled`, `confirmed`, `pending`, `late`, `en-route`, `started` — NOT `completed`, `cancelled`).
+
+**Gate ordering note:** Gates 6 + 7 (drift + dirty) run AFTER linkage/mapping checks (gates 4 + 5) and BEFORE the build+insert path. Rationale: linkage checks are cheap and tenant-scoped; drift/dirty checks involve their own indexes; running drift/dirty after linkage means we don't surface "ledger_drift" on jobs that wouldn't enqueue anyway for upstream reasons. Drift takes precedence over dirty when both are present (drift implies a P0 violation; dirty implies a sync-layer issue that may itself be downstream of drift).
+
+**Fail-open on internal errors:** If a drift/dirty check errors (DB hiccup, table absent in unexpected env), the producer logs loud (`logger.error`) and treats the result as `not found`. Rationale: the gate exists for KNOWN drift, not for unknown DB errors; failing closed on transient query failure would stampede every job into `skipped_precondition`. Failure to detect drift is detected by the outer reconcile system; failure to enqueue every job is not.
 
 ### 4.4 Diff semantics for list-shaped command bodies (invariant)
 
@@ -1032,6 +1038,19 @@ These MUST be resolved before the corresponding phase ships.
 | Q11 | Should `confirm_timeout` for `job.cancel` specifically be more aggressive (e.g., 2 minutes)? Cancel intent has UX urgency that reschedule doesn't. | Phase C |
 | Q12 | What happens to the SF UI's optimistic display when a command flips to `conflict`? Revert to projected state, show a banner, or both? UX decision. | Phase C |
 | Q13 | Are there ZB API calls that have side-effects in third systems (e.g., emailing customers on reschedule)? If yes, do we want SF-initiated commands to trigger those emails or suppress them? | Phase C |
+
+**Field contract questions opened by the 2026-05-19 incident** (originally Q12–Q17 in [producer-field-contract-audit.md §7](./producer-field-contract-audit.md), renumbered here to continue the §13 sequence):
+
+| # | Question | Audit ref | Blocks |
+|---|---|---|---|
+| Q14 | Is `timeslot.type` a real field on the `job.create` body? If yes, what enum values does ZB accept (`"specific_time"`, `"window"`, `"flexible"`, …)? Currently INFERENCE. | audit Q12 | Phase B (post-fix verification) |
+| Q15 | Does the `job.create` `timeslot` object require an `end` field, or does ZB compute end from `duration`? Is `timeslot.timezone` accepted (IANA name / offset)? Is `arrival_window_minutes` accepted on create the way it is on reschedule? | audit Q13 | Phase B (post-fix verification) |
+| Q16 | What are the actual sub-keys of the `address` object in the `POST /v1/jobs` body? Producer currently emits `{line1, city, state, postal_code}` — INFERRED from the inbound webhook response shape. Could equally be `line_1`, `address_line_1`, `street`, etc. (Same asymmetry that broke `timeslot.start_time` vs `timeslot.start`.) | audit Q14 | Phase B (post-fix verification, possibly blocking) |
+| Q17 | Does `address.state` accept long state names (`"Florida"`) or only ISO codes (`"FL"`)? The customer record's state value was ZB-minted, but the job-create body context may differ. | audit Q15 | Phase B (post-fix verification) |
+| Q18 | What is the inner sub-key of the `services[]` array's object on the `POST /v1/jobs` body? Producer emits `{service_id: <id>}` — could be `id`, `service_id`, or another key entirely. Inbound mapping shows `zb.service_id || zb.id` ambiguity on response objects (zenbooker-sync.js mapService line 128). | audit Q16 | Phase B (post-fix verification) |
+| Q19 | Does ZB silently ignore unknown body fields (typical REST) or 400 on them? Producer used to emit `notes` on inference; R3 removed it. Reintroducing `notes` (or any other documented-but-untested field) requires verifying ZB's tolerance posture first. | audit Q17 | Phase B (post-fix verification) |
+
+Q14–Q19 can be closed by **two carefully-staged live POSTs** against a throwaway pilot-tenant job (Q14+Q15 share a payload; Q16+Q17 share a payload; Q18 is isolated; Q19 is isolated). They are NOT pre-unfreeze gates — they are post-unfreeze hardening questions. The pre-unfreeze gate is PC17 (audit complete + R1+R2+R3 implemented), which is satisfied.
 
 ---
 

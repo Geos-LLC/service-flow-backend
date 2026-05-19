@@ -158,12 +158,37 @@ SELECT last_error, count(*)
 
 | `last_error` pattern | Response |
 |---|---|
+| `http 400: ... INVALID_TIME_SLOT ... timeslot.start is required` (or similar payload-shape rejection) | **Producer-side contract bug.** First seen 2026-05-19 — see §3.2.1 incident below. **Do not retry the failed row** (its `payload_json` is frozen with the bad shape). Freeze if not already. Fix the producer field name; ship; re-arm with a NEW command. |
 | `http 422: missing required parameter: <name>` | Producer-side payload bug. Freeze if multiple commands affected. Inspect `payload_json` of the failing row. Fix producer; retry the row(s) via §3.4. |
 | `http 401` | Auth misconfigured. Pause; do not retry. Check `users.zenbooker_api_key` for the affected tenant. Resolve and re-arm. |
 | `http 404: object with this id does not exist` | The target ZB resource was deleted upstream after the command was queued. Mark `cancelled` (§3.5); the producer's intent is now meaningless. |
 | `network: ECONNRESET` / `network: ETIMEDOUT` | Transient. Already retried up to 5 attempts. Re-arm (§3.4); if it fails again, escalate ZB-side. |
 | `http 429` | Rate-limited. **First occurrence:** auto-retry handles it (no action). **5+ in 1 hour:** reduce `ZB_OUTBOUND_BATCH_SIZE` from `5` to `2`. **Hitting DLQ:** freeze + contact ZB support per [phase-b-pilot-tenant.md §2.7](./phase-b-pilot-tenant.md#27-escalation-path-if-429-appears). |
 | `phase_a_scaffolding` | Stale rows from Phase A scaffolding period. Check the `requested_at` timestamp; safe to DELETE manually if pre-Phase-B. |
+
+Producer-side `defer_reason` values (rows in `state='skipped_precondition'` — these never POSTed):
+
+| `defer_reason` | Meaning | Response |
+|---|---|---|
+| `missing_scheduled_date` / `missing_customer` / `missing_service` / `missing_territory` | SF job is incomplete relative to ZB requirements. | Edit the SF job to add the missing field; the next operator-issued command will succeed. |
+| `customer_not_in_zb` / `service_not_in_zb` / `territory_not_in_zb` | SF entity exists but has no `zenbooker_id` linkage. | Run `/api/zenbooker/sync` for the tenant (pulls fresh ZB state and back-fills linkages). Re-issue. |
+| `unmapped_team_members` | One or more `team_members` referenced by the SF job have NULL `zenbooker_id`. | See [known-issues.md Issue #1](./known-issues.md) workarounds. Pick a linked team member OR run sync. |
+| `ledger_drift` (PC16) | An unresolved `ledger_drift_detected` row exists for this SF job. Constitution §P0 hard gate. | **Do not bypass.** Resolve the drift row first (set `resolved_at` after operator inspection + reconciliation). Then issue a new command. |
+| `zb_sync_dirty` (PC16) | An unresolved `zb_sync_dirty` row exists for this SF job. Constitution §P1 hard gate. | **Do not bypass.** Inspect the dirty row, run the appropriate reconcile path, mark resolved. Then issue a new command. |
+
+### 3.2.1 Incident 2026-05-19 — first live POST failed (`timeslot.start_time` → `timeslot.start`)
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-19 |
+| Pilot tenant | `user_id=2` |
+| Sequence | `ZB_OUTBOUND_DRY_RUN=false` flipped at 16:17:07 UTC → operator created SF job 142206 at 16:24:47 UTC → drainer POSTed → ZB returned `400 INVALID_TIME_SLOT — timeslot.start is required` |
+| Command row | `eb778119-cb11-486c-a958-2673198ace29` — terminal in `state='failed'`, never retried |
+| Root cause | Producer emitted `timeslot.start_time`; ZB requires `timeslot.start`. Field name was inferred from SF's own column naming, never empirically verified. Dry-run could not catch it (dry-run doesn't POST to ZB). |
+| Time to rollback | ~7 min — `ZB_OUTBOUND_GLOBAL_FREEZE=true` upserted at 16:24:47 UTC; redeploy SUCCESS at 16:27:11 UTC. |
+| Resolution | Producer fixed in commit `131428d`; PC16 hard gate added in commit `86e81cf`; pre-unfreeze audit in [producer-field-contract-audit.md](../architecture/producer-field-contract-audit.md); readiness updated to [phase-b-readiness-v3.md](../architecture/phase-b-readiness-v3.md). |
+| Disposition of SF job 142206 | Operator's choice — recommend deleting and recreating after re-arm so the smoke test is end-to-end fresh. |
+| Lessons | (1) Dry-run validates producer's intent, not ZB's contract. (2) Roundtripping ZB IDs is safe; roundtripping ZB field names is not (response shape ≠ request shape — e.g. response uses `start_date`, request requires `timeslot.start`). (3) Tests that mirror producer assumptions are not regression tests. |
 
 ### 3.3 Inspect a single failed row
 
