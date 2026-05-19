@@ -75,7 +75,7 @@ describe('buildZbBody', () => {
     service_zb_id: 'svc_456',
     territory_zb_id: 'terr_789',
     team_member_zb_ids: ['prov_a', 'prov_b'],
-    sf_address: { line1: '123 Main', city: 'Tampa', state: 'FL', postal_code: '33602' },
+    sf_address: { line1: '123 Main', city: 'Tampa', state: 'FL', postal_code: '33602', country: 'USA' },
   };
 
   test('produces ZB-shaped body with all required fields', () => {
@@ -128,7 +128,16 @@ describe('buildZbBody', () => {
 
   test('embeds address when present', () => {
     const body = buildZbBody(baseSfJob, linkage);
-    expect(body.address).toEqual({ line1: '123 Main', city: 'Tampa', state: 'FL', postal_code: '33602' });
+    expect(body.address).toEqual({ line1: '123 Main', city: 'Tampa', state: 'FL', postal_code: '33602', country: 'USA' });
+  });
+
+  // Regression guard: 2026-05-19 second incident — ZB 400 INVALID_ADDRESS,
+  // "Address object is missing required fields: country".
+  // See docs/architecture/job-create-contract-discovery.md.
+  test('address includes country sub-key (ZB-required per 2026-05-19 discovery)', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.address).toHaveProperty('country');
+    expect(body.address.country).toBe('USA');
   });
 
   test('omits address when fully empty', () => {
@@ -203,6 +212,37 @@ describe('resolveZbLinkage — fail-fast on missing linkage', () => {
     expect(r.service_zb_id).toBe('svc_y');
     expect(r.territory_zb_id).toBe('terr_z');
     expect(r.team_member_zb_ids).toEqual([]);
+  });
+
+  // Country sub-key per 2026-05-19 discovery (audit Q16 / §13 Q16 resolved).
+  test('sf_address.country flows through from sfJob.service_address_country', async () => {
+    const sup = makeSupabase({
+      customer: { id: 100, zenbooker_id: 'cust_x' },
+      service: { id: 7, zenbooker_id: 'svc_y' },
+      territory: { id: 1, zenbooker_id: 'terr_z', name: 'Tampa' },
+    });
+    const r = await resolveZbLinkage(sup, {
+      user_id: 2, id: 42, scheduled_date: '2026-05-20 15:00:00',
+      customer_id: 100, service_id: 7, territory: 'Tampa',
+      service_address_country: 'USA',
+    });
+    expect(r.ok).toBe(true);
+    expect(r.sf_address.country).toBe('USA');
+  });
+
+  test('sf_address.country defaults to "USA" when sfJob omits the field', async () => {
+    const sup = makeSupabase({
+      customer: { id: 100, zenbooker_id: 'cust_x' },
+      service: { id: 7, zenbooker_id: 'svc_y' },
+      territory: { id: 1, zenbooker_id: 'terr_z', name: 'Tampa' },
+    });
+    const r = await resolveZbLinkage(sup, {
+      user_id: 2, id: 42, scheduled_date: '2026-05-20 15:00:00',
+      customer_id: 100, service_id: 7, territory: 'Tampa',
+      // no service_address_country
+    });
+    expect(r.ok).toBe(true);
+    expect(r.sf_address.country).toBe('USA');
   });
 });
 

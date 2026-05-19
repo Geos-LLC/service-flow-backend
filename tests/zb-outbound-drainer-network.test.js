@@ -17,6 +17,7 @@ const {
   retryOrDlq,
   networkBackoff,
   markSent,
+  extractZbId,
   NETWORK_MAX_ATTEMPTS,
 } = require('../workers/zb-outbound-drainer');
 
@@ -233,5 +234,49 @@ describe('processRow — non-job.create command types skipped in Phase B', () =>
     expect(fetchSpy).not.toHaveBeenCalled();
     const update = supabase.updates[supabase.updates.length - 1];
     expect(update.defer_reason).toBe('not_in_phase_b_scope');
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// extractZbId shape contract — verified by 2026-05-19 direct discovery.
+// ZB POST /v1/jobs success body uses `body.job_id`, NOT `body.id`. The
+// prior implementation missed this entirely and would have written
+// zenbooker_id=null on a successful POST, breaking correlation.
+// See docs/architecture/job-create-contract-discovery.md §5.2.
+// ────────────────────────────────────────────────────────────────────
+
+describe('extractZbId — response shape contract', () => {
+  test('picks up body.job_id (ZB POST /v1/jobs success shape)', () => {
+    expect(extractZbId({ job_id: '1779218669134x745511977577383300', status: 'scheduled' }))
+      .toBe('1779218669134x745511977577383300');
+  });
+
+  test('coerces non-string job_id values to string', () => {
+    expect(extractZbId({ job_id: 12345 })).toBe('12345');
+  });
+
+  test('legacy fallback — body.id (for endpoints/responses that use it)', () => {
+    expect(extractZbId({ id: 'abc' })).toBe('abc');
+  });
+
+  test('legacy fallback — body.response.job (assign endpoint shape)', () => {
+    expect(extractZbId({ status: 'success', response: { job: 'xyz' } })).toBe('xyz');
+  });
+
+  test('legacy fallback — body.job.id (nested job object)', () => {
+    expect(extractZbId({ job: { id: 'nested' } })).toBe('nested');
+  });
+
+  test('job_id has precedence over fallback keys', () => {
+    expect(extractZbId({ job_id: 'first', id: 'second', response: { job: 'third' } }))
+      .toBe('first');
+  });
+
+  test('returns null when no recognized id key present', () => {
+    expect(extractZbId({})).toBeNull();
+    expect(extractZbId({ status: 'success' })).toBeNull();
+    expect(extractZbId(null)).toBeNull();
+    expect(extractZbId(undefined)).toBeNull();
+    expect(extractZbId('not-an-object')).toBeNull();
   });
 });

@@ -238,17 +238,27 @@ async function postToZb({ apiKey, path, body, idempotencyKey }) {
   }
 }
 
-async function handlePostResult({ supabase, logger, row, result, attempts }) {
-  // Extract the new ZB resource id for correlation later. ZB's create response
-  // (per 2026-05-16 discovery) varies in shape — try common locations.
-  function extractZbId(body) {
-    if (!body || typeof body !== 'object') return null;
-    if (body.id) return String(body.id);
-    if (body.response && body.response.job) return String(body.response.job);
-    if (body.job && body.job.id) return String(body.job.id);
-    return null;
-  }
+/**
+ * Extract the new ZB resource id for correlation later. ZB's create response
+ * uses `body.job_id` (verified by 2026-05-19 direct discovery — see
+ * docs/architecture/job-create-contract-discovery.md §5.2). Other endpoints
+ * (assign, etc.) use other shapes — fall through.
+ *
+ * Module-level + exported so the shape contract is testable independent
+ * of the full handlePostResult network path.
+ */
+function extractZbId(body) {
+  if (!body || typeof body !== 'object') return null;
+  // ZB POST /v1/jobs success returns { job_id, status, ... } — Tier-A verified 2026-05-19.
+  if (body.job_id) return String(body.job_id);
+  // Legacy fallbacks kept for other endpoints / future commands.
+  if (body.id) return String(body.id);
+  if (body.response && body.response.job) return String(body.response.job);
+  if (body.job && body.job.id) return String(body.job.id);
+  return null;
+}
 
+async function handlePostResult({ supabase, logger, row, result, attempts }) {
   // 200 / 201 → success
   if (result.ok && (result.status === 200 || result.status === 201)) {
     const zenbookerId = extractZbId(result.body);
@@ -439,6 +449,7 @@ module.exports = {
   markSent,
   markFailed,
   shortBody,
+  extractZbId,
   TICK_MS,
   BATCH_SIZE,
   LEASE_S,
