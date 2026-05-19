@@ -80,18 +80,35 @@ describe('buildZbBody', () => {
     expect(body.territory_id).toBe('terr_789');
     expect(body.customer_id).toBe('cust_123');
     expect(body.services).toEqual([{ service_id: 'svc_456' }]);
-    expect(body.timeslot).toEqual({ type: 'specific_time', start_time: expect.any(String) });
+    expect(body.timeslot).toEqual({ type: 'specific_time', start: expect.any(String) });
   });
 
   test('converts SF local datetime to ISO 8601 Z form', () => {
     const body = buildZbBody(baseSfJob, linkage);
-    expect(body.timeslot.start_time).toBe('2026-05-20T15:00:00Z');
+    expect(body.timeslot.start).toBe('2026-05-20T15:00:00Z');
   });
 
   test('preserves existing ISO format if already present', () => {
     const sf = { ...baseSfJob, scheduled_date: '2026-05-20T15:00:00Z' };
     const body = buildZbBody(sf, linkage);
-    expect(body.timeslot.start_time).toBe('2026-05-20T15:00:00Z');
+    expect(body.timeslot.start).toBe('2026-05-20T15:00:00Z');
+  });
+
+  // Regression guards added after 2026-05-19 incident:
+  // ZB 400 INVALID_TIME_SLOT — `timeslot.start_time` was the wrong key.
+  // See docs/architecture/producer-field-contract-audit.md.
+  test('timeslot uses ZB-required key `start` (not SF-style `start_time`)', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.timeslot.start).toBe('2026-05-20T15:00:00Z');
+    expect(body.timeslot.start_time).toBeUndefined();
+    expect(body.timeslot.type).toBe('specific_time');
+  });
+
+  test('body has no SF-style aliases at top level', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body).not.toHaveProperty('start_time');
+    expect(body).not.toHaveProperty('scheduled_date');
+    expect(body).not.toHaveProperty('service_date');
   });
 
   test('includes assigned_providers when team mapped', () => {
@@ -116,10 +133,10 @@ describe('buildZbBody', () => {
     expect(body.address).toBeUndefined();
   });
 
-  test('truncates notes to 1000 chars', () => {
+  test('omits `notes` from ZB body (pending ZB acceptance verification — audit R3)', () => {
     const sf = { ...baseSfJob, notes: 'x'.repeat(2000) };
     const body = buildZbBody(sf, linkage);
-    expect(body.notes.length).toBe(1000);
+    expect(body.notes).toBeUndefined();
   });
 });
 
