@@ -6033,12 +6033,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         }
       }
 
-      // Send success response
-      res.json({
-        success: true,
-        message: 'Job created successfully',
-        job: result
-      });
+      // F2 (2026-05-20): legacy `res.json({ success: true, ... job: result })`
+      // was emitted here. It fired BEFORE the team-member assignments / status
+      // history / createdJob fetch, then control fell through to the
+      // canonical `res.status(201).json(...)` below — every successful job
+      // creation triggered ERR_HTTP_HEADERS_SENT. The canonical response
+      // (which includes warnings + fully-joined createdJob + correct 201
+      // status) is the only one we now emit. See investigation notes for
+      // SF job 142213 / 2026-05-20.
 
       // Create team member assignments in job_team_assignments table
       if (teamMemberIdValue || teamMemberIds.length > 0) {
