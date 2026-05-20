@@ -79,9 +79,25 @@ For each field: **Business owner** (where intent originates and historical truth
 
 **Rule:** A field is outbound-pushable only if (a) ZB has a schema slot for it AND (b) SF is the legitimate origin of the intent AND (c) the field is not constitutionally immutable. Anything not in the "Yes — Phase 1" column **MUST NOT** generate an outbound command.
 
----
+### 1.F Notification ownership (added 2026-05-20)
 
-## 2. Command / confirmation architecture
+Notification dispatch (SMS, email) for a job is owned by **whichever system created the job**:
+
+| Job origin | Notification owner | ZB notification flags in outbound payload |
+|---|---|---|
+| **SF-originated** (created via `POST /api/jobs` → outbound `job.create` command) | **SF** | `sms_notifications: false` AND `email_notifications: false` — MUST be set explicitly on every `job.create` POST. Suppresses ZB's tenant-level defaults. |
+| **ZB-originated** (created in ZB UI / API by manager) | **ZB** | N/A — SF does not POST. Inbound `job.created` webhook hits SF; SF projects the job and does NOT fire its own confirmation flow for it. |
+
+**Rationale (incident 2026-05-20, SF job 142213).** SF's outbound `job.create` payload omitted `sms_notifications` / `email_notifications`. ZB's tenant-level defaults fired ZB's native notification system, which sent a customer-greeting SMS ("Hi {customer.name}! Your appointment is confirmed…") to the **assigned provider's phone** (not the customer). Customer had `accepts_sms=false` in ZB so customer was correctly NOT messaged; provider was messaged because ZB auto-notifies assigned providers on job creation. SF's own confirmation flow at [server.js:5887–5980](../../server.js#L5887-L5980) did not fire either, so the customer received NO confirmation from any system.
+
+**Enforcement.**
+
+1. **Producer (lib/zb-outbound-producer.js `buildZbBody`)** MUST emit `sms_notifications: false` and `email_notifications: false` on every `job.create` payload. **Explicit `false` beats omitted** — omitted defaults to ZB tenant settings (which leaked notifications).
+2. **Producer tests** assert presence of both flags as `boolean false`. Golden-fixture contract test pins the shape.
+3. **Future commands** (`job.reschedule`, `job.cancel`, `job.assign_providers`) MUST follow the same convention if/when ZB's notification model applies to them. Discovery (Phase C+) MUST verify whether ZB fires notifications on those mutations and add suppression flags if so.
+4. **SF confirmation path** ([server.js:5887–5980](../../server.js#L5887-L5980)) is now SOLELY responsible for customer/provider notification on SF-originated jobs. If it doesn't fire, no one is notified. This is the correct posture but it makes SF's confirmation path's reliability a new soft-blocker for Phase B soak — see [phase-b-readiness-v3 §X / pending investigation](./phase-b-readiness-v3.md).
+
+**What does NOT change.** ZB→SF inbound notifications, the existing tip preserve rule, ledger immutability, the assignment_method semantics. The suppression is per-payload, not tenant-wide.
 
 ### 2.1 The two-phase model
 

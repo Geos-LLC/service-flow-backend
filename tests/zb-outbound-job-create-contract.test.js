@@ -36,6 +36,9 @@ const { buildZbBody } = require('../lib/zb-outbound-producer');
 // Tier-A verified 2026-05-19 — two consecutive `201 Created` responses
 // against pilot tenant ZB API; full discovery transcript in
 // docs/architecture/job-create-contract-discovery.md §1.
+// 2026-05-20: added sms_notifications + email_notifications to suppress
+// ZB's native notification system per SF-owns-notifications design
+// (see zb-outbound-command-confirmation.md §1.F).
 const VERIFIED_TOP_LEVEL_KEYS = [
   'territory_id',
   'customer_id',
@@ -45,6 +48,8 @@ const VERIFIED_TOP_LEVEL_KEYS = [
   'assigned_providers',
   'assignment_method',
   'duration',
+  'sms_notifications',
+  'email_notifications',
 ];
 
 const VERIFIED_ADDRESS_SUB_KEYS = [
@@ -154,7 +159,7 @@ describe('job.create body — Tier-A verified shape (2026-05-19)', () => {
     expect(body.duration).toBe(120);
   });
 
-  test('full body deep-equals the verified 2026-05-19 shape', () => {
+  test('full body deep-equals the verified 2026-05-19 shape (+ notification suppression flags 2026-05-20)', () => {
     const body = buildZbBody(baseSfJob, linkage);
     expect(body).toEqual({
       territory_id: '1774549605695x331883119954100200',
@@ -171,6 +176,40 @@ describe('job.create body — Tier-A verified shape (2026-05-19)', () => {
       assigned_providers: ['1733415450171x961236852912174200'],
       assignment_method: 'auto',
       duration: 120,
+      sms_notifications: false,
+      email_notifications: false,
     });
+  });
+
+  // Regression guards added 2026-05-20 after incident:
+  // ZB sent its native provider-notification SMS using the customer-greeting
+  // template to the team member's phone. SF owns notifications for
+  // SF-originated jobs; ZB notifications must be explicitly suppressed.
+  test('producer emits sms_notifications=false (SF owns SMS, ZB suppressed)', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.sms_notifications).toBe(false);
+  });
+
+  test('producer emits email_notifications=false (SF owns email, ZB suppressed)', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.email_notifications).toBe(false);
+  });
+
+  test('notification suppression is explicit boolean false (not undefined / not null)', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body).toHaveProperty('sms_notifications');
+    expect(body).toHaveProperty('email_notifications');
+    expect(typeof body.sms_notifications).toBe('boolean');
+    expect(typeof body.email_notifications).toBe('boolean');
+    // Explicit false beats omitted-and-defaulted-by-ZB; the suppression must be
+    // wire-visible so ZB cannot fall back to tenant-level notification settings.
+  });
+
+  test('assigned_providers + assignment_method preserved alongside suppression flags', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.assigned_providers).toEqual(['1733415450171x961236852912174200']);
+    expect(body.assignment_method).toBe('auto');
+    // Suppression flags do NOT replace the assignment behavior — ZB still
+    // applies the explicit provider list; ZB just doesn't notify them.
   });
 });

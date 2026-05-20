@@ -140,6 +140,27 @@ describe('buildZbBody', () => {
     expect(body.address.country).toBe('USA');
   });
 
+  // Regression guards added 2026-05-20 — SF owns notifications for
+  // SF-originated jobs. ZB's native provider-notification SMS leaked
+  // (see zb-outbound-command-confirmation.md §1.F).
+  test('emits sms_notifications=false to suppress ZB-side SMS', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.sms_notifications).toBe(false);
+  });
+
+  test('emits email_notifications=false to suppress ZB-side email', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.email_notifications).toBe(false);
+  });
+
+  test('suppression flags do not displace assigned_providers / assignment_method', () => {
+    const body = buildZbBody(baseSfJob, linkage);
+    expect(body.assigned_providers).toEqual(['prov_a', 'prov_b']);
+    expect(body.assignment_method).toBe('auto');
+    expect(body.sms_notifications).toBe(false);
+    expect(body.email_notifications).toBe(false);
+  });
+
   test('omits address when fully empty', () => {
     const body = buildZbBody(baseSfJob, { ...linkage, sf_address: { line1: null, city: null, state: null, postal_code: null } });
     expect(body.address).toBeUndefined();
