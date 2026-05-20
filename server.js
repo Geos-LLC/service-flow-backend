@@ -5786,7 +5786,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   smsNotifications = preferences.sms_notifications;
                 } else {
                   // Create default preferences for new customer
-                  console.log('📝 Creating default notification preferences for new customer');
+                  logger.log('[JobConfirmation] 📝 Creating default notification preferences for new customer');
                   const { error: insertError } = await supabase
                     .from('customer_notification_preferences')
                     .insert({
@@ -5794,16 +5794,16 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                       email_notifications: emailNotifications,
                       sms_notifications: smsNotifications
                     });
-                  
+
                   if (insertError) {
-                    console.error('❌ Error creating customer notification preferences:', insertError);
+                    logger.error('[JobConfirmation] ❌ Error creating customer notification preferences: ' + (insertError.message || JSON.stringify(insertError)));
                   } else {
-                    console.log('✅ Created default notification preferences for customer');
+                    logger.log('[JobConfirmation] ✅ Created default notification preferences for customer');
                   }
                 }
               } catch (prefError) {
-                console.log('📝 No notification preferences found for new customer, creating defaults');
-                
+                logger.log('[JobConfirmation] 📝 No notification preferences found for new customer, creating defaults');
+
                 // Create default preferences for new customer
                 const { error: insertError } = await supabase
                   .from('customer_notification_preferences')
@@ -5812,11 +5812,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     email_notifications: emailNotifications,
                     sms_notifications: smsNotifications
                   });
-                
+
                 if (insertError) {
-                  console.error('❌ Error creating customer notification preferences:', insertError);
+                  logger.error('[JobConfirmation] ❌ Error creating customer notification preferences: ' + (insertError.message || JSON.stringify(insertError)));
                 } else {
-                  console.log('✅ Created default notification preferences for customer');
+                  logger.log('[JobConfirmation] ✅ Created default notification preferences for customer');
                 }
               }
               
@@ -5878,14 +5878,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               const hasEmail = customerData.email && customerData.email.trim() !== '';
               const hasPhone = customerData.phone && customerData.phone.trim() !== '';
               
-              console.log('📧 Notification check:', {
-                hasEmail,
-                hasPhone,
-                customerEmail: customerData.email,
-                customerPhone: customerData.phone,
-                emailNotifications,
-                smsNotifications
-              });
+              logger.log(`[JobConfirmation] 📧 Notification check job=${result.id} hasEmail=${hasEmail} hasPhone=${hasPhone} emailNotifications=${emailNotifications} smsNotifications=${smsNotifications}`);
               
               // Send email notification if customer has email and email notifications are enabled.
               // P1.5 — routed through notificationEmail.sendCustomerEmail (was inline sgMail.send).
@@ -5899,7 +5892,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     text: textContent,
                     emailType: 'appointment_confirmation_auto',
                   });
-                  console.log('✅ Automatic job confirmation email sent successfully to:', customerData.email);
+                  logger.log(`[JobConfirmation] ✅ Automatic job confirmation email sent job=${result.id} to=${customerData.email}`);
 
                   // Update job with confirmation status (F1: checked update)
                   await persistConfirmationStatus(supabase, logger, result.id, {
@@ -5909,7 +5902,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   }, 'email_success');
 
                 } catch (sendError) {
-                  console.error('❌ Error sending automatic confirmation email:', sendError);
+                  logger.error(`[JobConfirmation] ❌ Error sending automatic confirmation email job=${result.id} error=${sendError && sendError.message}`);
 
                   // Update job with failed confirmation status (F1: checked update)
                   await persistConfirmationStatus(supabase, logger, result.id, {
@@ -5921,13 +5914,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               }
               // If customer has no email, automatically send SMS instead
               else if (!hasEmail && hasPhone) {
-                console.log('📱 Customer has no email, sending SMS confirmation instead');
-                console.log('📱 SMS details:', {
-                  customerPhone: customerData.phone,
-                  userId: req.user.userId,
-                  serviceName,
-                  scheduledDate: result.scheduled_date
-                });
+                logger.log(`[JobConfirmation] 📱 Customer has no email — sending SMS confirmation instead job=${result.id}`);
+                logger.log(`[JobConfirmation] 📱 SMS dispatch job=${result.id} user=${req.user.userId} to=${customerData.phone} service="${serviceName}" scheduledDate=${result.scheduled_date}`);
 
                 try {
                   const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', {
@@ -5940,9 +5928,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     hour12: true
                   })}. We'll see you soon! - ${businessName}`;
 
-                  console.log('📱 Sending SMS message:', smsMessage);
+                  logger.log(`[JobConfirmation] 📱 Sending SMS message job=${result.id} body_len=${smsMessage.length}`);
                   const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
-                  console.log('✅ Automatic job confirmation SMS sent (no email) to:', customerData.phone, 'SID:', smsResult.sid);
+                  logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (no email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
 
                   // Update job with SMS confirmation status (F1: checked update,
                   // confirmation_method removed — column does not exist on jobs table).
@@ -5958,8 +5946,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   }, 'sms_no_email_success');
 
                 } catch (smsError) {
-                  console.error('❌ SMS sending failed:', smsError);
-                  console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                  logger.error(`[JobConfirmation] ❌ SMS sending failed (no-email path) job=${result.id} error=${smsError && smsError.message}`);
 
                   // Update job with failed SMS status (F1: checked update)
                   await persistConfirmationStatus(supabase, logger, result.id, {
@@ -5972,7 +5959,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   }, 'sms_no_email_failure');
                 }
               } else if (!hasEmail && !hasPhone) {
-                console.log('⚠️ Customer has no email and no phone number - no confirmation sent');
+                logger.warn(`[JobConfirmation] ⚠️ Customer has no email and no phone — no confirmation sent job=${result.id}`);
               }
 
               // Send SMS notification if enabled (for customers with email who also want SMS)
@@ -5992,9 +5979,9 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   let smsResult;
                   try {
                     smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
-                    console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
+                    logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (with email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
                   } catch (smsError) {
-                    console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                    logger.warn(`[JobConfirmation] ⚠️ SMS notification skipped (Twilio error) job=${result.id} error=${smsError && smsError.message}`);
                     // Continue without failing the job creation
                   }
 
@@ -6009,7 +5996,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   }
 
                 } catch (smsError) {
-                  console.error('❌ Error sending automatic confirmation SMS:', smsError);
+                  logger.error(`[JobConfirmation] ❌ Error sending automatic confirmation SMS (with-email path) job=${result.id} error=${smsError && smsError.message}`);
 
                   // Update job with failed SMS notification status (F1: checked update)
                   await persistConfirmationStatus(supabase, logger, result.id, {
@@ -6028,7 +6015,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
             }, 'no_customer');
           }
         } catch (confirmationError) {
-          console.error('❌ Error in automatic confirmation process:', confirmationError);
+          logger.error(`[JobConfirmation] ❌ Error in automatic confirmation process job=${result.id} error=${confirmationError && confirmationError.message}`);
           // Don't fail the job creation if confirmation fails
         }
       }
