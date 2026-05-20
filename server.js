@@ -5743,6 +5743,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       
       // Send automatic confirmation if customer has email
       if (result.customer_id) {
+        // F1: persist updates through a checked helper so missing-column /
+        // RLS / network errors are surfaced instead of silently dropped.
+        // See lib/job-confirmation-updater.js and investigation notes for
+        // job 142213 (2026-05-20).
+        const { persistConfirmationStatus } = require('./lib/job-confirmation-updater');
         try {
           const { data: customerData, error: customerError } = await supabase
             .from('customers')
@@ -5896,28 +5901,22 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   });
                   console.log('✅ Automatic job confirmation email sent successfully to:', customerData.email);
 
-                  // Update job with confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: true,
-                      confirmation_sent_at: new Date().toISOString(),
-                      confirmation_email: customerData.email
-                    })
-                    .eq('id', result.id);
+                  // Update job with confirmation status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: true,
+                    confirmation_sent_at: new Date().toISOString(),
+                    confirmation_email: customerData.email,
+                  }, 'email_success');
 
                 } catch (sendError) {
                   console.error('❌ Error sending automatic confirmation email:', sendError);
 
-                  // Update job with failed confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: false,
-                      confirmation_failed: true,
-                      confirmation_error: sendError.message
-                    })
-                    .eq('id', result.id);
+                  // Update job with failed confirmation status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: false,
+                    confirmation_failed: true,
+                    confirmation_error: sendError.message,
+                  }, 'email_failure');
                 }
               }
               // If customer has no email, automatically send SMS instead
@@ -5929,54 +5928,48 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   serviceName,
                   scheduledDate: result.scheduled_date
                 });
-                
+
                 try {
-                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
-                    weekday: 'long', 
-                    month: 'long', 
-                    day: 'numeric' 
-                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', {
+                    weekday: 'long',
+                    month: 'long',
+                    day: 'numeric'
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', {
+                    hour: 'numeric',
                     minute: '2-digit',
-                    hour12: true 
+                    hour12: true
                   })}. We'll see you soon! - ${businessName}`;
 
                   console.log('📱 Sending SMS message:', smsMessage);
                   const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
                   console.log('✅ Automatic job confirmation SMS sent (no email) to:', customerData.phone, 'SID:', smsResult.sid);
-                  
-                  // Update job with SMS confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: true,
-                      confirmation_sent_at: new Date().toISOString(),
-                      confirmation_method: 'sms',
-                      sms_sent: true,
-                      sms_sent_at: new Date().toISOString(),
-                      sms_phone: customerData.phone,
-                      sms_sid: smsResult.sid,
-                      sms_failed: false,
-                      sms_error: null
-                    })
-                    .eq('id', result.id);
-                  
+
+                  // Update job with SMS confirmation status (F1: checked update,
+                  // confirmation_method removed — column does not exist on jobs table).
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: true,
+                    confirmation_sent_at: new Date().toISOString(),
+                    sms_sent: true,
+                    sms_sent_at: new Date().toISOString(),
+                    sms_phone: customerData.phone,
+                    sms_sid: smsResult.sid,
+                    sms_failed: false,
+                    sms_error: null,
+                  }, 'sms_no_email_success');
+
                 } catch (smsError) {
                   console.error('❌ SMS sending failed:', smsError);
                   console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
-                  
-                  // Update job with failed SMS status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: false,
-                      confirmation_failed: true,
-                      confirmation_error: smsError.message,
-                      sms_sent: false,
-                      sms_failed: true,
-                      sms_error: smsError.message
-                    })
-                    .eq('id', result.id);
+
+                  // Update job with failed SMS status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: false,
+                    confirmation_failed: true,
+                    confirmation_error: smsError.message,
+                    sms_sent: false,
+                    sms_failed: true,
+                    sms_error: smsError.message,
+                  }, 'sms_no_email_failure');
                 }
               } else if (!hasEmail && !hasPhone) {
                 console.log('⚠️ Customer has no email and no phone number - no confirmation sent');
@@ -5985,14 +5978,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               // Send SMS notification if enabled (for customers with email who also want SMS)
               if (smsNotifications && hasPhone && hasEmail) {
                 try {
-                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
-                    weekday: 'long', 
-                    month: 'long', 
-                    day: 'numeric' 
-                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', {
+                    weekday: 'long',
+                    month: 'long',
+                    day: 'numeric'
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', {
+                    hour: 'numeric',
                     minute: '2-digit',
-                    hour12: true 
+                    hour12: true
                   })}. We'll see you soon! - ${businessName}`;
 
                   // Send SMS using user's Twilio Connect account
@@ -6005,43 +5998,34 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     // Continue without failing the job creation
                   }
 
-                  // Update job with SMS notification status
+                  // Update job with SMS notification status (F1: checked update)
                   if (smsResult) {
-                    await supabase
-                      .from('jobs')
-                      .update({
-                        sms_sent: true,
-                        sms_sent_at: new Date().toISOString(),
-                        sms_phone: customerData.phone,
-                        sms_sid: smsResult.sid
-                      })
-                      .eq('id', result.id);
+                    await persistConfirmationStatus(supabase, logger, result.id, {
+                      sms_sent: true,
+                      sms_sent_at: new Date().toISOString(),
+                      sms_phone: customerData.phone,
+                      sms_sid: smsResult.sid,
+                    }, 'sms_with_email_success');
                   }
-                  
+
                 } catch (smsError) {
                   console.error('❌ Error sending automatic confirmation SMS:', smsError);
-                  
-                  // Update job with failed SMS notification status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      sms_sent: false,
-                      sms_failed: true,
-                      sms_error: smsError.message
-                    })
-                    .eq('id', result.id);
+
+                  // Update job with failed SMS notification status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    sms_sent: false,
+                    sms_failed: true,
+                    sms_error: smsError.message,
+                  }, 'sms_with_email_failure');
                 }
               }
             }
           } else {
-            // Update job with no email status
-            await supabase
-              .from('jobs')
-              .update({
-                confirmation_sent: false,
-                confirmation_no_email: true
-              })
-              .eq('id', result.id);
+            // Update job with no email status (F1: checked update)
+            await persistConfirmationStatus(supabase, logger, result.id, {
+              confirmation_sent: false,
+              confirmation_no_email: true,
+            }, 'no_customer');
           }
         } catch (confirmationError) {
           console.error('❌ Error in automatic confirmation process:', confirmationError);
