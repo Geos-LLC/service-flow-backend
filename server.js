@@ -5929,7 +5929,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   })}. We'll see you soon! - ${businessName}`;
 
                   logger.log(`[JobConfirmation] 📱 Sending SMS message job=${result.id} body_len=${smsMessage.length}`);
-                  const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
+                  // P-01: customer-facing — must not resolve a team_member phone.
+                  const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage, {
+                    intent: 'customer_facing',
+                    source: 'customers.phone',
+                    message_type: 'job_confirmation_no_email_sms',
+                    customer_id: customerData.id,
+                    job_id: result.id,
+                    path: 'P-01',
+                  });
                   logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (no email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
 
                   // Update job with SMS confirmation status (F1: checked update,
@@ -5978,7 +5986,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   // Send SMS using user's Twilio Connect account
                   let smsResult;
                   try {
-                    smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
+                    // P-02: customer-facing — must not resolve a team_member phone.
+                    smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage, {
+                      intent: 'customer_facing',
+                      source: 'customers.phone',
+                      message_type: 'job_confirmation_with_email_sms',
+                      customer_id: customerData.id,
+                      job_id: result.id,
+                      path: 'P-02',
+                    });
                     logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (with email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
                   } catch (smsError) {
                     logger.warn(`[JobConfirmation] ⚠️ SMS notification skipped (Twilio error) job=${result.id} error=${smsError && smsError.message}`);
@@ -6591,7 +6607,15 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
               // Send SMS using user's Twilio Connect account
               let smsResult;
               try {
-                smsResult = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage);
+                // P-03: customer-facing status SMS — must not resolve a team_member phone.
+                smsResult = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage, {
+                  intent: 'customer_facing',
+                  source: 'jobs.customers.phone',
+                  message_type: `job_status_${status}_sms`,
+                  customer_id: jobData.customer_id,
+                  job_id: jobData.id,
+                  path: 'P-03',
+                });
                 console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', smsResult.sid);
               } catch (smsError) {
                 console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
@@ -35936,31 +35960,129 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
   }
 });
 
-// Helper function to send SMS using user's direct Twilio credentials
-const sendSMSWithUserTwilio = async (userId, to, message) => {
-  // Get user's Twilio credentials
+// Helper function to send SMS using user's direct Twilio credentials.
+//
+// P0 Recipient Integrity Audit (2026-05-20):
+//   - `options.intent` (when set to 'customer_facing' or 'cleaner_facing')
+//     triggers an audit that BLOCKS the send if the resolved recipient
+//     phone collides with the OTHER role's phone in the same tenant.
+//     On block: emits [RecipientIntegrityViolation] and throws.
+//   - All sends emit a [NotificationRecipient] structured log line
+//     (pre-send + post-send) so Loki has full forensic provenance.
+//
+// Legacy callers that don't pass `options` still work — audit skips when
+// no intent is provided. Migration of remaining paths is tracked
+// separately. See docs/operations/recipient_source_map.md.
+const sendSMSWithUserTwilio = async (userId, to, message, options = {}) => {
+  const {
+    auditRecipientIntegrity,
+    emitNotificationRecipientLog,
+    emitRecipientIntegrityViolation,
+  } = require('./lib/sms-recipient-integrity');
+
+  const o = options || {};
+  const path = o.path || 'sendSMSWithUserTwilio';
+
+  // 1. Recipient integrity audit (no-op when intent absent).
+  const audit = await auditRecipientIntegrity(supabase, {
+    userId, intent: o.intent, recipient: to, logger,
+  });
+  if (audit.verdict === 'violation') {
+    emitRecipientIntegrityViolation(logger, {
+      message_type: o.message_type,
+      intent: o.intent,
+      resolved_phone: to,
+      source: o.source,
+      reason: audit.reason,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      collision_table: audit.collision && audit.collision.table,
+      collision_id: audit.collision && audit.collision.id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      path,
+    });
+    const err = new Error(`Recipient integrity violation: ${audit.reason}`);
+    err.code = 'RECIPIENT_INTEGRITY_VIOLATION';
+    err.audit = audit;
+    throw err;
+  }
+
+  // 2. Pre-send forensic log.
+  emitNotificationRecipientLog(logger, {
+    message_type: o.message_type,
+    resolved_phone: to,
+    source: o.source,
+    fallback_depth: o.fallback_depth,
+    customer_id: o.customer_id,
+    team_member_id: o.team_member_id,
+    job_id: o.job_id,
+    workspace_id: userId,
+    twilio_sid: null,
+    path,
+  });
+
+  // 3. Resolve tenant Twilio credentials.
   const { data: userData, error: userError } = await supabase
     .from('users')
     .select('twilio_account_sid, twilio_auth_token, twilio_notification_phone')
     .eq('id', userId)
     .single();
-  
+
   if (userError || !userData?.twilio_account_sid || !userData?.twilio_auth_token) {
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: null,
+      path,
+      result: 'failure',
+      error: 'twilio_not_configured',
+    });
     throw new Error('Twilio not configured. Please set up your Twilio credentials first.');
   }
-  
-  // Create Twilio client with user's credentials
+
+  // 4. Send SMS via user's Twilio account.
   const userTwilioClient = require('twilio')(userData.twilio_account_sid, userData.twilio_auth_token);
-  
-  // Send SMS using user's Twilio account
-  const result = await userTwilioClient.messages.create({
-    body: message,
-    from: userData.twilio_notification_phone,
-    to: to
-  });
-  
-  console.log('📱 SMS sent via user Twilio credentials:', result.sid);
-  return result;
+  try {
+    const result = await userTwilioClient.messages.create({
+      body: message,
+      from: userData.twilio_notification_phone,
+      to: to
+    });
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: result.sid,
+      path,
+      result: 'success',
+    });
+    return result;
+  } catch (twilioErr) {
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: null,
+      path,
+      result: 'failure',
+      error: twilioErr && twilioErr.message,
+    });
+    throw twilioErr;
+  }
 };
 
 // Twilio SMS endpoints
