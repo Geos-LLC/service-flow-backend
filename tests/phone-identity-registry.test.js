@@ -27,6 +27,8 @@ const {
   newConflictsPerDay,
   emitIdentityConflictLog,
   maskPhone,
+  classifyExternalSource,
+  enrichOwners,
 } = require('../lib/phone-identity-registry');
 
 // ────────────────────────────────────────────────────────────────────
@@ -422,6 +424,145 @@ describe('emitIdentityConflictLog', () => {
 // ────────────────────────────────────────────────────────────────────
 // Exports sanity
 // ────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────
+// classifyExternalSource + enrichOwners (added 2026-05-20 evening)
+// ────────────────────────────────────────────────────────────────────
+
+describe('classifyExternalSource', () => {
+  test('customer with zenbooker_id → zenbooker', () => {
+    expect(classifyExternalSource('customer', { zenbooker_id: '1778631…', source: 'Thumbtack Tampa' }))
+      .toBe('zenbooker');
+  });
+  test('team_member with zenbooker_id → zenbooker', () => {
+    expect(classifyExternalSource('team_member', { zenbooker_id: 'x' })).toBe('zenbooker');
+  });
+  test('customer with leadbridge-style source → leadbridge', () => {
+    expect(classifyExternalSource('customer', { source: 'leadbridge_thumbtack' })).toBe('leadbridge');
+    expect(classifyExternalSource('customer', { source: 'Thumbtack Tampa' })).toBe('leadbridge');
+    expect(classifyExternalSource('customer', { source: 'Yelp Jacksonville' })).toBe('leadbridge');
+  });
+  test('lead with thumbtack/yelp source → leadbridge', () => {
+    expect(classifyExternalSource('lead', { source: 'Spotless Homes Tampa (thumbtack)' }))
+      .toBe('leadbridge');
+  });
+  test('source contains openphone → openphone', () => {
+    expect(classifyExternalSource('customer', { source: 'openphone_sync' })).toBe('openphone');
+  });
+  test('no zenbooker_id and no external source → sf', () => {
+    expect(classifyExternalSource('customer', { source: 'Website' })).toBe('sf');
+    expect(classifyExternalSource('lead', { source: 'Cold Call' })).toBe('sf');
+    expect(classifyExternalSource('team_member', { zenbooker_id: null })).toBe('sf');
+  });
+  test('null row → unknown', () => {
+    expect(classifyExternalSource('customer', null)).toBe('unknown');
+  });
+});
+
+function makeEnrichSupabase({ customers = [], team_members = [], leads = [], users = [] } = {}) {
+  return {
+    from: jest.fn((tbl) => {
+      const rowsForTable = tbl === 'customers' ? customers
+        : tbl === 'team_members' ? team_members
+        : tbl === 'leads' ? leads
+        : tbl === 'users' ? users
+        : [];
+      return {
+        select: jest.fn(() => ({
+          eq: jest.fn(() => ({
+            in: jest.fn(async (col, ids) => ({
+              data: rowsForTable.filter((r) => ids.map(String).includes(String(r.id))),
+              error: null,
+            })),
+          })),
+          in: jest.fn(async (col, ids) => ({
+            data: rowsForTable.filter((r) => ids.map(String).includes(String(r.id))),
+            error: null,
+          })),
+        })),
+      };
+    }),
+  };
+}
+
+describe('enrichOwners — owner name + external_source + phone', () => {
+  test('Kira Osipova case: customer (ZB) + lead (LB)', async () => {
+    const supabase = makeEnrichSupabase({
+      customers: [{ id: 23421, first_name: 'Kira', last_name: 'Osipova', phone: '3013272882', email: null, zenbooker_id: '1778…', source: 'Thumbtack Tampa' }],
+      leads:     [{ id: 67,    first_name: 'Kira', last_name: 'Osipova', phone: '+13013272882', email: null, source: 'Spotless Homes Tampa (thumbtack)' }],
+    });
+    const rows = [{
+      id: 2, normalized_phone: '3013272882',
+      owners: [
+        { entity_type: 'customer', entity_id: '23421', source: 'backfill_customer', first_seen: '2026-05-20T...' },
+        { entity_type: 'lead',     entity_id: '67',    source: 'backfill_lead',     first_seen: '2026-05-20T...' },
+      ],
+    }];
+    const [out] = await enrichOwners(supabase, 2, rows);
+    expect(out.owners).toHaveLength(2);
+    expect(out.owners[0]).toMatchObject({
+      entity_type: 'customer', entity_id: '23421',
+      name: 'Kira Osipova', phone: '3013272882', external_source: 'zenbooker',
+    });
+    expect(out.owners[1]).toMatchObject({
+      entity_type: 'lead', entity_id: '67',
+      name: 'Kira Osipova', phone: '+13013272882', external_source: 'leadbridge',
+    });
+  });
+
+  test('missing source row → owner marked missing=true (gracefully)', async () => {
+    const supabase = makeEnrichSupabase({ customers: [], leads: [] });
+    const [out] = await enrichOwners(supabase, 2, [{
+      id: 99, owners: [
+        { entity_type: 'customer', entity_id: '99999' },
+      ],
+    }]);
+    expect(out.owners[0].missing).toBe(true);
+    expect(out.owners[0]).not.toHaveProperty('name');
+  });
+
+  test('row without owners array is left unchanged', async () => {
+    const supabase = makeEnrichSupabase();
+    const out = await enrichOwners(supabase, 2, [{ id: 1, status: 'open' }]);
+    expect(out[0]).toEqual({ id: 1, status: 'open' });
+  });
+
+  test('user (workspace owner) enrichment uses business_name', async () => {
+    const supabase = makeEnrichSupabase({
+      users: [{ id: 2, first_name: 'Georgiy', last_name: 'S', email: 'g@x.com', phone: '+18139212100', business_name: 'Spotless Homes Florida LLC' }],
+    });
+    const [out] = await enrichOwners(supabase, 2, [{
+      owners: [{ entity_type: 'user', entity_id: '2' }],
+    }]);
+    expect(out.owners[0].name).toBe('Spotless Homes Florida LLC');
+  });
+
+  test('batched across many conflicts: at most one query per entity type', async () => {
+    const fromCalls = [];
+    const supabase = {
+      from: jest.fn((tbl) => {
+        fromCalls.push(tbl);
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              in: jest.fn(async () => ({ data: [], error: null })),
+            })),
+            in: jest.fn(async () => ({ data: [], error: null })),
+          })),
+        };
+      }),
+    };
+    const rows = Array.from({ length: 50 }, (_, i) => ({
+      id: i, owners: [
+        { entity_type: 'customer', entity_id: String(1000 + i) },
+        { entity_type: 'lead',     entity_id: String(2000 + i) },
+      ],
+    }));
+    await enrichOwners(supabase, 2, rows);
+    // Customers, leads, team_members (empty), users (empty) — at most 4 total.
+    expect(fromCalls.length).toBeLessThanOrEqual(4);
+  });
+});
 
 describe('exports sanity', () => {
   test('PHASE_1_ACTIONS contains only keep_separate + ignore', () => {
