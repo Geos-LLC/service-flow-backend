@@ -24,9 +24,13 @@ const {
   listConflicts,
   getConflict,
   resolveConflict,
+  deleteOwner,
+  combine,
   summary,
   newConflictsPerDay,
   PHASE_1_ACTIONS,
+  COMBINE_SUPPORTED_TYPES,
+  DELETE_SUPPORTED_TYPES,
 } = require('./lib/phone-identity-registry');
 
 module.exports = (supabase, logger) => {
@@ -116,6 +120,58 @@ module.exports = (supabase, logger) => {
       return res.status(status).json(result);
     }
     return res.json({ ok: true, conflict: result.conflict });
+  });
+
+  // POST /:id/delete-owner — delete one source entity row
+  // body: { entity_type, entity_id }
+  router.post('/:id/delete-owner', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
+
+    const { entity_type, entity_id } = req.body || {};
+    if (!entity_type || entity_id == null) {
+      return res.status(400).json({ error: 'entity_type and entity_id required' });
+    }
+
+    const result = await deleteOwner(supabase, logger, userId, id, entity_type, entity_id);
+    if (!result.ok) {
+      const status = result.error === 'not_found' ? 404
+        : result.error === 'owner_not_in_conflict' ? 409
+        : result.error === 'source_delete_failed' ? 409
+        : 400;
+      return res.status(status).json(result);
+    }
+    return res.json(result);
+  });
+
+  // POST /:id/combine — same-type merge of secondaries into a primary
+  // body: { primary: {entity_type, entity_id}, secondaries: [{entity_type, entity_id}, ...] }
+  router.post('/:id/combine', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
+
+    const { primary, secondaries } = req.body || {};
+    if (!primary || !Array.isArray(secondaries)) {
+      return res.status(400).json({ error: 'primary + secondaries required' });
+    }
+
+    const result = await combine(supabase, logger, userId, id, primary, secondaries);
+    if (!result.ok) {
+      const status = result.error === 'not_found' ? 404
+        : result.error === 'unsupported_primary_type' ? 400
+        : result.error === 'combine_rpc_failed' ? 409
+        : 400;
+      return res.status(status).json({
+        ...result,
+        ...(result.error === 'unsupported_primary_type' ? {
+          combine_supported_types: COMBINE_SUPPORTED_TYPES,
+          hint: 'Use Delete for team_members and users. Combine is only available for customers and leads.',
+        } : {}),
+      });
+    }
+    return res.json(result);
   });
 
   return router;
