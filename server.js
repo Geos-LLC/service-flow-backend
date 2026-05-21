@@ -36009,6 +36009,21 @@ const sendSMSWithUserTwilio = async (userId, to, message, options = {}) => {
     throw err;
   }
 
+  // 1b. If the audit detected a collision but the operator has resolved
+  // the conflict with keep_separate, log the consent-based bypass for
+  // forensic trail. The send proceeds (audit.verdict === 'ok').
+  if (audit.reason === 'bypassed_by_keep_separate') {
+    if (logger && logger.warn) {
+      logger.warn(
+        `[RecipientIntegrityBypass] reason=keep_separate intent=${o.intent} ` +
+        `collision_table=${audit.collision && audit.collision.table} ` +
+        `collision_id=${audit.collision && audit.collision.id} ` +
+        `conflict_id=${audit.bypass && audit.bypass.conflict_id} ` +
+        `path=${path}`
+      );
+    }
+  }
+
   // 2. Pre-send forensic log.
   emitNotificationRecipientLog(logger, {
     message_type: o.message_type,

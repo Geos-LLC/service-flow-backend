@@ -19,6 +19,7 @@ const {
   normalizePhone,
   maskPhone,
   auditRecipientIntegrity,
+  checkKeepSeparateBypass,
   emitNotificationRecipientLog,
   emitRecipientIntegrityViolation,
 } = require('../lib/sms-recipient-integrity');
@@ -55,21 +56,50 @@ describe('maskPhone', () => {
 // auditRecipientIntegrity — the eight required cases
 // ────────────────────────────────────────────────────────────────────
 
-function makeSupabase({ teamPhones = [], customerPhones = [], error = null, throws = null } = {}) {
+function makeSupabase({
+  teamPhones = [],
+  customerPhones = [],
+  identityConflicts = [],     // rows of {id, normalized_phone, status, resolution, resolved_at}
+  error = null,
+  throws = null,
+} = {}) {
   return {
-    from: jest.fn((tbl) => ({
-      select: jest.fn(() => ({
-        eq: jest.fn(() => ({
-          not: jest.fn(async () => {
+    from: jest.fn((tbl) => {
+      // identity_conflicts uses a deeper chain: .select().eq().eq().eq().eq().order().limit()
+      // The mock applies all eq() filters so tests verify the production
+      // query semantics (resolution=keep_separate AND status=resolved).
+      if (tbl === 'identity_conflicts') {
+        const filters = [];
+        const chain = {
+          eq: jest.fn(function (col, val) { filters.push([col, val]); return chain; }),
+          order: jest.fn(function () { return chain; }),
+          limit: jest.fn(async function () {
             if (throws) throw throws;
             if (error) return { data: null, error };
-            if (tbl === 'team_members') return { data: teamPhones, error: null };
-            if (tbl === 'customers') return { data: customerPhones, error: null };
-            return { data: [], error: null };
+            // Apply every eq() filter to the seed data.
+            const filtered = (identityConflicts || []).filter((row) =>
+              filters.every(([col, val]) => row[col] === val || (col === 'workspace_id'))
+            );
+            return { data: filtered, error: null };
           }),
+        };
+        return { select: jest.fn(() => chain) };
+      }
+      // team_members / customers chain (existing): .select().eq().not()
+      return {
+        select: jest.fn(() => ({
+          eq: jest.fn(() => ({
+            not: jest.fn(async () => {
+              if (throws) throw throws;
+              if (error) return { data: null, error };
+              if (tbl === 'team_members') return { data: teamPhones, error: null };
+              if (tbl === 'customers') return { data: customerPhones, error: null };
+              return { data: [], error: null };
+            }),
+          })),
         })),
-      })),
-    })),
+      };
+    }),
   };
 }
 
@@ -374,6 +404,154 @@ describe('emitRecipientIntegrityViolation', () => {
   test('does not crash when logger.error is missing', () => {
     expect(() => emitRecipientIntegrityViolation(null, {})).not.toThrow();
     expect(() => emitRecipientIntegrityViolation({ log: () => {} }, {})).not.toThrow();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// P0.1.1 (2026-05-21) — `keep_separate` bypass
+// When the operator has explicitly resolved a conflict with
+// resolution='keep_separate' in identity_conflicts, that's consent;
+// subsequent SMS to that phone goes through with audit trail.
+// ────────────────────────────────────────────────────────────────────
+
+describe('auditRecipientIntegrity — keep_separate bypass', () => {
+  test('collision exists + keep_separate resolved → verdict=ok, reason=bypassed_by_keep_separate', async () => {
+    const supabase = makeSupabase({
+      teamPhones: [{ id: 2623, phone: '2483462681' }],
+      identityConflicts: [{
+        id: 1, normalized_phone: '2483462681', status: 'resolved',
+        resolution: 'keep_separate', resolved_at: '2026-05-21T08:00:00Z',
+      }],
+    });
+    const r = await auditRecipientIntegrity(supabase, {
+      userId: 2, intent: 'customer_facing', recipient: '2483462681',
+    });
+    expect(r.verdict).toBe('ok');
+    expect(r.reason).toBe('bypassed_by_keep_separate');
+    expect(r.collision).toBeDefined();
+    expect(r.bypass.conflict_id).toBe(1);
+  });
+
+  test('collision exists + resolution=ignore → still violation (no consent)', async () => {
+    const supabase = makeSupabase({
+      teamPhones: [{ id: 2623, phone: '2483462681' }],
+      identityConflicts: [{
+        id: 1, normalized_phone: '2483462681', status: 'resolved',
+        resolution: 'ignore', resolved_at: '2026-05-21T08:00:00Z',
+      }],
+    });
+    const r = await auditRecipientIntegrity(supabase, {
+      userId: 2, intent: 'customer_facing', recipient: '2483462681',
+    });
+    // resolution='ignore' is NOT consent — only keep_separate bypasses.
+    // The bypass query filters resolution='keep_separate' so this returns no row.
+    expect(r.verdict).toBe('violation');
+  });
+
+  test('collision exists + status=open → still violation', async () => {
+    const supabase = makeSupabase({
+      teamPhones: [{ id: 2623, phone: '2483462681' }],
+      identityConflicts: [{
+        id: 1, normalized_phone: '2483462681', status: 'open',
+        resolution: null, resolved_at: null,
+      }],
+    });
+    const r = await auditRecipientIntegrity(supabase, {
+      userId: 2, intent: 'customer_facing', recipient: '2483462681',
+    });
+    expect(r.verdict).toBe('violation');
+  });
+
+  test('no collision + keep_separate row exists → verdict=ok (bypass not needed)', async () => {
+    const supabase = makeSupabase({
+      teamPhones: [],
+      identityConflicts: [{
+        id: 1, normalized_phone: '2483462681', status: 'resolved',
+        resolution: 'keep_separate',
+      }],
+    });
+    const r = await auditRecipientIntegrity(supabase, {
+      userId: 2, intent: 'customer_facing', recipient: '2483462681',
+    });
+    expect(r.verdict).toBe('ok');
+    expect(r.reason).toBe('no_collision');
+  });
+
+  test('keep_separate bypass is tenant-scoped (workspace_id filter)', async () => {
+    // The mock's bypass chain accepts any sequence of .eq() calls and
+    // returns the same identityConflicts dataset. We verify the actual
+    // helper applies the .eq('workspace_id', userId) constraint by
+    // inspecting the chain's eq mock.
+    const eqCalls = [];
+    const supabase = {
+      from: jest.fn((tbl) => {
+        if (tbl === 'identity_conflicts') {
+          const chain = {
+            eq: jest.fn(function (col, val) {
+              eqCalls.push([col, val]);
+              return chain;
+            }),
+            order: jest.fn(function () { return chain; }),
+            limit: jest.fn(async () => ({ data: [], error: null })),
+          };
+          return { select: jest.fn(() => chain) };
+        }
+        return {
+          select: jest.fn(() => ({
+            eq: jest.fn(() => ({
+              not: jest.fn(async () => ({ data: [{ id: 1, phone: '2483462681' }], error: null })),
+            })),
+          })),
+        };
+      }),
+    };
+    await auditRecipientIntegrity(supabase, {
+      userId: 2, intent: 'customer_facing', recipient: '2483462681',
+    });
+    // Verify the bypass query applied workspace_id=2 + the right phone +
+    // status=resolved + resolution=keep_separate
+    expect(eqCalls).toEqual(expect.arrayContaining([
+      ['workspace_id', 2],
+      ['normalized_phone', '2483462681'],
+      ['status', 'resolved'],
+      ['resolution', 'keep_separate'],
+    ]));
+  });
+});
+
+describe('checkKeepSeparateBypass — direct unit tests', () => {
+  test('returns found=true when matching keep_separate row exists', async () => {
+    const supabase = makeSupabase({
+      identityConflicts: [{
+        id: 18, normalized_phone: '2483462681',
+        status: 'resolved', resolution: 'keep_separate',
+        resolved_at: '2026-05-21T12:00:00Z',
+      }],
+    });
+    const r = await checkKeepSeparateBypass(supabase, 2, '2483462681');
+    expect(r.found).toBe(true);
+    expect(r.conflictId).toBe(18);
+    expect(r.resolvedAt).toBe('2026-05-21T12:00:00Z');
+  });
+
+  test('returns found=false when no matching row', async () => {
+    const supabase = makeSupabase({ identityConflicts: [] });
+    const r = await checkKeepSeparateBypass(supabase, 2, '2483462681');
+    expect(r.found).toBe(false);
+  });
+
+  test('fail-open on supabase error', async () => {
+    const supabase = makeSupabase({ error: { message: 'db hiccup' } });
+    const logger = { warn: jest.fn() };
+    const r = await checkKeepSeparateBypass(supabase, 2, '2483462681', logger);
+    expect(r.found).toBe(false);
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  test('fail-open on throw', async () => {
+    const supabase = makeSupabase({ throws: new Error('boom') });
+    const r = await checkKeepSeparateBypass(supabase, 2, '2483462681');
+    expect(r.found).toBe(false);
   });
 });
 
