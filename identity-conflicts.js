@@ -32,6 +32,10 @@ const {
   COMBINE_SUPPORTED_TYPES,
   DELETE_SUPPORTED_TYPES,
 } = require('./lib/phone-identity-registry');
+const {
+  attemptLeadToCustomerLink,
+  applyLeadCustomerLink,
+} = require('./lib/identity-linker');
 
 module.exports = (supabase, logger) => {
   const router = express.Router();
@@ -172,6 +176,131 @@ module.exports = (supabase, logger) => {
       });
     }
     return res.json(result);
+  });
+
+  // POST /:id/link-lead — explicitly mark a lead as converted to a customer
+  // body: { lead_entity_id, customer_entity_id }
+  router.post('/:id/link-lead', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid_id' });
+
+    const { lead_entity_id, customer_entity_id } = req.body || {};
+    if (lead_entity_id == null || customer_entity_id == null) {
+      return res.status(400).json({ error: 'lead_entity_id + customer_entity_id required' });
+    }
+
+    // Confirm both are members of this conflict (defensive against stale UI).
+    const { row: conflict, error: getErr } = await getConflict(supabase, userId, id, { enrich: false });
+    if (getErr) return res.status(500).json({ error: getErr });
+    if (!conflict) return res.status(404).json({ error: 'not_found' });
+    const owners = Array.isArray(conflict.owners) ? conflict.owners : [];
+    const hasLead = owners.some((o) => o.entity_type === 'lead' && String(o.entity_id) === String(lead_entity_id));
+    const hasCust = owners.some((o) => o.entity_type === 'customer' && String(o.entity_id) === String(customer_entity_id));
+    if (!hasLead || !hasCust) {
+      return res.status(409).json({ error: 'lead_or_customer_not_in_conflict' });
+    }
+
+    const result = await applyLeadCustomerLink(supabase, logger, {
+      userId,
+      leadId: Number(lead_entity_id),
+      customerId: Number(customer_entity_id),
+      reasonsHint: ['operator_apply_from_ui'],
+    });
+    if (!result.ok) {
+      const status = result.error === 'lead_not_found' ? 404
+        : result.error === 'lead_already_converted' ? 409
+        : 400;
+      return res.status(status).json(result);
+    }
+    return res.json(result);
+  });
+
+  // POST /repair-lead-links — retroactive bulk reconciler.
+  // body: { dryRun: boolean, limit?: number }
+  // Walks open conflicts that have exactly 1 customer + 1 lead owner,
+  // runs the linker, returns per-conflict verdicts.
+  // In apply mode (dryRun=false), HIGH-confidence matches are linked.
+  router.post('/repair-lead-links', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const dryRun = !!(req.body && req.body.dryRun);
+    const limit = Math.min(Number((req.body && req.body.limit) || 100), 500);
+
+    // Pull open customer+lead conflicts.
+    const { data: conflicts, error } = await supabase
+      .from('identity_conflicts')
+      .select('id, normalized_phone, owners, severity, status')
+      .eq('workspace_id', userId)
+      .eq('status', 'open')
+      .limit(limit);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const candidates = (conflicts || []).filter((c) => {
+      const o = Array.isArray(c.owners) ? c.owners : [];
+      const hasCust = o.some((x) => x.entity_type === 'customer');
+      const hasLead = o.some((x) => x.entity_type === 'lead');
+      return hasCust && hasLead;
+    });
+
+    const results = [];
+    let highCount = 0;
+    let mediumCount = 0;
+    let lowCount = 0;
+    let linkedCount = 0;
+    let skippedCount = 0;
+
+    for (const c of candidates) {
+      const lead = c.owners.find((x) => x.entity_type === 'lead');
+      const customer = c.owners.find((x) => x.entity_type === 'customer');
+
+      // Need actual customer details to score. Pull them.
+      const { data: cust } = await supabase
+        .from('customers')
+        .select('id, first_name, last_name, phone, source')
+        .eq('id', customer.entity_id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (!cust) {
+        skippedCount++;
+        results.push({ conflict_id: c.id, lead_id: lead.entity_id, customer_id: customer.entity_id, skipped: 'customer_missing' });
+        continue;
+      }
+
+      const verdict = await attemptLeadToCustomerLink(supabase, logger, {
+        userId,
+        customerId: cust.id,
+        customerPhone: cust.phone,
+        customerName: `${cust.first_name || ''} ${cust.last_name || ''}`.trim(),
+        customerSource: cust.source,
+        dryRun,
+        mode: dryRun ? 'repair_dryrun' : 'repair_apply',
+      });
+
+      if (verdict.linked) linkedCount++;
+      if (verdict.confidence === 'high') highCount++;
+      else if (verdict.confidence === 'medium') mediumCount++;
+      else lowCount++;
+
+      results.push({
+        conflict_id: c.id,
+        lead_id: Number(lead.entity_id),
+        customer_id: Number(customer.entity_id),
+        normalized_phone: c.normalized_phone,
+        verdict,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      dryRun,
+      total_candidates: candidates.length,
+      high: highCount,
+      medium: mediumCount,
+      low: lowCount,
+      linked: linkedCount,
+      skipped: skippedCount,
+      results,
+    });
   });
 
   return router;

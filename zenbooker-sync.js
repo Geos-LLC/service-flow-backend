@@ -288,6 +288,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       return { id: null, mode: 'error', error }
     }
     await linkIdentityToCustomer(inserted.id)
+    // Auto-link to any unconverted lead matching the customer's phone +
+    // source channel (the lead → customer reconciliation layer, per
+    // operator request 2026-05-21). NEVER throws; failure is non-fatal.
+    try {
+      const { attemptLeadToCustomerLink } = require('./lib/identity-linker')
+      const fullName = `${mapped.first_name || ''} ${mapped.last_name || ''}`.trim() || zb.name || null
+      await attemptLeadToCustomerLink(supabase, logger, {
+        userId,
+        customerId: inserted.id,
+        customerPhone: mapped.phone,
+        customerName: fullName,
+        customerSource: mapped.source || null,
+        mode: 'zb_sync',
+      })
+    } catch (linkErr) {
+      logger.warn(`[Zenbooker] identity-linker threw: ${linkErr && linkErr.message}`)
+    }
     return { id: inserted.id, mode: 'created' }
   }
 
