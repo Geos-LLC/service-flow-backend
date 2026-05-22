@@ -195,14 +195,27 @@ const INSTRUMENTATION_RES = [
 // that transitional code MUST self-identify its owner, retirement plan,
 // and observability hook — otherwise it stagnates.
 
-const METADATA_LOOKBACK = 25;
+// 50 lines is enough to cover the largest current comment block (merge_duplicate_customers
+// has ~22 lines of metadata) PLUS the multi-line gate call (~10 lines) sitting between
+// the comment and the recordTransitionalBypass call. Bumped from 25 → 50 in Phase 3
+// when the Stage 3 simulation tags grew the comment blocks. The walker still skips
+// non-comment lines, so this enlarged window does not introduce false positives.
+const METADATA_LOOKBACK = 50;
 const REQUIRED_METADATA_TAGS = ['@transitional', '@owner', '@retirement-stage', '@observability'];
 
 // Stage 3 foundation tags. Optional today — missing tags produce a warning
 // but do not affect metadata_complete (the required-tag check is unchanged).
 // See docs/architecture/runtime-violation-taxonomy.md for the RV-N values
 // and docs/architecture/runtime-allowlist-design.md for the gate semantics.
-const OPTIONAL_METADATA_TAGS = ['@violation-class'];
+//
+// Phase 3 (merge-readiness) adds two more optional tags:
+//   @stage-3-disposition — declares what the dark Stage 3 simulation predicts
+//                          ("simulated_block" or "simulated_allow"). See
+//                          docs/operations/runtime-gate-validation.md.
+//   @replay-class        — declares the site's replay safety class ("safe",
+//                          "partial", "unsafe", "tbd"). See
+//                          docs/architecture/replay-confidence-audit.md.
+const OPTIONAL_METADATA_TAGS = ['@violation-class', '@stage-3-disposition', '@replay-class'];
 
 // Window (in lines) before a `recordTransitionalBypass(...)` call within
 // which a paired `identityWriteGate.evaluateIdentityWrite(...)` call must
@@ -275,6 +288,51 @@ function hasRuntimeGateNearby(lines, callIdx) {
 }
 
 /**
+ * Scan backward from a `recordTransitionalBypass` call to find the paired
+ * `identityWriteGate.evaluateIdentityWrite({...})` call site and detect
+ * whether it passes `simulateBlock: true`. Returns one of:
+ *
+ *   - 'present'  — gate call found and includes `simulateBlock: true`
+ *   - 'absent'   — gate call found but does NOT enable simulation
+ *   - 'no_gate'  — no gate call within GATE_LOOKBACK (already flagged by
+ *                  hasRuntimeGateNearby; we still return this for callers
+ *                  that want a tri-state response)
+ *
+ * The simulation flag is an OPTIONAL Stage 3 dry-run signal — missing it
+ * is a warning, not an error. See docs/operations/runtime-gate-validation.md.
+ */
+function detectSimulationFlag(lines, callIdx) {
+  const start = Math.max(0, callIdx - GATE_LOOKBACK);
+  // Walk backward to locate the gate call line.
+  let gateLine = -1;
+  for (let i = callIdx - 1; i >= start; i--) {
+    const line = lines[i] || '';
+    if (/identityWriteGate\.evaluateIdentityWrite\s*\(/.test(line)) {
+      if (/['"`].*identityWriteGate\.evaluateIdentityWrite.*['"`]/.test(line)) continue;
+      if (/^\s*(\/\/|\*)/.test(line)) continue;
+      gateLine = i;
+      break;
+    }
+  }
+  if (gateLine === -1) return 'no_gate';
+  // From the gate call opening, walk forward up to GATE_LOOKBACK lines to
+  // find the closing of its argument object. Look for `simulateBlock: true`
+  // within that window (bounded so we never bleed into the next site).
+  const end = Math.min(lines.length - 1, gateLine + GATE_LOOKBACK);
+  for (let j = gateLine; j <= end; j++) {
+    const l = lines[j] || '';
+    // Skip pure comment lines so a commented-out `// simulateBlock: true`
+    // does not satisfy the check.
+    if (/^\s*(\/\/|\*)/.test(l)) continue;
+    if (/simulateBlock\s*:\s*true\b/.test(l)) return 'present';
+    // Stop when we hit the close of the call argument object on a line
+    // shaped like `});`. Beyond that we're outside the gate call.
+    if (/^\s*\}\s*\)\s*;?\s*$/.test(l) && j > gateLine) break;
+  }
+  return 'absent';
+}
+
+/**
  * Scan a file for `recordTransitionalBypass(` calls and verify metadata.
  * Returns an array of metadata findings (warning-level).
  */
@@ -332,6 +390,48 @@ function scanTransitionalMetadata(rel, lines) {
         file: rel,
         line: i + 1,
         reason: 'transitional bypass site missing @violation-class tag (RV-1 through RV-7 — see runtime-violation-taxonomy.md)',
+      });
+    }
+
+    // Phase 3 merge-readiness — Stage 3 disposition tag (@stage-3-disposition).
+    // Sites must declare what the Stage 3 simulation predicts for them
+    // (simulated_block or simulated_allow). The tag is the human-readable
+    // counterpart to the gate's `simulateBlock: true` runtime flag.
+    if (meta.missingOptional && meta.missingOptional.includes('@stage-3-disposition')) {
+      findings.push({
+        severity: 'warning',
+        kind: 'stage_3_disposition_missing',
+        file: rel,
+        line: i + 1,
+        reason: 'transitional bypass site missing @stage-3-disposition tag (simulated_block | simulated_allow — see runtime-gate-validation.md)',
+      });
+    }
+
+    // Phase 3 merge-readiness — replay classification tag (@replay-class).
+    // Required so replay framework consumers know whether the site is
+    // safe, partial, unsafe, or tbd for replay. See replay-confidence-audit.md.
+    if (meta.missingOptional && meta.missingOptional.includes('@replay-class')) {
+      findings.push({
+        severity: 'warning',
+        kind: 'replay_class_missing',
+        file: rel,
+        line: i + 1,
+        reason: 'transitional bypass site missing @replay-class tag (safe | partial | unsafe | tbd — see replay-confidence-audit.md)',
+      });
+    }
+
+    // Phase 3 merge-readiness — the paired gate call should enable Stage 3
+    // dry-run simulation (`simulateBlock: true`). Missing the flag is a
+    // warning — the gate still runs, but no simulation log line is emitted
+    // for the site so the Stage 3 dashboard would be blind to it.
+    const sim = detectSimulationFlag(lines, i);
+    if (sim === 'absent') {
+      findings.push({
+        severity: 'warning',
+        kind: 'simulation_missing',
+        file: rel,
+        line: i + 1,
+        reason: 'paired identityWriteGate.evaluateIdentityWrite call missing simulateBlock: true (Stage 3 dry-run simulation flag)',
       });
     }
   }
@@ -531,6 +631,12 @@ function main() {
             console.log(`  ${f.file}:${f.line}  [runtime_gate_missing]`);
           } else if (f.kind === 'taxonomy_classification_missing') {
             console.log(`  ${f.file}:${f.line}  [taxonomy_classification_missing]`);
+          } else if (f.kind === 'stage_3_disposition_missing') {
+            console.log(`  ${f.file}:${f.line}  [stage_3_disposition_missing]`);
+          } else if (f.kind === 'replay_class_missing') {
+            console.log(`  ${f.file}:${f.line}  [replay_class_missing]`);
+          } else if (f.kind === 'simulation_missing') {
+            console.log(`  ${f.file}:${f.line}  [simulation_missing]`);
           } else {
             console.log(`  ${f.file}:${f.line}  [${f.kind || 'warning'}]`);
           }
@@ -544,13 +650,16 @@ function main() {
         console.log('     * @transitional');
         console.log('     * @owner:            identity-v5');
         console.log('     * @retirement-stage: stage-2-ci-static');
-        console.log('     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass"');
-        console.log('     * @violation-class:  RV-2');
+        console.log('     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass"');
+        console.log('     * @violation-class:     RV-2');
+        console.log('     * @stage-3-disposition: simulated_block');
+        console.log('     * @replay-class:        partial');
         console.log('     */');
         console.log('    identityWriteGate.evaluateIdentityWrite({');
         console.log('      tenantId: userId, source: "file:function", target: "table.column",');
         console.log('      operation: "update", bypassStage: "stage-2-ci-static",');
-        console.log('      owner: "identity-v5", violationClass: "RV-2", logger,');
+        console.log('      owner: "identity-v5", violationClass: "RV-2",');
+        console.log('      simulateBlock: true, logger,');
         console.log('    });');
         console.log('    recordTransitionalBypass(logger, { kind: ..., tenant, target, source, reason });');
         console.log('');
@@ -586,6 +695,7 @@ module.exports = {
   extractMetadataNearby,
   scanTransitionalMetadata,
   hasRuntimeGateNearby,
+  detectSimulationFlag,
   findEnclosingTable,
   isInsideWriteCall,
 };

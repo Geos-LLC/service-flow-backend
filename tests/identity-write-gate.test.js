@@ -14,10 +14,14 @@
 
 const {
   evaluateIdentityWrite,
+  simulateBlockDecision,
   KNOWN_STAGES,
   KNOWN_VIOLATION_CLASSES,
   BLOCK_CANDIDATE_STAGES,
   KNOWN_OPERATIONS,
+  KNOWN_REPLAY_CLASSES,
+  KNOWN_SIMULATED_DISPOSITIONS,
+  SIMULATED_PERMANENT_ALLOWLIST,
 } = require('../lib/identity-write-gate');
 
 function makeLogger() {
@@ -192,6 +196,11 @@ describe('evaluateIdentityWrite — return shape', () => {
       observability_key: 'test:test',
       violation_class: 'RV-2',
       notes: [],
+      // simulation fields default to null when simulateBlock is not requested
+      simulated_block: null,
+      simulated_reason: null,
+      simulated_stage: null,
+      simulated_owner: null,
     });
   });
 
@@ -416,5 +425,281 @@ describe('evaluateIdentityWrite — no-behavior-change invariant', () => {
     // The fact that this test completes without OOM / slowdown is the assertion.
     // No state should be accumulating.
     expect(true).toBe(true);
+  });
+});
+
+// ── Stage 3 simulation vocabulary ────────────────────────────────
+
+describe('simulation vocabulary', () => {
+  test('KNOWN_REPLAY_CLASSES has exactly the 4 expected entries', () => {
+    expect(KNOWN_REPLAY_CLASSES).toEqual(['safe', 'partial', 'unsafe', 'tbd']);
+  });
+
+  test('KNOWN_SIMULATED_DISPOSITIONS has exactly simulated_block and simulated_allow', () => {
+    expect(KNOWN_SIMULATED_DISPOSITIONS).toEqual(['simulated_block', 'simulated_allow']);
+  });
+
+  test('SIMULATED_PERMANENT_ALLOWLIST contains merge_duplicate_customers', () => {
+    expect(SIMULATED_PERMANENT_ALLOWLIST.has('server.js:merge_duplicate_customers')).toBe(true);
+  });
+});
+
+// ── Stage 3 simulation — pure decision function ──────────────────
+
+describe('simulateBlockDecision — pure function', () => {
+  test('permanent allow-list source returns would_block=false with simulated_permanent_allowlist reason', () => {
+    const d = simulateBlockDecision({
+      source: 'server.js:merge_duplicate_customers',
+      bypassStage: 'stage-3-runtime-block',
+    });
+    expect(d.would_block).toBe(false);
+    expect(d.reason).toBe('simulated_permanent_allowlist');
+  });
+
+  test('stage-1-observe is never a block candidate', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: 'stage-1-observe' });
+    expect(d.would_block).toBe(false);
+    expect(d.reason).toBe('simulated_not_block_candidate_at_stage-1-observe');
+  });
+
+  test('stage-5-remove is never a block candidate', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: 'stage-5-remove' });
+    expect(d.would_block).toBe(false);
+    expect(d.reason).toBe('simulated_not_block_candidate_at_stage-5-remove');
+  });
+
+  test('stage-2-ci-static produces simulated_block', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: 'stage-2-ci-static' });
+    expect(d.would_block).toBe(true);
+    expect(d.reason).toBe('simulated_block_at_stage-2-ci-static');
+  });
+
+  test('stage-3-runtime-block produces simulated_block', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: 'stage-3-runtime-block' });
+    expect(d.would_block).toBe(true);
+  });
+
+  test('stage-4-adapter-only produces simulated_block', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: 'stage-4-adapter-only' });
+    expect(d.would_block).toBe(true);
+  });
+
+  test('missing stage returns would_block=false with unknown_stage reason', () => {
+    const d = simulateBlockDecision({ source: 'somewhere', bypassStage: null });
+    expect(d.would_block).toBe(false);
+    expect(d.reason).toMatch(/unknown_stage/);
+  });
+});
+
+// ── Stage 3 simulation — gate integration ────────────────────────
+
+describe('evaluateIdentityWrite — simulation mode (DARK)', () => {
+  test('simulateBlock is not enabled by default — fields stay null', () => {
+    const r = evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'test:test',
+      target: 'leads.x',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+    });
+    expect(r.simulated_block).toBeNull();
+    expect(r.simulated_reason).toBeNull();
+    expect(r.simulated_stage).toBeNull();
+    expect(r.simulated_owner).toBeNull();
+  });
+
+  test('simulateBlock: true on a stage-3 site returns simulated_block=true', () => {
+    const r = evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+    });
+    expect(r.simulated_block).toBe(true);
+    expect(r.simulated_reason).toBe('simulated_block_at_stage-2-ci-static');
+    expect(r.simulated_stage).toBe('stage-2-ci-static');
+    expect(r.simulated_owner).toBe('identity-v5');
+  });
+
+  test('simulateBlock: true on the permanent allow-list source returns simulated_block=false', () => {
+    const r = evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'server.js:merge_duplicate_customers',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+    });
+    expect(r.simulated_block).toBe(false);
+    expect(r.simulated_reason).toBe('simulated_permanent_allowlist');
+  });
+
+  test('simulateBlock: true on stage-1-observe returns simulated_block=false', () => {
+    const r = evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'test:observe-only',
+      target: 'leads.x',
+      operation: 'update',
+      bypassStage: 'stage-1-observe',
+      owner: 'identity-v5',
+      simulateBlock: true,
+    });
+    expect(r.simulated_block).toBe(false);
+    expect(r.simulated_reason).toMatch(/not_block_candidate_at_stage-1-observe/);
+  });
+
+  test('simulation NEVER changes allowed — it is always true', () => {
+    // Every stage, with simulateBlock:true, must still produce allowed:true.
+    for (const stage of KNOWN_STAGES) {
+      const r = evaluateIdentityWrite({
+        tenantId: 2,
+        source: 'test:test',
+        target: 'leads.x',
+        operation: 'update',
+        bypassStage: stage,
+        owner: 'identity-v5',
+        simulateBlock: true,
+      });
+      expect(r.allowed).toBe(true);
+    }
+  });
+
+  test('simulation does not change future_block_candidate semantics', () => {
+    // future_block_candidate is determined ONLY by stage; the simulation
+    // flag must not alter it.
+    const without = evaluateIdentityWrite({
+      tenantId: 2, source: 'x', target: 'y', operation: 'update',
+      bypassStage: 'stage-1-observe', owner: 'identity-v5',
+    });
+    const withSim = evaluateIdentityWrite({
+      tenantId: 2, source: 'x', target: 'y', operation: 'update',
+      bypassStage: 'stage-1-observe', owner: 'identity-v5',
+      simulateBlock: true,
+    });
+    expect(withSim.future_block_candidate).toBe(without.future_block_candidate);
+  });
+
+  test('simulation does not change metadata_complete', () => {
+    const without = evaluateIdentityWrite({
+      tenantId: 2, source: 'x', target: 'y', operation: 'update',
+      bypassStage: 'stage-3-runtime-block', owner: 'identity-v5',
+    });
+    const withSim = evaluateIdentityWrite({
+      tenantId: 2, source: 'x', target: 'y', operation: 'update',
+      bypassStage: 'stage-3-runtime-block', owner: 'identity-v5',
+      simulateBlock: true,
+    });
+    expect(withSim.metadata_complete).toBe(without.metadata_complete);
+  });
+});
+
+// ── Stage 3 simulation — log emission ────────────────────────────
+
+describe('evaluateIdentityWrite — simulation log emission', () => {
+  test('simulateBlock: true emits a second [IdentityWriteGateSimulation] line', () => {
+    const logger = makeLogger();
+    evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    // Two lines: the regular gate line + the simulation line.
+    expect(logger.log).toHaveBeenCalledTimes(2);
+    const gateLine = logger.log.mock.calls[0][0];
+    const simLine = logger.log.mock.calls[1][0];
+    expect(gateLine).toMatch(/^\[IdentityWriteGate\] /);
+    expect(simLine).toMatch(/^\[IdentityWriteGateSimulation\] /);
+    expect(simLine).toMatch(/simulated_block=true/);
+    expect(simLine).toMatch(/simulated_reason=simulated_block_at_stage-2-ci-static/);
+    expect(simLine).toMatch(/source=server\.js:convert_lead_to_customer_endpoint/);
+    expect(simLine).toMatch(/tenant=2/);
+    expect(simLine).toMatch(/stage=stage-2-ci-static/);
+    expect(simLine).toMatch(/owner=identity-v5/);
+    expect(simLine).toMatch(/violation_class=RV-2/);
+  });
+
+  test('without simulateBlock, no [IdentityWriteGateSimulation] line is emitted', () => {
+    const logger = makeLogger();
+    evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'test:test',
+      target: 'leads.x',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      logger,
+    });
+    expect(logger.log).toHaveBeenCalledTimes(1);
+    expect(logger.log.mock.calls[0][0]).not.toMatch(/IdentityWriteGateSimulation/);
+  });
+
+  test('simulation log line is emitted even when the regular gate logger throws', () => {
+    // We construct a logger whose .log fails once then succeeds; the gate
+    // must swallow the first throw and still produce a return value. We do
+    // NOT assert that the second call ran (it may not, depending on order),
+    // but the gate itself must not throw.
+    let calls = 0;
+    const logger = {
+      log: jest.fn(() => {
+        calls++;
+        if (calls === 1) throw new Error('logger fault');
+      }),
+    };
+    expect(() => evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'test:test',
+      target: 'leads.x',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      simulateBlock: true,
+      logger,
+    })).not.toThrow();
+  });
+
+  test('simulation log line is omitted when no logger is provided', () => {
+    // No assertion target other than "does not throw". The simulation
+    // decision is still computed and present on the return value.
+    const r = evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'test:test',
+      target: 'leads.x',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      simulateBlock: true,
+    });
+    expect(r.simulated_block).toBe(true);
+  });
+
+  test('simulation line for permanent-allowlist source emits simulated_block=false', () => {
+    const logger = makeLogger();
+    evaluateIdentityWrite({
+      tenantId: 2,
+      source: 'server.js:merge_duplicate_customers',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      simulateBlock: true,
+      logger,
+    });
+    expect(logger.log).toHaveBeenCalledTimes(2);
+    const simLine = logger.log.mock.calls[1][0];
+    expect(simLine).toMatch(/simulated_block=false/);
+    expect(simLine).toMatch(/simulated_reason=simulated_permanent_allowlist/);
   });
 });

@@ -8481,10 +8481,15 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     /**
      * @transitional — OP path links identity → CRM customer directly. Should
      *   migrate to setIdentityCustomer when the Stage 4 OP adapter lands.
-     * @owner:            identity-v5
-     * @retirement-stage: stage-4-adapter-only
-     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
-     * @violation-class:  RV-2
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — idempotent re-link in steady-state, but a graph
+     *                       change between event and replay can repoint the identity
+     *                       to a different customer (scoring-fallback re-evaluation).
+     *                       See docs/architecture/replay-confidence-audit.md.
      * Retires when: OP adapter is on for all tenants (RECONCILIATION_ENGINE_OPENPHONE_TENANTS covers production set)
      * AND the OP webhook handler routes identity-CRM linking through the engine + setIdentityCustomer.
      */
@@ -8496,6 +8501,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
       bypassStage: 'stage-4-adapter-only',
       owner: 'identity-v5',
       violationClass: 'RV-2',
+      simulateBlock: true,
       logger,
     });
     identityGraphViolation.recordTransitionalBypass(logger, {
@@ -8523,10 +8529,14 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   if (crmMatch.type === 'lead') {
     /**
      * @transitional — same shape as the customer branch above; migrate to setIdentityLead.
-     * @owner:            identity-v5
-     * @retirement-stage: stage-4-adapter-only
-     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
-     * @violation-class:  RV-2
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — same rationale as the customer-anchor branch.
+     *                       Replay can re-anchor to a different lead if a new lead
+     *                       was created between the original event and the replay.
      * Retires when: OP adapter is on for all tenants AND lead-anchor branch routes through setIdentityLead.
      */
     identityWriteGate.evaluateIdentityWrite({
@@ -8537,6 +8547,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
       bypassStage: 'stage-4-adapter-only',
       owner: 'identity-v5',
       violationClass: 'RV-2',
+      simulateBlock: true,
       logger,
     });
     identityGraphViolation.recordTransitionalBypass(logger, {
@@ -8598,10 +8609,14 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
    *   by the architectural-hardening emitter so we can measure how often it
    *   fires and migrate this call site to setIdentityLead() in a follow-up.
    *   See docs/architecture/integration-compliance-audit.md (OpenPhone).
-   * @owner:            identity-v5
-   * @retirement-stage: stage-4-adapter-only
-   * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
-   * @violation-class:  RV-2
+   * @owner:               identity-v5
+   * @retirement-stage:    stage-4-adapter-only
+   * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
+   * @violation-class:     RV-2
+   * @stage-3-disposition: simulated_block
+   * @replay-class:        partial — creates a fresh lead and links the identity to it.
+   *                       Replay creates a different lead row, so the original lead is
+   *                       orphaned in the CRM. Acceptable under operator review only.
    * Retires when: OP adapter creates leads through the engine
    * and writes identity rows via setIdentityLead/projectIdentityToCRM only.
    */
@@ -8613,6 +8628,7 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     bypassStage: 'stage-4-adapter-only',
     owner: 'identity-v5',
     violationClass: 'RV-2',
+    simulateBlock: true,
     logger,
   });
   identityGraphViolation.recordTransitionalBypass(logger, {
@@ -10309,10 +10325,15 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
      *   writes converted_customer_id directly. Migration target: route through
      *   applyLeadCustomerLink (which already handles operator-override
      *   semantics + provenance + audit).
-     * @owner:            identity-v5
-     * @retirement-stage: stage-2-ci-static
-     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
-     * @violation-class:  RV-2
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-2-ci-static
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        unsafe — operator-initiated mutation. The original
+     *                       operator's intent is not in the replay event log; a
+     *                       replay would re-fire the conversion without consent.
+     *                       Replay framework must skip operator endpoints (§6.3).
      * Retires when: this endpoint delegates to applyLeadCustomerLink({mode:'operator_override'}).
      */
     identityWriteGate.evaluateIdentityWrite({
@@ -10323,6 +10344,7 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       bypassStage: 'stage-2-ci-static',
       owner: 'identity-v5',
       violationClass: 'RV-2',
+      simulateBlock: true,
       logger,
     });
     identityGraphViolation.recordTransitionalBypass(logger, {
@@ -10937,10 +10959,18 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
      *   and can audit operator merge volume. Routing through applyLeadCustomerLink
      *   here is not appropriate because that function refuses to overwrite an
      *   already-linked lead.
-     * @owner:            identity-v5
-     * @retirement-stage: stage-3-runtime-block
-     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
-     * @violation-class:  RV-2
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-3-runtime-block
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_allow — this source is on the hypothetical
+     *                       permanent allow-list (runtime-allowlist-design.md §2.2).
+     *                       The merge endpoint legitimately needs to repoint
+     *                       leads.converted_customer_id and must not be refused
+     *                       under any posture.
+     * @replay-class:        unsafe — operator-initiated mutation with side effects
+     *                       (deletes the source customer). Replay framework MUST
+     *                       skip this site (replay-confidence-audit.md).
      * Retires when: applyLeadCustomerLink gains an `operator_repoint` mode
      * that permits overwriting an existing converted_customer_id under audit + reason code.
      */
@@ -10952,6 +10982,7 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       bypassStage: 'stage-3-runtime-block',
       owner: 'identity-v5',
       violationClass: 'RV-2',
+      simulateBlock: true,
       logger,
     });
     identityGraphViolation.recordTransitionalBypass(logger, {

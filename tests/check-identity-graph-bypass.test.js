@@ -20,6 +20,7 @@ const {
   extractMetadataNearby,
   scanTransitionalMetadata,
   hasRuntimeGateNearby,
+  detectSimulationFlag,
   REQUIRED_METADATA_TAGS,
   OPTIONAL_METADATA_TAGS,
   METADATA_LOOKBACK,
@@ -163,7 +164,10 @@ describe('extractMetadataNearby', () => {
 // ── scanTransitionalMetadata ─────────────────────────────────────────
 
 describe('scanTransitionalMetadata', () => {
-  test('returns no METADATA findings when all required tags present (gate-missing warning still expected without an adjacent gate call)', () => {
+  test('returns no METADATA findings when all required tags are present', () => {
+    // This test focuses ONLY on the required-tag check. Other warning kinds
+    // (replay_class_missing, stage_3_disposition_missing, simulation_missing)
+    // are scoped out — they have dedicated suites below.
     const lines = [
       '/**',
       ' * @transitional',
@@ -175,7 +179,8 @@ describe('scanTransitionalMetadata', () => {
       'identityWriteGate.evaluateIdentityWrite({ source: "x" });',
       'recordTransitionalBypass(logger, { kind, tenant });',
     ];
-    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines)
+      .filter(f => f.kind === 'metadata');
     expect(findings).toEqual([]);
   });
 
@@ -242,12 +247,14 @@ describe('scanTransitionalMetadata', () => {
       'function doIt() {',
       '  /**',
       '   * @transitional — old direct write, being phased out',
-      '   * @owner:            identity-v5',
-      '   * @retirement-stage: stage-3-runtime-block',
-      '   * @observability:    Loki kind=transitional_bypass',
-      '   * @violation-class:  RV-2',
+      '   * @owner:               identity-v5',
+      '   * @retirement-stage:    stage-3-runtime-block',
+      '   * @observability:       Loki kind=transitional_bypass',
+      '   * @violation-class:     RV-2',
+      '   * @stage-3-disposition: simulated_block',
+      '   * @replay-class:        partial',
       '   */',
-      '  identityWriteGate.evaluateIdentityWrite({ source: "x" });',
+      '  identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
       '  recordTransitionalBypass(logger, { kind, tenant, source });',
       '}',
     ];
@@ -428,6 +435,279 @@ describe('scanTransitionalMetadata — runtime gate + taxonomy warnings', () => 
     const meta = extractMetadataNearby(lines, lines.length - 1);
     expect(meta.missing).toEqual([]);                          // required complete
     expect(meta.missingOptional).toContain('@violation-class'); // optional missing
+  });
+});
+
+// ── detectSimulationFlag (Phase 3 merge-readiness) ───────────────────
+
+describe('detectSimulationFlag', () => {
+  test('returns "present" when simulateBlock: true is on the same line as the gate call', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 1)).toBe('present');
+  });
+
+  test('returns "present" when simulateBlock: true is on a later line inside the call', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({',
+      '  source: "x",',
+      '  simulateBlock: true,',
+      '  logger,',
+      '});',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 5)).toBe('present');
+  });
+
+  test('returns "absent" when gate call is present but simulateBlock missing', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({',
+      '  source: "x",',
+      '  logger,',
+      '});',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 4)).toBe('absent');
+  });
+
+  test('returns "absent" when simulateBlock: false', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: false });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 1)).toBe('absent');
+  });
+
+  test('returns "no_gate" when no gate call is in the window', () => {
+    const lines = [
+      'const x = 1;',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 1)).toBe('no_gate');
+  });
+
+  test('returns "absent" when simulateBlock: true is only present inside a comment line', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({',
+      '  source: "x",',
+      '  // simulateBlock: true, ← turned off for now',
+      '});',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    expect(detectSimulationFlag(lines, 4)).toBe('absent');
+  });
+
+  test('does not bleed into the NEXT site when sites are spaced apart', () => {
+    const lines = [
+      'identityWriteGate.evaluateIdentityWrite({ source: "y", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind: "site-1" });',
+    ];
+    // Pad with code so the next bypass is past GATE_LOOKBACK.
+    for (let k = 0; k < GATE_LOOKBACK + 5; k++) lines.push(`const x${k} = ${k};`);
+    lines.push('identityWriteGate.evaluateIdentityWrite({ source: "z" });'); // no simulateBlock
+    lines.push('recordTransitionalBypass(logger, { kind: "site-2" });');
+    // The second site should report 'absent' — the first site's simulateBlock
+    // must NOT carry over.
+    expect(detectSimulationFlag(lines, lines.length - 1)).toBe('absent');
+  });
+});
+
+// ── New Phase 3 warning kinds ────────────────────────────────────────
+
+describe('scanTransitionalMetadata — Phase 3 merge-readiness warnings', () => {
+  test('emits stage_3_disposition_missing when @stage-3-disposition absent', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @replay-class: partial',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    const disp = findings.find(f => f.kind === 'stage_3_disposition_missing');
+    expect(disp).toBeDefined();
+    expect(disp.severity).toBe('warning');
+    expect(disp.file).toBe('lib/some-file.js');
+  });
+
+  test('does NOT emit stage_3_disposition_missing when @stage-3-disposition is simulated_block', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: partial',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.find(f => f.kind === 'stage_3_disposition_missing')).toBeUndefined();
+  });
+
+  test('does NOT emit stage_3_disposition_missing when @stage-3-disposition is simulated_allow', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-3-runtime-block',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_allow',
+      ' * @replay-class: unsafe',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "merge_duplicate", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.find(f => f.kind === 'stage_3_disposition_missing')).toBeUndefined();
+  });
+
+  test('emits replay_class_missing when @replay-class absent', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    const rc = findings.find(f => f.kind === 'replay_class_missing');
+    expect(rc).toBeDefined();
+    expect(rc.severity).toBe('warning');
+  });
+
+  test('does NOT emit replay_class_missing when @replay-class is present', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: safe',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.find(f => f.kind === 'replay_class_missing')).toBeUndefined();
+  });
+
+  test('emits simulation_missing when paired gate call lacks simulateBlock: true', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: partial',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({',
+      '  source: "x",',
+      '  logger,',
+      '});',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    const sim = findings.find(f => f.kind === 'simulation_missing');
+    expect(sim).toBeDefined();
+    expect(sim.severity).toBe('warning');
+  });
+
+  test('does NOT emit simulation_missing when simulateBlock: true is set', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: partial',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({',
+      '  source: "x",',
+      '  simulateBlock: true,',
+      '  logger,',
+      '});',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.find(f => f.kind === 'simulation_missing')).toBeUndefined();
+  });
+
+  test('a fully-tagged site with simulateBlock: true emits ZERO warnings', () => {
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: partial',
+      ' */',
+      'identityWriteGate.evaluateIdentityWrite({ source: "x", simulateBlock: true });',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings).toEqual([]);
+  });
+
+  test('OPTIONAL_METADATA_TAGS contains the new Phase 3 tags', () => {
+    expect(OPTIONAL_METADATA_TAGS).toContain('@stage-3-disposition');
+    expect(OPTIONAL_METADATA_TAGS).toContain('@replay-class');
+  });
+
+  test('all Phase 3 warnings are severity=warning (never error)', () => {
+    // A bypass with NO metadata + no gate + no simulateBlock generates:
+    //   metadata + runtime_gate_missing + taxonomy + stage_3_disposition + replay_class
+    // (simulation_missing is suppressed when the gate is also missing — we
+    //  only flag the simulation gap on sites that DO have a gate call.)
+    const lines = ['recordTransitionalBypass(logger, { kind });'];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.length).toBeGreaterThanOrEqual(5);
+    for (const f of findings) expect(f.severity).toBe('warning');
+  });
+
+  test('simulation_missing is suppressed when no gate is present (only runtime_gate_missing fires)', () => {
+    // Sites without a gate call already get runtime_gate_missing — we don't
+    // want to double-report. detectSimulationFlag returns 'no_gate' in that
+    // case, and the scanner only fires simulation_missing on 'absent'.
+    const lines = [
+      '/**',
+      ' * @transitional',
+      ' * @owner: identity-v5',
+      ' * @retirement-stage: stage-2-ci-static',
+      ' * @observability: loki',
+      ' * @violation-class: RV-2',
+      ' * @stage-3-disposition: simulated_block',
+      ' * @replay-class: partial',
+      ' */',
+      'recordTransitionalBypass(logger, { kind });',
+    ];
+    const findings = scanTransitionalMetadata('lib/some-file.js', lines);
+    expect(findings.find(f => f.kind === 'runtime_gate_missing')).toBeDefined();
+    expect(findings.find(f => f.kind === 'simulation_missing')).toBeUndefined();
   });
 });
 
