@@ -22,6 +22,17 @@
  *           @observability:     <how to monitor it in Loki/Grafana>
  *       Missing tags are flagged as warnings — Stage 1: warn only.
  *
+ *   (3) Runtime gate adjacency. Each `recordTransitionalBypass(...)` site
+ *       must be paired with an adjacent (within GATE_LOOKBACK lines)
+ *       `identityWriteGate.evaluateIdentityWrite(...)` call. The gate is
+ *       the Stage 3 foundation insertion point. Missing the call today
+ *       is a warning, not an error — runtime behavior is unchanged.
+ *
+ *   (4) Taxonomy classification. Each bypass site SHOULD declare a
+ *       runtime violation class via `@violation-class: RV-N` in the
+ *       metadata block. See docs/architecture/runtime-violation-taxonomy.md
+ *       for the closed set RV-1 through RV-7. Missing is a warning.
+ *
  * If a match is neither allowlisted nor instrumented (case 1), or a
  * transitional bypass lacks required metadata (case 2), the scanner
  * reports it. CI failure only when `--strict` is passed.
@@ -187,33 +198,80 @@ const INSTRUMENTATION_RES = [
 const METADATA_LOOKBACK = 25;
 const REQUIRED_METADATA_TAGS = ['@transitional', '@owner', '@retirement-stage', '@observability'];
 
+// Stage 3 foundation tags. Optional today — missing tags produce a warning
+// but do not affect metadata_complete (the required-tag check is unchanged).
+// See docs/architecture/runtime-violation-taxonomy.md for the RV-N values
+// and docs/architecture/runtime-allowlist-design.md for the gate semantics.
+const OPTIONAL_METADATA_TAGS = ['@violation-class'];
+
+// Window (in lines) before a `recordTransitionalBypass(...)` call within
+// which a paired `identityWriteGate.evaluateIdentityWrite(...)` call must
+// appear. Same magnitude as METADATA_LOOKBACK so the comment block and the
+// two calls all live within one "site" of source.
+const GATE_LOOKBACK = 30;
+
 function extractMetadataNearby(lines, callIdx) {
-  // Walk backward, collecting lines that begin with `*` or `//` until we
-  // hit the first non-comment line (other than blank lines).
+  // Walk backward up to METADATA_LOOKBACK lines from the bypass call.
+  //
+  // We do NOT stop at the first non-comment line anymore: the Stage 3
+  // foundation puts an `identityWriteGate.evaluateIdentityWrite(...)`
+  // call BETWEEN the comment block and the `recordTransitionalBypass(...)`
+  // call (so the comment + gate + emit form one logical site). Stopping
+  // at the gate call would erase the comment block.
+  //
+  // Safety: tags (`@transitional`, `@owner`, etc.) are only matched on
+  // comment-shaped lines (`//`, `*`, `/*`) or the call line itself, so
+  // unrelated code lines do NOT contribute false positives. The walker
+  // is bounded by METADATA_LOOKBACK to prevent picking up tags from a
+  // neighbouring site.
   const found = new Set();
   const detail = {};
+  const allTags = [...REQUIRED_METADATA_TAGS, ...OPTIONAL_METADATA_TAGS];
   for (let i = callIdx; i >= Math.max(0, callIdx - METADATA_LOOKBACK); i--) {
     const line = lines[i] || '';
     const trimmed = line.trim();
-    // Look at comment lines + the call line itself.
-    if (trimmed === '' || /^(\/\/|\*|\/\*)/.test(trimmed) || i === callIdx) {
-      for (const tag of REQUIRED_METADATA_TAGS) {
-        if (trimmed.includes(tag)) {
-          found.add(tag);
-          // Capture inline value, e.g. "@owner: identity-v5" → "identity-v5"
-          const m = trimmed.match(new RegExp(tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:\\s*([^*]+?)(?:\\s*\\*\\/|$)'));
-          if (m && m[1]) detail[tag] = m[1].trim();
-          else if (tag === '@transitional') detail[tag] = true;
-        }
+    // Tags can ONLY appear on comment lines (or the call line itself).
+    // Other lines (gate call args, blank lines, code) are walked through
+    // but contribute no matches.
+    const isCommentish = trimmed === '' || /^(\/\/|\*|\/\*)/.test(trimmed) || i === callIdx;
+    if (!isCommentish) continue;
+    for (const tag of allTags) {
+      if (trimmed.includes(tag)) {
+        found.add(tag);
+        // Capture inline value, e.g. "@owner: identity-v5" → "identity-v5"
+        const m = trimmed.match(new RegExp(tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:\\s*([^*]+?)(?:\\s*\\*\\/|$)'));
+        if (m && m[1]) detail[tag] = m[1].trim();
+        else if (tag === '@transitional') detail[tag] = true;
       }
-    } else {
-      // First non-comment, non-blank line above the call breaks the
-      // comment block — stop collecting.
-      break;
     }
   }
   const missing = REQUIRED_METADATA_TAGS.filter(t => !found.has(t));
-  return { found: Array.from(found), missing, detail };
+  const missingOptional = OPTIONAL_METADATA_TAGS.filter(t => !found.has(t));
+  return { found: Array.from(found), missing, missingOptional, detail };
+}
+
+/**
+ * Scan backward from a `recordTransitionalBypass` call to see if a paired
+ * `identityWriteGate.evaluateIdentityWrite` call exists within GATE_LOOKBACK
+ * lines (typically immediately above, inside the same site).
+ *
+ * Stage 3 foundation: every transitional bypass should also run the runtime
+ * gate so we have a future insertion point for hard refusal. Missing the
+ * gate today is a warning, not an error.
+ */
+function hasRuntimeGateNearby(lines, callIdx) {
+  const start = Math.max(0, callIdx - GATE_LOOKBACK);
+  for (let i = callIdx - 1; i >= start; i--) {
+    const line = lines[i] || '';
+    if (/identityWriteGate\.evaluateIdentityWrite\s*\(/.test(line)) {
+      // Skip mentions inside string literals or comment lines (same
+      // protections we use for recordTransitionalBypass detection).
+      if (/['"`].*identityWriteGate\.evaluateIdentityWrite.*['"`]/.test(line)) continue;
+      if (/^\s*(\/\/|\*)/.test(line)) continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -241,6 +299,8 @@ function scanTransitionalMetadata(rel, lines) {
     // Skip comment lines that document the name.
     if (/^\s*(\/\/|\*)/.test(line)) continue;
     const meta = extractMetadataNearby(lines, i);
+
+    // Existing check — required metadata tags.
     if (meta.missing.length > 0) {
       findings.push({
         severity: 'warning',
@@ -250,6 +310,28 @@ function scanTransitionalMetadata(rel, lines) {
         missing: meta.missing,
         found: meta.found,
         reason: `transitional bypass missing required metadata tags: ${meta.missing.join(', ')}`,
+      });
+    }
+
+    // Stage 3 foundation — runtime gate call must be adjacent.
+    if (!hasRuntimeGateNearby(lines, i)) {
+      findings.push({
+        severity: 'warning',
+        kind: 'runtime_gate_missing',
+        file: rel,
+        line: i + 1,
+        reason: 'transitional bypass site missing adjacent identityWriteGate.evaluateIdentityWrite(...) call (Stage 3 foundation)',
+      });
+    }
+
+    // Stage 3 foundation — taxonomy classification tag (@violation-class: RV-N).
+    if (meta.missingOptional && meta.missingOptional.includes('@violation-class')) {
+      findings.push({
+        severity: 'warning',
+        kind: 'taxonomy_classification_missing',
+        file: rel,
+        line: i + 1,
+        reason: 'transitional bypass site missing @violation-class tag (RV-1 through RV-7 — see runtime-violation-taxonomy.md)',
       });
     }
   }
@@ -441,24 +523,39 @@ function main() {
         console.log('');
       }
       if (warnings.length > 0) {
-        console.log(`[identity-graph-bypass] ${warnings.length} WARNING(s) — transitional bypasses missing metadata:`);
+        console.log(`[identity-graph-bypass] ${warnings.length} WARNING(s) — transitional bypasses missing governance / runtime instrumentation:`);
         for (const f of warnings) {
-          console.log(`  ${f.file}:${f.line}  missing=${(f.missing || []).join(',')}  found=${(f.found || []).join(',') || '(none)'}`);
+          if (f.kind === 'metadata') {
+            console.log(`  ${f.file}:${f.line}  [metadata] missing=${(f.missing || []).join(',')}  found=${(f.found || []).join(',') || '(none)'}`);
+          } else if (f.kind === 'runtime_gate_missing') {
+            console.log(`  ${f.file}:${f.line}  [runtime_gate_missing]`);
+          } else if (f.kind === 'taxonomy_classification_missing') {
+            console.log(`  ${f.file}:${f.line}  [taxonomy_classification_missing]`);
+          } else {
+            console.log(`  ${f.file}:${f.line}  [${f.kind || 'warning'}]`);
+          }
           console.log(`    reason: ${f.reason}`);
         }
         console.log('');
         console.log('Remediation (warnings): add a structured comment block immediately above');
-        console.log('  the recordTransitionalBypass(...) call, e.g.:');
+        console.log('  the recordTransitionalBypass(...) call AND an adjacent gate call, e.g.:');
         console.log('');
         console.log('    /**');
         console.log('     * @transitional');
         console.log('     * @owner:            identity-v5');
         console.log('     * @retirement-stage: stage-2-ci-static');
         console.log('     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass"');
+        console.log('     * @violation-class:  RV-2');
         console.log('     */');
+        console.log('    identityWriteGate.evaluateIdentityWrite({');
+        console.log('      tenantId: userId, source: "file:function", target: "table.column",');
+        console.log('      operation: "update", bypassStage: "stage-2-ci-static",');
+        console.log('      owner: "identity-v5", violationClass: "RV-2", logger,');
+        console.log('    });');
         console.log('    recordTransitionalBypass(logger, { kind: ..., tenant, target, source, reason });');
         console.log('');
         console.log('  See: docs/architecture/transitional-infrastructure-registry.md');
+        console.log('       docs/architecture/runtime-violation-taxonomy.md');
       }
     }
   }
@@ -478,14 +575,17 @@ module.exports = {
   // Constants exposed for tests
   METADATA_LOOKBACK,
   REQUIRED_METADATA_TAGS,
+  OPTIONAL_METADATA_TAGS,
   METADATA_SCAN_EXCLUSIONS,
   ADJACENCY,
+  GATE_LOOKBACK,
   PATTERNS,
   AUTHORIZED_WRITER_FILES,
   TRANSITIONAL_BYPASS_FILES,
   // Pure helpers exposed for tests
   extractMetadataNearby,
   scanTransitionalMetadata,
+  hasRuntimeGateNearby,
   findEnclosingTable,
   isInsideWriteCall,
 };

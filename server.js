@@ -48,6 +48,7 @@ const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
+const identityWriteGate = require('./lib/identity-write-gate');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
@@ -8483,9 +8484,20 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
      * @owner:            identity-v5
      * @retirement-stage: stage-4-adapter-only
      * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
+     * @violation-class:  RV-2
      * Retires when: OP adapter is on for all tenants (RECONCILIATION_ENGINE_OPENPHONE_TENANTS covers production set)
      * AND the OP webhook handler routes identity-CRM linking through the engine + setIdentityCustomer.
      */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      target: 'communication_participant_identities.sf_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      logger,
+    });
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'communication_participant_identities.sf_customer_id',
       tenant: userId,
@@ -8514,8 +8526,19 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
      * @owner:            identity-v5
      * @retirement-stage: stage-4-adapter-only
      * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
+     * @violation-class:  RV-2
      * Retires when: OP adapter is on for all tenants AND lead-anchor branch routes through setIdentityLead.
      */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      target: 'communication_participant_identities.sf_lead_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      logger,
+    });
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'communication_participant_identities.sf_lead_id',
       tenant: userId,
@@ -8578,9 +8601,20 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
    * @owner:            identity-v5
    * @retirement-stage: stage-4-adapter-only
    * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
+   * @violation-class:  RV-2
    * Retires when: OP adapter creates leads through the engine
    * and writes identity rows via setIdentityLead/projectIdentityToCRM only.
    */
+  identityWriteGate.evaluateIdentityWrite({
+    tenantId: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    target: 'communication_participant_identities.sf_lead_id',
+    operation: 'update',
+    bypassStage: 'stage-4-adapter-only',
+    owner: 'identity-v5',
+    violationClass: 'RV-2',
+    logger,
+  });
   identityGraphViolation.recordTransitionalBypass(logger, {
     target: 'communication_participant_identities.sf_lead_id',
     tenant: userId,
@@ -10278,8 +10312,19 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
      * @owner:            identity-v5
      * @retirement-stage: stage-2-ci-static
      * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
+     * @violation-class:  RV-2
      * Retires when: this endpoint delegates to applyLeadCustomerLink({mode:'operator_override'}).
      */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      logger,
+    });
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'leads.converted_customer_id',
       tenant: req.user && req.user.userId,
@@ -10895,9 +10940,20 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
      * @owner:            identity-v5
      * @retirement-stage: stage-3-runtime-block
      * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
+     * @violation-class:  RV-2
      * Retires when: applyLeadCustomerLink gains an `operator_repoint` mode
      * that permits overwriting an existing converted_customer_id under audit + reason code.
      */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:merge_duplicate_customers',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      logger,
+    });
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'leads.converted_customer_id',
       tenant: userId,
