@@ -9,6 +9,7 @@ const express = require('express')
 const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { setIdentityCustomer } = require('./lib/identity-linker')
 const { mapJobFinancials, stripDiagnostics } = require('./lib/zenbooker-financial')
 const { safeReconcileJobLedger } = require('./lib/zenbooker-ledger-reconcile')
 const { mapJobLifecycle, stripLifecycleDiagnostics } = require('./lib/zenbooker-lifecycle')
@@ -211,13 +212,26 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       return { id: null, mode: 'skipped_ambiguous_identity' }
     }
 
+    // Routes through the canonical setter — guarded atomic UPDATE on the
+    // identity row, automatic projection to leads.converted_customer_id
+    // when the identity already has sf_lead_id, audit row written.
+    // Phase 0 — no behavior change when IDENTITY_RESOLVER_ZENBOOKER is OFF
+    // (identity stays null and the setter is never called).
     const linkIdentityToCustomer = async (customerId) => {
       if (!identity || !customerId) return
       if (identity.sf_customer_id === customerId) return
-      const newStatus = identity.sf_lead_id ? 'resolved_both' : 'resolved_customer'
-      await supabase.from('communication_participant_identities')
-        .update({ sf_customer_id: customerId, status: newStatus, updated_at: new Date().toISOString() })
-        .eq('id', identity.id)
+      await setIdentityCustomer(supabase, logger, {
+        userId,
+        identityId: identity.id,
+        customerId,
+        identitySnapshot: identity,
+        policy: {
+          resolvedBy: 'automatic',
+          resolutionReason: 'identity_graph_projection',
+          source: 'zenbooker',
+          allowStageMove: false,
+        },
+      })
     }
 
     // 1. Match by zenbooker_id
@@ -288,23 +302,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       return { id: null, mode: 'error', error }
     }
     await linkIdentityToCustomer(inserted.id)
-    // Auto-link to any unconverted lead matching the customer's phone +
-    // source channel (the lead → customer reconciliation layer, per
-    // operator request 2026-05-21). NEVER throws; failure is non-fatal.
-    try {
-      const { attemptLeadToCustomerLink } = require('./lib/identity-linker')
-      const fullName = `${mapped.first_name || ''} ${mapped.last_name || ''}`.trim() || zb.name || null
-      await attemptLeadToCustomerLink(supabase, logger, {
-        userId,
-        customerId: inserted.id,
-        customerPhone: mapped.phone,
-        customerName: fullName,
-        customerSource: mapped.source || null,
-        mode: 'zb_sync',
-      })
-    } catch (linkErr) {
-      logger.warn(`[Zenbooker] identity-linker threw: ${linkErr && linkErr.message}`)
-    }
+    // Lead↔customer reconciliation is handled by the projection layer
+    // inside setIdentityCustomer. When IDENTITY_RESOLVER_ZENBOOKER is ON
+    // the resolver's CRM-anchor preference adopts an existing identity
+    // that already has sf_lead_id; setIdentityCustomer then projects to
+    // leads.converted_customer_id automatically. No runtime second matcher.
+    // For tenants where the flag is OFF, historic dups are reconciled by
+    // the operator-triggered POST /api/identity-conflicts/repair-lead-links
+    // endpoint (dry-run by default).
     return { id: inserted.id, mode: 'created' }
   }
 

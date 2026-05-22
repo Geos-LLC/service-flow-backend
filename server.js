@@ -47,7 +47,8 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
-const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
+const { FLAGS, isEnabled, isEnabledForTenant, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
+const { setIdentityCustomer, setIdentityLead, applyLeadCustomerLink } = require('./lib/identity-linker');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
 const { runStartupConfigAudit } = require('./lib/config-audit');
@@ -8476,13 +8477,18 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
-    await supabase.from('communication_participant_identities')
-      .update({
-        sf_customer_id: crmMatch.id,
-        status: identity.sf_lead_id ? 'resolved_both' : 'resolved_customer',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', identity.id);
+    await setIdentityCustomer(supabase, logger, {
+      userId,
+      identityId: identity.id,
+      customerId: crmMatch.id,
+      identitySnapshot: identity,
+      policy: {
+        resolvedBy: 'automatic',
+        resolutionReason: 'identity_graph_projection',
+        source: 'openphone',
+        allowStageMove: false,
+      },
+    });
     await logOpDecision({
       userId, identityId: identity.id,
       outcome: 'linked_existing_customer_by_phone', reason: decision.reason,
@@ -8492,13 +8498,18 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
-    await supabase.from('communication_participant_identities')
-      .update({
-        sf_lead_id: crmMatch.id,
-        status: identity.sf_customer_id ? 'resolved_both' : 'resolved_lead',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', identity.id);
+    await setIdentityLead(supabase, logger, {
+      userId,
+      identityId: identity.id,
+      leadId: crmMatch.id,
+      identitySnapshot: identity,
+      policy: {
+        resolvedBy: 'automatic',
+        resolutionReason: 'identity_graph_projection',
+        source: 'openphone',
+        allowStageMove: false,
+      },
+    });
     await logOpDecision({
       userId, identityId: identity.id,
       outcome: 'linked_existing_lead_by_phone', reason: decision.reason,
@@ -8537,10 +8548,20 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
 
   if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
 
-  // Link identity → new lead + mark status.
-  await supabase.from('communication_participant_identities')
-    .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
-    .eq('id', identity.id);
+  // Link identity → new lead through the canonical setter.
+  // Projection fires automatically if identity already has sf_customer_id.
+  await setIdentityLead(supabase, logger, {
+    userId,
+    identityId: identity.id,
+    leadId: newLead.id,
+    identitySnapshot: identity,
+    policy: {
+      resolvedBy: 'automatic',
+      resolutionReason: 'identity_graph_projection',
+      source: 'openphone',
+      allowStageMove: false,
+    },
+  });
 
   const outcome = decision.note === 'openphone_lb_recovery'
     ? 'created_lead_openphone_lb_recovery'
@@ -9550,22 +9571,30 @@ app.delete('/api/leads/pipeline/stages/:id', authenticateToken, async (req, res)
 app.get('/api/leads', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    const { data: leads, error } = await supabase
+    // Phase 0.5: canonical (parent_lead_id IS NULL) leads only by default.
+    // Children are acquisition-event records, not pipeline entities, and
+    // should not show in the main lead list. Set ?include_children=true to
+    // include them (used by detail panels / analytics drill-down).
+    const includeChildren = String(req.query.include_children || '').toLowerCase() === 'true';
+
+    let query = supabase
       .from('leads')
       .select(`
         *,
         lead_stages (*),
         lead_pipelines (*)
       `)
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
-    
+      .eq('user_id', userId);
+    if (!includeChildren) {
+      query = query.is('parent_lead_id', null);
+    }
+    const { data: leads, error } = await query.order('created_at', { ascending: false });
+
     if (error) {
       console.error('Error fetching leads:', error);
       return res.status(500).json({ error: 'Failed to fetch leads' });
     }
-    
+
     res.json({ leads: leads || [] });
   } catch (error) {
     console.error('Get leads error:', error);
@@ -9623,13 +9652,16 @@ app.get('/api/leads/tasks', authenticateToken, async (req, res) => {
   }
 });
 
-// Get a single lead
+// Get a single lead — Phase 0.5: when the lead is canonical, attach
+// `child_leads` array + `child_leads_count`. When it's a child, attach
+// `parent_lead` summary. Children carry acquisition attribution but no
+// pipeline lifecycle of their own.
 app.get('/api/leads/:id', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     const { id } = req.params;
-    
-    const { data: leads, error } = await supabase
+
+    const { data: leadRow, error } = await supabase
       .from('leads')
       .select(`
         *,
@@ -9640,17 +9672,38 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
       .eq('id', id)
       .eq('user_id', userId)
       .single();
-    
+
     if (error) {
       console.error('Error fetching lead:', error);
       return res.status(500).json({ error: 'Failed to fetch lead' });
     }
-    
-    if (!leads) {
+    if (!leadRow) {
       return res.status(404).json({ error: 'Lead not found' });
     }
-    
-    res.json(leads);
+
+    // Attach child/parent context.
+    if (leadRow.parent_lead_id == null) {
+      // Canonical → fetch children (acquisition events).
+      const { data: children } = await supabase
+        .from('leads')
+        .select('id, source, lead_cost, lead_origin_type, created_at, notes, stage_id, phone, email')
+        .eq('user_id', userId)
+        .eq('parent_lead_id', leadRow.id)
+        .order('created_at', { ascending: true });
+      leadRow.child_leads = children || [];
+      leadRow.child_leads_count = (children || []).length;
+    } else {
+      // Child → fetch parent summary.
+      const { data: parent } = await supabase
+        .from('leads')
+        .select('id, first_name, last_name, source, stage_id, converted_customer_id, created_at, lead_origin_type')
+        .eq('user_id', userId)
+        .eq('id', leadRow.parent_lead_id)
+        .maybeSingle();
+      leadRow.parent_lead = parent || null;
+    }
+
+    res.json(leadRow);
   } catch (error) {
     console.error('Get lead error:', error);
     res.status(500).json({ error: 'Failed to fetch lead' });
@@ -10159,7 +10212,17 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
     if (leadError || !lead) {
       return res.status(404).json({ error: 'Lead not found' });
     }
-    
+
+    // Phase 0.5: refuse conversion on child leads. Children are acquisition
+    // events; pipeline lifecycle + conversion belong to the canonical lead.
+    if (lead.parent_lead_id != null) {
+      return res.status(409).json({
+        error: 'cannot_convert_child_lead',
+        parent_lead_id: lead.parent_lead_id,
+        hint: 'This lead is a child acquisition event. Convert the canonical lead instead.',
+      });
+    }
+
     // Check if already converted
     if (lead.converted_customer_id) {
       return res.status(400).json({ error: 'Lead already converted' });
@@ -21554,15 +21617,25 @@ app.get('/api/analytics/recurring-conversion', authenticateToken, async (req, re
 });
 
 // Get conversion analytics (Leads to Customers)
+//
+// Phase 0.5: `viewBy` controls aggregation level.
+//   viewBy=acquisition (default) — one row per lead (acquisition event)
+//   viewBy=person                — group by canonical_lead_id (unique person)
+//
+// `groupBy` (existing param, kept) controls time-series bucket: day|week|month.
+//
+// Person-level response adds `personSummary` block with first_touch /
+// repeat_acquisition / reactivation counts and total_acquisition_cost.
 app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { startDate, endDate, groupBy = 'day' } = req.query;
+    const { startDate, endDate, groupBy = 'day', viewBy = 'acquisition' } = req.query;
+    const personView = String(viewBy).toLowerCase() === 'person';
 
-    // Get all leads for this user
+    // Get all leads for this user (Phase 0.5: select the new columns too)
     let leadsQuery = supabase
       .from('leads')
-      .select('id, source, stage_id, converted_customer_id, converted_at, created_at, value')
+      .select('id, source, stage_id, converted_customer_id, converted_at, created_at, value, parent_lead_id, canonical_lead_id, lead_origin_type, lead_cost')
       .eq('user_id', userId);
 
     if (startDate) {
@@ -21713,6 +21786,34 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
     const convertedLeadValue = (allLeads || []).filter(lead => lead.converted_customer_id)
       .reduce((sum, lead) => sum + parseFloat(lead.value || 0), 0);
 
+    // Phase 0.5 — person-level summary alongside the existing
+    // acquisition-event summary. Computed in JS to avoid changing the
+    // existing acquisition view.
+    const { personLevelCounts, groupByCanonical } = require('./lib/lead-aggregation');
+    const personCounts = personLevelCounts(allLeads || []);
+    const personGroups = personView ? groupByCanonical(allLeads || []) : null;
+
+    // Per-person source attribution: original (canonical) source +
+    // repeat acquisition sources per group. Only built in person view.
+    let personSourceBreakdown = null;
+    if (personView) {
+      personSourceBreakdown = {};
+      for (const cid of Object.keys(personGroups)) {
+        const g = personGroups[cid];
+        const original = g.canonical_lead?.source || 'Unknown';
+        const repeats = (g.children || []).map(c => c.source).filter(Boolean);
+        if (!personSourceBreakdown[original]) {
+          personSourceBreakdown[original] = { unique_people: 0, converted_people: 0, repeat_sources_seen: {} };
+        }
+        personSourceBreakdown[original].unique_people++;
+        if (g.converted) personSourceBreakdown[original].converted_people++;
+        for (const rs of repeats) {
+          personSourceBreakdown[original].repeat_sources_seen[rs] =
+            (personSourceBreakdown[original].repeat_sources_seen[rs] || 0) + 1;
+        }
+      }
+    }
+
     res.json({
       summary: {
         totalLeads,
@@ -21722,8 +21823,19 @@ app.get('/api/analytics/conversion', authenticateToken, async (req, res) => {
         totalLeadValue: parseFloat(totalLeadValue.toFixed(2)),
         convertedLeadValue: parseFloat(convertedLeadValue.toFixed(2))
       },
+      personSummary: {
+        viewBy: personView ? 'person' : 'acquisition',
+        unique_people: personCounts.unique_people,
+        first_touch_count: personCounts.first_touch_count,
+        repeat_acquisition_count: personCounts.repeat_acquisition_count,
+        reactivation_count: personCounts.reactivation_count,
+        converted_people: personCounts.converted_people,
+        conversion_rate_per_person: parseFloat((personCounts.conversion_rate * 100).toFixed(2)),
+        total_acquisition_cost: personCounts.total_acquisition_cost,
+      },
       bySource: conversionBySource,
       byStage: conversionByStage,
+      ...(personView ? { personSourceBreakdown } : {}),
       timeSeries
     });
   } catch (error) {
