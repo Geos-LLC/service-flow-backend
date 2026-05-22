@@ -25,9 +25,10 @@ const {
 } = require('./services/lb-encryption')
 
 const { resolveIdentity } = require('./lib/identity-resolver')
-const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
+const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
 const { authenticateWebhook } = require('./lib/webhook-signature')
-const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant } = require('./lib/lb-ingestion')
+const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
 
@@ -364,6 +365,12 @@ module.exports = (supabase, logger) => {
     const normalized = normalizePhone(customerPhone)
     const source = pickLBSource({ accountDisplayName, channel })
 
+    // Phase 0.5: lead_origin_type written at create time.
+    // reactivation = identity already has a customer (returning customer)
+    // first_touch = no prior CRM link
+    const isReactivation = !!identity.sf_customer_id
+    const leadOriginType = isReactivation ? 'reactivation' : 'first_touch'
+
     const { data: newLead, error } = await supabase.from('leads').insert({
       user_id: userId,
       pipeline_id: pipeline.id,
@@ -374,51 +381,165 @@ module.exports = (supabase, logger) => {
       email: customerEmail || null,
       source,
       notes: message ? message.substring(0, 500) : null,
+      lead_origin_type: leadOriginType,
     }).select().single()
 
     if (error) { logger.error('[LB Lead] Create error:', error.message); return null }
 
-    await supabase.from('communication_participant_identities')
-      .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
-      .eq('id', identity.id)
+    // Route through canonical setter — projection fires automatically if
+    // identity already has sf_customer_id from a prior ZB sync.
+    await setIdentityLead(supabase, logger, {
+      userId,
+      identityId: identity.id,
+      leadId: newLead.id,
+      identitySnapshot: identity,
+      policy: {
+        resolvedBy: 'automatic',
+        resolutionReason: 'identity_graph_projection',
+        source: 'leadbridge',
+        allowStageMove: false,
+      },
+    })
 
-    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source})`)
-    return { type: 'new_lead', id: newLead.id, created: true, action: 'created' }
+    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source}) origin=${leadOriginType}`)
+    return { type: isReactivation ? 'reactivation_lead' : 'new_lead', id: newLead.id, created: true, action: isReactivation ? 'reactivation' : 'created' }
+  }
+
+  // Phase 0.5 — child lead create. Records a repeat LB acquisition for an
+  // identity that already has sf_lead_id. The new row is an attribution /
+  // history record: it does NOT participate in pipeline lifecycle, does NOT
+  // trigger stage automation, does NOT update the identity row.
+  //
+  // Identity-graph stability invariant: this function MUST NOT call
+  // setIdentityLead / setIdentityCustomer. Identity.sf_lead_id continues
+  // to point at the canonical lead.
+  //
+  // Communication invariant: conversations belong to the identity, not the
+  // child lead. No conversation-attach work happens here.
+  async function createChildLeadFromLB(userId, parentLeadId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName }) {
+    // Fetch parent for invariant checks + pipeline/stage snapshot.
+    const { data: parent } = await supabase.from('leads')
+      .select('id, user_id, parent_lead_id, pipeline_id, stage_id, source')
+      .eq('id', parentLeadId).eq('user_id', userId).maybeSingle()
+
+    try {
+      assertCreateChildLeadInvariant(parent, userId)
+    } catch (e) {
+      // Confidence-downgrade protection: surface as conflict log, refuse child create.
+      // Caller should fall back to legacy enrich (or skip) — never auto-collapse.
+      logger.warn(`[LeadCardinalityConflict] tenant=${userId} parent=${parentLeadId} reason=${e.message}`)
+      return null
+    }
+
+    const nameParts = (customerName || '').trim().split(/\s+/)
+    const firstName = nameParts[0] || null
+    const lastName = nameParts.slice(1).join(' ') || null
+    const normalized = normalizePhone(customerPhone)
+    const source = pickLBSource({ accountDisplayName, channel })
+
+    // Stage inheritance: snapshot the canonical's stage at create time.
+    // Children do not transition; they remain at this snapshot forever.
+    // Pipeline inheritance: same pipeline as parent.
+    const { data: newChild, error } = await supabase.from('leads').insert({
+      user_id: userId,
+      parent_lead_id: parent.id,
+      pipeline_id: parent.pipeline_id,
+      stage_id: parent.stage_id,
+      first_name: firstName,
+      last_name: lastName,
+      phone: normalized || null,
+      email: customerEmail || null,
+      source,
+      notes: message ? message.substring(0, 500) : null,
+      lead_origin_type: 'repeat_acquisition',
+    }).select().single()
+
+    if (error) {
+      logger.error(`[LB Lead] Child create error: ${error.message}`)
+      return null
+    }
+
+    // Structured log — counters derived in Loki.
+    logger.log(`[LeadCardinality] event=child_created tenant=${userId} parent=${parent.id} child=${newChild.id} identity=${identity.id} source=${source} channel=${channel || 'unknown'}`)
+
+    return newChild
   }
 
   async function resolveOrCreateLead(userId, identity, input) {
     if (!identity) return null
     const { customerPhone } = input
 
-    // HARD INVARIANT: identity already tied to a lead → enrich, NEVER create.
+    // Identity already tied to a lead.
     if (identity.sf_lead_id) {
+      // Phase 0.5: when child-leads flag ON, preserve repeat acquisition as
+      // a child lead (parent_lead_id = canonical). When OFF, legacy enrich.
+      if (isEnabledForTenant(FLAGS.LEAD_CARDINALITY_CHILD_LEADS, userId)) {
+        const child = await createChildLeadFromLB(userId, identity.sf_lead_id, identity, input)
+        if (child) {
+          return { type: 'child_lead', id: child.id, parent_lead_id: identity.sf_lead_id, created: true, action: 'child_acquisition' }
+        }
+        // Child create failed (e.g., invariant violation) — fall through to legacy enrich.
+      }
       await enrichLeadFromLB(userId, identity.sf_lead_id, input)
       return { type: 'lead', id: identity.sf_lead_id, created: false, action: 'enriched' }
     }
 
-    // Identity already tied to a customer → do NOT create lead.
+    // Identity already tied to a customer.
+    // Phase 0.5: when child-leads flag ON, create a NEW canonical lead and
+    // tag it as 'reactivation'. The projection layer auto-links it to the
+    // existing customer via setIdentityLead → projectIdentityToCRM. Identity
+    // graph is unchanged (same identity row, new sf_lead_id pointer).
+    // When flag OFF, legacy: suppress lead.
     if (identity.sf_customer_id) {
+      if (isEnabledForTenant(FLAGS.LEAD_CARDINALITY_CHILD_LEADS, userId)) {
+        // Note: assertCreateLeadInvariant inside createLeadFromLB will throw
+        // if identity.sf_lead_id is set (it isn't here), so this is safe.
+        const newLead = await createLeadFromLB(userId, identity, input)
+        if (newLead) {
+          return { type: 'reactivation_lead', id: newLead.id, created: true, action: 'reactivation' }
+        }
+      }
       return { type: 'customer', id: identity.sf_customer_id, created: false, action: 'identity_already_customer' }
     }
 
     // Try to find existing CRM entity by phone (legacy behavior preserved).
+    // Identity-graph writes route through setters → projection fires when
+    // both sides become populated.
     const last10 = normalizePhone(customerPhone)?.slice(-10)
     if (last10 && last10.length >= 7) {
       const { data: customer } = await supabase.from('customers')
         .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
       if (customer) {
-        await supabase.from('communication_participant_identities')
-          .update({ sf_customer_id: customer.id, status: 'resolved_customer', updated_at: new Date().toISOString() })
-          .eq('id', identity.id)
+        await setIdentityCustomer(supabase, logger, {
+          userId,
+          identityId: identity.id,
+          customerId: customer.id,
+          identitySnapshot: identity,
+          policy: {
+            resolvedBy: 'automatic',
+            resolutionReason: 'identity_graph_projection',
+            source: 'leadbridge',
+            allowStageMove: false,
+          },
+        })
         return { type: 'customer', id: customer.id, created: false, action: 'linked_customer' }
       }
 
       const { data: existingLead } = await supabase.from('leads')
         .select('id').eq('user_id', userId).ilike('phone', `%${last10}%`).limit(1).maybeSingle()
       if (existingLead) {
-        await supabase.from('communication_participant_identities')
-          .update({ sf_lead_id: existingLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
-          .eq('id', identity.id)
+        await setIdentityLead(supabase, logger, {
+          userId,
+          identityId: identity.id,
+          leadId: existingLead.id,
+          identitySnapshot: identity,
+          policy: {
+            resolvedBy: 'automatic',
+            resolutionReason: 'identity_graph_projection',
+            source: 'leadbridge',
+            allowStageMove: false,
+          },
+        })
         await enrichLeadFromLB(userId, existingLead.id, input)
         return { type: 'lead', id: existingLead.id, created: false, action: 'linked_enriched' }
       }

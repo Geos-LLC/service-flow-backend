@@ -3,6 +3,7 @@ const {
   isLegacyFlatSource,
   buildEnrichLeadPatch,
   assertCreateLeadInvariant,
+  assertCreateChildLeadInvariant,
 } = require('../lib/lb-ingestion');
 
 describe('pickLBSource', () => {
@@ -121,5 +122,31 @@ describe('assertCreateLeadInvariant — HARD INVARIANT: never create when sf_lea
 
   test('passes when identity has only sf_customer_id', () => {
     expect(() => assertCreateLeadInvariant({ id: 1, sf_customer_id: 200 })).not.toThrow();
+  });
+});
+
+describe('assertCreateChildLeadInvariant — Phase 0.5', () => {
+  test('I-CL-1: throws when parent is null', () => {
+    expect(() => assertCreateChildLeadInvariant(null, 2)).toThrow(/parent lead not found/);
+  });
+
+  test('I-CL-2: throws on cross-tenant parent', () => {
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 999, parent_lead_id: null }, 2))
+      .toThrow(/cross-tenant parent/);
+  });
+
+  test('I-CL-2: matches numeric vs string user_id safely', () => {
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: '2', parent_lead_id: null }, 2))
+      .not.toThrow();
+  });
+
+  test('I-CL-3: throws when parent is itself a child (no grandchildren)', () => {
+    expect(() => assertCreateChildLeadInvariant({ id: 245, user_id: 2, parent_lead_id: 67 }, 2))
+      .toThrow(/parent is itself a child/);
+  });
+
+  test('happy path: parent is canonical, same tenant', () => {
+    expect(() => assertCreateChildLeadInvariant({ id: 67, user_id: 2, parent_lead_id: null }, 2))
+      .not.toThrow();
   });
 });
