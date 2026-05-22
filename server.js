@@ -47,6 +47,7 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
+const identityGraphViolation = require('./lib/identity-graph-violation');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
@@ -8476,6 +8477,15 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
+    // @transitional — OP path links identity → CRM customer directly. Should
+    // migrate to setIdentityCustomer (Stage 4 OP adapter).
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_customer_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      reason: 'op_direct_identity_link_to_existing_customer',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_customer_id: crmMatch.id,
@@ -8492,6 +8502,14 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
+    // @transitional — same shape as the customer branch above; migrate to setIdentityLead.
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_lead_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      reason: 'op_direct_identity_link_to_existing_lead',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_lead_id: crmMatch.id,
@@ -8538,6 +8556,18 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
 
   // Link identity → new lead + mark status.
+  // @transitional — direct identity-row write outside lib/identity-linker.js
+  // setIdentityLead(). Authorised by current OP path semantics but flagged
+  // by the architectural-hardening emitter so we can measure how often it
+  // fires and migrate this call site to setIdentityLead() in a follow-up.
+  // See docs/architecture/integration-compliance-audit.md (OpenPhone).
+  identityGraphViolation.recordTransitionalBypass(logger, {
+    target: 'communication_participant_identities.sf_lead_id',
+    tenant: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    reason: 'op_direct_identity_link',
+    includeCallPath: false,
+  });
   await supabase.from('communication_participant_identities')
     .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
     .eq('id', identity.id);
@@ -10219,7 +10249,18 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       // Continue with conversion even if stage lookup fails
     }
     
-    // Update lead with converted customer ID and move to "Won" stage if found
+    // Update lead with converted customer ID and move to "Won" stage if found.
+    // @transitional — operator-initiated "Convert lead → customer" endpoint
+    // writes converted_customer_id directly. Migration target: route through
+    // applyLeadCustomerLink (which already handles operator-override
+    // semantics + provenance + audit).
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      reason: 'operator_lead_to_customer_conversion',
+      includeCallPath: false,
+    });
     const updateData = {
       converted_customer_id: customer.id,
       converted_at: new Date().toISOString()
@@ -10817,6 +10858,20 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       } catch (e) { /* table or column may not exist — skip */ }
     }
     // Special: 'leads' uses converted_customer_id
+    // @transitional — direct leads.converted_customer_id repointing outside
+    // lib/identity-linker.js. This IS legitimate during operator-initiated
+    // customer merge (source customer is about to be deleted; its converted
+    // leads must move to the surviving customer). Emit so we have a count
+    // and can audit operator merge volume. Routing through applyLeadCustomerLink
+    // here is not appropriate because that function refuses to overwrite an
+    // already-linked lead.
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: userId,
+      source: 'server.js:merge_duplicate_customers',
+      reason: 'operator_initiated_customer_merge',
+      includeCallPath: false,
+    });
     try {
       await supabase.from('leads').update({ converted_customer_id: targetId })
         .eq('converted_customer_id', sourceId).eq('user_id', userId);
