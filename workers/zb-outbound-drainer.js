@@ -24,10 +24,20 @@
 
 const crypto = require('crypto');
 const { ENABLED, DRY_RUN, FROZEN } = require('../lib/zb-outbound-delivery');
+const { emitSent, emitDlq } = require('../lib/zb-outbound-metrics');
 
 const TICK_MS = parseInt(process.env.ZB_OUTBOUND_TICK_MS || '5000', 10);
 const BATCH_SIZE = parseInt(process.env.ZB_OUTBOUND_BATCH_SIZE || '50', 10);
 const LEASE_S = parseInt(process.env.ZB_OUTBOUND_LEASE_S || '120', 10);
+const ZB_BASE = 'https://api.zenbooker.com/v1';
+const NETWORK_MAX_ATTEMPTS = 5;
+const CONFIRM_DEADLINE_MS = 10 * 60 * 1000; // 10 min per design §2.4
+
+// Retry schedule for network/5xx/429 (seconds). Matches LB outbound + design §3.3.
+function networkBackoff(attempt) {
+  const schedule = [0, 10, 60, 600, 3600];
+  return schedule[Math.min(Math.max(attempt, 1) - 1, schedule.length - 1)];
+}
 
 function nowIso() { return new Date().toISOString(); }
 
@@ -131,30 +141,258 @@ async function runDrainerTick({ supabase, logger = console }) {
 }
 
 /**
- * Phase A row processor — DEFERS, does not execute.
+ * Phase B row processor — dispatches by command_type.
  *
- * Returns the claimed row to `pending` with `defer_reason='phase_a_scaffolding'`
- * so it appears in the operator's "idle pending" view but never hits ZB.
- * Phase B replaces this with the real network code path.
+ * Phase B scope: `job.create` only. All other command types continue
+ * to defer (Phase C/D/E will graduate them per design §10).
+ *
+ * For `job.create`:
+ *   - Resolves the tenant ZB API key from users.zenbooker_api_key.
+ *   - In DRY_RUN mode: builds + signs the request, logs, marks state='sent'
+ *     with zb_response={dry_run:true,payload:<>}, no HTTP. Confirmation
+ *     never arrives (no real webhook). This is the days-1-3 soak posture.
+ *   - In live mode: POSTs /v1/jobs with Idempotency-Key header. Extracts
+ *     the new ZB id from response and stamps zenbooker_id so the inbound
+ *     webhook handler's correlation step can match it to this command.
+ *
+ * Handles 200/201/409/4xx/5xx/network per design §3.3.
  */
 async function processRow({ supabase, logger, row }) {
-  const attempts = (row.attempts || 0) + 1;
-  await supabase
-    .from('zb_outbound_commands')
-    .update({
-      state: 'pending',
-      attempts,
-      next_attempt_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(), // 1h defer
-      defer_reason: 'phase_a_scaffolding',
-      claimed_by: null,
-      claimed_until: null,
-      last_attempt_at: nowIso(),
-    })
-    .eq('id', row.id);
-
-  if (logger.log) {
-    logger.log(`[ZB Outbound] phase_a_defer event=${row.event_id} job=${row.sf_job_id} cmd=${row.command_type} attempts=${attempts}`);
+  if (row.command_type === 'job.create') {
+    return processJobCreate({ supabase, logger, row });
   }
+  return processNotInPhaseBScope({ supabase, logger, row });
+}
+
+async function processJobCreate({ supabase, logger, row }) {
+  const attempts = (row.attempts || 0) + 1;
+
+  // 1. Resolve tenant ZB API key
+  const { data: user } = await supabase
+    .from('users')
+    .select('zenbooker_api_key, zenbooker_status')
+    .eq('id', row.user_id)
+    .maybeSingle();
+  if (!user || user.zenbooker_status !== 'connected' || !user.zenbooker_api_key) {
+    return deferRow(supabase, row.id, attempts, 'zb_disconnected', 60 * 60 * 1000, logger,
+      `tenant ${row.user_id} is not connected to ZB or has no API key`);
+  }
+
+  // 2. Dry-run short-circuit — Phase B days 1-3 default posture
+  if (DRY_RUN()) {
+    const dryBody = { dry_run: true, would_post_to: '/v1/jobs', payload: row.payload_json };
+    await markSent(supabase, row.id, attempts, dryBody, null);
+    emitSent({
+      userId: row.user_id, commandType: row.command_type, fieldGroup: row.field_group,
+      eventId: row.event_id, note: 'dry_run', logger,
+    });
+    if (logger.log) {
+      logger.log(`[ZB Outbound] dry_run sent event=${row.event_id} job=${row.sf_job_id} attempts=${attempts}`);
+    }
+    return;
+  }
+
+  // 3. Real POST to ZB
+  const result = await postToZb({
+    apiKey: user.zenbooker_api_key,
+    path: '/jobs',
+    body: row.payload_json,
+    idempotencyKey: row.event_id,
+  });
+
+  await handlePostResult({ supabase, logger, row, result, attempts });
+}
+
+async function postToZb({ apiKey, path, body, idempotencyKey }) {
+  const url = `${ZB_BASE}${path}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        // Sent as defense-in-depth per design §3.6.1. Q1 not confirmed
+        // by ZB as honored, but the header costs ~36 bytes and provides
+        // free dedup if/when ZB supports it.
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let parsed;
+    try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { _raw: text.slice(0, 500) }; }
+    return {
+      ok: res.ok,
+      status: res.status,
+      body: parsed,
+      response_time_ms: res.headers && res.headers.get && parseInt(res.headers.get('x-response-time') || '0', 10) || null,
+    };
+  } catch (err) {
+    return { ok: false, status: 0, network_error: (err && (err.code || err.message)) || String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Extract the new ZB resource id for correlation later. ZB's create response
+ * uses `body.job_id` (verified by 2026-05-19 direct discovery — see
+ * docs/architecture/job-create-contract-discovery.md §5.2). Other endpoints
+ * (assign, etc.) use other shapes — fall through.
+ *
+ * Module-level + exported so the shape contract is testable independent
+ * of the full handlePostResult network path.
+ */
+function extractZbId(body) {
+  if (!body || typeof body !== 'object') return null;
+  // ZB POST /v1/jobs success returns { job_id, status, ... } — Tier-A verified 2026-05-19.
+  if (body.job_id) return String(body.job_id);
+  // Legacy fallbacks kept for other endpoints / future commands.
+  if (body.id) return String(body.id);
+  if (body.response && body.response.job) return String(body.response.job);
+  if (body.job && body.job.id) return String(body.job.id);
+  return null;
+}
+
+async function handlePostResult({ supabase, logger, row, result, attempts }) {
+  // 200 / 201 → success
+  if (result.ok && (result.status === 200 || result.status === 201)) {
+    const zenbookerId = extractZbId(result.body);
+    await markSent(supabase, row.id, attempts, result.body, zenbookerId);
+    emitSent({
+      userId: row.user_id, commandType: row.command_type, fieldGroup: row.field_group,
+      eventId: row.event_id, logger,
+    });
+    if (logger.log) {
+      logger.log(`[ZB Outbound] sent event=${row.event_id} job=${row.sf_job_id} zb_id=${zenbookerId || 'unknown'} attempts=${attempts}`);
+    }
+    return;
+  }
+
+  // 409 → ZB saw this idempotency key before; treat as sent (duplicate)
+  if (result.status === 409) {
+    const zenbookerId = extractZbId(result.body);
+    await markSent(supabase, row.id, attempts, result.body, zenbookerId);
+    emitSent({
+      userId: row.user_id, commandType: row.command_type, fieldGroup: row.field_group,
+      eventId: row.event_id, note: 'duplicate', logger,
+    });
+    return;
+  }
+
+  // Hard 4xx → DLQ
+  if (result.status === 400 || result.status === 401 || result.status === 404 || result.status === 422) {
+    const errMsg = `http ${result.status}: ${shortBody(result.body)}`;
+    await markFailed(supabase, row.id, attempts, result, errMsg);
+    emitDlq({
+      userId: row.user_id, commandType: row.command_type, fieldGroup: row.field_group,
+      eventId: row.event_id, errorClass: `http_${result.status}`, logger,
+    });
+    if (logger.warn) logger.warn(`[ZB Outbound] dlq event=${row.event_id} job=${row.sf_job_id} ${errMsg}`);
+    return;
+  }
+
+  // 429 / 5xx / network → retry per backoff schedule
+  const errMsg = result.network_error
+    ? `network: ${result.network_error}`
+    : `http ${result.status}: ${shortBody(result.body)}`;
+  await retryOrDlq(supabase, row, attempts, errMsg, result, logger);
+}
+
+async function retryOrDlq(supabase, row, attempts, errMsg, result, logger) {
+  if (attempts > NETWORK_MAX_ATTEMPTS) {
+    await markFailed(supabase, row.id, attempts, result, errMsg);
+    emitDlq({
+      userId: row.user_id, commandType: row.command_type, fieldGroup: row.field_group,
+      eventId: row.event_id, errorClass: 'max_attempts_exceeded', logger,
+    });
+    if (logger.warn) logger.warn(`[ZB Outbound] dlq event=${row.event_id} job=${row.sf_job_id} ${errMsg}`);
+    return;
+  }
+  const wait = networkBackoff(attempts);
+  await supabase.from('zb_outbound_commands').update({
+    state: 'pending',
+    attempts,
+    next_attempt_at: new Date(Date.now() + wait * 1000).toISOString(),
+    last_error: errMsg,
+    last_attempt_at: nowIso(),
+    claimed_by: null,
+    claimed_until: null,
+  }).eq('id', row.id);
+  if (logger.log) {
+    logger.log(`[ZB Outbound] retry event=${row.event_id} job=${row.sf_job_id} in=${wait}s attempt=${attempts} ${errMsg}`);
+  }
+}
+
+async function markSent(supabase, id, attempts, responseBody, zenbookerId) {
+  const update = {
+    state: 'sent',
+    attempts,
+    sent_at: nowIso(),
+    last_attempt_at: nowIso(),
+    confirmation_deadline: new Date(Date.now() + CONFIRM_DEADLINE_MS).toISOString(),
+    zb_response: responseBody,
+    last_error: null,
+    defer_reason: null,
+    claimed_by: null,
+    claimed_until: null,
+  };
+  if (zenbookerId) update.zenbooker_id = zenbookerId;
+  await supabase.from('zb_outbound_commands').update(update).eq('id', id);
+}
+
+async function markFailed(supabase, id, attempts, result, errMsg) {
+  await supabase.from('zb_outbound_commands').update({
+    state: 'failed',
+    attempts,
+    last_error: errMsg,
+    last_attempt_at: nowIso(),
+    terminal_at: nowIso(),
+    zb_response: (result && result.body) || null,
+    claimed_by: null,
+    claimed_until: null,
+  }).eq('id', id);
+}
+
+async function deferRow(supabase, id, attempts, defer_reason, defer_ms, logger, note) {
+  await supabase.from('zb_outbound_commands').update({
+    state: 'pending',
+    attempts,
+    next_attempt_at: new Date(Date.now() + defer_ms).toISOString(),
+    defer_reason,
+    claimed_by: null,
+    claimed_until: null,
+    last_attempt_at: nowIso(),
+  }).eq('id', id);
+  if (logger && logger.log) {
+    logger.log(`[ZB Outbound] defer event=<row> reason=${defer_reason} ${note || ''}`);
+  }
+}
+
+async function processNotInPhaseBScope({ supabase, logger, row }) {
+  const attempts = (row.attempts || 0) + 1;
+  await supabase.from('zb_outbound_commands').update({
+    state: 'pending',
+    attempts,
+    next_attempt_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    defer_reason: 'not_in_phase_b_scope',
+    claimed_by: null,
+    claimed_until: null,
+    last_attempt_at: nowIso(),
+  }).eq('id', row.id);
+  if (logger.log) {
+    logger.log(`[ZB Outbound] phase_b_skip event=${row.event_id} job=${row.sf_job_id} cmd=${row.command_type} (Phase B is job.create only)`);
+  }
+}
+
+function shortBody(body) {
+  if (body == null) return '';
+  if (typeof body === 'string') return body.slice(0, 300);
+  try { return JSON.stringify(body).slice(0, 300); } catch { return '<unserializable>'; }
 }
 
 /**
@@ -202,7 +440,20 @@ module.exports = {
   startDrainer,
   runDrainerTick,
   processRow,
+  // exported for tests
+  processJobCreate,
+  postToZb,
+  handlePostResult,
+  retryOrDlq,
+  networkBackoff,
+  markSent,
+  markFailed,
+  shortBody,
+  extractZbId,
   TICK_MS,
   BATCH_SIZE,
   LEASE_S,
+  NETWORK_MAX_ATTEMPTS,
+  CONFIRM_DEADLINE_MS,
+  ZB_BASE,
 };

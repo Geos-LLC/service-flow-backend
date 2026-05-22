@@ -9,6 +9,7 @@ const express = require('express')
 const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
+const { setIdentityCustomer, attemptScoringFallback } = require('./lib/identity-linker')
 const { mapJobFinancials, stripDiagnostics } = require('./lib/zenbooker-financial')
 const { safeReconcileJobLedger } = require('./lib/zenbooker-ledger-reconcile')
 const { mapJobLifecycle, stripLifecycleDiagnostics } = require('./lib/zenbooker-lifecycle')
@@ -18,6 +19,7 @@ const {
 } = require('./lib/ledger-immutability')
 const { authenticateZenbookerWebhook } = require('./lib/zenbooker-webhook-auth')
 const { observe: zbBodyObserve } = require('./lib/zb-body-observe')
+const { correlateInboundEcho, isCorrelatable } = require('./lib/zb-outbound-correlation')
 const { logDelivery } = require('./lib/delivery-log')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
@@ -210,13 +212,68 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       return { id: null, mode: 'skipped_ambiguous_identity' }
     }
 
+    // Phase 0 hybrid bridge — graph projection first, scoring fallback
+    // second. See docs/architecture/cross-source-identity-reconciliation.md
+    // "Hybrid migration bridge" section.
+    //
+    // Precedence:
+    //   1. Identity graph projection (authoritative)
+    //        setIdentityCustomer → projectIdentityToCRM when both
+    //        sf_lead_id and sf_customer_id are populated on the
+    //        identity row.
+    //   2. Scoring fallback (TEMPORARY migration bridge)
+    //        runs ONLY if graph couldn't project. Strict safety gates;
+    //        on success it also HYDRATES the identity graph so future
+    //        events for the same person use the graph path directly.
+    //        Default ON; per-tenant opt-out via
+    //        IDENTITY_SCORING_FALLBACK_TENANTS once a tenant's graph
+    //        is complete.
+    //
+    // Resolver-ambiguous customers (status='ambiguous') never reach this
+    // function because upsertCustomerFromZB returned early above with
+    // mode='skipped_ambiguous_identity'. That keeps the
+    // wrong-non-merge > wrong-merge invariant intact.
     const linkIdentityToCustomer = async (customerId) => {
-      if (!identity || !customerId) return
-      if (identity.sf_customer_id === customerId) return
-      const newStatus = identity.sf_lead_id ? 'resolved_both' : 'resolved_customer'
-      await supabase.from('communication_participant_identities')
-        .update({ sf_customer_id: customerId, status: newStatus, updated_at: new Date().toISOString() })
-        .eq('id', identity.id)
+      if (!customerId) return
+
+      // 1) Graph projection path — only viable when the resolver
+      //    produced an identity row.
+      let projected = false
+      if (identity && identity.sf_customer_id !== customerId) {
+        const result = await setIdentityCustomer(supabase, logger, {
+          userId,
+          identityId: identity.id,
+          customerId,
+          identitySnapshot: identity,
+          policy: {
+            resolvedBy: 'graph_projection',
+            resolutionReason: 'identity_graph_projection',
+            source: 'zenbooker',
+            allowStageMove: false,
+          },
+        })
+        projected = !!(result && result.ok && result.projection && result.projection.projected)
+      } else if (identity && identity.sf_customer_id === customerId) {
+        // Identity already linked to this customer — no work needed.
+        // Don't run fallback either: customer is canonical.
+        return
+      }
+
+      // 2) Scoring fallback — only when graph couldn't project.
+      //    Hydrates the identity graph on success.
+      if (!projected) {
+        const fullName = [mapped.first_name, mapped.last_name].filter(Boolean).join(' ').trim() || zb.name || null
+        await attemptScoringFallback(supabase, logger, {
+          userId,
+          customerId,
+          customerPhone: mapped.phone,
+          customerName: fullName,
+          customerSource: mapped.source || null,
+          identityId: identity ? identity.id : null,
+          activeWindowHours: 24,
+          source: 'zenbooker',
+        })
+      }
     }
 
     // 1. Match by zenbooker_id
@@ -287,6 +344,17 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       return { id: null, mode: 'error', error }
     }
     await linkIdentityToCustomer(inserted.id)
+    // Lead↔customer reconciliation is handled by the hybrid bridge in
+    // linkIdentityToCustomer above (graph projection first, scoring
+    // fallback second). When IDENTITY_RESOLVER_ZENBOOKER is ON and the
+    // resolver's CRM-anchor preference adopted an identity that already
+    // had sf_lead_id, setIdentityCustomer projects to
+    // leads.converted_customer_id automatically (mode=graph_projection).
+    // Otherwise attemptScoringFallback bridges the gap and also hydrates
+    // the identity graph (mode=fallback_projection_bridge) so future
+    // events use the graph path. Operator-triggered
+    // POST /api/identity-conflicts/repair-lead-links remains available
+    // for evidence-based bulk repair (dry-run by default).
     return { id: inserted.id, mode: 'created' }
   }
 
@@ -2323,6 +2391,23 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
           } else {
             logger.log(`[Zenbooker] Unhandled event: ${event}`)
+          }
+          // Phase B outbound correlation — after the existing inbound
+          // dispatch completes, check whether this echo confirms any open
+          // SF→ZB command. Phase B scope: only job.created → job.create.
+          // Other event types short-circuit inside isCorrelatable.
+          if (isCorrelatable(event)) {
+            try {
+              await correlateInboundEcho(supabase, {
+                userId: user.id,
+                event,
+                data,
+                webhookId: req.body && req.body.webhook_id,
+                logger,
+              })
+            } catch (cErr) {
+              logger.warn(`[Zenbooker] correlation (non-blocking) failed: ${cErr.message}`)
+            }
           }
         } catch (err) {
           logger.error(`[Zenbooker] Webhook handler error for user ${user.id}: ${err.message}`)

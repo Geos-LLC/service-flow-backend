@@ -1,0 +1,807 @@
+{
+  "summary": {
+    "user_id": 2,
+    "active_window_hours": 24,
+    "recent_conversation_window_days": 7,
+    "total": 13,
+    "safe_to_apply": 6,
+    "review": 7,
+    "exclude": 0
+  },
+  "packet": [
+    {
+      "conflict_id": 2,
+      "lead_id": 67,
+      "customer_id": 23421,
+      "normalized_phone": "3013272882",
+      "phone_formatted": "(301) 327-2882",
+      "lead": {
+        "id": 67,
+        "name": "Kira Osipova",
+        "phone": "(301) 327-2882",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-04-08 16:41:48.457888",
+        "updated_at": "2026-04-23 22:37:53.774236",
+        "created_ago": "43.2d ago",
+        "updated_ago": "28.0d ago",
+        "stage_id": 9,
+        "stage_name": "Contacted",
+        "notes_excerpt": "Hi!\nDo you have any cleaners available within the next week or week and a half? I have a 1-bedroom, 1-bathroom apartment",
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23421,
+        "name": "Kira Osipova",
+        "phone": "(301) 327-2882",
+        "source": "Thumbtack Tampa",
+        "created_at": "2026-04-08 17:26:29.252925",
+        "updated_at": "2026-04-24 13:52:28.810636",
+        "created_ago": "43.2d ago",
+        "updated_ago": "27.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-04-14"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "active_pipeline_stage:Contacted"
+      ]
+    },
+    {
+      "conflict_id": 3,
+      "lead_id": 308,
+      "customer_id": 23442,
+      "normalized_phone": "3022051323",
+      "phone_formatted": "(302) 205-1323",
+      "lead": {
+        "id": 308,
+        "name": "Souki Ar",
+        "phone": "(302) 205-1323",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-04-22 21:29:04.946832",
+        "updated_at": "2026-04-23 22:38:06.485103",
+        "created_ago": "29.0d ago",
+        "updated_ago": "28.0d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23442,
+        "name": "Souki Ar",
+        "phone": "(302) 205-1323",
+        "source": "Thumbtack Tampa",
+        "created_at": "2026-04-28 14:51:29.929653",
+        "updated_at": "2026-04-28 15:50:55.384474",
+        "created_ago": "23.3d ago",
+        "updated_ago": "23.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-06"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    },
+    {
+      "conflict_id": 4,
+      "lead_id": 1570,
+      "customer_id": 23441,
+      "normalized_phone": "3022145347",
+      "phone_formatted": "(302) 214-5347",
+      "lead": {
+        "id": 1570,
+        "name": "Montrella Cowan",
+        "phone": "(302) 214-5347",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-04-25 15:22:08.611124",
+        "updated_at": "2026-04-25 15:22:08.611124",
+        "created_ago": "26.3d ago",
+        "updated_ago": "26.3d ago",
+        "stage_id": 9,
+        "stage_name": "Contacted",
+        "notes_excerpt": "Looking for an excellent cleaner.",
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23441,
+        "name": "Montrella Cowan",
+        "phone": "(302) 214-5347",
+        "source": "Thumbtack Tampa",
+        "created_at": "2026-04-26 13:42:08.503397",
+        "updated_at": "2026-04-28 15:50:55.301188",
+        "created_ago": "25.4d ago",
+        "updated_ago": "23.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-04-27"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "active_pipeline_stage:Contacted"
+      ]
+    },
+    {
+      "conflict_id": 5,
+      "lead_id": 1678,
+      "customer_id": 23453,
+      "normalized_phone": "3023132281",
+      "phone_formatted": "(302) 313-2281",
+      "lead": {
+        "id": 1678,
+        "name": "Austin Labban",
+        "phone": "(302) 313-2281",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-08 16:41:24.42773",
+        "updated_at": "2026-05-08 16:41:24.42773",
+        "created_ago": "13.2d ago",
+        "updated_ago": "13.2d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23453,
+        "name": "Austin Labban",
+        "phone": "(302) 313-2281",
+        "source": null,
+        "created_at": "2026-05-08 17:11:18.867575",
+        "updated_at": "2026-05-08 17:11:18.867575",
+        "created_ago": "13.2d ago",
+        "updated_ago": "13.2d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-12"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    },
+    {
+      "conflict_id": 6,
+      "lead_id": 1688,
+      "customer_id": 23454,
+      "normalized_phone": "3023163237",
+      "phone_formatted": "(302) 316-3237",
+      "lead": {
+        "id": 1688,
+        "name": "Vanida Chan",
+        "phone": "(302) 316-3237",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-09 16:29:33.368557",
+        "updated_at": "2026-05-09 16:29:33.368557",
+        "created_ago": "12.2d ago",
+        "updated_ago": "12.2d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23454,
+        "name": "Vanida Chan",
+        "phone": "(302) 316-3237",
+        "source": null,
+        "created_at": "2026-05-09 16:50:55.003241",
+        "updated_at": "2026-05-09 16:50:55.003241",
+        "created_ago": "12.2d ago",
+        "updated_ago": "12.2d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-12"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    },
+    {
+      "conflict_id": 7,
+      "lead_id": 1696,
+      "customer_id": 23464,
+      "normalized_phone": "3023163303",
+      "phone_formatted": "(302) 316-3303",
+      "lead": {
+        "id": 1696,
+        "name": "Dalmie Gomez",
+        "phone": "(302) 316-3303",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-10 16:35:24.920112",
+        "updated_at": "2026-05-10 16:35:24.920112",
+        "created_ago": "11.2d ago",
+        "updated_ago": "11.2d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23464,
+        "name": "Dalmie Gomez",
+        "phone": "(302) 316-3303",
+        "source": null,
+        "created_at": "2026-05-11 20:23:11.699208",
+        "updated_at": "2026-05-11 20:23:11.699208",
+        "created_ago": "10.1d ago",
+        "updated_ago": "10.1d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-14"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 1,
+          "last_event_at": "2026-05-16 13:01:40.898+00",
+          "last_event_ago": "5.5d ago"
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "1_conversation(s)_in_7d"
+      ]
+    },
+    {
+      "conflict_id": 8,
+      "lead_id": 1699,
+      "customer_id": 23455,
+      "normalized_phone": "3023166279",
+      "phone_formatted": "(302) 316-6279",
+      "lead": {
+        "id": 1699,
+        "name": "Lisa Cote",
+        "phone": "(302) 316-6279",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-10 18:52:34.767645",
+        "updated_at": "2026-05-10 18:52:34.767645",
+        "created_ago": "11.1d ago",
+        "updated_ago": "11.1d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23455,
+        "name": "Lisa Cote",
+        "phone": "(302) 316-6279",
+        "source": null,
+        "created_at": "2026-05-10 19:07:24.460858",
+        "updated_at": "2026-05-10 19:07:24.460858",
+        "created_ago": "11.1d ago",
+        "updated_ago": "11.1d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-16"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    },
+    {
+      "conflict_id": 9,
+      "lead_id": 1704,
+      "customer_id": 23465,
+      "normalized_phone": "3023308358",
+      "phone_formatted": "(302) 330-8358",
+      "lead": {
+        "id": 1704,
+        "name": "Savanna Picariello",
+        "phone": "(302) 330-8358",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-11 14:19:29.852541",
+        "updated_at": "2026-05-11 14:19:29.852541",
+        "created_ago": "10.3d ago",
+        "updated_ago": "10.3d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23465,
+        "name": "Savanna Picariello",
+        "phone": "(302) 330-8358",
+        "source": null,
+        "created_at": "2026-05-12 16:01:06.424209",
+        "updated_at": "2026-05-12 16:01:06.424209",
+        "created_ago": "9.3d ago",
+        "updated_ago": "9.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-21"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 1,
+          "last_event_at": "2026-05-21 16:25:28.768+00",
+          "last_event_ago": "9.8h ago"
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "1_conversation(s)_in_7d"
+      ]
+    },
+    {
+      "conflict_id": 10,
+      "lead_id": 1709,
+      "customer_id": 23466,
+      "normalized_phone": "3023436389",
+      "phone_formatted": "(302) 343-6389",
+      "lead": {
+        "id": 1709,
+        "name": "Chelsi Rodriguez",
+        "phone": "(302) 343-6389",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-12 17:29:11.955616",
+        "updated_at": "2026-05-12 17:29:11.955616",
+        "created_ago": "9.2d ago",
+        "updated_ago": "9.2d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23466,
+        "name": "Chelsi Rodriguez",
+        "phone": "(302) 343-6389",
+        "source": null,
+        "created_at": "2026-05-12 19:03:40.406996",
+        "updated_at": "2026-05-12 19:03:40.406996",
+        "created_ago": "9.1d ago",
+        "updated_ago": "9.1d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 2,
+          "past": 1,
+          "future": 1,
+          "last_job_date": "2026-05-13"
+        },
+        "next_scheduled_job": "2026-08-21",
+        "recent_conversations_last_7d": {
+          "count": 1,
+          "last_event_at": "2026-05-16 13:37:45.639+00",
+          "last_event_ago": "5.5d ago"
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "future_job_scheduled",
+        "1_conversation(s)_in_7d"
+      ]
+    },
+    {
+      "conflict_id": 11,
+      "lead_id": 1722,
+      "customer_id": 23469,
+      "normalized_phone": "3024025468",
+      "phone_formatted": "(302) 402-5468",
+      "lead": {
+        "id": 1722,
+        "name": "Holly Clevenger",
+        "phone": "(302) 402-5468",
+        "source": "Spotless Homes Saint Petersburg (thumbtack)",
+        "created_at": "2026-05-14 18:54:14.259977",
+        "updated_at": "2026-05-14 18:54:14.259977",
+        "created_ago": "7.1d ago",
+        "updated_ago": "7.1d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23469,
+        "name": "Holly Clevenger",
+        "phone": "(302) 402-5468",
+        "source": null,
+        "created_at": "2026-05-14 19:12:12.762002",
+        "updated_at": "2026-05-14 19:12:12.762002",
+        "created_ago": "7.1d ago",
+        "updated_ago": "7.1d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-22"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    },
+    {
+      "conflict_id": 12,
+      "lead_id": 1726,
+      "customer_id": 23471,
+      "normalized_phone": "3024042308",
+      "phone_formatted": "(302) 404-2308",
+      "lead": {
+        "id": 1726,
+        "name": "Angel Tenaj",
+        "phone": "(302) 404-2308",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-15 21:52:07.193959",
+        "updated_at": "2026-05-15 21:52:07.193959",
+        "created_ago": "6.0d ago",
+        "updated_ago": "6.0d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23471,
+        "name": "Angel Tenaj",
+        "phone": "(302) 404-2308",
+        "source": null,
+        "created_at": "2026-05-16 13:52:06.91211",
+        "updated_at": "2026-05-16 13:52:06.91211",
+        "created_ago": "5.3d ago",
+        "updated_ago": "5.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-21"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 2,
+          "last_event_at": "2026-05-21 22:12:57.381+00",
+          "last_event_ago": "4.0h ago"
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "2_conversation(s)_in_7d"
+      ]
+    },
+    {
+      "conflict_id": 13,
+      "lead_id": 1734,
+      "customer_id": 23476,
+      "normalized_phone": "3024054049",
+      "phone_formatted": "(302) 405-4049",
+      "lead": {
+        "id": 1734,
+        "name": "Timon Schill",
+        "phone": "(302) 405-4049",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-05-18 18:24:32.447602",
+        "updated_at": "2026-05-18 18:24:32.447602",
+        "created_ago": "3.2d ago",
+        "updated_ago": "3.2d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23476,
+        "name": "Timon Schill",
+        "phone": "(302) 405-4049",
+        "source": null,
+        "created_at": "2026-05-19 15:27:29.87408",
+        "updated_at": "2026-05-19 15:27:29.87408",
+        "created_ago": "2.3d ago",
+        "updated_ago": "2.3d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 1,
+          "past": 1,
+          "future": 0,
+          "last_job_date": "2026-05-22"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 2,
+          "last_event_at": "2026-05-19 15:26:09.026+00",
+          "last_event_ago": "2.4d ago"
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "review",
+      "recommendation_reasons": [
+        "2_conversation(s)_in_7d"
+      ]
+    },
+    {
+      "conflict_id": 17,
+      "lead_id": 315,
+      "customer_id": 23437,
+      "normalized_phone": "4085822555",
+      "phone_formatted": "(408) 582-2555",
+      "lead": {
+        "id": 315,
+        "name": "Swathi M",
+        "phone": "(408) 582-2555",
+        "source": "Spotless Homes Tampa (thumbtack)",
+        "created_at": "2026-04-22 21:29:25.988831",
+        "updated_at": "2026-04-23 22:38:06.933144",
+        "created_ago": "29.0d ago",
+        "updated_ago": "28.0d ago",
+        "stage_id": 8,
+        "stage_name": "New Lead",
+        "notes_excerpt": null,
+        "lead_cost": null
+      },
+      "customer": {
+        "id": 23437,
+        "name": "Swathi M",
+        "phone": "(408) 582-2555",
+        "source": "Thumbtack Tampa",
+        "created_at": "2026-04-24 18:54:57.183912",
+        "updated_at": "2026-04-24 23:18:44.147153",
+        "created_ago": "27.1d ago",
+        "updated_ago": "27.0d ago"
+      },
+      "match": {
+        "name_class": "strong_exact",
+        "is_strong_name": true,
+        "phone_match": true,
+        "active_window_downgrade": false
+      },
+      "activity": {
+        "open_tasks": [],
+        "open_task_count": 0,
+        "customer_jobs": {
+          "total": 2,
+          "past": 2,
+          "future": 0,
+          "last_job_date": "2026-04-29"
+        },
+        "next_scheduled_job": null,
+        "recent_conversations_last_7d": {
+          "count": 0,
+          "last_event_at": null,
+          "last_event_ago": null
+        }
+      },
+      "shared_phone_owners": {
+        "count": 0,
+        "owners": []
+      },
+      "recommendation": "safe_to_apply",
+      "recommendation_reasons": [
+        "no_signals_against"
+      ]
+    }
+  ]
+}

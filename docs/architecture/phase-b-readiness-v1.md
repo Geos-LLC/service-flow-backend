@@ -38,9 +38,9 @@ This document is the transition point: from "can we safely build SF→ZB outboun
 | **PC10** | Constitution §10 contract tests | ⚠ Partial — soft stop | 6 of 11 named files present. 5 named-but-missing files (identity/source-account/status writer-funnel, webhook-pattern, tenant-scope) tracked as constitution-hygiene debt; do NOT gate Phase B. |
 | **PC11** | Pilot tenant identified | ❌ Pending | **Phase B gate.** Needs: tenant ID, written opt-in, ZB account credentials access. |
 | **PC12** | Operator runbook drafted | ❌ Pending | **Phase B gate.** Needs: DLQ triage steps, conflict resolution playbook, freeze procedure, migration re-arm steps. |
-| **PC13** | Constitution §11 exceptions register empty | ❌ Needs audit | Quick check: list any active exceptions touching §3.1 / §2.4 / §6.10 surfaces. Likely already empty. |
-| **PC14** | Pilot tenant ZB quota confirmed | ❌ Pending | **Phase B gate.** Need ZB rate limits + pilot tenant's headroom for expected outbound volume. |
-| **PC15** | Staging freeze rehearsal | ❌ Pending | **Phase B gate.** End-to-end: freeze → bad command → DLQ inspection → unfreeze. ~30 min exercise. |
+| **PC13** | Constitution §11 exceptions register empty | ✅ **VERIFIED 2026-05-17** — register is `_(none)_`; zero active exceptions touching Phase B surfaces (§3.1, §2.4, §6.10). |
+| **PC14** | Pilot tenant ZB quota confirmed | ❌ Pending — needs ZB support reply (Q9) OR conservative estimate by operator |
+| **PC15** | Staging freeze rehearsal | ✅ **PASS 2026-05-17** — see [zb-outbound-freeze-rehearsal-2026-05-17.md](../operations/zb-outbound-freeze-rehearsal-2026-05-17.md). 5-step rehearsal verified drainer-frozen short-circuit, synthetic command not claimed during 9 tick cycles, no outbound HTTP, no errors, queue restored to empty. |
 | **PC-Phase-A** | Scaffolding implemented | ✅ Complete 2026-05-16 | Tables, RPCs, libs, drainer, router, 6 tests, 156/156 pass. |
 | **PC-Q2B-Instrument** | Sampling deployed + retired | ✅ Complete 2026-05-17 | Captured 13 real prod samples. `platform_settings.zb_body_observe` row deleted post-resolution. |
 | **PC-account-fix** | `account_id` → `account` field-name hygiene | ✅ Complete 2026-05-17 | Deployed in commit `a1076eb`. Next real webhook will populate `delivery_log.context.zb_account_id` (was previously always null). |

@@ -92,16 +92,19 @@ describe('zb-outbound queue + drainer (Phase A)', () => {
     expect(supabase._calls.rpc.find((c) => c.fn === 'zb_outbound_claim_due')).toBeDefined();
   });
 
-  test('unfrozen tick with claimed row: Phase A defers (no HTTP, no mutation)', async () => {
+  test('unfrozen tick with claimed non-job.create row: Phase B skips (no HTTP, no mutation)', async () => {
+    // Phase B scope is job.create only. Other command types defer with
+    // 'not_in_phase_b_scope' until Phase C/D/E. Tests command_type=job.assign_providers.
     process.env.ZB_OUTBOUND_ENABLED = 'true';
     process.env.ZB_OUTBOUND_GLOBAL_FREEZE = 'false';
+    process.env.ZB_OUTBOUND_DRY_RUN = 'true';
     const supabase = makeSupabase({
       claimed: [{ id: 'cmd-1', event_id: 'zboe_x', user_id: 'u1', command_type: 'job.assign_providers', sf_job_id: 'j1', payload_json: {}, source_revision: {}, intent_hash: 'h', attempts: 0, field_group: 'assignment', origin: 'user' }],
     });
     const logs = [];
     const result = await runDrainerTick({ supabase, logger: { log: (m) => logs.push(m), warn: () => {}, error: () => {} } });
     expect(result.processed).toBe(1);
-    expect(logs.some((m) => m.includes('phase_a_defer'))).toBe(true);
+    expect(logs.some((m) => m.includes('phase_b_skip'))).toBe(true);
     expect(supabase._calls.updates.length).toBe(1); // exactly one defer update
   });
 });

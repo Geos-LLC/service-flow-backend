@@ -47,6 +47,8 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
+const identityGraphViolation = require('./lib/identity-graph-violation');
+const identityWriteGate = require('./lib/identity-write-gate');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
@@ -1073,6 +1075,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
 try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
+try { app.use('/api/identity-conflicts', require('./identity-conflicts')(supabase, logger)); } catch (e) { console.log('Identity conflicts module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
@@ -5345,6 +5348,32 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       bookingWarnings = validation.warnings || [];
     }
 
+    // Auto-territory resolution. Runs only when operator left the
+    // territory dropdown empty. Override-safe (explicit values pass
+    // through). On any inferred/ambiguous/no-match result a warning is
+    // pushed into bookingWarnings so the operator sees what was filled
+    // (or why it stayed empty). NEVER throws.
+    let resolvedTerritory = territory;
+    try {
+      const { resolveTerritory } = require('./lib/territory-resolver');
+      const tr = await resolveTerritory(supabase, {
+        user_id: userId,
+        customer_id: customerId,
+        service_address_city: serviceAddress && serviceAddress.city,
+        currentTerritory: territory,
+        logger,
+      });
+      if (tr.territory && (!territory || !String(territory).trim())) {
+        resolvedTerritory = tr.territory;
+      }
+      if (tr.warning) {
+        bookingWarnings.push(tr.warning);
+      }
+      logger.log(`[Territory resolver] sf_job_create user_id=${userId} customer_id=${customerId} confidence=${tr.confidence} source=${tr.source} territory=${tr.territory == null ? 'null' : tr.territory}`);
+    } catch (terrErr) {
+      logger.warn(`[Territory resolver] failed (non-blocking): ${terrErr && terrErr.message}`);
+    }
+
     // Process modifiers and intake questions to calculate final price and duration
     const finalPrice = parseFloat(price) || 0;
     let finalDuration = parseFloat(duration) || 0;
@@ -5605,7 +5634,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         total: finalTotal,
         total_amount: finalTotal,
         payment_method: paymentMethod,
-        territory: territory,
+        territory: resolvedTerritory,
         is_recurring: recurringJob,
         recurring_frequency: recurringFrequency || null, // Save null if empty, not empty string
         next_billing_date: (recurringJob && recurringFrequency) ? (() => {
@@ -5673,6 +5702,23 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         id: userId,
         display_name: null,
       }).catch((e) => console.warn('[LB Outbound] Insert emit skipped:', e?.message));
+
+      // Phase B: ZB outbound producer hook for job.create. Gated by
+      // ZB_OUTBOUND_ENABLED + per-tenant opt-in in platform_settings.
+      // NEVER throws — failure to enqueue MUST NOT break job creation.
+      // Pass the server's structured logger so producer + emitQueued
+      // metric lines reach Loki (Day-1 P8 fix — bare console.log from
+      // fire-and-forget promise was getting lost).
+      try {
+        const { maybeEmitJobCreateCommand } = require('./lib/zb-outbound-producer');
+        maybeEmitJobCreateCommand(supabase, result, {
+          type: 'account_owner',
+          id: userId,
+          display_name: null,
+        }, { logger }).catch((e) => console.warn('[ZB Outbound producer] hook failed:', e?.message));
+      } catch (zbErr) {
+        console.warn('[ZB Outbound producer] require failed:', zbErr?.message);
+      }
       
             // Verify customer exists and get customer data
       let customerData = null;
@@ -5700,6 +5746,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       
       // Send automatic confirmation if customer has email
       if (result.customer_id) {
+        // F1: persist updates through a checked helper so missing-column /
+        // RLS / network errors are surfaced instead of silently dropped.
+        // See lib/job-confirmation-updater.js and investigation notes for
+        // job 142213 (2026-05-20).
+        const { persistConfirmationStatus } = require('./lib/job-confirmation-updater');
         try {
           const { data: customerData, error: customerError } = await supabase
             .from('customers')
@@ -5738,7 +5789,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                   smsNotifications = preferences.sms_notifications;
                 } else {
                   // Create default preferences for new customer
-                  console.log('📝 Creating default notification preferences for new customer');
+                  logger.log('[JobConfirmation] 📝 Creating default notification preferences for new customer');
                   const { error: insertError } = await supabase
                     .from('customer_notification_preferences')
                     .insert({
@@ -5746,16 +5797,16 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                       email_notifications: emailNotifications,
                       sms_notifications: smsNotifications
                     });
-                  
+
                   if (insertError) {
-                    console.error('❌ Error creating customer notification preferences:', insertError);
+                    logger.error('[JobConfirmation] ❌ Error creating customer notification preferences: ' + (insertError.message || JSON.stringify(insertError)));
                   } else {
-                    console.log('✅ Created default notification preferences for customer');
+                    logger.log('[JobConfirmation] ✅ Created default notification preferences for customer');
                   }
                 }
               } catch (prefError) {
-                console.log('📝 No notification preferences found for new customer, creating defaults');
-                
+                logger.log('[JobConfirmation] 📝 No notification preferences found for new customer, creating defaults');
+
                 // Create default preferences for new customer
                 const { error: insertError } = await supabase
                   .from('customer_notification_preferences')
@@ -5764,11 +5815,11 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     email_notifications: emailNotifications,
                     sms_notifications: smsNotifications
                   });
-                
+
                 if (insertError) {
-                  console.error('❌ Error creating customer notification preferences:', insertError);
+                  logger.error('[JobConfirmation] ❌ Error creating customer notification preferences: ' + (insertError.message || JSON.stringify(insertError)));
                 } else {
-                  console.log('✅ Created default notification preferences for customer');
+                  logger.log('[JobConfirmation] ✅ Created default notification preferences for customer');
                 }
               }
               
@@ -5830,14 +5881,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
               const hasEmail = customerData.email && customerData.email.trim() !== '';
               const hasPhone = customerData.phone && customerData.phone.trim() !== '';
               
-              console.log('📧 Notification check:', {
-                hasEmail,
-                hasPhone,
-                customerEmail: customerData.email,
-                customerPhone: customerData.phone,
-                emailNotifications,
-                smsNotifications
-              });
+              logger.log(`[JobConfirmation] 📧 Notification check job=${result.id} hasEmail=${hasEmail} hasPhone=${hasPhone} emailNotifications=${emailNotifications} smsNotifications=${smsNotifications}`);
               
               // Send email notification if customer has email and email notifications are enabled.
               // P1.5 — routed through notificationEmail.sendCustomerEmail (was inline sgMail.send).
@@ -5851,167 +5895,158 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
                     text: textContent,
                     emailType: 'appointment_confirmation_auto',
                   });
-                  console.log('✅ Automatic job confirmation email sent successfully to:', customerData.email);
+                  logger.log(`[JobConfirmation] ✅ Automatic job confirmation email sent job=${result.id} to=${customerData.email}`);
 
-                  // Update job with confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: true,
-                      confirmation_sent_at: new Date().toISOString(),
-                      confirmation_email: customerData.email
-                    })
-                    .eq('id', result.id);
+                  // Update job with confirmation status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: true,
+                    confirmation_sent_at: new Date().toISOString(),
+                    confirmation_email: customerData.email,
+                  }, 'email_success');
 
                 } catch (sendError) {
-                  console.error('❌ Error sending automatic confirmation email:', sendError);
+                  logger.error(`[JobConfirmation] ❌ Error sending automatic confirmation email job=${result.id} error=${sendError && sendError.message}`);
 
-                  // Update job with failed confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: false,
-                      confirmation_failed: true,
-                      confirmation_error: sendError.message
-                    })
-                    .eq('id', result.id);
+                  // Update job with failed confirmation status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: false,
+                    confirmation_failed: true,
+                    confirmation_error: sendError.message,
+                  }, 'email_failure');
                 }
               }
               // If customer has no email, automatically send SMS instead
               else if (!hasEmail && hasPhone) {
-                console.log('📱 Customer has no email, sending SMS confirmation instead');
-                console.log('📱 SMS details:', {
-                  customerPhone: customerData.phone,
-                  userId: req.user.userId,
-                  serviceName,
-                  scheduledDate: result.scheduled_date
-                });
-                
+                logger.log(`[JobConfirmation] 📱 Customer has no email — sending SMS confirmation instead job=${result.id}`);
+                logger.log(`[JobConfirmation] 📱 SMS dispatch job=${result.id} user=${req.user.userId} to=${customerData.phone} service="${serviceName}" scheduledDate=${result.scheduled_date}`);
+
                 try {
-                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
-                    weekday: 'long', 
-                    month: 'long', 
-                    day: 'numeric' 
-                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', {
+                    weekday: 'long',
+                    month: 'long',
+                    day: 'numeric'
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', {
+                    hour: 'numeric',
                     minute: '2-digit',
-                    hour12: true 
+                    hour12: true
                   })}. We'll see you soon! - ${businessName}`;
 
-                  console.log('📱 Sending SMS message:', smsMessage);
-                  const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
-                  console.log('✅ Automatic job confirmation SMS sent (no email) to:', customerData.phone, 'SID:', smsResult.sid);
-                  
-                  // Update job with SMS confirmation status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: true,
-                      confirmation_sent_at: new Date().toISOString(),
-                      confirmation_method: 'sms',
-                      sms_sent: true,
-                      sms_sent_at: new Date().toISOString(),
-                      sms_phone: customerData.phone,
-                      sms_sid: smsResult.sid,
-                      sms_failed: false,
-                      sms_error: null
-                    })
-                    .eq('id', result.id);
-                  
+                  logger.log(`[JobConfirmation] 📱 Sending SMS message job=${result.id} body_len=${smsMessage.length}`);
+                  // P-01: customer-facing — must not resolve a team_member phone.
+                  const smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage, {
+                    intent: 'customer_facing',
+                    source: 'customers.phone',
+                    message_type: 'job_confirmation_no_email_sms',
+                    customer_id: customerData.id,
+                    job_id: result.id,
+                    path: 'P-01',
+                  });
+                  logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (no email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
+
+                  // Update job with SMS confirmation status (F1: checked update,
+                  // confirmation_method removed — column does not exist on jobs table).
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: true,
+                    confirmation_sent_at: new Date().toISOString(),
+                    sms_sent: true,
+                    sms_sent_at: new Date().toISOString(),
+                    sms_phone: customerData.phone,
+                    sms_sid: smsResult.sid,
+                    sms_failed: false,
+                    sms_error: null,
+                  }, 'sms_no_email_success');
+
                 } catch (smsError) {
-                  console.error('❌ SMS sending failed:', smsError);
-                  console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
-                  
-                  // Update job with failed SMS status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      confirmation_sent: false,
-                      confirmation_failed: true,
-                      confirmation_error: smsError.message,
-                      sms_sent: false,
-                      sms_failed: true,
-                      sms_error: smsError.message
-                    })
-                    .eq('id', result.id);
+                  logger.error(`[JobConfirmation] ❌ SMS sending failed (no-email path) job=${result.id} error=${smsError && smsError.message}`);
+
+                  // Update job with failed SMS status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    confirmation_sent: false,
+                    confirmation_failed: true,
+                    confirmation_error: smsError.message,
+                    sms_sent: false,
+                    sms_failed: true,
+                    sms_error: smsError.message,
+                  }, 'sms_no_email_failure');
                 }
               } else if (!hasEmail && !hasPhone) {
-                console.log('⚠️ Customer has no email and no phone number - no confirmation sent');
+                logger.warn(`[JobConfirmation] ⚠️ Customer has no email and no phone — no confirmation sent job=${result.id}`);
               }
 
               // Send SMS notification if enabled (for customers with email who also want SMS)
               if (smsNotifications && hasPhone && hasEmail) {
                 try {
-                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', { 
-                    weekday: 'long', 
-                    month: 'long', 
-                    day: 'numeric' 
-                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
+                  const smsMessage = `Hi ${customerName}! Your appointment is confirmed for ${serviceName} on ${new Date(result.scheduled_date).toLocaleDateString('en-US', {
+                    weekday: 'long',
+                    month: 'long',
+                    day: 'numeric'
+                  })} at ${new Date(result.scheduled_date).toLocaleTimeString('en-US', {
+                    hour: 'numeric',
                     minute: '2-digit',
-                    hour12: true 
+                    hour12: true
                   })}. We'll see you soon! - ${businessName}`;
 
                   // Send SMS using user's Twilio Connect account
                   let smsResult;
                   try {
-                    smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage);
-                    console.log('✅ Automatic job confirmation SMS sent successfully to:', customerData.phone, 'SID:', smsResult.sid);
+                    // P-02: customer-facing — must not resolve a team_member phone.
+                    smsResult = await sendSMSWithUserTwilio(req.user.userId, customerData.phone, smsMessage, {
+                      intent: 'customer_facing',
+                      source: 'customers.phone',
+                      message_type: 'job_confirmation_with_email_sms',
+                      customer_id: customerData.id,
+                      job_id: result.id,
+                      path: 'P-02',
+                    });
+                    logger.log(`[JobConfirmation] ✅ Automatic job confirmation SMS sent (with email) job=${result.id} to=${customerData.phone} sid=${smsResult.sid}`);
                   } catch (smsError) {
-                    console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
+                    logger.warn(`[JobConfirmation] ⚠️ SMS notification skipped (Twilio error) job=${result.id} error=${smsError && smsError.message}`);
                     // Continue without failing the job creation
                   }
 
-                  // Update job with SMS notification status
+                  // Update job with SMS notification status (F1: checked update)
                   if (smsResult) {
-                    await supabase
-                      .from('jobs')
-                      .update({
-                        sms_sent: true,
-                        sms_sent_at: new Date().toISOString(),
-                        sms_phone: customerData.phone,
-                        sms_sid: smsResult.sid
-                      })
-                      .eq('id', result.id);
+                    await persistConfirmationStatus(supabase, logger, result.id, {
+                      sms_sent: true,
+                      sms_sent_at: new Date().toISOString(),
+                      sms_phone: customerData.phone,
+                      sms_sid: smsResult.sid,
+                    }, 'sms_with_email_success');
                   }
-                  
+
                 } catch (smsError) {
-                  console.error('❌ Error sending automatic confirmation SMS:', smsError);
-                  
-                  // Update job with failed SMS notification status
-                  await supabase
-                    .from('jobs')
-                    .update({
-                      sms_sent: false,
-                      sms_failed: true,
-                      sms_error: smsError.message
-                    })
-                    .eq('id', result.id);
+                  logger.error(`[JobConfirmation] ❌ Error sending automatic confirmation SMS (with-email path) job=${result.id} error=${smsError && smsError.message}`);
+
+                  // Update job with failed SMS notification status (F1: checked update)
+                  await persistConfirmationStatus(supabase, logger, result.id, {
+                    sms_sent: false,
+                    sms_failed: true,
+                    sms_error: smsError.message,
+                  }, 'sms_with_email_failure');
                 }
               }
             }
           } else {
-            // Update job with no email status
-            await supabase
-              .from('jobs')
-              .update({
-                confirmation_sent: false,
-                confirmation_no_email: true
-              })
-              .eq('id', result.id);
+            // Update job with no email status (F1: checked update)
+            await persistConfirmationStatus(supabase, logger, result.id, {
+              confirmation_sent: false,
+              confirmation_no_email: true,
+            }, 'no_customer');
           }
         } catch (confirmationError) {
-          console.error('❌ Error in automatic confirmation process:', confirmationError);
+          logger.error(`[JobConfirmation] ❌ Error in automatic confirmation process job=${result.id} error=${confirmationError && confirmationError.message}`);
           // Don't fail the job creation if confirmation fails
         }
       }
 
-      // Send success response
-      res.json({
-        success: true,
-        message: 'Job created successfully',
-        job: result
-      });
+      // F2 (2026-05-20): legacy `res.json({ success: true, ... job: result })`
+      // was emitted here. It fired BEFORE the team-member assignments / status
+      // history / createdJob fetch, then control fell through to the
+      // canonical `res.status(201).json(...)` below — every successful job
+      // creation triggered ERR_HTTP_HEADERS_SENT. The canonical response
+      // (which includes warnings + fully-joined createdJob + correct 201
+      // status) is the only one we now emit. See investigation notes for
+      // SF job 142213 / 2026-05-20.
 
       // Create team member assignments in job_team_assignments table
       if (teamMemberIdValue || teamMemberIds.length > 0) {
@@ -6575,7 +6610,15 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
               // Send SMS using user's Twilio Connect account
               let smsResult;
               try {
-                smsResult = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage);
+                // P-03: customer-facing status SMS — must not resolve a team_member phone.
+                smsResult = await sendSMSWithUserTwilio(req.user.userId, jobData.customers.phone, smsMessage, {
+                  intent: 'customer_facing',
+                  source: 'jobs.customers.phone',
+                  message_type: `job_status_${status}_sms`,
+                  customer_id: jobData.customer_id,
+                  job_id: jobData.id,
+                  path: 'P-03',
+                });
                 console.log(`✅ Automatic ${status} SMS notification sent successfully to:`, jobData.customers.phone, 'SID:', smsResult.sid);
               } catch (smsError) {
                 console.log('⚠️ SMS notification skipped - user Twilio not connected:', smsError.message);
@@ -8435,6 +8478,39 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
+    /**
+     * @transitional — OP path links identity → CRM customer directly. Should
+     *   migrate to setIdentityCustomer when the Stage 4 OP adapter lands.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — idempotent re-link in steady-state, but a graph
+     *                       change between event and replay can repoint the identity
+     *                       to a different customer (scoring-fallback re-evaluation).
+     *                       See docs/architecture/replay-confidence-audit.md.
+     * Retires when: OP adapter is on for all tenants (RECONCILIATION_ENGINE_OPENPHONE_TENANTS covers production set)
+     * AND the OP webhook handler routes identity-CRM linking through the engine + setIdentityCustomer.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      target: 'communication_participant_identities.sf_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_customer_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      reason: 'op_direct_identity_link_to_existing_customer',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_customer_id: crmMatch.id,
@@ -8451,6 +8527,36 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
+    /**
+     * @transitional — same shape as the customer branch above; migrate to setIdentityLead.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — same rationale as the customer-anchor branch.
+     *                       Replay can re-anchor to a different lead if a new lead
+     *                       was created between the original event and the replay.
+     * Retires when: OP adapter is on for all tenants AND lead-anchor branch routes through setIdentityLead.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      target: 'communication_participant_identities.sf_lead_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_lead_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      reason: 'op_direct_identity_link_to_existing_lead',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_lead_id: crmMatch.id,
@@ -8497,6 +8603,41 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
 
   // Link identity → new lead + mark status.
+  /**
+   * @transitional — direct identity-row write outside lib/identity-linker.js
+   *   setIdentityLead(). Authorised by current OP path semantics but flagged
+   *   by the architectural-hardening emitter so we can measure how often it
+   *   fires and migrate this call site to setIdentityLead() in a follow-up.
+   *   See docs/architecture/integration-compliance-audit.md (OpenPhone).
+   * @owner:               identity-v5
+   * @retirement-stage:    stage-4-adapter-only
+   * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
+   * @violation-class:     RV-2
+   * @stage-3-disposition: simulated_block
+   * @replay-class:        partial — creates a fresh lead and links the identity to it.
+   *                       Replay creates a different lead row, so the original lead is
+   *                       orphaned in the CRM. Acceptable under operator review only.
+   * Retires when: OP adapter creates leads through the engine
+   * and writes identity rows via setIdentityLead/projectIdentityToCRM only.
+   */
+  identityWriteGate.evaluateIdentityWrite({
+    tenantId: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    target: 'communication_participant_identities.sf_lead_id',
+    operation: 'update',
+    bypassStage: 'stage-4-adapter-only',
+    owner: 'identity-v5',
+    violationClass: 'RV-2',
+    simulateBlock: true,
+    logger,
+  });
+  identityGraphViolation.recordTransitionalBypass(logger, {
+    target: 'communication_participant_identities.sf_lead_id',
+    tenant: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    reason: 'op_direct_identity_link',
+    includeCallPath: false,
+  });
   await supabase.from('communication_participant_identities')
     .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
     .eq('id', identity.id);
@@ -10178,7 +10319,41 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       // Continue with conversion even if stage lookup fails
     }
     
-    // Update lead with converted customer ID and move to "Won" stage if found
+    // Update lead with converted customer ID and move to "Won" stage if found.
+    /**
+     * @transitional — operator-initiated "Convert lead → customer" endpoint
+     *   writes converted_customer_id directly. Migration target: route through
+     *   applyLeadCustomerLink (which already handles operator-override
+     *   semantics + provenance + audit).
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-2-ci-static
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        unsafe — operator-initiated mutation. The original
+     *                       operator's intent is not in the replay event log; a
+     *                       replay would re-fire the conversion without consent.
+     *                       Replay framework must skip operator endpoints (§6.3).
+     * Retires when: this endpoint delegates to applyLeadCustomerLink({mode:'operator_override'}).
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      reason: 'operator_lead_to_customer_conversion',
+      includeCallPath: false,
+    });
     const updateData = {
       converted_customer_id: customer.id,
       converted_at: new Date().toISOString()
@@ -10776,6 +10951,47 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       } catch (e) { /* table or column may not exist — skip */ }
     }
     // Special: 'leads' uses converted_customer_id
+    /**
+     * @transitional — direct leads.converted_customer_id repointing outside
+     *   lib/identity-linker.js. This IS legitimate during operator-initiated
+     *   customer merge (source customer is about to be deleted; its converted
+     *   leads must move to the surviving customer). Emit so we have a count
+     *   and can audit operator merge volume. Routing through applyLeadCustomerLink
+     *   here is not appropriate because that function refuses to overwrite an
+     *   already-linked lead.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-3-runtime-block
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_allow — this source is on the hypothetical
+     *                       permanent allow-list (runtime-allowlist-design.md §2.2).
+     *                       The merge endpoint legitimately needs to repoint
+     *                       leads.converted_customer_id and must not be refused
+     *                       under any posture.
+     * @replay-class:        unsafe — operator-initiated mutation with side effects
+     *                       (deletes the source customer). Replay framework MUST
+     *                       skip this site (replay-confidence-audit.md).
+     * Retires when: applyLeadCustomerLink gains an `operator_repoint` mode
+     * that permits overwriting an existing converted_customer_id under audit + reason code.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:merge_duplicate_customers',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: userId,
+      source: 'server.js:merge_duplicate_customers',
+      reason: 'operator_initiated_customer_merge',
+      includeCallPath: false,
+    });
     try {
       await supabase.from('leads').update({ converted_customer_id: targetId })
         .eq('converted_customer_id', sourceId).eq('user_id', userId);
@@ -36079,31 +36295,144 @@ app.post('/api/twilio/set-default-phone-number', authenticateToken, async (req, 
   }
 });
 
-// Helper function to send SMS using user's direct Twilio credentials
-const sendSMSWithUserTwilio = async (userId, to, message) => {
-  // Get user's Twilio credentials
+// Helper function to send SMS using user's direct Twilio credentials.
+//
+// P0 Recipient Integrity Audit (2026-05-20):
+//   - `options.intent` (when set to 'customer_facing' or 'cleaner_facing')
+//     triggers an audit that BLOCKS the send if the resolved recipient
+//     phone collides with the OTHER role's phone in the same tenant.
+//     On block: emits [RecipientIntegrityViolation] and throws.
+//   - All sends emit a [NotificationRecipient] structured log line
+//     (pre-send + post-send) so Loki has full forensic provenance.
+//
+// Legacy callers that don't pass `options` still work — audit skips when
+// no intent is provided. Migration of remaining paths is tracked
+// separately. See docs/operations/recipient_source_map.md.
+const sendSMSWithUserTwilio = async (userId, to, message, options = {}) => {
+  const {
+    auditRecipientIntegrity,
+    emitNotificationRecipientLog,
+    emitRecipientIntegrityViolation,
+  } = require('./lib/sms-recipient-integrity');
+
+  const o = options || {};
+  const path = o.path || 'sendSMSWithUserTwilio';
+
+  // 1. Recipient integrity audit (no-op when intent absent).
+  const audit = await auditRecipientIntegrity(supabase, {
+    userId, intent: o.intent, recipient: to, logger,
+  });
+  if (audit.verdict === 'violation') {
+    emitRecipientIntegrityViolation(logger, {
+      message_type: o.message_type,
+      intent: o.intent,
+      resolved_phone: to,
+      source: o.source,
+      reason: audit.reason,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      collision_table: audit.collision && audit.collision.table,
+      collision_id: audit.collision && audit.collision.id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      path,
+    });
+    const err = new Error(`Recipient integrity violation: ${audit.reason}`);
+    err.code = 'RECIPIENT_INTEGRITY_VIOLATION';
+    err.audit = audit;
+    throw err;
+  }
+
+  // 1b. If the audit detected a collision but the operator has resolved
+  // the conflict with keep_separate, log the consent-based bypass for
+  // forensic trail. The send proceeds (audit.verdict === 'ok').
+  if (audit.reason === 'bypassed_by_keep_separate') {
+    if (logger && logger.warn) {
+      logger.warn(
+        `[RecipientIntegrityBypass] reason=keep_separate intent=${o.intent} ` +
+        `collision_table=${audit.collision && audit.collision.table} ` +
+        `collision_id=${audit.collision && audit.collision.id} ` +
+        `conflict_id=${audit.bypass && audit.bypass.conflict_id} ` +
+        `path=${path}`
+      );
+    }
+  }
+
+  // 2. Pre-send forensic log.
+  emitNotificationRecipientLog(logger, {
+    message_type: o.message_type,
+    resolved_phone: to,
+    source: o.source,
+    fallback_depth: o.fallback_depth,
+    customer_id: o.customer_id,
+    team_member_id: o.team_member_id,
+    job_id: o.job_id,
+    workspace_id: userId,
+    twilio_sid: null,
+    path,
+  });
+
+  // 3. Resolve tenant Twilio credentials.
   const { data: userData, error: userError } = await supabase
     .from('users')
     .select('twilio_account_sid, twilio_auth_token, twilio_notification_phone')
     .eq('id', userId)
     .single();
-  
+
   if (userError || !userData?.twilio_account_sid || !userData?.twilio_auth_token) {
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: null,
+      path,
+      result: 'failure',
+      error: 'twilio_not_configured',
+    });
     throw new Error('Twilio not configured. Please set up your Twilio credentials first.');
   }
-  
-  // Create Twilio client with user's credentials
+
+  // 4. Send SMS via user's Twilio account.
   const userTwilioClient = require('twilio')(userData.twilio_account_sid, userData.twilio_auth_token);
-  
-  // Send SMS using user's Twilio account
-  const result = await userTwilioClient.messages.create({
-    body: message,
-    from: userData.twilio_notification_phone,
-    to: to
-  });
-  
-  console.log('📱 SMS sent via user Twilio credentials:', result.sid);
-  return result;
+  try {
+    const result = await userTwilioClient.messages.create({
+      body: message,
+      from: userData.twilio_notification_phone,
+      to: to
+    });
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: result.sid,
+      path,
+      result: 'success',
+    });
+    return result;
+  } catch (twilioErr) {
+    emitNotificationRecipientLog(logger, {
+      message_type: o.message_type,
+      resolved_phone: to,
+      source: o.source,
+      customer_id: o.customer_id,
+      team_member_id: o.team_member_id,
+      job_id: o.job_id,
+      workspace_id: userId,
+      twilio_sid: null,
+      path,
+      result: 'failure',
+      error: twilioErr && twilioErr.message,
+    });
+    throw twilioErr;
+  }
 };
 
 // Twilio SMS endpoints
