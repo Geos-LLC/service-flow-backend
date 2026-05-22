@@ -47,6 +47,8 @@ const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-o
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
+const identityGraphViolation = require('./lib/identity-graph-violation');
+const identityWriteGate = require('./lib/identity-write-gate');
 const { FLAGS, isEnabled, getOpenPhoneLeadMaxAgeDays } = require('./lib/feature-flags');
 const { adminConstantTimeCompare, requireAdminFlag: requireAdminFlagPure } = require('./lib/admin-auth');
 const { validateScheduledDate } = require('./lib/import-date-guard');
@@ -8476,6 +8478,39 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
+    /**
+     * @transitional — OP path links identity → CRM customer directly. Should
+     *   migrate to setIdentityCustomer when the Stage 4 OP adapter lands.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — idempotent re-link in steady-state, but a graph
+     *                       change between event and replay can repoint the identity
+     *                       to a different customer (scoring-fallback re-evaluation).
+     *                       See docs/architecture/replay-confidence-audit.md.
+     * Retires when: OP adapter is on for all tenants (RECONCILIATION_ENGINE_OPENPHONE_TENANTS covers production set)
+     * AND the OP webhook handler routes identity-CRM linking through the engine + setIdentityCustomer.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      target: 'communication_participant_identities.sf_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_customer_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer',
+      reason: 'op_direct_identity_link_to_existing_customer',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_customer_id: crmMatch.id,
@@ -8492,6 +8527,36 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
+    /**
+     * @transitional — same shape as the customer branch above; migrate to setIdentityLead.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-4-adapter-only
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        partial — same rationale as the customer-anchor branch.
+     *                       Replay can re-anchor to a different lead if a new lead
+     *                       was created between the original event and the replay.
+     * Retires when: OP adapter is on for all tenants AND lead-anchor branch routes through setIdentityLead.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      target: 'communication_participant_identities.sf_lead_id',
+      operation: 'update',
+      bypassStage: 'stage-4-adapter-only',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'communication_participant_identities.sf_lead_id',
+      tenant: userId,
+      source: 'server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead',
+      reason: 'op_direct_identity_link_to_existing_lead',
+      includeCallPath: false,
+    });
     await supabase.from('communication_participant_identities')
       .update({
         sf_lead_id: crmMatch.id,
@@ -8538,6 +8603,41 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
 
   // Link identity → new lead + mark status.
+  /**
+   * @transitional — direct identity-row write outside lib/identity-linker.js
+   *   setIdentityLead(). Authorised by current OP path semantics but flagged
+   *   by the architectural-hardening emitter so we can measure how often it
+   *   fires and migrate this call site to setIdentityLead() in a follow-up.
+   *   See docs/architecture/integration-compliance-audit.md (OpenPhone).
+   * @owner:               identity-v5
+   * @retirement-stage:    stage-4-adapter-only
+   * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
+   * @violation-class:     RV-2
+   * @stage-3-disposition: simulated_block
+   * @replay-class:        partial — creates a fresh lead and links the identity to it.
+   *                       Replay creates a different lead row, so the original lead is
+   *                       orphaned in the CRM. Acceptable under operator review only.
+   * Retires when: OP adapter creates leads through the engine
+   * and writes identity rows via setIdentityLead/projectIdentityToCRM only.
+   */
+  identityWriteGate.evaluateIdentityWrite({
+    tenantId: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    target: 'communication_participant_identities.sf_lead_id',
+    operation: 'update',
+    bypassStage: 'stage-4-adapter-only',
+    owner: 'identity-v5',
+    violationClass: 'RV-2',
+    simulateBlock: true,
+    logger,
+  });
+  identityGraphViolation.recordTransitionalBypass(logger, {
+    target: 'communication_participant_identities.sf_lead_id',
+    tenant: userId,
+    source: 'server.js:maybeCreateLeadFromOpenPhone',
+    reason: 'op_direct_identity_link',
+    includeCallPath: false,
+  });
   await supabase.from('communication_participant_identities')
     .update({ sf_lead_id: newLead.id, status: 'resolved_lead', updated_at: new Date().toISOString() })
     .eq('id', identity.id);
@@ -10219,7 +10319,41 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       // Continue with conversion even if stage lookup fails
     }
     
-    // Update lead with converted customer ID and move to "Won" stage if found
+    // Update lead with converted customer ID and move to "Won" stage if found.
+    /**
+     * @transitional — operator-initiated "Convert lead → customer" endpoint
+     *   writes converted_customer_id directly. Migration target: route through
+     *   applyLeadCustomerLink (which already handles operator-override
+     *   semantics + provenance + audit).
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-2-ci-static
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_block
+     * @replay-class:        unsafe — operator-initiated mutation. The original
+     *                       operator's intent is not in the replay event log; a
+     *                       replay would re-fire the conversion without consent.
+     *                       Replay framework must skip operator endpoints (§6.3).
+     * Retires when: this endpoint delegates to applyLeadCustomerLink({mode:'operator_override'}).
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-2-ci-static',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: req.user && req.user.userId,
+      source: 'server.js:convert_lead_to_customer_endpoint',
+      reason: 'operator_lead_to_customer_conversion',
+      includeCallPath: false,
+    });
     const updateData = {
       converted_customer_id: customer.id,
       converted_at: new Date().toISOString()
@@ -10817,6 +10951,47 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       } catch (e) { /* table or column may not exist — skip */ }
     }
     // Special: 'leads' uses converted_customer_id
+    /**
+     * @transitional — direct leads.converted_customer_id repointing outside
+     *   lib/identity-linker.js. This IS legitimate during operator-initiated
+     *   customer merge (source customer is about to be deleted; its converted
+     *   leads must move to the surviving customer). Emit so we have a count
+     *   and can audit operator merge volume. Routing through applyLeadCustomerLink
+     *   here is not appropriate because that function refuses to overwrite an
+     *   already-linked lead.
+     * @owner:               identity-v5
+     * @retirement-stage:    stage-3-runtime-block
+     * @observability:       Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
+     * @violation-class:     RV-2
+     * @stage-3-disposition: simulated_allow — this source is on the hypothetical
+     *                       permanent allow-list (runtime-allowlist-design.md §2.2).
+     *                       The merge endpoint legitimately needs to repoint
+     *                       leads.converted_customer_id and must not be refused
+     *                       under any posture.
+     * @replay-class:        unsafe — operator-initiated mutation with side effects
+     *                       (deletes the source customer). Replay framework MUST
+     *                       skip this site (replay-confidence-audit.md).
+     * Retires when: applyLeadCustomerLink gains an `operator_repoint` mode
+     * that permits overwriting an existing converted_customer_id under audit + reason code.
+     */
+    identityWriteGate.evaluateIdentityWrite({
+      tenantId: userId,
+      source: 'server.js:merge_duplicate_customers',
+      target: 'leads.converted_customer_id',
+      operation: 'update',
+      bypassStage: 'stage-3-runtime-block',
+      owner: 'identity-v5',
+      violationClass: 'RV-2',
+      simulateBlock: true,
+      logger,
+    });
+    identityGraphViolation.recordTransitionalBypass(logger, {
+      target: 'leads.converted_customer_id',
+      tenant: userId,
+      source: 'server.js:merge_duplicate_customers',
+      reason: 'operator_initiated_customer_merge',
+      includeCallPath: false,
+    });
     try {
       await supabase.from('leads').update({ converted_customer_id: targetId })
         .eq('converted_customer_id', sourceId).eq('user_id', userId);
@@ -19113,6 +19288,109 @@ app.get('/api/user/billing/payment-methods', authenticateToken, requireBillingOw
   }
 });
 
+// List billing invoices (subscription receipts for the tenant)
+app.get('/api/user/billing/invoices', authenticateToken, requireBillingOwner, async (req, res) => {
+  try {
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
+    const { data: billingData } = await supabase
+      .from('user_billing')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (!billingData?.[0]?.stripe_customer_id) {
+      return res.json({ invoices: [] });
+    }
+
+    const list = await stripe.invoices.list({
+      customer: billingData[0].stripe_customer_id,
+      limit: 24,
+    });
+
+    res.json({
+      invoices: list.data.map((inv) => ({
+        id:           inv.id,
+        number:       inv.number,
+        status:       inv.status,
+        amount_paid:  inv.amount_paid,
+        amount_due:   inv.amount_due,
+        currency:     inv.currency,
+        created:      inv.created,
+        period_start: inv.period_start,
+        period_end:   inv.period_end,
+        hosted_url:   inv.hosted_invoice_url,
+        pdf_url:      inv.invoice_pdf,
+        description:  inv.description || (inv.lines?.data?.[0]?.description ?? null),
+      })),
+    });
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
+// Usage this period — aggregated tallies for the Billing page's
+// "Usage this period" card. Returns counts that are cheap to compute;
+// metrics we don't track yet (like API calls) are returned as null so
+// the frontend can fall back to "Unlimited" / "—".
+app.get('/api/user/billing/usage', authenticateToken, requireBillingOwner, async (req, res) => {
+  try {
+    const userId = resolveBillingUserId(req);
+    if (userId == null) return res.status(401).json({ error: 'authentication_required' });
+
+    // Current calendar month window (UTC). Matches the "May 1 – 31" copy.
+    const now = new Date();
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const end   = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString();
+
+    const [teamRes, jobsRes, filesRes] = await Promise.allSettled([
+      // Active team members for this owner
+      supabase
+        .from('team_members')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .eq('is_active', true),
+      // Jobs scheduled this month
+      supabase
+        .from('jobs')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .gte('scheduled_date', start)
+        .lt('scheduled_date', end),
+      // Customer files — sum size_bytes
+      supabase
+        .from('customer_files')
+        .select('size_bytes')
+        .eq('user_id', userId)
+        .is('deleted_at', null),
+    ]);
+
+    const teamCount = teamRes.status === 'fulfilled' ? (teamRes.value?.count ?? 0) : 0;
+    const jobCount  = jobsRes.status === 'fulfilled' ? (jobsRes.value?.count ?? 0) : 0;
+    const storageBytes =
+      filesRes.status === 'fulfilled' && Array.isArray(filesRes.value?.data)
+        ? filesRes.value.data.reduce((s, r) => s + (Number(r.size_bytes) || 0), 0)
+        : 0;
+
+    // SMS / API call counts aren't tracked per-user yet — surface null
+    // so the UI renders "Unlimited" / "—" rather than misleading zeros.
+    res.json({
+      periodStart: start,
+      periodEnd:   end,
+      activeTeams: teamCount,
+      jobsThisMonth: jobCount,
+      smsSent: null,
+      storageBytes,
+      apiCalls: null,
+    });
+  } catch (error) {
+    console.error('Get usage error:', error);
+    res.status(500).json({ error: 'Failed to fetch usage' });
+  }
+});
+
 // Cancel subscription
 app.post('/api/user/billing/cancel-subscription', authenticateToken, requireBillingOwner, async (req, res) => {
   try {
@@ -19220,6 +19498,21 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch payment settings' });
     }
     
+    const DEFAULT_ACCEPTED = {
+      card:             true,
+      ach:              true,
+      apple_google_pay: true,
+      afterpay:         false,
+      cash:             true,
+    };
+    const DEFAULT_AUTOMATION = {
+      autoChargeOnCompletion:  true,
+      saveCardsForRecurring:   true,
+      retryFailedPayments:     true,
+      allowTipping:            false,
+      emailReceiptAutomatically: true,
+    };
+
     if (!settings || settings.length === 0) {
       // Return default settings
       return res.json({
@@ -19234,7 +19527,12 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
         paymentProcessor: null,
         paymentProcessorConnected: false,
         tipCalculationMode: 'automatic',
-        paymentTypeFees: {}
+        paymentTypeFees: {},
+        acceptedMethods: DEFAULT_ACCEPTED,
+        payoutFrequency: 'daily_t2',
+        minimumPayout: 100,
+        statementDescriptor: '',
+        automation: DEFAULT_AUTOMATION,
       });
     }
 
@@ -19251,7 +19549,12 @@ app.get('/api/user/payment-settings', authenticateToken, async (req, res) => {
       paymentProcessor: setting.payment_processor,
       paymentProcessorConnected: setting.payment_processor_connected === true,
       tipCalculationMode: setting.tip_calculation_mode || 'automatic',
-      paymentTypeFees: setting.payment_type_fees || {}
+      paymentTypeFees: setting.payment_type_fees || {},
+      acceptedMethods: { ...DEFAULT_ACCEPTED, ...(setting.accepted_methods || {}) },
+      payoutFrequency: setting.payout_frequency || 'daily_t2',
+      minimumPayout: setting.minimum_payout != null ? Number(setting.minimum_payout) : 100,
+      statementDescriptor: setting.statement_descriptor || '',
+      automation: { ...DEFAULT_AUTOMATION, ...(setting.automation || {}) },
     });
   } catch (error) {
     console.error('Get payment settings error:', error);
@@ -19274,7 +19577,12 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       paymentProcessor,
       paymentProcessorConnected,
       tipCalculationMode,
-      paymentTypeFees
+      paymentTypeFees,
+      acceptedMethods,
+      payoutFrequency,
+      minimumPayout,
+      statementDescriptor,
+      automation,
     } = req.body;
 
     // Check if settings exist
@@ -19289,24 +19597,32 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to check existing settings' });
     }
 
+    // Only include keys that were actually sent so partial updates
+    // don't wipe untouched fields.
+    const payload = { tip_calculation_mode: tipCalculationMode || 'automatic' };
+    const setIfPresent = (k, v) => { if (v !== undefined) payload[k] = v; };
+    setIfPresent('online_booking_tips',       onlineBookingTips);
+    setIfPresent('invoice_payment_tips',      invoicePaymentTips);
+    setIfPresent('show_service_prices',       showServicePrices);
+    setIfPresent('show_service_descriptions', showServiceDescriptions);
+    setIfPresent('payment_due_days',          paymentDueDays);
+    setIfPresent('payment_due_unit',          paymentDueUnit);
+    setIfPresent('default_memo',              defaultMemo);
+    setIfPresent('invoice_footer',            invoiceFooter);
+    setIfPresent('payment_processor',         paymentProcessor);
+    setIfPresent('payment_processor_connected', paymentProcessorConnected);
+    setIfPresent('payment_type_fees',         paymentTypeFees);
+    setIfPresent('accepted_methods',          acceptedMethods);
+    setIfPresent('payout_frequency',          payoutFrequency);
+    setIfPresent('minimum_payout',            minimumPayout);
+    setIfPresent('statement_descriptor',      statementDescriptor);
+    setIfPresent('automation',                automation);
+
     if (existingSettings) {
       // Update existing settings
       const { error: updateError } = await supabase
         .from('user_payment_settings')
-        .update({
-          online_booking_tips: onlineBookingTips,
-          invoice_payment_tips: invoicePaymentTips,
-          show_service_prices: showServicePrices,
-          show_service_descriptions: showServiceDescriptions,
-          payment_due_days: paymentDueDays,
-          payment_due_unit: paymentDueUnit,
-          default_memo: defaultMemo,
-          invoice_footer: invoiceFooter,
-          payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected,
-          tip_calculation_mode: tipCalculationMode || 'automatic',
-          payment_type_fees: paymentTypeFees || {}
-        })
+        .update(payload)
         .eq('user_id', userId);
 
       if (updateError) {
@@ -19317,21 +19633,7 @@ app.put('/api/user/payment-settings', authenticateToken, async (req, res) => {
       // Insert new settings
       const { error: insertError } = await supabase
         .from('user_payment_settings')
-        .insert({
-          user_id: userId,
-          online_booking_tips: onlineBookingTips,
-          invoice_payment_tips: invoicePaymentTips,
-          show_service_prices: showServicePrices,
-          show_service_descriptions: showServiceDescriptions,
-          payment_due_days: paymentDueDays,
-          payment_due_unit: paymentDueUnit,
-          default_memo: defaultMemo,
-          invoice_footer: invoiceFooter,
-          payment_processor: paymentProcessor,
-          payment_processor_connected: paymentProcessorConnected,
-          tip_calculation_mode: tipCalculationMode || 'automatic',
-          payment_type_fees: paymentTypeFees || {}
-        });
+        .insert({ user_id: userId, ...payload });
 
       if (insertError) {
         console.error('Error creating payment settings:', insertError);
@@ -34222,7 +34524,16 @@ app.get('/api/user/business-details', authenticateToken, async (req, res) => {
         first_name,
         last_name,
         business_slug,
-        time_format
+        time_format,
+        tagline,
+        industry,
+        business_type,
+        website,
+        support_email,
+        location,
+        timezone,
+        currency,
+        logo_url
       `)
       .eq('id', userId)
       .limit(1);
@@ -34233,15 +34544,25 @@ app.get('/api/user/business-details', authenticateToken, async (req, res) => {
     }
 
     if (userData && userData.length > 0) {
+      const u = userData[0];
       res.json({
-        businessName: userData[0].business_name || '',
-        businessEmail: userData[0].business_email || '',
-        phone: userData[0].phone || '',
-        email: userData[0].email || '',
-        firstName: userData[0].first_name || '',
-        lastName: userData[0].last_name || '',
-        businessSlug: userData[0].business_slug || '',
-        timeFormat: userData[0].time_format || '12h'
+        businessName: u.business_name || '',
+        businessEmail: u.business_email || '',
+        phone: u.phone || '',
+        email: u.email || '',
+        firstName: u.first_name || '',
+        lastName: u.last_name || '',
+        businessSlug: u.business_slug || '',
+        timeFormat: u.time_format || '12h',
+        tagline: u.tagline || '',
+        industry: u.industry || '',
+        businessType: u.business_type || '',
+        website: u.website || '',
+        supportEmail: u.support_email || '',
+        location: u.location || '',
+        timezone: u.timezone || '',
+        currency: u.currency || '',
+        logoUrl: u.logo_url || ''
       });
     } else {
       res.status(404).json({ error: 'User not found' });
@@ -34258,20 +34579,36 @@ app.put('/api/user/business-details', authenticateToken, async (req, res) => {
     // present and different (handled by resolveAuthenticatedUserId).
     const userId = resolveAuthenticatedUserId(req, res);
     if (userId === null) return;
-    const { businessName, businessEmail, phone, email, firstName, lastName, timeFormat } = req.body;
+    const {
+      businessName, businessEmail, phone, email, firstName, lastName, timeFormat,
+      tagline, industry, businessType, website, supportEmail,
+      location, timezone, currency, logoUrl,
+    } = req.body;
 
     const normalizedTimeFormat = timeFormat === '24h' ? '24h' : (timeFormat === '12h' ? '12h' : null);
 
-    const updateData = {
-      business_name: businessName,
-      business_email: businessEmail,
-      phone,
-      email,
-      first_name: firstName,
-      last_name: lastName,
-      updated_at: new Date().toISOString(),
-      ...(normalizedTimeFormat ? { time_format: normalizedTimeFormat } : {})
+    // Only include fields that were actually sent in the body — `undefined`
+    // would otherwise wipe existing values for tenants on stale builds.
+    const updateData = { updated_at: new Date().toISOString() };
+    const setIfPresent = (key, value) => {
+      if (value !== undefined) updateData[key] = value;
     };
+    setIfPresent('business_name', businessName);
+    setIfPresent('business_email', businessEmail);
+    setIfPresent('phone', phone);
+    setIfPresent('email', email);
+    setIfPresent('first_name', firstName);
+    setIfPresent('last_name', lastName);
+    setIfPresent('tagline', tagline);
+    setIfPresent('industry', industry);
+    setIfPresent('business_type', businessType);
+    setIfPresent('website', website);
+    setIfPresent('support_email', supportEmail);
+    setIfPresent('location', location);
+    setIfPresent('timezone', timezone);
+    setIfPresent('currency', currency);
+    setIfPresent('logo_url', logoUrl);
+    if (normalizedTimeFormat) updateData.time_format = normalizedTimeFormat;
 
     const { error: updateError } = await supabase
       .from('users')
@@ -34286,12 +34623,9 @@ app.put('/api/user/business-details', authenticateToken, async (req, res) => {
     res.json({
       message: 'Business details updated successfully',
       businessDetails: {
-        businessName,
-        businessEmail,
-        phone,
-        email,
-        firstName,
-        lastName,
+        businessName, businessEmail, phone, email, firstName, lastName,
+        tagline, industry, businessType, website, supportEmail,
+        location, timezone, currency, logoUrl,
         ...(normalizedTimeFormat ? { timeFormat: normalizedTimeFormat } : {})
       }
     });
