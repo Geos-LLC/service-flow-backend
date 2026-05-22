@@ -3,6 +3,17 @@
 **Status:** Active. Simulation is wired and dark. No tenant impact.
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
+
+> **Terminology pin.** Throughout this doc:
+> - **"Simulation merge"** = merging the dark, passive `simulateBlock`
+>   layer (this PR). Always returns `allowed: true`. No tenant impact.
+>   Allowed to proceed without a soak.
+> - **"Stage 3 flip"** = activating actual runtime blocking — flipping
+>   a tenant's posture to `enforced_strict` so the gate refuses writes.
+>   Requires the Stage 3 *activation* PR (allow-list, posture column,
+>   `IDENTITY_WRITE_GATE_ENFORCED` flag) AND a clean 14-day soak.
+>
+> Merging the simulation is NOT the flip.
 **Companion docs:**
 - [../architecture/runtime-allowlist-design.md](../architecture/runtime-allowlist-design.md) — what Stage 3 will actually do
 - [../architecture/runtime-violation-taxonomy.md](../architecture/runtime-violation-taxonomy.md) — RV-N vocabulary
@@ -185,8 +196,13 @@ without simulation enabled.
 
 ## 6. Success criteria for Stage 3 flip
 
-Before promoting the first tenant to `enforced_strict`, all of these
-must be observed in Loki for ≥14 consecutive days:
+The Stage 3 flip = promoting a tenant to `enforced_strict` posture.
+This is a *separate* PR from the simulation merge: it adds the
+allow-list, the posture column, the `IDENTITY_WRITE_GATE_ENFORCED`
+flag, and the per-tenant promotion ritual.
+
+Before authoring that activation PR, all of these must be observed
+in Loki for ≥14 consecutive days on the simulation:
 
 1. **Coverage.** Query 5.5 returns zero for all sources for 14d.
 2. **Predicted-block stability.** Query 5.1 has a stable baseline; no
@@ -201,8 +217,13 @@ must be observed in Loki for ≥14 consecutive days:
 5. **Scanner clean.** `node scripts/check-identity-graph-bypass.js` reports
    zero warnings (covers the structural correctness side).
 
-Failure to meet any criterion blocks the Stage 3 flip — see
-`stage-3-merge-readiness-audit.md` for the operator checklist.
+Failure to meet any criterion blocks the Stage 3 *flip* (activation
+PR + posture promotion), not the simulation merge. The simulation
+remains live regardless of the soak verdict — only the activation PR
+is gated. See [tenant-2-soak-readiness.md](tenant-2-soak-readiness.md)
+for the soak procedure and
+[stage-3-merge-readiness-audit.md](stage-3-merge-readiness-audit.md)
+for the (separate) simulation merge checklist.
 
 ---
 

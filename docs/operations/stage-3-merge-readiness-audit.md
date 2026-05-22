@@ -3,6 +3,13 @@
 **Status:** Acceptance checklist for the Phase 3 merge-readiness PR.
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
+
+> **What this audit gates:** merge of the dark / passive / observational
+> simulation layer. Merge approval requires runtime neutrality
+> (`allowed: true` always), zero behavior change, and passing tests.
+> **It does NOT require a completed soak.** The 14-day tenant-2 soak
+> is a post-merge / post-deploy validation that gates the next PR
+> (Stage 3 *activation*), not this one.
 **Companion docs:**
 - [runtime-gate-validation.md](runtime-gate-validation.md) — simulation semantics
 - [tenant-2-soak-readiness.md](tenant-2-soak-readiness.md) — soak prep
@@ -150,9 +157,12 @@ separate review.
 
 ---
 
-## 5. Observability acceptance
+## 5. Post-deploy observability acceptance
 
-Within 1h of deploy to staging:
+**These checks are post-merge, post-deploy.** They do NOT gate merge.
+Merge proceeds on §2 + §3 + §4. The team runs these checks within 1h
+of staging deploy to confirm the simulation layer is healthy in
+production. Failure here triggers the §6 rollback, not a merge block.
 
 - [ ] `{service_name="service-flow-backend"} |~ "IdentityWriteGate "`
   (with the trailing space) emits the regular gate lines at expected
@@ -166,9 +176,10 @@ Within 1h of deploy to staging:
 - [ ] Latency P99 unchanged (gate adds at most one extra log line
   per call — no DB, no network).
 
-These checks are performed by the identity-v5 team after merge.
-This PR does not pre-fill the checkboxes — they belong to the
-*deploy* event, not the *merge* event.
+Once these all pass, the 14-day **simulation soak** begins on
+production tenant-2 per [tenant-2-soak-readiness.md](tenant-2-soak-readiness.md).
+The soak's verdict gates the *next* PR (Stage 3 activation), not
+this one.
 
 ---
 
@@ -198,15 +209,22 @@ This PR is **ready to merge** when:
 
 - All §2 checkboxes are ticked (they are above — green).
 - All §3 checkboxes are ticked (they are above — green).
-- §5 observability checks are queued for post-deploy verification.
 - Reviewer confirms no §4 invariant has been violated.
+- §5 post-deploy checks are *scheduled* (they don't have to be
+  *completed* — merge can proceed; the deploy step that follows
+  will run them).
+
+The 14-day soak is explicitly **not** a merge prerequisite. The
+soak is a post-deploy validation milestone that gates the Stage 3
+*activation* PR, not this PR.
 
 Reviewer: identity-v5 owner-of-the-week.
 Author: identity-v5.
 
-After merge, the next milestone is the 14-day **simulation soak**
-on tenant-2 (see `tenant-2-soak-readiness.md`). Stage 3
-implementation does not begin until soak passes.
+After merge + deploy + clean post-deploy checks, the 14-day
+**simulation soak** begins on tenant-2 (see
+[tenant-2-soak-readiness.md](tenant-2-soak-readiness.md)). Stage 3
+*activation* implementation does not begin until the soak passes.
 
 ---
 

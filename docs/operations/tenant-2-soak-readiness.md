@@ -3,6 +3,13 @@
 **Status:** Pre-soak checklist. Tenant-2 is the canonical first-soak tenant.
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
+
+> **What the soak gates:** Stage 3 *activation* — flipping a tenant to
+> `enforced_strict` posture so the gate actually refuses writes. The
+> soak is NOT a prerequisite for merging the dark simulation layer.
+> Simulation infrastructure (this branch's contents) is runtime-neutral
+> and may merge + deploy independently. The soak window begins
+> **after** merge + deploy.
 **Companion docs:**
 - [identity-rollout-governance.md](identity-rollout-governance.md) — tenant tier policy
 - [runtime-gate-validation.md](runtime-gate-validation.md) — simulation semantics
@@ -31,8 +38,15 @@ investigated by the team without escalation.
 
 > **Scope:** Soak prep checklist. The soak itself is not yet running.
 > This doc says what must be true before we declare tenant-2 ready
-> for the simulation soak (Phase 3 acceptance) and, later, for the
-> first `enforced_strict` posture (post-Stage 3 design lands).
+> for the simulation soak window. The soak is **post-merge,
+> post-deploy** — it cannot begin until the dark simulation layer is
+> in production emitting `[IdentityWriteGateSimulation]` lines.
+>
+> **What soak success unlocks:** the Stage 3 *implementation* PR
+> (allow-list, posture column, `IDENTITY_WRITE_GATE_ENFORCED` flag).
+> Without a clean soak, no Stage 3 activation may proceed. With a
+> clean soak, the team can author the activation PR — which carries
+> its own readiness audit and its own go/no-go decision.
 
 ---
 
@@ -92,13 +106,19 @@ explicitly when you verify.
 
 **Duration:** 14 consecutive calendar days (not business days).
 **Trigger:** all pre-soak invariants checked off, recorded in this
-file with date + initials.
+file with date + initials, AND the Phase 3 PR is merged + deployed
+to production for ≥1h (so simulation lines are actually flowing).
 **End condition:** Day 14 review passes (see §5).
 
-The soak is *passive* — no posture flips, no behavior changes. The
-simulation has already been running since merge of the Phase 3 PR;
-the soak is the period during which we agree to *watch* it without
-making further changes.
+The soak is *passive* — no posture flips, no behavior changes,
+nothing tenant-visible. The simulation runs automatically once the
+Phase 3 PR is live; the soak is the period during which the team
+agrees to *watch* it without making further changes.
+
+**Important:** the soak gates the Stage 3 *activation* PR, not this
+PR. The simulation layer is allowed to merge and deploy with no
+soak. The soak's only purpose is to build confidence before
+authoring the activation PR.
 
 ---
 
@@ -159,13 +179,16 @@ from `runtime-gate-validation.md` §6:
 5. **Scanner clean** — `check-identity-graph-bypass.js` reports OK
    throughout.
 
-If all five pass: tenant-2 is **soak-ready**. The team can then
-schedule the Stage 3 design + implementation, and tenant-2 becomes
-the first candidate for `enforced_monitored` posture after Stage 3
-ships.
+If all five pass: tenant-2 has completed a clean soak. The team is
+now cleared to author the Stage 3 *activation* PR (allow-list, posture
+column, `IDENTITY_WRITE_GATE_ENFORCED` flag, per-tenant promotion).
+Tenant-2 becomes the first candidate for `enforced_monitored` posture
+under that follow-up PR.
 
-If any fails: do NOT proceed. Investigate the failing axis, file a
-fix, and restart the 14-day clock.
+If any fails: do NOT proceed to authoring the activation PR.
+Investigate the failing axis, file a fix, and restart the 14-day
+clock. The dark simulation layer itself remains deployed — only the
+soak verdict resets.
 
 ---
 
