@@ -27,6 +27,7 @@ const {
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
 const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
+const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
 const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
@@ -548,6 +549,31 @@ module.exports = (supabase, logger) => {
     // No existing CRM entity → create lead.
     return await createLeadFromLB(userId, identity, input)
   }
+
+  // ══════════════════════════════════════
+  // Stage 2 — LB engine adapter
+  //
+  // Binds lib/identity-reconciliation-engine to the LB writer closures
+  // defined above. The webhook handler and runLbSync each gain ONE
+  // guarded branch that calls resolveOrCreateLeadViaEngine when the
+  // RECONCILIATION_ENGINE_LEADBRIDGE prerequisite chain is satisfied
+  // for the tenant; otherwise legacy path runs unchanged + a rate-limited
+  // warn is emitted on prerequisite-miss.
+  //
+  // See docs/architecture/stage-2-leadbridge-adapter-plan.md.
+  // ══════════════════════════════════════
+
+  const lbEngineAdapter = makeLbEngineAdapter({
+    supabase,
+    logger,
+    executors: {
+      createLeadFromLB,
+      createChildLeadFromLB,
+      enrichLeadFromLB,
+      setIdentityLead,
+      setIdentityCustomer,
+    },
+  })
 
   // ══════════════════════════════════════
   // Lead Stage Automation Engine
@@ -1721,14 +1747,26 @@ module.exports = (supabase, logger) => {
       const message = event.message || {}
       const channel = event.channel || 'thumbtack'
 
-      // Upsert participant identity
-      const identity = await upsertParticipantIdentity(userId, {
-        phone: participant.phone,
-        email: participant.email,
-        displayName: participant.name,
-        lbContactId: participant.external_contact_id,
-        channel,
-      })
+      // Stage 2 — engine vs legacy dispatch (per-tenant prerequisite chain).
+      // engineFlagOn + missing prereqs → legacy + rate-limited warn (§2 of
+      // docs/architecture/stage-2-leadbridge-adapter-plan.md).
+      const prereq = lbEngineAdapter.checkPrerequisites(userId)
+      if (prereq.engineFlagOn && !prereq.useEngine) {
+        lbEngineAdapter.emitPrereqMissingWarning(logger, userId, prereq.missing)
+      }
+
+      // Upsert participant identity (legacy path only — engine path resolves
+      // the identity internally via resolveIdentity inside engine.reconcile).
+      let identity = null
+      if (!prereq.useEngine) {
+        identity = await upsertParticipantIdentity(userId, {
+          phone: participant.phone,
+          email: participant.email,
+          displayName: participant.name,
+          lbContactId: participant.external_contact_id,
+          channel,
+        })
+      }
 
       // Resolve provider account (need display_name for per-location source)
       let resolvedAccountId = null
@@ -1741,8 +1779,24 @@ module.exports = (supabase, logger) => {
         resolvedAccountDisplayName = pa?.display_name || null
       }
 
-      // Phase B: resolve or create SF lead (non-blocking for webhook speed)
-      if (identity) {
+      if (prereq.useEngine) {
+        // Stage 2 engine path — identity resolution + lead-create in one call.
+        try {
+          const { identity: engineIdentity } = await lbEngineAdapter.resolveOrCreateLeadViaEngine(userId, {
+            channel,
+            customerName: participant.name,
+            customerPhone: participant.phone,
+            customerEmail: participant.email,
+            message: message.body,
+            lbContactId: participant.external_contact_id,
+            accountDisplayName: resolvedAccountDisplayName,
+          })
+          identity = engineIdentity
+        } catch (e) {
+          logger.warn(`[LB Webhook] Engine path: ${e.message}`)
+        }
+      } else if (identity) {
+        // Legacy path — Phase B: resolve or create SF lead (non-blocking for webhook speed)
         resolveOrCreateLead(userId, identity, {
           channel, customerName: participant.name, customerPhone: participant.phone,
           customerEmail: participant.email, message: message.body,
@@ -1862,23 +1916,44 @@ module.exports = (supabase, logger) => {
 
           for (const lead of leads) {
             try {
-              // Upsert participant identity
-              const identity = await upsertParticipantIdentity(userId, {
-                phone: lead.customerPhone,
-                email: lead.customerEmail,
-                displayName: lead.customerName,
-                lbContactId: lead.id,
-                channel,
-              })
+              // Stage 2 — engine vs legacy dispatch (per-tenant prerequisite chain).
+              const prereq = lbEngineAdapter.checkPrerequisites(userId)
+              if (prereq.engineFlagOn && !prereq.useEngine) {
+                lbEngineAdapter.emitPrereqMissingWarning(logger, userId, prereq.missing)
+              }
 
-              // Phase B: resolve or create SF lead
-              if (identity) {
-                await resolveOrCreateLead(userId, identity, {
-                  channel, customerName: lead.customerName, customerPhone: lead.customerPhone,
-                  customerEmail: lead.customerEmail, message: lead.message,
-                  externalLeadId: lead.id,
-                  accountDisplayName: acct.display_name, // per-location source
+              let identity = null
+              if (prereq.useEngine) {
+                // Engine path — resolver + dispatch inside the adapter.
+                const { identity: engineIdentity } = await lbEngineAdapter.resolveOrCreateLeadViaEngine(userId, {
+                  channel,
+                  customerName: lead.customerName,
+                  customerPhone: lead.customerPhone,
+                  customerEmail: lead.customerEmail,
+                  message: lead.message,
+                  lbContactId: lead.id,
+                  accountDisplayName: acct.display_name,
                 })
+                identity = engineIdentity
+              } else {
+                // Legacy path — upsertParticipantIdentity + resolveOrCreateLead
+                identity = await upsertParticipantIdentity(userId, {
+                  phone: lead.customerPhone,
+                  email: lead.customerEmail,
+                  displayName: lead.customerName,
+                  lbContactId: lead.id,
+                  channel,
+                })
+
+                // Phase B: resolve or create SF lead
+                if (identity) {
+                  await resolveOrCreateLead(userId, identity, {
+                    channel, customerName: lead.customerName, customerPhone: lead.customerPhone,
+                    customerEmail: lead.customerEmail, message: lead.message,
+                    externalLeadId: lead.id,
+                    accountDisplayName: acct.display_name, // per-location source
+                  })
+                }
               }
 
               // Upsert conversation
