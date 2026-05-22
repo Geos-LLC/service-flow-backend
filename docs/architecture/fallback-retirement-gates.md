@@ -4,6 +4,8 @@
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
 **Companion docs:**
+- [identity-governance-principles.md](identity-governance-principles.md) — why retirement is governed (top-level principles)
+- [retirement-stage-registry.md](retirement-stage-registry.md) — stage vocabulary these gates advance through
 - [transitional-infrastructure-registry.md](transitional-infrastructure-registry.md) — what's being retired
 - [identity-rollout-governance.md](../operations/identity-rollout-governance.md) — who decides + when
 - [identity-enforcement-roadmap.md](identity-enforcement-roadmap.md) — code-level enforcement progression

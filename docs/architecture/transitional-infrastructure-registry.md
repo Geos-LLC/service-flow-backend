@@ -4,6 +4,8 @@
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
 **Companion docs:**
+- [identity-governance-principles.md](identity-governance-principles.md) — why these bypasses are governed this way (top-level principles)
+- [retirement-stage-registry.md](retirement-stage-registry.md) — closed set of stage tags every entry references
 - [identity-enforcement-roadmap.md](identity-enforcement-roadmap.md) — the 4-stage roadmap (warn → CI → runtime → adapter-only)
 - [fallback-retirement-gates.md](fallback-retirement-gates.md) — numeric thresholds each entry must meet to retire
 - [integration-compliance-audit.md](integration-compliance-audit.md) — historical audit of bypasses (this doc supersedes §2)

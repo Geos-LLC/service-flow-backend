@@ -4,6 +4,8 @@
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
 **Companion docs:**
+- [identity-governance-principles.md](../architecture/identity-governance-principles.md) — top-level principles this rollout enforces
+- [retirement-stage-registry.md](../architecture/retirement-stage-registry.md) — stage vocabulary referenced in tenant promotions
 - [identity-enforcement-roadmap.md](../architecture/identity-enforcement-roadmap.md) — code-level enforcement stages (warn → CI → runtime → adapter-only)
 - [transitional-infrastructure-registry.md](../architecture/transitional-infrastructure-registry.md) — every transitional bypass enumerated
 - [fallback-retirement-gates.md](../architecture/fallback-retirement-gates.md) — numeric thresholds for each retirement gate

@@ -4,6 +4,8 @@
 **Owner:** identity-v5
 **Last updated:** 2026-05-22
 **Companion docs:**
+- [identity-governance-principles.md](identity-governance-principles.md) — top-level principles new integrations must satisfy
+- [retirement-stage-registry.md](retirement-stage-registry.md) — stage vocabulary any transitional code in a new integration must use
 - [new-integration-requirements.md](new-integration-requirements.md) — concrete checklist for adding a new integration
 - [identity-graph-refactor-plan.md](identity-graph-refactor-plan.md) — overall architecture
 - [identity-enforcement-roadmap.md](identity-enforcement-roadmap.md) — code-enforcement progression
