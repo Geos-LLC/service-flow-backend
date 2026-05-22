@@ -7,19 +7,28 @@
  * Stage 1 (current default): dry-run. Reports violations but exits 0.
  * Stage 2 (when promoted via --strict): fails CI on any unexpected match.
  *
- * Scans the codebase for direct writes to graph-owned columns and asserts
- * each occurrence is either:
- *   1. Inside an authorised writer file (allowlist by file path).
- *   2. Adjacent to a `recordTransitionalBypass(...)` or `emitViolation(...)`
- *      call within a small line window.
+ * Scans the codebase for:
  *
- * If a match is neither allowlisted nor instrumented, it's a NEW unauthorised
- * direct write — the kind of code that has historically caused identity
- * graph drift.
+ *   (1) Direct writes to graph-owned columns. Each occurrence must be
+ *       either inside an authorised writer file OR adjacent to a
+ *       `recordTransitionalBypass`/`emitViolation` call.
+ *
+ *   (2) Transitional-bypass metadata completeness. Each
+ *       `recordTransitionalBypass(...)` call must be preceded (within
+ *       METADATA_LOOKBACK lines) by a structured comment carrying:
+ *           @transitional
+ *           @owner:             <team or person>
+ *           @retirement-stage:  <enforcement-roadmap stage tag>
+ *           @observability:     <how to monitor it in Loki/Grafana>
+ *       Missing tags are flagged as warnings — Stage 1: warn only.
+ *
+ * If a match is neither allowlisted nor instrumented (case 1), or a
+ * transitional bypass lacks required metadata (case 2), the scanner
+ * reports it. CI failure only when `--strict` is passed.
  *
  * Usage:
  *   node scripts/check-identity-graph-bypass.js              # dry-run (Stage 1)
- *   node scripts/check-identity-graph-bypass.js --strict     # CI gate (Stage 2)
+ *   node scripts/check-identity-graph-bypass.js --strict     # CI gate (Stage 2+)
  *   node scripts/check-identity-graph-bypass.js --json       # machine-readable output
  *
  * Exit codes:
@@ -29,6 +38,7 @@
  * See:
  *   docs/architecture/identity-enforcement-roadmap.md (Stage 1 → 2 transition)
  *   docs/architecture/integration-compliance-audit.md (the allowlist + known bypasses)
+ *   docs/architecture/transitional-infrastructure-registry.md (canonical list of transitional systems)
  *   docs/architecture/new-integration-requirements.md (what NEW integrations must do)
  */
 
@@ -156,6 +166,96 @@ const INSTRUMENTATION_RES = [
   /emitViolation\s*\(/,
 ];
 
+// ── Transitional-bypass metadata ──────────────────────────────────────
+//
+// Every `recordTransitionalBypass(...)` call MUST be preceded by a
+// structured comment block containing these tags:
+//
+//   @transitional
+//   @owner:            <team or person>
+//   @retirement-stage: <stage tag from enforcement roadmap>
+//   @observability:    <how this bypass is monitored>
+//
+// The metadata lives in JS line comments (// or /** */). The scanner walks
+// backward up to METADATA_LOOKBACK lines from the
+// `recordTransitionalBypass(` call site, collecting any @-tag lines.
+//
+// Missing or malformed metadata is reported as a warning. The point is
+// that transitional code MUST self-identify its owner, retirement plan,
+// and observability hook — otherwise it stagnates.
+
+const METADATA_LOOKBACK = 25;
+const REQUIRED_METADATA_TAGS = ['@transitional', '@owner', '@retirement-stage', '@observability'];
+
+function extractMetadataNearby(lines, callIdx) {
+  // Walk backward, collecting lines that begin with `*` or `//` until we
+  // hit the first non-comment line (other than blank lines).
+  const found = new Set();
+  const detail = {};
+  for (let i = callIdx; i >= Math.max(0, callIdx - METADATA_LOOKBACK); i--) {
+    const line = lines[i] || '';
+    const trimmed = line.trim();
+    // Look at comment lines + the call line itself.
+    if (trimmed === '' || /^(\/\/|\*|\/\*)/.test(trimmed) || i === callIdx) {
+      for (const tag of REQUIRED_METADATA_TAGS) {
+        if (trimmed.includes(tag)) {
+          found.add(tag);
+          // Capture inline value, e.g. "@owner: identity-v5" → "identity-v5"
+          const m = trimmed.match(new RegExp(tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*:\\s*([^*]+?)(?:\\s*\\*\\/|$)'));
+          if (m && m[1]) detail[tag] = m[1].trim();
+          else if (tag === '@transitional') detail[tag] = true;
+        }
+      }
+    } else {
+      // First non-comment, non-blank line above the call breaks the
+      // comment block — stop collecting.
+      break;
+    }
+  }
+  const missing = REQUIRED_METADATA_TAGS.filter(t => !found.has(t));
+  return { found: Array.from(found), missing, detail };
+}
+
+/**
+ * Scan a file for `recordTransitionalBypass(` calls and verify metadata.
+ * Returns an array of metadata findings (warning-level).
+ */
+// Files where `recordTransitionalBypass` legitimately appears in string
+// literals, regex patterns, or helper documentation — NOT as an actual call
+// site. Skipping these prevents false positives.
+const METADATA_SCAN_EXCLUSIONS = new Set([
+  'lib/identity-graph-violation.js',       // the helper definition itself
+  'scripts/check-identity-graph-bypass.js',// this scanner — references the name in regex/docs
+]);
+
+function scanTransitionalMetadata(rel, lines) {
+  if (METADATA_SCAN_EXCLUSIONS.has(rel)) return [];
+  const findings = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Must be an actual invocation, not a string/regex/comment mention.
+    if (!/recordTransitionalBypass\s*\(/.test(line)) continue;
+    // Skip if appears inside a string literal (quoted name) — e.g. test
+    // assertions like expect(...).toContain('recordTransitionalBypass').
+    if (/['"`].*recordTransitionalBypass.*['"`]/.test(line)) continue;
+    // Skip comment lines that document the name.
+    if (/^\s*(\/\/|\*)/.test(line)) continue;
+    const meta = extractMetadataNearby(lines, i);
+    if (meta.missing.length > 0) {
+      findings.push({
+        severity: 'warning',
+        kind: 'metadata',
+        file: rel,
+        line: i + 1,
+        missing: meta.missing,
+        found: meta.found,
+        reason: `transitional bypass missing required metadata tags: ${meta.missing.join(', ')}`,
+      });
+    }
+  }
+  return findings;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function relpath(abs) {
@@ -217,13 +317,22 @@ function scan() {
     if (isAuxFile(rel)) continue;
     if (isTestFile(rel)) continue;
     if (isNonWritingScript(rel)) continue;
-    if (isInsideAuthorisedWriter(rel)) continue;
 
     let text;
     try { text = fs.readFileSync(abs, 'utf8'); }
     catch (_) { continue; }
 
     const lines = text.split(/\r?\n/);
+
+    // Case 2 — transitional-bypass metadata completeness. Runs on every file
+    // (including authorised writers, since recordTransitionalBypass can show
+    // up anywhere a transitional bypass lives). Skipped only for the helper
+    // itself (handled inside scanTransitionalMetadata).
+    for (const f of scanTransitionalMetadata(rel, lines)) findings.push(f);
+
+    // Case 1 — direct-write detection. Skipped inside authorised writers,
+    // since those files own the writes by design.
+    if (isInsideAuthorisedWriter(rel)) continue;
 
     for (const { name, table, re } of PATTERNS) {
       for (let i = 0; i < lines.length; i++) {
@@ -247,6 +356,7 @@ function scan() {
         if (transitional && !instrumented) {
           findings.push({
             severity: 'error',
+            kind: 'direct_write',
             file: rel,
             line: i + 1,
             pattern: name,
@@ -258,6 +368,7 @@ function scan() {
         // Not transitional, not authorised — a genuine new bypass.
         findings.push({
           severity: 'error',
+          kind: 'direct_write',
           file: rel,
           line: i + 1,
           pattern: name,
@@ -289,6 +400,8 @@ function main() {
   const json = args.includes('--json');
 
   const findings = scan();
+  const errors   = findings.filter(f => f.severity === 'error');
+  const warnings = findings.filter(f => f.severity === 'warning');
 
   if (json) {
     process.stdout.write(JSON.stringify({
@@ -296,36 +409,83 @@ function main() {
       findings,
       summary: {
         total: findings.length,
-        by_pattern: findings.reduce((m, f) => ((m[f.pattern] = (m[f.pattern] || 0) + 1), m), {}),
+        errors: errors.length,
+        warnings: warnings.length,
+        by_pattern: findings.reduce((m, f) => f.pattern ? ((m[f.pattern] = (m[f.pattern] || 0) + 1), m) : m, {}),
+        by_kind: findings.reduce((m, f) => ((m[f.kind || 'unknown'] = (m[f.kind || 'unknown'] || 0) + 1), m), {}),
         by_file: findings.reduce((m, f) => ((m[f.file] = (m[f.file] || 0) + 1), m), {}),
       },
     }, null, 2));
     process.stdout.write('\n');
   } else {
     if (findings.length === 0) {
-      console.log('[identity-graph-bypass] No direct writes to graph-owned surfaces outside authorised writers.');
+      console.log('[identity-graph-bypass] OK — no direct writes outside authorised writers and all transitional bypasses are well-documented.');
     } else {
-      console.log(`[identity-graph-bypass] ${findings.length} potential violation(s):`);
-      for (const f of findings) {
-        console.log(`  ${f.file}:${f.line}  pattern=${f.pattern}`);
-        console.log(`    ${f.code}`);
-        console.log(`    reason: ${f.reason}`);
+      if (errors.length > 0) {
+        console.log(`[identity-graph-bypass] ${errors.length} ERROR(s) — direct writes to graph-owned surfaces:`);
+        for (const f of errors) {
+          console.log(`  ${f.file}:${f.line}  pattern=${f.pattern}`);
+          console.log(`    ${f.code}`);
+          console.log(`    reason: ${f.reason}`);
+        }
+        console.log('');
+        console.log('Remediation (errors):');
+        console.log('  - If the write should go through an authorised writer:');
+        console.log('      use setIdentityCustomer/setIdentityLead/projectIdentityToCRM/applyLeadCustomerLink');
+        console.log('  - If the write is a known transitional bypass:');
+        console.log('      add recordTransitionalBypass({kind,target,source,reason}) within',
+          ADJACENCY, 'lines before the write,');
+        console.log('      AND document it in docs/architecture/integration-compliance-audit.md §2.');
+        console.log('  - If you are adding a new integration:');
+        console.log('      see docs/architecture/new-integration-requirements.md');
+        console.log('');
       }
-      console.log('');
-      console.log('Remediation:');
-      console.log('  - If the write should go through an authorised writer:');
-      console.log('      use setIdentityCustomer/setIdentityLead/projectIdentityToCRM/applyLeadCustomerLink');
-      console.log('  - If the write is a known transitional bypass:');
-      console.log('      add recordTransitionalBypass({kind,target,source,reason}) within',
-        ADJACENCY, 'lines before the write,');
-      console.log('      AND document it in docs/architecture/integration-compliance-audit.md §2.');
-      console.log('  - If you are adding a new integration:');
-      console.log('      see docs/architecture/new-integration-requirements.md');
+      if (warnings.length > 0) {
+        console.log(`[identity-graph-bypass] ${warnings.length} WARNING(s) — transitional bypasses missing metadata:`);
+        for (const f of warnings) {
+          console.log(`  ${f.file}:${f.line}  missing=${(f.missing || []).join(',')}  found=${(f.found || []).join(',') || '(none)'}`);
+          console.log(`    reason: ${f.reason}`);
+        }
+        console.log('');
+        console.log('Remediation (warnings): add a structured comment block immediately above');
+        console.log('  the recordTransitionalBypass(...) call, e.g.:');
+        console.log('');
+        console.log('    /**');
+        console.log('     * @transitional');
+        console.log('     * @owner:            identity-v5');
+        console.log('     * @retirement-stage: stage-2-ci-static');
+        console.log('     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass"');
+        console.log('     */');
+        console.log('    recordTransitionalBypass(logger, { kind: ..., tenant, target, source, reason });');
+        console.log('');
+        console.log('  See: docs/architecture/transitional-infrastructure-registry.md');
+      }
     }
   }
 
-  if (strict && findings.length > 0) process.exit(1);
+  // Warnings are advisory only — they never fail CI, even with --strict.
+  // Only direct-write errors gate CI when --strict is passed.
+  if (strict && errors.length > 0) process.exit(1);
   process.exit(0);
 }
 
-main();
+// Only auto-run as a script (skip when required from tests).
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  // Constants exposed for tests
+  METADATA_LOOKBACK,
+  REQUIRED_METADATA_TAGS,
+  METADATA_SCAN_EXCLUSIONS,
+  ADJACENCY,
+  PATTERNS,
+  AUTHORIZED_WRITER_FILES,
+  TRANSITIONAL_BYPASS_FILES,
+  // Pure helpers exposed for tests
+  extractMetadataNearby,
+  scanTransitionalMetadata,
+  findEnclosingTable,
+  isInsideWriteCall,
+};

@@ -469,3 +469,311 @@ No automation walks tenants without explicit operator action per tenant.
 - **acquisition attribution** — `lead.source`, `lead.lead_cost`, `lead.created_at`, `lead.lead_origin_type`. **Never overwritten.**
 - **acquisition event** — one row in the `leads` table. Each LB submission produces one. Canonical + children = multiple acquisition events per person.
 - **person** — identified by `canonical_lead_id` in lead aggregation, by `identity.id` in the identity graph. **The identity row is the singular truth for "who is this real person"; everything else is a projection.**
+
+---
+
+## 9. Incident classes
+
+When an identity-graph incident is reported, classify it FIRST. Class
+determines the response, the freeze posture, and the replay decision.
+
+### Class A — Cross-tenant leakage (P1, always-page)
+
+**Definition:** an identity row, lead, or customer for tenant X is
+visible to or written by code acting on behalf of tenant Y. Detected via
+`[IdentityLinkInvariantViolation]` log lines, or operator-reported.
+
+**Response:**
+1. Page identity-v5 owner immediately.
+2. Set `IDENTITY_PROJECTION_FREEZE=true` for ALL tenants (not just the
+   affected pair) — leakage may not yet be fully scoped.
+3. Snapshot `identity_link_audit` for the prior 7d into a forensics table.
+4. DO NOT delete affected rows. DO NOT attempt "cleanup" while frozen.
+   The forensics matter more than the cleanup.
+5. Root-cause before unfreezing. Acceptable triggers for unfreeze: code
+   fix deployed + verified on staging + operator written approval.
+
+**What this is NOT:** a tenant seeing the wrong projection within their
+own tenant (that's Class C).
+
+### Class B — Wrong merge / wrong split (P1-P2 depending on volume)
+
+**Definition:** two real people merged into one identity, or one real
+person split into two identities, when there's no operator-initiated
+action behind it.
+
+**Sub-classes:**
+- **B1 — Wrong merge** (engine combined two distinct people). P1 if
+  affects ≥ 5 identities OR involves payment/billing rows.
+- **B2 — Wrong split** (engine created two identity rows for one real
+  person). P2 in most cases — auto-link rate suffers but no data corruption.
+
+**Response (B1):**
+1. Page identity-v5 owner.
+2. Set `IDENTITY_PROJECTION_FREEZE=true` for the affected tenant only.
+3. Identify the merge in audit log: `SELECT * FROM identity_link_audit
+   WHERE user_id=$T AND resolved_by='automatic' AND created_at > $time
+   ORDER BY created_at DESC LIMIT 50`.
+4. Manually split via Identity Conflicts UI (do NOT raw-SQL the split —
+   the UI writes the audit row + emits the metric).
+5. Decide replay (§11) — usually NO, since wrong-merge is operator-recoverable
+   and replay re-introduces the bug.
+
+**Response (B2):**
+1. Notify identity-v5 owner (no page).
+2. Investigate why the resolver produced two rows: usually a phone
+   normalisation bug or a name-similarity threshold issue.
+3. Once root-caused, operator can manually merge via UI.
+4. Replay decision (§11) — usually NO unless the bug affected many tenants.
+
+### Class C — Projection refusal cascade (P2)
+
+**Definition:** the engine returns `kind: 'unknown'` or `decision: 'refused'`
+for a large fraction of events. CRM rows stop updating from identity.
+
+**Sub-classes:**
+- **C1 — Frozen.** Operator set freeze; this is the expected behaviour.
+  Not an incident; verify via `outcome="freeze"` Loki count.
+- **C2 — Engine bug.** Resolver started rejecting valid events.
+- **C3 — Source side problem.** Webhooks delivering malformed payloads.
+
+**Response:**
+1. Check freeze flag status first (1-line Slack check). If `true` and
+   intentional → C1, no action.
+2. If unintentional or false: pull `metric=graph_projection_skipped_*`
+   breakdown in Loki. The dominant skipped-reason tells you C2 vs C3.
+3. For C2: revert the most recent engine deploy. Replay decision (§11)
+   typically YES — re-process events that were skipped during the bug
+   window, since data is recoverable from source webhook logs.
+4. For C3: alert source integration owner. Skipped events stay skipped
+   until source is fixed; replay decision typically YES after source fix.
+
+### Class D — Operator-induced regression (P2-P3)
+
+**Definition:** an operator made a change (flag flip, manual SQL, UI
+action) that introduced wrong identity state. Differs from Class B in
+that the cause is known and recent.
+
+**Response:**
+1. Identity the change: `git log --since="1 day ago"` for code, Railway
+   audit log for env vars, `identity_link_audit` for UI actions.
+2. Roll back the operator action (revert PR, restore env var, UI unlink).
+3. Replay decision (§11) — typically NO; the regression's blast radius
+   is small enough that replay overhead isn't worth it.
+
+### Class E — Transitional-bypass anomaly (P3)
+
+**Definition:** a `[IdentityGraphViolation] kind=transitional_bypass`
+warning appears in Loki from a `source=` that's NOT in the transitional
+infrastructure registry, OR from a known source at an unexpected volume
+(≥ 10× baseline).
+
+**Response:**
+1. Identify the source from the log line's `source=` field.
+2. If untracked: file as `identity-transitional-untracked` bug. Add to
+   registry §1.
+3. If known but spiking: investigate caller. Often a new code path
+   accidentally exercised an existing transitional helper.
+4. No page. No freeze. Investigate during business hours.
+
+### Class summary table
+
+| Class | Trigger | Page? | Freeze posture | Default replay |
+|-------|---------|-------|----------------|----------------|
+| A     | Cross-tenant leakage | Always | Global freeze | NO |
+| B1    | Wrong merge ≥5 affected | Yes  | Per-tenant freeze | NO |
+| B2    | Wrong split | No (notify) | None | NO |
+| C1    | Intentional freeze | No   | Already frozen | N/A |
+| C2    | Engine bug | Yes if widespread | Per-tenant if needed | YES after fix |
+| C3    | Source malformed | Notify source | None | YES after source fix |
+| D     | Operator regression | No (Slack) | None | NO |
+| E     | Untracked transitional | No | None | NO |
+
+---
+
+## 10. Freeze semantics (formal)
+
+The `IDENTITY_PROJECTION_FREEZE` flag is the central operational
+containment lever. This section makes its semantics precise.
+
+### 10.1 Scope: per-tenant
+
+The flag is read as `isEnabledForTenant('IDENTITY_PROJECTION_FREEZE',
+userId)`. To freeze for a single tenant, set
+`IDENTITY_PROJECTION_FREEZE_TENANTS=<csv>`. To freeze globally, set
+`IDENTITY_PROJECTION_FREEZE=true`.
+
+Always-on global freeze is a Class A incident response only. For Class
+B/C/D, prefer per-tenant freeze.
+
+### 10.2 What freeze STOPS
+
+| Operation | Frozen? |
+|-----------|---------|
+| `projectIdentityToCRM` (writes `leads.converted_customer_id`) | YES |
+| `applyLeadCustomerLink` (operator-override path) | YES — returns `{ok: false, error: 'freeze'}` |
+| Engine decisions that include a projection step in their plan | YES — engine returns `decision: 'refused'`, `reason: 'frozen'` |
+| Scoring fallback bridge (writes via the linker) | YES — fallback runs but projection step refuses |
+
+### 10.3 What freeze DOES NOT stop
+
+| Operation | Continues during freeze? |
+|-----------|--------------------------|
+| `resolveIdentity` (writes identity rows only) | YES — graph continues hydrating |
+| `setIdentityCustomer` / `setIdentityLead` (direct identity-row writers) | YES |
+| Source projection (writes from source events into identity rows) | YES |
+| Audit row writes to `identity_link_audit` | YES |
+| Webhook receipt and queueing | YES |
+| Read endpoints (reporting, lookups) | YES |
+
+**Invariant:** freeze is a write-gate on the CRM-side projection only.
+It NEVER blocks identity graph accumulation. This is intentional: data
+loss is unrecoverable, but a paused projection is a 30-second flag flip
+away from resuming.
+
+### 10.4 Freeze observability
+
+Every freeze-refused operation emits a Loki line with
+`outcome="freeze"` AND `metric="graph_projection_skipped_frozen"`. The
+counter rate tells you both "is freeze working" and "how much work is
+being deferred."
+
+When unfreezing, the operator should expect a brief spike in
+`identity_graph_projection_success` as deferred events catch up (these
+are NOT new events — they're newly-arriving fresh source events for
+which the identity graph already had the data).
+
+### 10.5 Freeze does NOT trigger replay
+
+Unfreeze does not automatically replay events that fired during the
+freeze window. If replay is desired (Class C2/C3), explicitly trigger
+it via §11. The reason: many freeze windows are precautionary; replay
+would re-apply work that was correctly deferred.
+
+### 10.6 Test the freeze switch quarterly
+
+The freeze switch is critical infrastructure that's rarely used. To
+prevent bitrot:
+
+1. On staging, set `IDENTITY_PROJECTION_FREEZE=true` for one test tenant.
+2. Fire a test webhook for that tenant.
+3. Verify Loki shows `outcome="freeze"`.
+4. Verify identity row was created/updated but `leads.converted_customer_id`
+   stayed NULL.
+5. Unfreeze. Verify next event projects normally.
+6. Log the test result in `#identity-ops` Slack.
+
+---
+
+## 11. Replay policy
+
+Replay = re-processing source events to re-emit identity decisions after a
+code fix or freeze window.
+
+### 11.1 Replay is NEVER automatic
+
+The engine does not auto-replay. Every replay is operator-initiated, scoped
+to a tenant + time window, with a written reason.
+
+**Why:** replay can re-apply a bug that was just fixed, or amplify a
+regression. The default of NOT replaying is safer than the default of
+replaying.
+
+### 11.2 When to replay
+
+| Class | Replay? | Why |
+|-------|---------|-----|
+| A     | NO  | Cross-tenant leakage — replay would re-leak. Manual cleanup only. |
+| B1    | NO  | Wrong merges — replay could re-merge if root cause persists. |
+| B2    | NO  | Wrong splits — operator merges via UI on a case basis. |
+| C2    | YES (after fix) | Engine bug fixed; events were skipped — replay to catch up. |
+| C3    | YES (after source fix) | Source delivered bad data; once fixed, replay. |
+| D     | NO  | Operator-induced; specific change is rolled back. |
+| E     | NO  | Anomaly is observational; nothing to "replay." |
+
+### 11.3 Replay scope
+
+Replay is always scoped:
+
+- **By tenant:** never global. One tenant per replay job.
+- **By time window:** ≤ 24 hours. Larger windows split into multiple jobs.
+- **By source:** one integration at a time (LB, ZB, OP, SF).
+- **Dry-run first:** every replay starts with `dryRun: true` and the
+  operator verifies the count + outcome distribution.
+
+### 11.4 Replay mechanism
+
+Replay reads from the source-side webhook log (LB has `lb_inbound_events`,
+ZB has `zb_inbound_events`, OP has `op_message_log`) and re-invokes the
+engine for each event.
+
+Idempotency: each event has a stable `external_id` that the engine uses
+as an idempotency key. Replaying an event that was already processed
+emits `outcome="idempotent"` and writes nothing.
+
+### 11.5 Replay command (template)
+
+```bash
+# Dry-run first
+curl -X POST '.../api/admin/identity-replay' \
+  -H 'Authorization: Bearer <operator JWT>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tenantId": 2,
+    "source": "leadbridge",
+    "windowStart": "2026-05-22T14:00:00Z",
+    "windowEnd":   "2026-05-22T15:00:00Z",
+    "dryRun": true,
+    "reason": "C2-engine-bug-fix-replay-after-deploy-X"
+  }'
+```
+
+Expected dry-run response includes per-outcome counts. If counts look
+right (mostly `success` and `idempotent`, no surprise `refused`), repeat
+with `dryRun: false`.
+
+### 11.6 Replay forbidden during freeze
+
+The replay endpoint refuses if the target tenant is currently frozen. To
+replay across a freeze window, unfreeze first, replay, then re-freeze if
+needed. (This is intentional — replaying during freeze would emit
+`outcome="freeze"` for every event, achieving nothing.)
+
+### 11.7 Replay audit
+
+Each replay writes an `identity_link_audit` entry per affected lead with
+`resolved_by='replay'` AND `resolution_reason=<the reason string>`. This
+distinguishes replayed links from live and from operator-override links.
+
+### 11.8 Replay budget
+
+A single tenant can have at most **3 replay jobs per day** (rate-limit
+enforced server-side). If you find yourself needing more, the underlying
+problem is bigger than replay can solve — escalate to a Class B/C
+incident review.
+
+### 11.9 Replay endpoint is not yet implemented
+
+As of 2026-05-22, the `POST /api/admin/identity-replay` endpoint is
+described but not yet built. The policy is documented here so that when
+the endpoint is implemented, the contract is already settled.
+
+**Tracking:** see `docs/architecture/identity-graph-refactor-plan.md`
+Phase G+1 — Replay infrastructure.
+
+---
+
+## 12. Cross-references for incident response
+
+When an incident fires, consult in this order:
+
+1. **This runbook** §9 — classify the incident.
+2. **`reconciliation-health-dashboard.md`** — confirm metric signal.
+3. **`transitional-infrastructure-registry.md`** — identify if a known
+   transitional path is implicated.
+4. **`fallback-retirement-gates.md`** — if the question is "should we
+   retire this code," consult the gate definitions.
+5. **`identity-enforcement-roadmap.md`** — if the question is "should
+   we promote to stricter enforcement," consult the roadmap stages.
+6. **`identity-rollout-governance.md`** — if the question involves a
+   tenant tier or stage, consult the maturity definitions.

@@ -8477,8 +8477,15 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   // never linked to this identity. Customer precedence over lead.
   const crmMatch = await findCrmMatchByPhone(supabase, userId, identity.normalized_phone);
   if (crmMatch.type === 'customer') {
-    // @transitional — OP path links identity → CRM customer directly. Should
-    // migrate to setIdentityCustomer (Stage 4 OP adapter).
+    /**
+     * @transitional — OP path links identity → CRM customer directly. Should
+     *   migrate to setIdentityCustomer when the Stage 4 OP adapter lands.
+     * @owner:            identity-v5
+     * @retirement-stage: stage-4-adapter-only
+     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_customer"
+     * Retires when: OP adapter is on for all tenants (RECONCILIATION_ENGINE_OPENPHONE_TENANTS covers production set)
+     * AND the OP webhook handler routes identity-CRM linking through the engine + setIdentityCustomer.
+     */
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'communication_participant_identities.sf_customer_id',
       tenant: userId,
@@ -8502,7 +8509,13 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     return { action: 'linked_existing_customer_by_phone', customer_id: crmMatch.id };
   }
   if (crmMatch.type === 'lead') {
-    // @transitional — same shape as the customer branch above; migrate to setIdentityLead.
+    /**
+     * @transitional — same shape as the customer branch above; migrate to setIdentityLead.
+     * @owner:            identity-v5
+     * @retirement-stage: stage-4-adapter-only
+     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone:crm_phone_anchor_lead"
+     * Retires when: OP adapter is on for all tenants AND lead-anchor branch routes through setIdentityLead.
+     */
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'communication_participant_identities.sf_lead_id',
       tenant: userId,
@@ -8556,11 +8569,18 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
   if (error) { logger.error('[OP] Lead create error:', error.message); return null; }
 
   // Link identity → new lead + mark status.
-  // @transitional — direct identity-row write outside lib/identity-linker.js
-  // setIdentityLead(). Authorised by current OP path semantics but flagged
-  // by the architectural-hardening emitter so we can measure how often it
-  // fires and migrate this call site to setIdentityLead() in a follow-up.
-  // See docs/architecture/integration-compliance-audit.md (OpenPhone).
+  /**
+   * @transitional — direct identity-row write outside lib/identity-linker.js
+   *   setIdentityLead(). Authorised by current OP path semantics but flagged
+   *   by the architectural-hardening emitter so we can measure how often it
+   *   fires and migrate this call site to setIdentityLead() in a follow-up.
+   *   See docs/architecture/integration-compliance-audit.md (OpenPhone).
+   * @owner:            identity-v5
+   * @retirement-stage: stage-4-adapter-only
+   * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:maybeCreateLeadFromOpenPhone"
+   * Retires when: OP adapter creates leads through the engine
+   * and writes identity rows via setIdentityLead/projectIdentityToCRM only.
+   */
   identityGraphViolation.recordTransitionalBypass(logger, {
     target: 'communication_participant_identities.sf_lead_id',
     tenant: userId,
@@ -10250,10 +10270,16 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
     }
     
     // Update lead with converted customer ID and move to "Won" stage if found.
-    // @transitional — operator-initiated "Convert lead → customer" endpoint
-    // writes converted_customer_id directly. Migration target: route through
-    // applyLeadCustomerLink (which already handles operator-override
-    // semantics + provenance + audit).
+    /**
+     * @transitional — operator-initiated "Convert lead → customer" endpoint
+     *   writes converted_customer_id directly. Migration target: route through
+     *   applyLeadCustomerLink (which already handles operator-override
+     *   semantics + provenance + audit).
+     * @owner:            identity-v5
+     * @retirement-stage: stage-2-ci-static
+     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:convert_lead_to_customer_endpoint"
+     * Retires when: this endpoint delegates to applyLeadCustomerLink({mode:'operator_override'}).
+     */
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'leads.converted_customer_id',
       tenant: req.user && req.user.userId,
@@ -10858,13 +10884,20 @@ app.post('/api/customers/:sourceId/merge-into/:targetId', authenticateToken, asy
       } catch (e) { /* table or column may not exist — skip */ }
     }
     // Special: 'leads' uses converted_customer_id
-    // @transitional — direct leads.converted_customer_id repointing outside
-    // lib/identity-linker.js. This IS legitimate during operator-initiated
-    // customer merge (source customer is about to be deleted; its converted
-    // leads must move to the surviving customer). Emit so we have a count
-    // and can audit operator merge volume. Routing through applyLeadCustomerLink
-    // here is not appropriate because that function refuses to overwrite an
-    // already-linked lead.
+    /**
+     * @transitional — direct leads.converted_customer_id repointing outside
+     *   lib/identity-linker.js. This IS legitimate during operator-initiated
+     *   customer merge (source customer is about to be deleted; its converted
+     *   leads must move to the surviving customer). Emit so we have a count
+     *   and can audit operator merge volume. Routing through applyLeadCustomerLink
+     *   here is not appropriate because that function refuses to overwrite an
+     *   already-linked lead.
+     * @owner:            identity-v5
+     * @retirement-stage: stage-3-runtime-block
+     * @observability:    Loki {service_name="service-flow-backend"} |~ "IdentityGraphViolation" | json | kind="transitional_bypass" source="server.js:merge_duplicate_customers"
+     * Retires when: applyLeadCustomerLink gains an `operator_repoint` mode
+     * that permits overwriting an existing converted_customer_id under audit + reason code.
+     */
     identityGraphViolation.recordTransitionalBypass(logger, {
       target: 'leads.converted_customer_id',
       tenant: userId,
