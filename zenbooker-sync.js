@@ -23,6 +23,8 @@ const { correlateInboundEcho, isCorrelatable } = require('./lib/zb-outbound-corr
 const { logDelivery } = require('./lib/delivery-log')
 const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
+const { recordZbImportAmbiguity, reconcileOrphans } = require('./lib/zb-orphan-reconciliation')
+const { normalizePhone: normalizePhoneCanon } = require('./lib/name-normalize')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -195,9 +197,29 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           phone: mapped.phone,
           email: mapped.email,
           displayName: fullName,
+          // Resolver will return ambiguous status with candidates, but the
+          // resolver's own ambiguity row uses a generic reason and the
+          // resolver-side source_payload is empty. We write a richer,
+          // ZB-specific row below via recordZbImportAmbiguity().
+          suppressAmbiguityLog: true,
         })
         if (result.status === 'ambiguous') {
-          logger.warn(`[Zenbooker] Ambiguous identity for zenbooker_id=${zb.id} reason=${result.reason} candidates=${result.candidates.join(',')} — skipping customer upsert`)
+          logger.warn(`[Zenbooker] Ambiguous identity for zenbooker_id=${zb.id} reason=${result.reason} candidates=${(result.candidates || []).join(',')} — queuing for operator review (not silently skipping)`)
+          // Task 2 — write a structured queue row so the operator can resolve.
+          // Idempotent on (user, source='zenbooker', attempted_external_id=zb.id, status='open').
+          try {
+            await recordZbImportAmbiguity({
+              supabase,
+              logger,
+              userId,
+              zbCustomer: zb,
+              attemptedPhone: normalizePhoneCanon(mapped.phone),
+              candidateIdentityIds: result.candidates || [],
+              resolverReason: result.reason || null,
+            })
+          } catch (e) {
+            logger.warn(`[Zenbooker] recordZbImportAmbiguity threw: ${e.message}`)
+          }
           resolverSkipped = true
         } else if (result.status === 'matched') {
           identity = result.identity
@@ -1616,6 +1638,53 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     } catch (e) {
       logger.error(`[AutoReconcile] manual run endpoint error: ${e.message}`)
       res.status(500).json({ error: 'Failed to start reconcile' })
+    }
+  })
+
+  // POST /reconcile-orphans — full-set diff against ZB + provenance-aware cleanup.
+  //
+  // Compares every SF customer carrying a zenbooker_id against the live ZB
+  // customer list. Any SF row whose zenbooker_id is no longer in ZB is an
+  // orphan; orphans are classified by SF-side history (source_only/mixed/risky)
+  // and cleaned up safely.
+  //
+  // Defaults to dry-run; apply requires explicit `mode: 'apply'`.
+  // See lib/zb-orphan-reconciliation.js for classification + action policy.
+  router.post('/reconcile-orphans', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const { data: user } = await supabase.from('users')
+        .select('zenbooker_api_key, zenbooker_status').eq('id', userId).single()
+      if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+        return res.status(400).json({ error: 'Zenbooker not connected' })
+      }
+
+      const mode = (req.body && req.body.mode === 'apply') ? 'apply' : 'dryRun'
+
+      // Fetch live ZB customer set. Same pagination as full sync.
+      let zbCustomers
+      try {
+        zbCustomers = await zbFetchAll(user.zenbooker_api_key, '/customers')
+      } catch (e) {
+        logger.error(`[ZBReconcile] Failed to fetch live ZB customer list: ${e.message}`)
+        return res.status(502).json({ error: 'Failed to fetch ZB customer list', detail: e.message })
+      }
+      const zbCustomerIds = new Set((zbCustomers || []).map(c => String(c.id)))
+
+      const report = await reconcileOrphans({
+        supabase,
+        logger,
+        userId,
+        zbCustomerIds,
+        mode,
+      })
+
+      logger.log(`[ZBReconcile] endpoint mode=${mode} tenant=${userId} sf_zb_count=${report.sf_zb_customer_count} zb_live_count=${report.zb_live_count} orphans=${report.orphans.length} source_only=${report.summary.source_only} mixed=${report.summary.mixed} risky=${report.summary.risky} applied_archive=${report.summary.applied_archive} applied_detach=${report.summary.applied_detach} applied_review=${report.summary.applied_review} errors=${report.summary.errors}`)
+
+      res.json(report)
+    } catch (e) {
+      logger.error(`[ZBReconcile] endpoint error: ${e.message}`)
+      res.status(500).json({ error: 'Failed to reconcile orphans', detail: e.message })
     }
   })
 
