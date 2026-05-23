@@ -40283,14 +40283,41 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     if (!apiKey) return res.status(400).json({ error: 'OpenPhone API key is required' });
     if (!SIGCORE_WORKSPACE_KEY) return res.status(500).json({ error: 'Sigcore workspace key not configured' });
 
-    // 1. Provision Sigcore tenant for the SF app (not per-user — the app is the tenant, users are sub-entities)
-    // Fixed externalTenantId: all SF users share one Sigcore tenant ("Service Flow")
-    const provisionRes = await sigcoreRequest('POST', '/tenants/provision', SIGCORE_WORKSPACE_KEY, {
-      externalTenantId: 'serviceflow-app',
-      displayName: 'Service Flow'
-    });
-    const { tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {};
-    if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
+    // 1. Reuse existing Sigcore tenant if this user already has a valid mapping.
+    //    Avoids the legacy reprovision-on-every-reconnect, which Sigcore now rejects
+    //    via its anchor-tenant guard (idempotent-provisioning.helpers.ts, PR10).
+    //    Canonical SF tenant model is preserved — no per-user customer-tenant migration
+    //    happens here; that's a separate architecture decision.
+    let tenantId, tenantApiKey;
+    const existing = await getSigcoreSettings(userId);
+    if (existing?.sigcore_tenant_id && existing?.sigcore_tenant_api_key) {
+      try {
+        const who = await sigcoreRequest('GET', '/v1/whoami', existing.sigcore_tenant_api_key);
+        const whoTenantId = who.data?.tenantId || who.data?.data?.tenantId;
+        if (whoTenantId && whoTenantId === existing.sigcore_tenant_id) {
+          tenantId = existing.sigcore_tenant_id;
+          tenantApiKey = existing.sigcore_tenant_api_key;
+          logger.log(`[Communications] Reusing existing Sigcore tenant ${tenantId} for user ${userId} (skipped provision)`);
+        } else {
+          logger.warn(`[Communications] Stored tenant key for user ${userId} resolves to a different tenant (stored=${existing.sigcore_tenant_id}, whoami=${whoTenantId || 'unknown'}) — falling back to provision`);
+        }
+      } catch (probeErr) {
+        logger.warn(`[Communications] /v1/whoami probe failed for user ${userId} (status=${probeErr.response?.status || 'network'}) — falling back to provision`);
+      }
+    }
+
+    // 2. Provision only when truly missing/broken. Preserves canonical SF anchor model.
+    //    For callers without a pre-existing valid mapping, this still uses the legacy
+    //    anchor inputs and will hit Sigcore's anchor-guard until a separate architecture
+    //    decision is made (canonical-anchor reuse vs per-user customer tenants).
+    if (!tenantApiKey) {
+      const provisionRes = await sigcoreRequest('POST', '/tenants/provision', SIGCORE_WORKSPACE_KEY, {
+        externalTenantId: 'serviceflow-app',
+        displayName: 'Service Flow'
+      });
+      ({ tenantId, apiKey: tenantApiKey } = provisionRes.data?.data || provisionRes.data || {});
+      if (!tenantApiKey) return res.status(500).json({ error: 'Failed to provision Sigcore tenant' });
+    }
 
     // 2. Connect OpenPhone via Sigcore (tenant-level for webhooks)
     await sigcoreRequest('POST', '/integrations/openphone/connect', tenantApiKey, { apiKey });
@@ -40348,9 +40375,23 @@ app.post('/api/communications/connect-openphone', authenticateToken, async (req,
     logger.log(`[Communications] OpenPhone connected for user ${userId}, ${phoneNumbers.length} numbers, webhook ${subscription.id}`);
     res.json({ success: true, phoneNumbers, tenantId });
   } catch (error) {
-    logger.error('Communications connect error:', error.response?.data || error.message);
-    const msg = error.response?.data?.message || error.response?.data?.error || error.message || 'Failed to connect OpenPhone';
-    res.status(error.response?.status || 500).json({ error: msg });
+    const upstreamStatus = error.response?.status;
+    const upstreamBody = error.response?.data;
+    // Log upstream body explicitly. Previous logger.error(msg, attrs) call only
+    // captured `msg` to Loki (logger.js drops the second arg), so the actual
+    // upstream response was lost — masking root causes like Sigcore 401/400.
+    logger.error(`Communications connect error: ${JSON.stringify({
+      upstreamStatus,
+      upstreamBody,
+      message: error.message
+    })}`);
+    const msg = upstreamBody?.message || upstreamBody?.error || error.message || 'Failed to connect OpenPhone';
+    // Translate upstream auth failures (Sigcore 401/403) to SF 502 so the
+    // frontend's session-expiry interceptor does not conflate them with the
+    // user's own SF session. SF auth failures still emit native 401/403.
+    let outStatus = upstreamStatus || 500;
+    if (upstreamStatus === 401 || upstreamStatus === 403) outStatus = 502;
+    res.status(outStatus).json({ error: msg, upstreamStatus });
   }
 });
 
