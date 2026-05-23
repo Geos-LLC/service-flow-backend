@@ -1899,9 +1899,13 @@ module.exports = (supabase, logger) => {
         syncProgress[userId].phase = `syncing_${platform}`
 
         try {
-          // Fetch leads from LB — no limit at API level (LB doesn't filter by account)
-          // Filter client-side by businessId, then apply per-account limit
-          const leadsPath = `/v1/${platform}/leads`
+          // Fetch leads from LB. The bare list endpoint started returning 400
+          // ("businessId or scope=all is required for this list endpoint")
+          // after a LB API contract change (~2026-04-28). scope=all returns
+          // the full unscoped set, which we still filter client-side by
+          // acct.external_business_id below so per-account routing is preserved
+          // (LB's `lead.businessId` namespace matches our stored values).
+          const leadsPath = `/v1/${platform}/leads?scope=all`
           const leadsRes = await lbRequest('GET', leadsPath, lbToken)
           const allLeads = leadsRes.data?.leads || []
           // Filter to this account's businessId
@@ -2014,7 +2018,19 @@ module.exports = (supabase, logger) => {
                   totalMessages++
                 }
               } catch (e) {
-                logger.warn(`[LB Sync] Messages for lead ${lead.id}: ${e.message}`)
+                // Include upstream response body — previous one-arg form
+                // logged only e.message ("Request failed with status code N"),
+                // hiding LB's actual error string and obscuring contract
+                // changes like the 2026-04-28 scope=all requirement.
+                logger.warn(`[LB Sync] Messages for lead ${lead.id}: ${JSON.stringify({
+                  status: e.response?.status,
+                  body: e.response?.data,
+                  platform,
+                  user_id: userId,
+                  account_id: acct.id,
+                  business_id: acct.external_business_id,
+                  message: e.message,
+                })}`)
               }
 
               totalSynced++
@@ -2033,9 +2049,27 @@ module.exports = (supabase, logger) => {
           }).eq('id', acct.id)
 
         } catch (e) {
-          logger.error(`[LB Sync] Account ${acct.display_name}: ${e.message}`)
+          // Include upstream response body and request context — previous
+          // one-arg form logged only e.message ("Request failed with status
+          // code N"), which is what masked the 2026-04-28 LB API contract
+          // change for nearly a month. Token/secret are never in axios error
+          // shape so this is safe to JSON-stringify.
+          const upstreamStatus = e.response?.status
+          const upstreamBody = e.response?.data
+          logger.error(`[LB Sync] Account ${acct.display_name}: ${JSON.stringify({
+            status: upstreamStatus,
+            body: upstreamBody,
+            platform,
+            user_id: userId,
+            account_id: acct.id,
+            business_id: acct.external_business_id,
+            message: e.message,
+          })}`)
+          // Persist a compact human-readable error to the row so operators
+          // see the actual upstream reason in the UI, not just "400".
+          const persistedError = upstreamBody?.message || upstreamBody?.error || e.message
           await supabase.from('communication_provider_accounts').update({
-            sync_error: e.message,
+            sync_error: upstreamStatus ? `[${upstreamStatus}] ${persistedError}` : persistedError,
           }).eq('id', acct.id)
           syncProgress[userId].errors++
         }

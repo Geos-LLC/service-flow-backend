@@ -38968,7 +38968,74 @@ app.post('/api/ledger/cash-to-company', authenticateToken, async (req, res) => {
 // === PAYOUT BATCH ENDPOINTS ===
 
 // Shared function to create a payout batch for a team member
-async function createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, source = 'manual') {
+// Mark scheduled (and other non-earnings) jobs in a period as completed for
+// a given team member, then create their ledger entries. Used by the
+// "Include scheduled" payout flow — the operator is choosing to pay for
+// work that hasn't been performed yet (e.g. weekend payout cuts off mid-job).
+// Once a resulting ledger entry is attached to a payout_batch it is immutable
+// (Constitution §3.1), so a later cancel cannot claw it back — operator owns
+// that risk.
+async function completeScheduledJobsForMemberInPeriod(userId, teamMemberId, periodStart, periodEnd) {
+  const earningsStatuses = new Set(['completed', 'complete', 'paid']);
+  // Find candidate jobs in the window assigned to this member by EITHER
+  // the legacy direct column OR the join table.
+  const memberIdInt = parseInt(teamMemberId);
+
+  // a) Direct assignment via jobs.team_member_id
+  const { data: directJobs } = await supabase
+    .from('jobs')
+    .select('id, status, scheduled_date, team_member_id')
+    .eq('user_id', userId)
+    .eq('team_member_id', memberIdInt)
+    .gte('scheduled_date', periodStart)
+    .lte('scheduled_date', `${periodEnd} 23:59:59`);
+
+  // b) Multi-cleaner assignment via job_team_assignments
+  const { data: joinRows } = await supabase
+    .from('job_team_assignments')
+    .select('job_id, jobs!inner(id, status, scheduled_date, user_id)')
+    .eq('team_member_id', memberIdInt)
+    .eq('jobs.user_id', userId)
+    .gte('jobs.scheduled_date', periodStart)
+    .lte('jobs.scheduled_date', `${periodEnd} 23:59:59`);
+  const joinJobs = (joinRows || []).map(r => r.jobs).filter(Boolean);
+
+  // Dedupe by id and keep only non-earnings statuses
+  const byId = new Map();
+  [...(directJobs || []), ...joinJobs].forEach(j => {
+    if (!j || !j.id) return;
+    if (earningsStatuses.has((j.status || '').toLowerCase())) return;
+    byId.set(j.id, j);
+  });
+  const candidates = Array.from(byId.values());
+
+  let completedCount = 0;
+  const errors = [];
+  for (const job of candidates) {
+    try {
+      const { error: updErr } = await supabase
+        .from('jobs')
+        .update({ status: 'completed', updated_at: new Date().toISOString() })
+        .eq('id', job.id)
+        .eq('user_id', userId);
+      if (updErr) { errors.push({ jobId: job.id, error: updErr.message }); continue; }
+      await createLedgerEntriesForCompletedJob(job.id, userId);
+      completedCount += 1;
+    } catch (e) {
+      errors.push({ jobId: job.id, error: e.message });
+    }
+  }
+  return { completedCount, errors };
+}
+
+async function createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, source = 'manual', includeScheduled = false) {
+  let scheduledCompleted = 0;
+  if (includeScheduled) {
+    const r = await completeScheduledJobsForMemberInPeriod(userId, teamMemberId, periodStart, periodEnd);
+    scheduledCompleted = r.completedCount;
+    if (r.errors.length) console.warn(`[Payout] completeScheduledJobs partial errors for member ${teamMemberId}:`, r.errors);
+  }
+
   // Fetch unpaid ledger entries in the period
   const { data: unpaidEntries, error: fetchError } = await supabase
     .from('cleaner_ledger')
@@ -39051,6 +39118,7 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     skipped: false,
     batch,
     entry_count: entryIds.length,
+    scheduled_completed: scheduledCompleted,
     entries_summary: {
       earnings: unpaidEntries.filter(e => e.type === 'earning').reduce((s, e) => s + parseFloat(e.amount), 0),
       tips: unpaidEntries.filter(e => e.type === 'tip').reduce((s, e) => s + parseFloat(e.amount), 0),
@@ -39064,16 +39132,19 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
 }
 
 // POST /api/ledger/payout-batch - Create payout batch for a cleaner
+// When `includeScheduled` is true, scheduled jobs in the period assigned to
+// this member are first marked completed (which generates their ledger
+// entries) and then rolled into the batch — pay-in-advance flow.
 app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { teamMemberId, periodStart, periodEnd, note } = req.body;
+    const { teamMemberId, periodStart, periodEnd, note, includeScheduled } = req.body;
 
     if (!teamMemberId || !periodStart || !periodEnd) {
       return res.status(400).json({ error: 'teamMemberId, periodStart, and periodEnd are required' });
     }
 
-    const result = await createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, 'manual');
+    const result = await createPayoutBatchForMember(userId, teamMemberId, periodStart, periodEnd, note, 'manual', !!includeScheduled);
 
     if (result.skipped) {
       return res.status(400).json({ error: result.reason });
@@ -39082,6 +39153,7 @@ app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
     res.json({
       ...result.batch,
       entry_count: result.entry_count,
+      scheduled_completed: result.scheduled_completed || 0,
       entries_summary: result.entries_summary
     });
   } catch (error) {
@@ -39094,7 +39166,7 @@ app.post('/api/ledger/payout-batch', authenticateToken, async (req, res) => {
 app.post('/api/ledger/payout-batch/all', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { periodStart, periodEnd, note } = req.body;
+    const { periodStart, periodEnd, note, includeScheduled } = req.body;
 
     if (!periodStart || !periodEnd) {
       return res.status(400).json({ error: 'periodStart and periodEnd are required' });
@@ -39111,15 +39183,22 @@ app.post('/api/ledger/payout-batch/all', authenticateToken, async (req, res) => 
       return res.status(500).json({ error: 'Failed to fetch team members' });
     }
 
-    const results = { created: [], skipped: [] };
+    const results = { created: [], skipped: [], scheduled_completed_total: 0 };
 
     for (const tm of (members || [])) {
       try {
-        const result = await createPayoutBatchForMember(userId, tm.id, periodStart, periodEnd, note, 'manual');
+        const result = await createPayoutBatchForMember(userId, tm.id, periodStart, periodEnd, note, 'manual', !!includeScheduled);
         if (result.skipped) {
           results.skipped.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), reason: result.reason });
         } else {
-          results.created.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), batch_id: result.batch.id, total: result.batch.total_amount });
+          results.created.push({
+            id: tm.id,
+            name: `${tm.first_name} ${tm.last_name || ''}`.trim(),
+            batch_id: result.batch.id,
+            total: result.batch.total_amount,
+            scheduled_completed: result.scheduled_completed || 0,
+          });
+          results.scheduled_completed_total += (result.scheduled_completed || 0);
         }
       } catch (err) {
         results.skipped.push({ id: tm.id, name: `${tm.first_name} ${tm.last_name || ''}`.trim(), reason: err.message });
