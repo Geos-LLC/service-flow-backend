@@ -278,6 +278,10 @@ describe('PR-4 / config-audit — inspectConfig', () => {
       SIGCORE_WEBHOOK_HMAC_REQUIRED: 'true',
       LB_INBOUND_HMAC_REQUIRED: 'true',
       SOURCE_ACCOUNT_BOUNDARY_ENFORCED: 'true',
+      // Sigcore app-level infrastructure (added to audit because tenants
+      // would otherwise hit HTTP 500 with no boot-time signal).
+      SIGCORE_URL: 'https://sigcore-production.up.railway.app/api',
+      SIGCORE_WORKSPACE_KEY: 'platform-key-value',
     });
     expect(findings).toEqual([]);
   });
