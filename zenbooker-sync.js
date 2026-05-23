@@ -25,6 +25,7 @@ const { markDirty, resolveDirty } = require('./lib/zb-dirty-marker')
 const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
 const { recordZbImportAmbiguity, reconcileOrphans } = require('./lib/zb-orphan-reconciliation')
 const { normalizePhone: normalizePhoneCanon } = require('./lib/name-normalize')
+const { upsertTeamMemberProviderMappingFromZbSync } = require('./lib/team-member-provider-mapping')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -628,21 +629,51 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     // Pre-fetch account owner email to avoid creating team members with owner's email
     const { data: ownerData } = await supabase.from('users').select('email').eq('id', userId).single()
     const ownerEmail = (ownerData?.email || '').toLowerCase().trim()
-    let created = 0, skipped = 0, errors = 0
+    let created = 0, skipped = 0, errors = 0, mappingsUpserted = 0
     for (const zb of zbTeam) {
+      if (!zb || !zb.id) continue
       const { data: existing } = await supabase.from('team_members').select('id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
-      if (existing) { skipped++; continue }
+      if (existing) {
+        skipped++
+        // Defensive: refresh the outbound mapping registry for already-known
+        // team members. Fills any gap left by team_members rows created post
+        // the migration-045 backfill (see Lesia Tampa repair, 2026-05-22).
+        const mapRes = await upsertTeamMemberProviderMappingFromZbSync(supabase, logger, {
+          userId,
+          sfTeamMemberId: existing.id,
+          zenbookerProviderId: zb.id,
+          isActive: true,
+        })
+        if (mapRes && mapRes.mode === 'upserted') mappingsUpserted++
+        continue
+      }
       const mapped = mapTeamMember(zb, userId)
       // Clear email if it matches the account owner to prevent role conflicts on login
       if (ownerEmail && (mapped.email || '').toLowerCase().trim() === ownerEmail) {
         logger.log(`[Zenbooker] Clearing owner email from team member ${zb.name} to avoid role conflict`)
         mapped.email = ''
       }
-      const { error } = await supabase.from('team_members').insert(mapped)
-      if (error) { logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`); errors++ }
-      else created++
+      // Insert with .select() so we have the new id for the mapping mirror below.
+      const { data: insertedRow, error } = await supabase.from('team_members').insert(mapped).select('id').maybeSingle()
+      if (error) {
+        logger.error(`[Zenbooker] Team insert error ${zb.name}: ${JSON.stringify(error)}`)
+        errors++
+        continue
+      }
+      created++
+      // Mirror into outbound mapping registry so SF→ZB commands can resolve
+      // this provider without joining team_members at runtime.
+      if (insertedRow && insertedRow.id) {
+        const mapRes = await upsertTeamMemberProviderMappingFromZbSync(supabase, logger, {
+          userId,
+          sfTeamMemberId: insertedRow.id,
+          zenbookerProviderId: zb.id,
+          isActive: true,
+        })
+        if (mapRes && mapRes.mode === 'upserted') mappingsUpserted++
+      }
     }
-    return { total: zbTeam.length, created, skipped, errors }
+    return { total: zbTeam.length, created, skipped, errors, mappingsUpserted }
   }
 
   async function syncCustomers(userId, apiKey) {
