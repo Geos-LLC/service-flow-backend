@@ -1892,6 +1892,30 @@ module.exports = (supabase, logger) => {
       let totalSynced = 0
       let totalMessages = 0
 
+      // Single canonical fetch — `/v1/leads?scope=all` returns every lead across
+      // all platforms (each lead carries its own `platform` field). Replaces the
+      // previous per-account /v1/{platform}/leads calls because:
+      //   - /v1/thumbtack/leads returns BOTH thumbtack + yelp leads (route is misleading)
+      //   - /v1/yelp/leads only returns a partial subset of yelp leads (~30%)
+      // Fetching once per sync run (vs once per account) also drops N-1 round trips.
+      let allLeads = []
+      try {
+        const leadsRes = await lbRequest('GET', '/v1/leads?scope=all', lbToken)
+        allLeads = leadsRes.data?.leads || []
+        logger.log(`[LB Sync] Fetched ${allLeads.length} leads from /v1/leads?scope=all`)
+      } catch (e) {
+        const upstreamStatus = e.response?.status
+        const upstreamBody = e.response?.data
+        logger.error('[LB Sync] /v1/leads?scope=all failed', JSON.stringify({
+          status: upstreamStatus,
+          body: upstreamBody,
+          user_id: userId,
+          message: e.message,
+        }))
+        syncProgress[userId] = { status: 'error', error: `LB fetch failed: ${upstreamStatus || e.message}` }
+        return
+      }
+
       for (const acct of targetAccounts) {
         const channel = acct.channel || 'thumbtack'
         const platform = channel === 'yelp' ? 'yelp' : 'thumbtack'
@@ -1899,16 +1923,7 @@ module.exports = (supabase, logger) => {
         syncProgress[userId].phase = `syncing_${platform}`
 
         try {
-          // Fetch leads from LB. The bare list endpoint started returning 400
-          // ("businessId or scope=all is required for this list endpoint")
-          // after a LB API contract change (~2026-04-28). scope=all returns
-          // the full unscoped set, which we still filter client-side by
-          // acct.external_business_id below so per-account routing is preserved
-          // (LB's `lead.businessId` namespace matches our stored values).
-          const leadsPath = `/v1/${platform}/leads?scope=all`
-          const leadsRes = await lbRequest('GET', leadsPath, lbToken)
-          const allLeads = leadsRes.data?.leads || []
-          // Filter to this account's businessId
+          // Filter the shared canonical response to this account's businessId.
           let leads = acct.external_business_id
             ? allLeads.filter(l => l.businessId === acct.external_business_id)
             : allLeads
