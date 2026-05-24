@@ -29,7 +29,8 @@ const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
 const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
 const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
-const { pickLBSource, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { pickLBSource, pickLBSources, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
 
@@ -326,15 +327,17 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
 
   async function enrichLeadFromLB(userId, leadId, input) {
+    // source_raw added for the two-field attribution upgrade — buildEnrichLeadPatch
+    // opportunistically fills it on rows missing the column (one-shot per row).
     const { data: existing } = await supabase.from('leads')
-      .select('id, source, email').eq('id', leadId).eq('user_id', userId).maybeSingle()
+      .select('id, source, source_raw, email').eq('id', leadId).eq('user_id', userId).maybeSingle()
     if (!existing) return
     const patch = buildEnrichLeadPatch({ existing, input })
     if (!patch) return
     await supabase.from('leads').update(patch).eq('id', leadId)
   }
 
-  async function createLeadFromLB(userId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName }) {
+  async function createLeadFromLB(userId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup }) {
     assertCreateLeadInvariant(identity)
 
     const { data: pipeline } = await supabase.from('lead_pipelines')
@@ -364,7 +367,9 @@ module.exports = (supabase, logger) => {
     const firstName = nameParts[0] || null
     const lastName = nameParts.slice(1).join(' ') || null
     const normalized = normalizePhone(customerPhone)
-    const source = pickLBSource({ accountDisplayName, channel })
+    // Two-field attribution (migration 050): canonical → leads.source,
+    // raw → leads.source_raw. Falls back to raw on both when no mapping.
+    const { source, source_raw } = pickLBSources({ accountDisplayName, channel, sourceMappingsLookup })
 
     // Phase 0.5: lead_origin_type written at create time.
     // reactivation = identity already has a customer (returning customer)
@@ -381,6 +386,7 @@ module.exports = (supabase, logger) => {
       phone: normalized || null,
       email: customerEmail || null,
       source,
+      source_raw,
       notes: message ? message.substring(0, 500) : null,
       lead_origin_type: leadOriginType,
     }).select().single()
@@ -402,7 +408,7 @@ module.exports = (supabase, logger) => {
       },
     })
 
-    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (${source}) origin=${leadOriginType}`)
+    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (source="${source}" raw="${source_raw}") origin=${leadOriginType}`)
     return { type: isReactivation ? 'reactivation_lead' : 'new_lead', id: newLead.id, created: true, action: isReactivation ? 'reactivation' : 'created' }
   }
 
@@ -417,7 +423,7 @@ module.exports = (supabase, logger) => {
   //
   // Communication invariant: conversations belong to the identity, not the
   // child lead. No conversation-attach work happens here.
-  async function createChildLeadFromLB(userId, parentLeadId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName }) {
+  async function createChildLeadFromLB(userId, parentLeadId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup }) {
     // Fetch parent for invariant checks + pipeline/stage snapshot.
     const { data: parent } = await supabase.from('leads')
       .select('id, user_id, parent_lead_id, pipeline_id, stage_id, source')
@@ -436,7 +442,9 @@ module.exports = (supabase, logger) => {
     const firstName = nameParts[0] || null
     const lastName = nameParts.slice(1).join(' ') || null
     const normalized = normalizePhone(customerPhone)
-    const source = pickLBSource({ accountDisplayName, channel })
+    // Two-field attribution — child rows preserve their own attribution
+    // separate from the canonical (acquisition history, not pipeline state).
+    const { source, source_raw } = pickLBSources({ accountDisplayName, channel, sourceMappingsLookup })
 
     // Stage inheritance: snapshot the canonical's stage at create time.
     // Children do not transition; they remain at this snapshot forever.
@@ -451,6 +459,7 @@ module.exports = (supabase, logger) => {
       phone: normalized || null,
       email: customerEmail || null,
       source,
+      source_raw,
       notes: message ? message.substring(0, 500) : null,
       lead_origin_type: 'repeat_acquisition',
     }).select().single()
@@ -461,7 +470,7 @@ module.exports = (supabase, logger) => {
     }
 
     // Structured log — counters derived in Loki.
-    logger.log(`[LeadCardinality] event=child_created tenant=${userId} parent=${parent.id} child=${newChild.id} identity=${identity.id} source=${source} channel=${channel || 'unknown'}`)
+    logger.log(`[LeadCardinality] event=child_created tenant=${userId} parent=${parent.id} child=${newChild.id} identity=${identity.id} source="${source}" raw="${source_raw}" channel=${channel || 'unknown'}`)
 
     return newChild
   }
@@ -1779,6 +1788,11 @@ module.exports = (supabase, logger) => {
         resolvedAccountDisplayName = pa?.display_name || null
       }
 
+      // Two-field attribution (migration 050) — load tenant's LB source
+      // mappings once per webhook. Strictly user-scoped → no cross-tenant
+      // leakage. Empty {} when no mappings configured → raw on both fields.
+      const sourceMappingsLookup = await loadSourceMappings(supabase, userId, 'leadbridge')
+
       if (prereq.useEngine) {
         // Stage 2 engine path — identity resolution + lead-create in one call.
         try {
@@ -1790,6 +1804,7 @@ module.exports = (supabase, logger) => {
             message: message.body,
             lbContactId: participant.external_contact_id,
             accountDisplayName: resolvedAccountDisplayName,
+            sourceMappingsLookup,
           })
           identity = engineIdentity
         } catch (e) {
@@ -1802,6 +1817,7 @@ module.exports = (supabase, logger) => {
           customerEmail: participant.email, message: message.body,
           externalLeadId: thread.external_lead_id,
           accountDisplayName: resolvedAccountDisplayName, // per-location source
+          sourceMappingsLookup,
         }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
       }
 
@@ -1892,6 +1908,16 @@ module.exports = (supabase, logger) => {
       let totalSynced = 0
       let totalMessages = 0
 
+      // Two-field attribution (migration 050) — load tenant's LB source mappings
+      // once per sync run. Empty {} when no mappings configured → pickLBSources
+      // falls back to raw on both fields (legacy behavior preserved). Strictly
+      // scoped to userId so no cross-tenant mapping leakage is possible.
+      const sourceMappingsLookup = await loadSourceMappings(supabase, userId, 'leadbridge')
+      const mappingCount = Object.keys(sourceMappingsLookup).length
+      if (mappingCount > 0) {
+        logger.log(`[LB Sync] Loaded ${mappingCount} LB source mappings for tenant ${userId}`)
+      }
+
       // Single canonical fetch — `/v1/leads?scope=all` returns every lead across
       // all platforms (each lead carries its own `platform` field). Replaces the
       // previous per-account /v1/{platform}/leads calls because:
@@ -1952,6 +1978,7 @@ module.exports = (supabase, logger) => {
                   message: lead.message,
                   lbContactId: lead.id,
                   accountDisplayName: acct.display_name,
+                  sourceMappingsLookup,
                 })
                 identity = engineIdentity
               } else {
@@ -1971,6 +1998,7 @@ module.exports = (supabase, logger) => {
                     customerEmail: lead.customerEmail, message: lead.message,
                     externalLeadId: lead.id,
                     accountDisplayName: acct.display_name, // per-location source
+                    sourceMappingsLookup,
                   })
                 }
               }

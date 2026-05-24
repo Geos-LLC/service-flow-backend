@@ -8596,7 +8596,11 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     last_name: lastName,
     phone,
     email: identity.email || null,
+    // Two-field attribution (migration 050): canonical → source, raw → source_raw.
+    // decision.source is already the canonical mapped value (or null fallback);
+    // company is the raw conversation tag at sync time, preserved losslessly.
     source: decision.source,
+    source_raw: company,
     notes: `[${decision.note}] Created from OpenPhone conversation`,
   }).select().single();
 

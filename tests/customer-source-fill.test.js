@@ -1,4 +1,4 @@
-const { deriveSourceForRow, phoneKey } = require('../lib/customer-source-fill');
+const { deriveSourceForRow, deriveSourceFieldsForRow, phoneKey } = require('../lib/customer-source-fill');
 
 describe('deriveSourceForRow — fill nulls only, resolve via mappings', () => {
   const mappings = {
@@ -63,6 +63,39 @@ describe('deriveSourceForRow — fill nulls only, resolve via mappings', () => {
 
   test('null row → null', () => {
     expect(deriveSourceForRow(null, mappings, [])).toBeNull();
+  });
+});
+
+describe('deriveSourceFieldsForRow — two-field attribution (migration 050)', () => {
+  const mappings = {
+    'thumbtack j': 'Thumbtack Jacksonville',
+    'thumbtack m': 'Thumbtack Miami',
+  };
+
+  test('null source + OP company maps → returns canonical + raw company tag', () => {
+    const row = { id: 1, source: null };
+    const convs = [{ company: 'Thumbtack J', last_event_at: '2026-04-20T00:00:00Z' }];
+    expect(deriveSourceFieldsForRow(row, mappings, convs))
+      .toEqual({ source: 'Thumbtack Jacksonville', source_raw: 'Thumbtack J' });
+  });
+
+  test('preserves original raw casing in source_raw', () => {
+    const row = { id: 1, source: null };
+    const convs = [{ company: 'THUMBTACK M', last_event_at: '2026-04-20T00:00:00Z' }];
+    expect(deriveSourceFieldsForRow(row, mappings, convs))
+      .toEqual({ source: 'Thumbtack Miami', source_raw: 'THUMBTACK M' });
+  });
+
+  test('non-null source → null (fill-nulls-only)', () => {
+    const row = { id: 1, source: 'Existing' };
+    const convs = [{ company: 'Thumbtack J', last_event_at: '2026-04-20T00:00:00Z' }];
+    expect(deriveSourceFieldsForRow(row, mappings, convs)).toBeNull();
+  });
+
+  test('unmapped company → null', () => {
+    const row = { id: 1, source: null };
+    const convs = [{ company: 'Unknown', last_event_at: '2026-04-20T00:00:00Z' }];
+    expect(deriveSourceFieldsForRow(row, mappings, convs)).toBeNull();
   });
 });
 
