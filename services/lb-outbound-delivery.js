@@ -16,6 +16,7 @@
 const crypto = require('crypto')
 const { isOutboundAllowed, normalizeStatus } = require('./lb-outbound-status-map')
 const { decryptIntegrationSecret } = require('./lb-encryption')
+const { recordOutboundSkippedNotLinked } = require('../lib/lb-linkage-metrics')
 
 const SF_INSTANCE = process.env.SF_INSTANCE || 'sf-prod'
 const OUTBOUND_ENABLED = () => String(process.env.LEADBRIDGE_OUTBOUND_STATUS_ENABLED || 'false').toLowerCase() === 'true'
@@ -142,6 +143,15 @@ async function recordOutboundIfApplicable(supabase, { job, oldStatus, newStatus,
     return { action: 'skipped_loop' }
   }
   if (!job || !job.lb_external_request_id || !job.lb_channel) {
+    // System invariant log — every status change on an unlinked LB-eligible
+    // job is recorded so the operator can audit how many lifecycle events
+    // we drop because linkage never landed at job-create time.
+    recordOutboundSkippedNotLinked()
+    console.log(
+      `[LBLinkage] action=outbound_skipped_not_linked job_id=${job?.id ?? 'null'} ` +
+      `user_id=${job?.user_id ?? 'null'} status=${newStatus} previous=${oldStatus ?? 'null'} ` +
+      `source=${source} reason=no_lb_linkage_on_job`
+    )
     return { action: 'skipped_not_linked' }
   }
   if (!isOutboundAllowed(newStatus)) {

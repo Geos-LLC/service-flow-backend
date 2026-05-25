@@ -7,6 +7,8 @@
 
 const express = require('express')
 const { updateJobStatus, maybeEmitInsertEvent } = require('./services/job-status-service')
+const { resolveLbLinkage, logResolution: logLbLinkage, REASONS: LB_LINK_REASONS } = require('./lib/lb-linkage-resolver')
+const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-metrics')
 const { resolveIdentity } = require('./lib/identity-resolver')
 const { FLAGS, isEnabled } = require('./lib/feature-flags')
 const { setIdentityCustomer, attemptScoringFallback } = require('./lib/identity-linker')
@@ -916,10 +918,44 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
       if (existing) { skipped++; continue }
 
       const mapped = mapJob(zb, userId, lookups)
+
+      // LB linkage propagation — ZB created this job for an SF customer;
+      // if that customer traces back to a LeadBridge-sourced lead, the
+      // job must inherit the LB external request id so SF→LB status
+      // outbound can emit later. Ambiguity returns nulls + review_required.
+      let zbLbResolution = null
+      if (mapped.customer_id != null) {
+        try {
+          zbLbResolution = await resolveLbLinkage(supabase, {
+            userId,
+            customerId: mapped.customer_id,
+            logger,
+          })
+          if (zbLbResolution.link.lb_external_request_id) {
+            mapped.lb_external_request_id = zbLbResolution.link.lb_external_request_id
+            mapped.lb_channel = zbLbResolution.link.lb_channel
+          }
+        } catch (lbErr) {
+          logger.warn(`[LBLinkage] ZB-bulk resolver threw user=${userId} zb_job=${zb.id}: ${lbErr?.message}`)
+          zbLbResolution = { link: {}, result: 'not_linked', reason: LB_LINK_REASONS.ERROR }
+        }
+      }
+
       const { data: newJob, error } = await supabase.from('jobs').insert(mapped).select('id').single()
       if (error) { logger.error(`[Zenbooker] Job insert error ${zb.id}: ${JSON.stringify(error)}`); errors++ }
       else {
         created++
+        if (zbLbResolution) {
+          logLbLinkage(logger, {
+            jobId: newJob?.id,
+            customerId: mapped.customer_id,
+            result: zbLbResolution.result,
+            reason: zbLbResolution.reason,
+            leadId: zbLbResolution.leadId,
+            link: zbLbResolution.link,
+          })
+          recordLbLinkageJobCreate(zbLbResolution)
+        }
         // Create job_team_assignments for ALL assigned providers (not just the first)
         const providers = zb.assigned_providers || []
         if (providers.length > 1 && newJob?.id) {
@@ -1103,12 +1139,44 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     } else {
       // First-time insert — status ships with the row directly.
       // No centralized service here because the row didn't exist yet;
-      // updateJobStatus would 404. maybeEmitInsertEvent handles the
-      // LB-linked case below (but ZB-sourced jobs won't have lb_*
-      // fields, so this is effectively a no-op for now).
+      // updateJobStatus would 404.
+      //
+      // LB linkage — if the ZB-created job's customer traces back to a
+      // LeadBridge lead, stamp lb_* on the INSERT so maybeEmitInsertEvent
+      // (when LEADBRIDGE_OUTBOUND_STATUS_ENABLED is true) sees a linked
+      // job and can enqueue an outbound event.
+      let webhookLbResolution = null
+      if (mapped.customer_id != null) {
+        try {
+          webhookLbResolution = await resolveLbLinkage(supabase, {
+            userId,
+            customerId: mapped.customer_id,
+            logger,
+          })
+          if (webhookLbResolution.link.lb_external_request_id) {
+            mapped.lb_external_request_id = webhookLbResolution.link.lb_external_request_id
+            mapped.lb_channel = webhookLbResolution.link.lb_channel
+          }
+        } catch (lbErr) {
+          logger.warn(`[LBLinkage] ZB-webhook resolver threw user=${userId} zb=${data.id}: ${lbErr?.message}`)
+          webhookLbResolution = { link: {}, result: 'not_linked', reason: LB_LINK_REASONS.ERROR }
+        }
+      }
+
       const { data: newJob } = await supabase.from('jobs').insert(mapped).select().single()
       jobId = newJob?.id
       if (newJob) {
+        if (webhookLbResolution) {
+          logLbLinkage(logger, {
+            jobId: newJob.id,
+            customerId: mapped.customer_id,
+            result: webhookLbResolution.result,
+            reason: webhookLbResolution.reason,
+            leadId: webhookLbResolution.leadId,
+            link: webhookLbResolution.link,
+          })
+          recordLbLinkageJobCreate(webhookLbResolution)
+        }
         maybeEmitInsertEvent(supabase, newJob, {
           type: 'system',
           id: null,
