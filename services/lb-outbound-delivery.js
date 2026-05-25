@@ -41,9 +41,13 @@ function uuidv7() {
   return hex
 }
 
-function buildPayload({ job, oldStatus, newStatus, actor }) {
+function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
+  // eventIdOverride lets reconcile-sourced events use a deterministic id
+  // like `evt_reconcile_<job>_<canonical>` so a repeat sync collides on
+  // the outbox UNIQUE(event_id) and is treated as duplicate / no-op.
+  // Status-change-triggered events leave it unset → fresh uuidv7.
   return {
-    event_id: `evt_${uuidv7()}`,
+    event_id: eventIdOverride || `evt_${uuidv7()}`,
     event_type: 'job.status_changed',
     occurred_at: new Date().toISOString(),
     source: 'service_flow',
@@ -134,7 +138,7 @@ async function insertOutboxRow(supabase, { user_id, sf_job_id, payload, state = 
  *   { action: 'skipped_unmapped', row } — persisted terminal row
  *   { action: 'enqueued', row }         — persisted pending row
  */
-async function recordOutboundIfApplicable(supabase, { job, oldStatus, newStatus, actor, source }) {
+async function recordOutboundIfApplicable(supabase, { job, oldStatus, newStatus, actor, source, eventIdOverride }) {
   if (!OUTBOUND_ENABLED()) {
     return { action: 'disabled' }
   }
@@ -155,7 +159,7 @@ async function recordOutboundIfApplicable(supabase, { job, oldStatus, newStatus,
     return { action: 'skipped_not_linked' }
   }
   if (!isOutboundAllowed(newStatus)) {
-    const payload = buildPayload({ job, oldStatus, newStatus, actor })
+    const payload = buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride })
     const row = await insertOutboxRow(supabase, {
       user_id: job.user_id,
       sf_job_id: job.id,

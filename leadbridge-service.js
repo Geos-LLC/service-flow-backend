@@ -34,6 +34,7 @@ const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
 const { getLinkageHealth } = require('./lib/lb-linkage-health')
+const { reconcileTenantWithLb } = require('./lib/lb-reconcile')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1397,6 +1398,16 @@ module.exports = (supabase, logger) => {
     try {
       const userId = req.user.userId
       const { accountId, limit } = req.body || {}
+      // Reconcile / mode resolution. Defaults:
+      //   reconcile=true   "Sync LeadBridge" now means bidirectional reconcile.
+      //   mode             accepted values: 'dryRun' | 'apply' (default 'apply').
+      //                    dryRun = run Phase 1 + Phase 2 enumeration but do NOT
+      //                    enqueue outbound events.
+      // Both ?mode= (query) and body.mode are honored; query wins.
+      const modeRaw = String(req.query.mode || req.body?.mode || 'apply').toLowerCase()
+      const dryRun = modeRaw === 'dryrun' || modeRaw === 'dry-run' || modeRaw === 'plan'
+      const reconcile = req.body?.reconcile === false ? false : true
+
       const settings = await getLbSettings(userId)
       if (!settings?.leadbridge_connected || !settings.leadbridge_integration_token) {
         return res.status(400).json({ error: 'LeadBridge not connected' })
@@ -1406,9 +1417,16 @@ module.exports = (supabase, logger) => {
         return res.json({ started: false, message: 'Sync already in progress', progress: syncProgress[userId] })
       }
 
-      // Start sync in background
-      setImmediate(() => runLbSync(userId, settings.leadbridge_integration_token, accountId, parseInt(limit) || 0))
-      res.json({ started: true })
+      // Start sync in background. Reconcile output lands in syncProgress.reconcile
+      // once the background job finishes. Clients poll GET /sync/progress.
+      setImmediate(() => runLbSync(
+        userId,
+        settings.leadbridge_integration_token,
+        accountId,
+        parseInt(limit) || 0,
+        { reconcile, dryRun }
+      ))
+      res.json({ started: true, mode: dryRun ? 'dryRun' : 'apply', reconcile })
     } catch (error) {
       res.status(500).json({ error: 'Failed to start sync' })
     }
@@ -1974,8 +1992,15 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // Background sync function
   // ══════════════════════════════════════
-  async function runLbSync(userId, lbToken, accountId, maxLeads = 0) {
-    syncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching' }
+  async function runLbSync(userId, lbToken, accountId, maxLeads = 0, opts = {}) {
+    // opts.reconcile = true  → run Phase 2/3 reconcile after Phase 1 pull
+    // opts.dryRun = true     → reconcile enumerates the plan but does NOT enqueue
+    // Reconcile defaults to ON because the user's spec says "Sync LeadBridge"
+    // now means "reconcile both directions". Callers that want pull-only must
+    // explicitly pass { reconcile: false }.
+    const reconcile = opts.reconcile !== false
+    const reconcileDryRun = !!opts.dryRun
+    syncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching', reconcile: null }
     const t0 = Date.now()
 
     try {
@@ -2224,12 +2249,35 @@ module.exports = (supabase, logger) => {
         }
       }
 
+      // ── Phase 2/3: Reconcile SF lifecycle → LB ─────────────────────
+      // After Phase 1 (LB → SF pull) finishes, find LB-linked SF jobs
+      // and push safe SF lifecycle statuses back to LB via the existing
+      // outbound queue. Uses the `allLeads` already fetched in Phase 1
+      // (no extra LB API calls). Skips ambiguous / unsupported / regressing
+      // transitions. Idempotent — deterministic event_id per (job, canonical)
+      // collides on UNIQUE so repeated reconcile is a no-op.
+      let reconcileResult = null
+      if (reconcile) {
+        try {
+          syncProgress[userId] = { ...syncProgress[userId], phase: reconcileDryRun ? 'reconcile_dry_run' : 'reconcile' }
+          logger.log(`[LB Reconcile] phase=pull lb_leads=${allLeads.length} user=${userId} dryRun=${reconcileDryRun}`)
+          reconcileResult = await reconcileTenantWithLb(supabase, userId, allLeads, {
+            dryRun: reconcileDryRun,
+            logger,
+          })
+        } catch (rcErr) {
+          logger.error(`[LB Reconcile] failed user=${userId}: ${rcErr.message}`)
+          reconcileResult = { plan: [], summary: { failures: 1, error: rcErr.message } }
+        }
+      }
+
       syncProgress[userId] = {
         status: 'complete', total: syncProgress[userId].total,
         synced: totalSynced, messages: totalMessages,
         errors: syncProgress[userId].errors, phase: 'done',
+        reconcile: reconcileResult,
       }
-      logger.log(`[LB Sync] DONE in ${Date.now() - t0}ms: ${totalSynced} conversations, ${totalMessages} messages`)
+      logger.log(`[LB Sync] DONE in ${Date.now() - t0}ms: ${totalSynced} conversations, ${totalMessages} messages${reconcileResult ? `, reconcile=${JSON.stringify(reconcileResult.summary)}` : ''}`)
     } catch (error) {
       logger.error('[LB Sync] Error:', error.message)
       syncProgress[userId] = { status: 'error', error: error.message }
