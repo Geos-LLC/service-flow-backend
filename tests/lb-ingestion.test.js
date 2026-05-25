@@ -1,5 +1,7 @@
 const {
   pickLBSource,
+  pickLBSourceRaw,
+  pickLBSources,
   isLegacyFlatSource,
   buildEnrichLeadPatch,
   assertCreateLeadInvariant,
@@ -16,6 +18,71 @@ describe('pickLBSource', () => {
   test('falls back to flat form when no account name', () => {
     expect(pickLBSource({ accountDisplayName: null, channel: 'yelp' })).toBe('leadbridge_yelp');
     expect(pickLBSource({ accountDisplayName: null, channel: 'thumbtack' })).toBe('leadbridge_thumbtack');
+  });
+});
+
+describe('pickLBSourceRaw', () => {
+  test('always returns the raw display-name form, never the mapped value', () => {
+    expect(pickLBSourceRaw({ accountDisplayName: 'Georgiy Sayapin', channel: 'thumbtack' }))
+      .toBe('Georgiy Sayapin (thumbtack)');
+  });
+  test('falls back to flat when displayName missing', () => {
+    expect(pickLBSourceRaw({ accountDisplayName: null, channel: 'yelp' })).toBe('leadbridge_yelp');
+  });
+});
+
+describe('pickLBSources — two-field attribution', () => {
+  test('returns canonical + raw when mapping has an entry', () => {
+    const out = pickLBSources({
+      accountDisplayName: 'Georgiy Sayapin',
+      channel: 'thumbtack',
+      sourceMappingsLookup: { 'georgiy sayapin (thumbtack)': 'Thumbtack Miami' },
+    });
+    expect(out).toEqual({ source: 'Thumbtack Miami', source_raw: 'Georgiy Sayapin (thumbtack)' });
+  });
+
+  test('falls back to raw on both fields when no mapping entry', () => {
+    const out = pickLBSources({
+      accountDisplayName: 'Newly Connected Acct',
+      channel: 'yelp',
+      sourceMappingsLookup: { 'georgiy sayapin (thumbtack)': 'Thumbtack Miami' },
+    });
+    expect(out).toEqual({
+      source: 'Newly Connected Acct (yelp)',
+      source_raw: 'Newly Connected Acct (yelp)',
+    });
+  });
+
+  test('treats missing sourceMappingsLookup as no mapping (legacy mode)', () => {
+    const out = pickLBSources({ accountDisplayName: 'X', channel: 'thumbtack' });
+    expect(out).toEqual({ source: 'X (thumbtack)', source_raw: 'X (thumbtack)' });
+  });
+
+  test('treats empty sourceMappingsLookup as no mapping', () => {
+    const out = pickLBSources({ accountDisplayName: 'X', channel: 'thumbtack', sourceMappingsLookup: {} });
+    expect(out).toEqual({ source: 'X (thumbtack)', source_raw: 'X (thumbtack)' });
+  });
+
+  test('mapping lookup is case-insensitive (raw is lowercased before lookup)', () => {
+    // pre-normalized lookup keys (loader stores lower-cased keys)
+    const out = pickLBSources({
+      accountDisplayName: 'GEORGIY SAYAPIN',
+      channel: 'Thumbtack',
+      sourceMappingsLookup: { 'georgiy sayapin (thumbtack)': 'Thumbtack Miami' },
+    });
+    expect(out.source).toBe('Thumbtack Miami');
+    // source_raw preserves the original casing from the account display name
+    expect(out.source_raw).toBe('GEORGIY SAYAPIN (Thumbtack)');
+  });
+
+  test('no canonical leakage: a stray mapping for a different raw value is not used', () => {
+    const out = pickLBSources({
+      accountDisplayName: 'Other Acct',
+      channel: 'thumbtack',
+      sourceMappingsLookup: { 'georgiy sayapin (thumbtack)': 'Thumbtack Miami' },
+    });
+    expect(out.source).toBe('Other Acct (thumbtack)');
+    expect(out.source_raw).toBe('Other Acct (thumbtack)');
   });
 });
 
@@ -53,17 +120,17 @@ describe('buildEnrichLeadPatch — fill nulls, never overwrite', () => {
     expect(patch.source).toBe('Spotless Homes Tampa (yelp)');
   });
 
-  test('does NOT overwrite per-location source', () => {
+  test('does NOT overwrite per-location source (when source_raw already set)', () => {
     const patch = buildEnrichLeadPatch({
-      existing: { source: 'Spotless Homes Tampa (yelp)', email: null },
+      existing: { source: 'Spotless Homes Tampa (yelp)', source_raw: 'Spotless Homes Tampa (yelp)', email: null },
       input: { accountDisplayName: 'Other Account', channel: 'yelp' },
     });
     expect(patch).toBeNull();
   });
 
-  test('does NOT overwrite non-LB source like Google Ads', () => {
+  test('does NOT overwrite non-LB source like Google Ads (when source_raw already set)', () => {
     const patch = buildEnrichLeadPatch({
-      existing: { source: 'Google Ads', email: null },
+      existing: { source: 'Google Ads', source_raw: 'Google Ads', email: null },
       input: { accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp' },
     });
     expect(patch).toBeNull();
@@ -71,23 +138,23 @@ describe('buildEnrichLeadPatch — fill nulls, never overwrite', () => {
 
   test('fills null email', () => {
     const patch = buildEnrichLeadPatch({
-      existing: { source: 'Spotless Homes Tampa (yelp)', email: null },
+      existing: { source: 'Spotless Homes Tampa (yelp)', source_raw: 'Spotless Homes Tampa (yelp)', email: null },
       input: { customerEmail: 'user@test.com', accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp' },
     });
     expect(patch.email).toBe('user@test.com');
   });
 
-  test('does NOT overwrite non-null email', () => {
+  test('does NOT overwrite non-null email (when source_raw already set)', () => {
     const patch = buildEnrichLeadPatch({
-      existing: { source: 'Spotless Homes Tampa (yelp)', email: 'original@test.com' },
+      existing: { source: 'Spotless Homes Tampa (yelp)', source_raw: 'Spotless Homes Tampa (yelp)', email: 'original@test.com' },
       input: { customerEmail: 'different@test.com', accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp' },
     });
     expect(patch).toBeNull();
   });
 
-  test('returns null when nothing to patch', () => {
+  test('returns null when nothing to patch (source_raw already set)', () => {
     const patch = buildEnrichLeadPatch({
-      existing: { source: 'Spotless Homes Tampa (yelp)', email: 'u@t.com' },
+      existing: { source: 'Spotless Homes Tampa (yelp)', source_raw: 'Spotless Homes Tampa (yelp)', email: 'u@t.com' },
       input: { customerEmail: 'u@t.com', accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp' },
     });
     expect(patch).toBeNull();
@@ -99,6 +166,37 @@ describe('buildEnrichLeadPatch — fill nulls, never overwrite', () => {
       input: { accountDisplayName: 'X', channel: 'yelp' },
     });
     expect(patch.updated_at).toBeDefined();
+  });
+
+  // ── source_raw two-field attribution ───────────────────────────────────
+  test('fills source_raw when it is missing on an existing row', () => {
+    const patch = buildEnrichLeadPatch({
+      existing: { source: 'Spotless Homes Tampa (yelp)', source_raw: null, email: 'u@t.com' },
+      input: { accountDisplayName: 'Spotless Homes Tampa', channel: 'yelp', customerEmail: 'u@t.com' },
+    });
+    expect(patch).not.toBeNull();
+    expect(patch.source_raw).toBe('Spotless Homes Tampa (yelp)');
+  });
+
+  test('does NOT overwrite existing source_raw', () => {
+    const patch = buildEnrichLeadPatch({
+      existing: { source: 'Yelp Tampa', source_raw: 'Spotless Homes Tampa (yelp)', email: 'u@t.com' },
+      input: { accountDisplayName: 'Other Acct', channel: 'yelp', customerEmail: 'u@t.com' },
+    });
+    expect(patch).toBeNull(); // nothing to do — source is non-legacy, source_raw set, email set
+  });
+
+  test('writes mapped source AND raw source on a fresh fill (canonical mapping supplied)', () => {
+    const patch = buildEnrichLeadPatch({
+      existing: { source: null, source_raw: null, email: null },
+      input: {
+        accountDisplayName: 'Georgiy Sayapin',
+        channel: 'thumbtack',
+        sourceMappingsLookup: { 'georgiy sayapin (thumbtack)': 'Thumbtack Miami' },
+      },
+    });
+    expect(patch.source).toBe('Thumbtack Miami');
+    expect(patch.source_raw).toBe('Georgiy Sayapin (thumbtack)');
   });
 });
 

@@ -1,23 +1,22 @@
 /**
- * LeadBridge sync — scope=all contract fix + error-logging hardening.
+ * LeadBridge sync — canonical /v1/leads?scope=all endpoint contract.
  *
- * Background: LB started returning 400 ("businessId or scope=all is required
- * for this list endpoint") on the bare /v1/{platform}/leads endpoint around
- * 2026-04-28. SF's sync silently failed for every account for ~26 days
- * because the catch block only logged e.message ("Request failed with
- * status code 400"), hiding LB's actual error string.
+ * History:
+ *   - 2026-04-28: LB started returning 400 on bare /v1/{platform}/leads.
+ *     First fix added ?scope=all per-platform.
+ *   - 2026-05-24: Reconciliation against LB DB showed /v1/thumbtack/leads
+ *     returned ALL leads (Thumbtack + Yelp) while /v1/yelp/leads returned
+ *     only ~30% of Yelp leads (broken/partial). Switched to the canonical
+ *     /v1/leads?scope=all which returns the full 1,416-lead corpus with
+ *     each lead carrying its own `platform` field.
  *
- * Coverage (per spec):
- *   1. Thumbtack sync request includes ?scope=all
- *   2. Yelp sync request includes ?scope=all
- *   3. Returned leads still partition by external_business_id
- *   4. 400 upstream error logs response body
+ * Coverage:
+ *   1. Sync fetches /v1/leads?scope=all (canonical) — once per sync run
+ *   2. No per-platform /v1/{thumbtack|yelp}/leads list calls remain
+ *   3. Leads still partition per-account by external_business_id
+ *   4. Upstream error logging captures status + body + context
  *   5. No duplicate provider accounts on reconnect
  *   6. Existing webhook subscription reuse remains unchanged
- *
- * Tests 1-4 directly verify the fix.
- * Tests 5-6 are source-scan regression guards for already-correct behavior
- *   verified live during the 2026-05-23 reconnect.
  */
 
 const fs = require('fs');
@@ -29,34 +28,37 @@ const LB_SRC = fs.readFileSync(
 );
 
 // ───────────────────────────────────────────────────────────
-// 1 & 2 — scope=all is on the leads list path for both platforms
+// 1 — canonical /v1/leads?scope=all is the only leads-list call site
 // ───────────────────────────────────────────────────────────
-describe('LB leads list endpoint includes scope=all', () => {
-  test('TEST #1+2 — leadsPath template uses ?scope=all (both platforms via ${platform})', () => {
-    // The fix is one templated line that serves both thumbtack and yelp.
-    expect(LB_SRC).toMatch(
-      /const leadsPath = `\/v1\/\$\{platform\}\/leads\?scope=all`/
-    );
+describe('LB sync uses canonical /v1/leads?scope=all', () => {
+  test('TEST #1 — sync calls /v1/leads?scope=all (canonical, no platform in path)', () => {
+    expect(LB_SRC).toMatch(/['"`]\/v1\/leads\?scope=all['"`]/);
   });
 
-  test('REGRESSION — the bare /v1/${platform}/leads path (no query) is gone', () => {
-    // Watch for any backslide. Allow it inside the comment block but not in
-    // executable code: require the trailing backtick (string literal close)
-    // to follow `leads` directly — that's only true when the query string
-    // is missing.
-    const bareCount = (
-      LB_SRC.match(/const leadsPath = `\/v1\/\$\{platform\}\/leads`/g) || []
-    ).length;
-    expect(bareCount).toBe(0);
+  test('TEST #2 — canonical fetch is hoisted (single call site, not per-account)', () => {
+    // The canonical fetch must happen ONCE, then be filtered per account.
+    // Heuristic: the canonical path string appears at most a few times in
+    // the file (once in code, optionally in a log line / comment).
+    const matches = LB_SRC.match(/\/v1\/leads\?scope=all/g) || [];
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+    expect(matches.length).toBeLessThanOrEqual(5);
   });
 
-  test('the path is the only LB leads-list call site (defensive)', () => {
-    // Make sure no other call site bypasses the fix by constructing the
-    // path elsewhere.
-    const otherSites = (
+  test('REGRESSION — no /v1/${platform}/leads list calls remain (template form)', () => {
+    const tplMatches = LB_SRC.match(/`\/v1\/\$\{platform\}\/leads[^`]*`/g) || [];
+    expect(tplMatches).toEqual([]);
+  });
+
+  test('REGRESSION — no hardcoded /v1/thumbtack/leads or /v1/yelp/leads list calls', () => {
+    // The per-platform list endpoints proved unreliable:
+    //   /v1/thumbtack/leads — returned all platforms (route misleading)
+    //   /v1/yelp/leads      — returned only ~30% of yelp leads
+    // Per-lead /v1/thumbtack/leads/:id/messages is a SEPARATE endpoint and
+    // legitimate, so we explicitly allow paths with /:something after /leads.
+    const listSites = (
       LB_SRC.match(/['"`]\/v1\/(thumbtack|yelp)\/leads(?!\/)/g) || []
-    ).filter((s) => !s.includes('${platform}'));
-    expect(otherSites).toEqual([]);
+    );
+    expect(listSites).toEqual([]);
   });
 });
 
@@ -71,8 +73,6 @@ describe('per-account partitioning preserved', () => {
   });
 
   test('the filter still gates on acct.external_business_id being truthy', () => {
-    // Pattern: `acct.external_business_id ? allLeads.filter(...) : allLeads`
-    // (ternary form, defends against accidental removal of the conditional).
     expect(LB_SRC).toMatch(
       /acct\.external_business_id[\s\S]{0,80}allLeads\.filter[\s\S]{0,200}:\s*allLeads/
     );
@@ -83,12 +83,18 @@ describe('per-account partitioning preserved', () => {
 // 4 — upstream error logging captures response body + context
 // ───────────────────────────────────────────────────────────
 describe('LB sync error logging captures upstream response body', () => {
-  test('TEST #4a — Account-level catch logs status + body + platform + user_id + account_id + business_id', () => {
-    // Find the account-level catch by its log prefix and assert it
-    // serializes the structured context we now require.
+  test('TEST #4a — Canonical-fetch failure logs status + body + user_id', () => {
+    const at = LB_SRC.indexOf('/v1/leads?scope=all failed');
+    expect(at).toBeGreaterThan(-1);
+    const window = LB_SRC.slice(at, at + 600);
+    expect(window).toMatch(/status:\s*upstreamStatus/);
+    expect(window).toMatch(/body:\s*upstreamBody/);
+    expect(window).toMatch(/user_id/);
+  });
+
+  test('TEST #4b — Account-level catch logs status + body + platform + user_id + account_id + business_id', () => {
     const at = LB_SRC.indexOf('[LB Sync] Account ');
     expect(at).toBeGreaterThan(-1);
-    // Window covers the structured fields we added.
     const window = LB_SRC.slice(at, at + 800);
     expect(window).toMatch(/status:\s*upstreamStatus|status:\s*e\.response\?\.status/);
     expect(window).toMatch(/body:\s*upstreamBody|body:\s*e\.response\?\.data/);
@@ -98,7 +104,7 @@ describe('LB sync error logging captures upstream response body', () => {
     expect(window).toMatch(/business_id/);
   });
 
-  test('TEST #4b — Messages-loop catch also logs upstream body + context', () => {
+  test('TEST #4c — Messages-loop catch also logs upstream body + context', () => {
     const at = LB_SRC.indexOf('[LB Sync] Messages for lead ');
     expect(at).toBeGreaterThan(-1);
     const window = LB_SRC.slice(at, at + 600);
@@ -109,9 +115,7 @@ describe('LB sync error logging captures upstream response body', () => {
     expect(window).toMatch(/account_id/);
   });
 
-  test('TEST #4c — persisted sync_error includes upstream status + LB-provided message', () => {
-    // The DB column gets a compact human-readable form so operators see the
-    // actual reason in the UI, not just the axios "status code N" string.
+  test('TEST #4d — persisted sync_error includes upstream status + LB-provided message', () => {
     const at = LB_SRC.indexOf('[LB Sync] Account ');
     const window = LB_SRC.slice(at, at + 1200);
     expect(window).toMatch(/sync_error:\s*upstreamStatus\s*\?[\s\S]{0,120}persistedError/);
@@ -120,9 +124,7 @@ describe('LB sync error logging captures upstream response body', () => {
     );
   });
 
-  test('TEST #4d — no logging of Authorization header or token values', () => {
-    // Spot-check: tokens are never echoed in axios errors so we shouldn't
-    // see them in our error logs. Guard against future regressions.
+  test('TEST #4e — no logging of Authorization header or token values', () => {
     const at = LB_SRC.indexOf('[LB Sync] Account ');
     const window = LB_SRC.slice(at, at + 1200);
     expect(window).not.toMatch(/lbToken|Bearer\s|leadbridge_integration_token|authorization/i);
@@ -134,30 +136,15 @@ describe('LB sync error logging captures upstream response body', () => {
 // ───────────────────────────────────────────────────────────
 describe('reconnect handler does not create duplicate provider_accounts', () => {
   test('TEST #5 — find-then-update-or-insert pattern keyed on external_account_id', () => {
-    // The connect path at line ~775 does:
-    //   .from('communication_provider_accounts')
-    //   .select('id')
-    //   .eq('user_id', userId)
-    //   .eq('provider', 'leadbridge')
-    //   .eq('channel', channel)
-    //   .eq('external_account_id', externalId)
-    //   .maybeSingle()
-    //   if (existing) UPDATE else INSERT
     expect(LB_SRC).toMatch(
       /\.from\(['"]communication_provider_accounts['"]\)[\s\S]{0,300}\.eq\(['"]external_account_id['"],/
     );
-    // The conditional branch must exist.
     expect(LB_SRC).toMatch(/if\s*\(existing\)\s*\{[\s\S]{0,600}\.update\(/);
     expect(LB_SRC).toMatch(/\}\s*else\s*\{[\s\S]{0,800}\.insert\(/);
   });
 
   test('REGRESSION — INSERT into provider_accounts only happens in the else branch', () => {
-    // Count unconditional inserts of communication_provider_accounts to make
-    // sure no new code path bypasses the find-first guard. The connect path
-    // is the only legitimate insert site (the source-account boundary helpers
-    // live in lib/source-account.js, not this file).
     const matches = LB_SRC.match(/\.from\(['"]communication_provider_accounts['"]\)\.insert\(/g) || [];
-    // Should be at most 1 (the connect path's else branch).
     expect(matches.length).toBeLessThanOrEqual(1);
   });
 });
@@ -166,11 +153,7 @@ describe('reconnect handler does not create duplicate provider_accounts', () => 
 // 6 — existing webhook subscription reuse remains intact
 // ───────────────────────────────────────────────────────────
 describe('webhook subscription reuse on reconnect', () => {
-  test('TEST #6 — outbound/lead_status/inbound subscriptions persist their IDs via OUTBOUND_/LEAD_STATUS_/INBOUND_COLUMNS', () => {
-    // These column groupings exist so reconnect can read the prior
-    // subscription id back from the DB and avoid re-registering. Live
-    // verification on 2026-05-23 reconnect confirmed the same IDs were
-    // reused across disconnect→reconnect. Guard the column groupings here.
+  test('TEST #6 — outbound/lead_status/inbound subscriptions persist their IDs', () => {
     expect(LB_SRC).toMatch(/OUTBOUND_COLUMNS\s*=\s*\[/);
     expect(LB_SRC).toMatch(/leadbridge_outbound_subscription_id/);
     expect(LB_SRC).toMatch(/LEAD_STATUS_COLUMNS\s*=\s*\[/);
@@ -179,8 +162,6 @@ describe('webhook subscription reuse on reconnect', () => {
   });
 
   test('registerOutboundSubscription is called (not a hard-fail on existing-sub)', () => {
-    // Subscription registration must not crash reconnect if the subscription
-    // already exists. The comment at the call site documents this contract.
     expect(LB_SRC).toMatch(/registerOutboundSubscription/);
     expect(LB_SRC).toMatch(/MUST NOT fail the connect flow|never break connect/i);
   });

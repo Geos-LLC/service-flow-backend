@@ -43,6 +43,7 @@ const {
   updateJobStatus: _updateJobStatus,
   maybeEmitInsertEvent,
 } = require('./services/job-status-service');
+const { resolveLbLinkageForNewJob } = require('./lib/lb-job-linkage');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
@@ -5613,10 +5614,44 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         console.error('Property resolution failed (non-blocking):', propErr);
       }
 
+      // LB linkage propagation (migration 051) — if the customer this job is
+      // for traces back to a LeadBridge-sourced lead, carry the LB external
+      // request id + channel onto the job INSERT so maybeEmitInsertEvent can
+      // enqueue an SF→LB job.status_changed event for the new job. Without
+      // this, every SF-UI-created job is `skipped_not_linked` regardless of
+      // whether the customer originated from LB.
+      //
+      // Resolver is read-only and tenant-scoped. Returns nulls when:
+      //   - customer has no lead (SF-native customer)
+      //   - lead has no LB linkage
+      //   - multiple LB-linked leads disagree on external_request_id
+      // In all of those cases the job is created without LB linkage, matching
+      // pre-migration behavior (no regression).
+      let lbLinkResult = null;
+      try {
+        lbLinkResult = await resolveLbLinkageForNewJob(supabase, {
+          userId,
+          customerId,
+          explicit: {
+            lb_external_request_id: req.body.lb_external_request_id,
+            lb_channel: req.body.lb_channel,
+            lb_business_id: req.body.lb_business_id,
+            lb_provider_account_id: req.body.lb_provider_account_id,
+          },
+          logger: console,
+        });
+      } catch (lbErr) {
+        console.warn('[LB Linkage] resolveLbLinkageForNewJob threw:', lbErr?.message);
+        lbLinkResult = { link: { lb_external_request_id: null, lb_channel: null, lb_business_id: null, lb_provider_account_id: null }, reason: 'error' };
+      }
+      const lbLink = lbLinkResult.link;
+
       // Create the job
       const jobData = {
         user_id: userId,
         customer_id: customerId,
+        lb_external_request_id: lbLink.lb_external_request_id,
+        lb_channel: lbLink.lb_channel,
         service_id: serviceId, // Keep for backward compatibility
         // Note: service_ids and service_names columns don't exist yet, storing in service_name for now
         team_member_id: teamMemberIdValue,
@@ -5697,6 +5732,14 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // LB insert-time emit (§5). No-op unless the job was created
       // with LB identity present at INSERT (not enriched later).
       // Failure is non-blocking — logged inside the helper.
+      if (lbLink.lb_external_request_id) {
+        console.log(
+          `[LB Linkage] job=${result.id} customer=${customerId} ` +
+          `external_request_id=${lbLink.lb_external_request_id} channel=${lbLink.lb_channel} ` +
+          `reason=${lbLinkResult.reason}` +
+          (lbLinkResult.leadId != null ? ` lead=${lbLinkResult.leadId}` : '')
+        );
+      }
       maybeEmitInsertEvent(supabase, result, {
         type: 'account_owner',
         id: userId,
@@ -8596,7 +8639,11 @@ async function maybeCreateLeadFromOpenPhone(userId, identity, { company, partici
     last_name: lastName,
     phone,
     email: identity.email || null,
+    // Two-field attribution (migration 050): canonical → source, raw → source_raw.
+    // decision.source is already the canonical mapped value (or null fallback);
+    // company is the raw conversation tag at sync time, preserved losslessly.
     source: decision.source,
+    source_raw: company,
     notes: `[${decision.note}] Created from OpenPhone conversation`,
   }).select().single();
 
