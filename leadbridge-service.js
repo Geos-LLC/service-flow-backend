@@ -29,7 +29,7 @@ const { FLAGS, isEnabled, isEnabledForTenant } = require('./lib/feature-flags')
 const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker')
 const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
-const { pickLBSource, pickLBSources, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { pickLBSource, pickLBSources, pickLbLink, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
 const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
@@ -327,17 +327,38 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
 
   async function enrichLeadFromLB(userId, leadId, input) {
-    // source_raw added for the two-field attribution upgrade — buildEnrichLeadPatch
-    // opportunistically fills it on rows missing the column (one-shot per row).
+    // source_raw + lb_* are opportunistically filled by buildEnrichLeadPatch on
+    // rows missing them; non-null lb_external_request_id is never overwritten.
     const { data: existing } = await supabase.from('leads')
-      .select('id, source, source_raw, email').eq('id', leadId).eq('user_id', userId).maybeSingle()
+      .select('id, source, source_raw, email, lb_external_request_id, lb_channel, lb_business_id, lb_provider_account_id')
+      .eq('id', leadId).eq('user_id', userId).maybeSingle()
     if (!existing) return
+
+    // Mismatch detection — if the incoming payload carries a *different*
+    // non-null LB external id than what's already on the row, that is a
+    // data-quality signal (duplicate-customer-merge upstream, or a
+    // misrouted webhook). Log and drop. Same-value or null incoming is
+    // handled silently by buildEnrichLeadPatch.
+    const link = pickLbLink(input)
+    if (
+      link.lb_external_request_id != null &&
+      existing.lb_external_request_id != null &&
+      String(link.lb_external_request_id) !== String(existing.lb_external_request_id)
+    ) {
+      logger.warn(
+        `[LB Lead] lb_linkage_mismatch lead=${leadId} user=${userId} ` +
+        `existing=${existing.lb_external_request_id}/${existing.lb_channel || ''} ` +
+        `incoming=${link.lb_external_request_id}/${link.lb_channel || ''} — dropped (fill-nulls-only)`
+      )
+    }
+
     const patch = buildEnrichLeadPatch({ existing, input })
     if (!patch) return
     await supabase.from('leads').update(patch).eq('id', leadId)
   }
 
-  async function createLeadFromLB(userId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup }) {
+  async function createLeadFromLB(userId, identity, input) {
+    const { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup } = input
     assertCreateLeadInvariant(identity)
 
     const { data: pipeline } = await supabase.from('lead_pipelines')
@@ -377,6 +398,13 @@ module.exports = (supabase, logger) => {
     const isReactivation = !!identity.sf_customer_id
     const leadOriginType = isReactivation ? 'reactivation' : 'first_touch'
 
+    // Migration 051 — LB linkage captured at create-time. These are the
+    // ground truth for SF→LB propagation: the lead carries the LB external
+    // request id forward through customer conversion and job creation. When
+    // the caller didn't pass an explicit lbExternalRequestId, these are NULL
+    // and the lead behaves like any other SF-native lead (no outbound).
+    const lbLink = pickLbLink(input)
+
     const { data: newLead, error } = await supabase.from('leads').insert({
       user_id: userId,
       pipeline_id: pipeline.id,
@@ -389,6 +417,10 @@ module.exports = (supabase, logger) => {
       source_raw,
       notes: message ? message.substring(0, 500) : null,
       lead_origin_type: leadOriginType,
+      lb_external_request_id: lbLink.lb_external_request_id,
+      lb_channel: lbLink.lb_channel,
+      lb_business_id: lbLink.lb_business_id,
+      lb_provider_account_id: lbLink.lb_provider_account_id,
     }).select().single()
 
     if (error) { logger.error('[LB Lead] Create error:', error.message); return null }
@@ -408,7 +440,7 @@ module.exports = (supabase, logger) => {
       },
     })
 
-    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (source="${source}" raw="${source_raw}") origin=${leadOriginType}`)
+    logger.log(`[LB Lead] Created lead ${newLead.id} for ${customerName} (source="${source}" raw="${source_raw}") origin=${leadOriginType} lb_external_request_id=${lbLink.lb_external_request_id || 'null'} lb_channel=${lbLink.lb_channel || 'null'}`)
     return { type: isReactivation ? 'reactivation_lead' : 'new_lead', id: newLead.id, created: true, action: isReactivation ? 'reactivation' : 'created' }
   }
 
@@ -423,7 +455,8 @@ module.exports = (supabase, logger) => {
   //
   // Communication invariant: conversations belong to the identity, not the
   // child lead. No conversation-attach work happens here.
-  async function createChildLeadFromLB(userId, parentLeadId, identity, { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup }) {
+  async function createChildLeadFromLB(userId, parentLeadId, identity, input) {
+    const { channel, customerName, customerPhone, customerEmail, message, accountDisplayName, sourceMappingsLookup } = input
     // Fetch parent for invariant checks + pipeline/stage snapshot.
     const { data: parent } = await supabase.from('leads')
       .select('id, user_id, parent_lead_id, pipeline_id, stage_id, source')
@@ -449,6 +482,16 @@ module.exports = (supabase, logger) => {
     // Stage inheritance: snapshot the canonical's stage at create time.
     // Children do not transition; they remain at this snapshot forever.
     // Pipeline inheritance: same pipeline as parent.
+    //
+    // LB linkage (migration 051) — child rows preserve their OWN LB
+    // attribution, not the parent's. The child represents a new repeat
+    // acquisition event; its externalRequestId/channel/businessId are
+    // distinct from the parent's. SF→LB outbound for jobs created from
+    // child leads (rare, since jobs typically reference parents) will
+    // therefore emit to the child's externalRequestId, which is the
+    // correct LB-side target for that acquisition.
+    const lbLink = pickLbLink(input)
+
     const { data: newChild, error } = await supabase.from('leads').insert({
       user_id: userId,
       parent_lead_id: parent.id,
@@ -462,6 +505,10 @@ module.exports = (supabase, logger) => {
       source_raw,
       notes: message ? message.substring(0, 500) : null,
       lead_origin_type: 'repeat_acquisition',
+      lb_external_request_id: lbLink.lb_external_request_id,
+      lb_channel: lbLink.lb_channel,
+      lb_business_id: lbLink.lb_business_id,
+      lb_provider_account_id: lbLink.lb_provider_account_id,
     }).select().single()
 
     if (error) {
@@ -1793,6 +1840,17 @@ module.exports = (supabase, logger) => {
       // leakage. Empty {} when no mappings configured → raw on both fields.
       const sourceMappingsLookup = await loadSourceMappings(supabase, userId, 'leadbridge')
 
+      // LB linkage fields (migration 051) — extracted once and forwarded to
+      // BOTH paths so the create writers (createLeadFromLB, child create) can
+      // stamp jobs.lb_* downstream via lead → customer → job conversion.
+      // thread.external_lead_id is the TT negotiation id / Yelp lead id in
+      // webhook payloads; event.business_id / thread.external_business_id
+      // disambiguates multi-account tenants.
+      const lbExternalRequestId = thread.external_lead_id || null
+      const lbChannel = channel || null
+      const lbBusinessId = thread.external_business_id || event.business_id || null
+      const lbProviderAccountId = resolvedAccountId || null
+
       if (prereq.useEngine) {
         // Stage 2 engine path — identity resolution + lead-create in one call.
         try {
@@ -1805,6 +1863,10 @@ module.exports = (supabase, logger) => {
             lbContactId: participant.external_contact_id,
             accountDisplayName: resolvedAccountDisplayName,
             sourceMappingsLookup,
+            lbExternalRequestId,
+            lbChannel,
+            lbBusinessId,
+            lbProviderAccountId,
           })
           identity = engineIdentity
         } catch (e) {
@@ -1818,6 +1880,10 @@ module.exports = (supabase, logger) => {
           externalLeadId: thread.external_lead_id,
           accountDisplayName: resolvedAccountDisplayName, // per-location source
           sourceMappingsLookup,
+          lbExternalRequestId,
+          lbChannel,
+          lbBusinessId,
+          lbProviderAccountId,
         }).catch(e => logger.warn(`[LB Webhook] Lead resolution: ${e.message}`))
       }
 
@@ -1967,6 +2033,17 @@ module.exports = (supabase, logger) => {
                 lbEngineAdapter.emitPrereqMissingWarning(logger, userId, prereq.missing)
               }
 
+              // LB linkage fields (migration 051) — `lead.externalRequestId`
+              // is the TT negotiation id / Yelp lead id (NOT `lead.id`, which
+              // is LB's internal UUID). The externalRequestId is what
+              // jobs.lb_external_request_id is indexed by, so we forward it
+              // here even though externalLeadId still gets lead.id for
+              // backward compat with the conversation upsert.
+              const lbExternalRequestId = lead.externalRequestId || null
+              const lbChannelVal = channel || null
+              const lbBusinessId = lead.businessId || acct.external_business_id || null
+              const lbProviderAccountId = acct.id || null
+
               let identity = null
               if (prereq.useEngine) {
                 // Engine path — resolver + dispatch inside the adapter.
@@ -1979,6 +2056,10 @@ module.exports = (supabase, logger) => {
                   lbContactId: lead.id,
                   accountDisplayName: acct.display_name,
                   sourceMappingsLookup,
+                  lbExternalRequestId,
+                  lbChannel: lbChannelVal,
+                  lbBusinessId,
+                  lbProviderAccountId,
                 })
                 identity = engineIdentity
               } else {
@@ -1999,6 +2080,10 @@ module.exports = (supabase, logger) => {
                     externalLeadId: lead.id,
                     accountDisplayName: acct.display_name, // per-location source
                     sourceMappingsLookup,
+                    lbExternalRequestId,
+                    lbChannel: lbChannelVal,
+                    lbBusinessId,
+                    lbProviderAccountId,
                   })
                 }
               }
