@@ -43,7 +43,9 @@ const {
   updateJobStatus: _updateJobStatus,
   maybeEmitInsertEvent,
 } = require('./services/job-status-service');
-const { resolveLbLinkageForNewJob } = require('./lib/lb-job-linkage');
+const { resolveLbLinkageForNewJob } = require('./lib/lb-job-linkage'); // back-compat
+const { resolveLbLinkage, linkageFromParentJob, logResolution: logLbLinkage, REASONS: LB_LINK_REASONS } = require('./lib/lb-linkage-resolver');
+const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-metrics');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 
@@ -5614,22 +5616,13 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         console.error('Property resolution failed (non-blocking):', propErr);
       }
 
-      // LB linkage propagation (migration 051) — if the customer this job is
-      // for traces back to a LeadBridge-sourced lead, carry the LB external
-      // request id + channel onto the job INSERT so maybeEmitInsertEvent can
-      // enqueue an SF→LB job.status_changed event for the new job. Without
-      // this, every SF-UI-created job is `skipped_not_linked` regardless of
-      // whether the customer originated from LB.
-      //
-      // Resolver is read-only and tenant-scoped. Returns nulls when:
-      //   - customer has no lead (SF-native customer)
-      //   - lead has no LB linkage
-      //   - multiple LB-linked leads disagree on external_request_id
-      // In all of those cases the job is created without LB linkage, matching
-      // pre-migration behavior (no regression).
-      let lbLinkResult = null;
+      // LB linkage propagation (canonical, migration 051) — see
+      // lib/lb-linkage-resolver.js. Tries explicit override → lead chain
+      // → identity-graph in order. Returns 'review_required' on multi-id
+      // / duplicate-customer / identity-disagrees ambiguity. Never guesses.
+      let lbResolution;
       try {
-        lbLinkResult = await resolveLbLinkageForNewJob(supabase, {
+        lbResolution = await resolveLbLinkage(supabase, {
           userId,
           customerId,
           explicit: {
@@ -5641,10 +5634,10 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
           logger: console,
         });
       } catch (lbErr) {
-        console.warn('[LB Linkage] resolveLbLinkageForNewJob threw:', lbErr?.message);
-        lbLinkResult = { link: { lb_external_request_id: null, lb_channel: null, lb_business_id: null, lb_provider_account_id: null }, reason: 'error' };
+        console.warn('[LBLinkage] resolveLbLinkage threw:', lbErr?.message);
+        lbResolution = { link: { lb_external_request_id: null, lb_channel: null, lb_business_id: null, lb_provider_account_id: null }, result: 'not_linked', reason: LB_LINK_REASONS.ERROR };
       }
-      const lbLink = lbLinkResult.link;
+      const lbLink = lbResolution.link;
 
       // Create the job
       const jobData = {
@@ -5732,14 +5725,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       // LB insert-time emit (§5). No-op unless the job was created
       // with LB identity present at INSERT (not enriched later).
       // Failure is non-blocking — logged inside the helper.
-      if (lbLink.lb_external_request_id) {
-        console.log(
-          `[LB Linkage] job=${result.id} customer=${customerId} ` +
-          `external_request_id=${lbLink.lb_external_request_id} channel=${lbLink.lb_channel} ` +
-          `reason=${lbLinkResult.reason}` +
-          (lbLinkResult.leadId != null ? ` lead=${lbLinkResult.leadId}` : '')
-        );
-      }
+      logLbLinkage(console, {
+        jobId: result.id,
+        customerId,
+        result: lbResolution.result,
+        reason: lbResolution.reason,
+        leadId: lbResolution.leadId,
+        link: lbLink,
+      });
+      recordLbLinkageJobCreate(lbResolution);
       maybeEmitInsertEvent(supabase, result, {
         type: 'account_owner',
         id: userId,
@@ -7178,10 +7172,17 @@ app.post('/api/jobs/:id/duplicate', authenticateToken, async (req, res) => {
       return date;
     };
     
+    // LB linkage (migration 051) — duplicate inherits the parent's
+    // linkage verbatim. linkageFromParentJob is null when the parent
+    // has no linkage, so spreading {...null} is a no-op (the duplicate
+    // INSERT gets no lb_* columns, same as today).
+    const parentLbLink = linkageFromParentJob(existingJob);
+
     // Create duplicate job data (excluding id and timestamps)
     const duplicateJobData = {
       user_id: existingJob.user_id,
       customer_id: existingJob.customer_id,
+      ...(parentLbLink || {}),
       service_id: existingJob.service_id,
       team_member_id: existingJob.team_member_id,
       scheduled_date: existingJob.scheduled_date,
@@ -7237,7 +7238,22 @@ app.post('/api/jobs/:id/duplicate', authenticateToken, async (req, res) => {
       console.error('Error creating duplicate job:', insertError);
       return res.status(500).json({ error: 'Failed to duplicate job' });
     }
-    
+
+    // [LBLinkage] log for duplicate: parent's linkage carries forward
+    // verbatim, so the log line documents what the duplicate inherited.
+    logLbLinkage(console, {
+      jobId: newJob?.id,
+      customerId: existingJob.customer_id,
+      result: parentLbLink ? 'linked' : 'not_linked',
+      reason: parentLbLink ? 'duplicate_inherits_parent' : 'parent_unlinked',
+      leadId: null,
+      link: parentLbLink || { lb_external_request_id: null, lb_channel: null },
+    });
+    recordLbLinkageJobCreate({
+      result: parentLbLink ? 'linked' : 'not_linked',
+      reason: parentLbLink ? 'duplicate_inherits_parent' : 'parent_unlinked',
+    });
+
     // If recurring, create jobs lazily (a few months ahead)
     if (isRecurring && frequency) {
       const jobsToCreate = [];

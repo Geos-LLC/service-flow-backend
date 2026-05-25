@@ -33,6 +33,7 @@ const { pickLBSource, pickLBSources, pickLbLink, buildEnrichLeadPatch, assertCre
 const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
+const { getLinkageHealth } = require('./lib/lb-linkage-health')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1366,6 +1367,26 @@ module.exports = (supabase, logger) => {
     } catch (error) {
       logger.error('[LB] Integration status error:', error.message)
       res.status(500).json({ error: 'Failed to fetch integration status' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // GET /linkage-health — operator-facing proof the LB↔SF lifecycle
+  // chain is wired. Returns the eight numbers the audit doc calls out:
+  //   - lb-origin leads total / linked / converted
+  //   - lb-linked jobs / missing-linkage-with-customer / recoverable
+  //   - outbound queue (pending/sent/dlq/skipped_unmapped/last_event_at)
+  //   - in-process linkage counters (jobs_created_with_lb_linkage etc.)
+  //
+  // Read-only. Tenant-scoped via authenticateToken → req.user.userId.
+  // ══════════════════════════════════════
+  router.get('/linkage-health', authenticateToken, async (req, res) => {
+    try {
+      const health = await getLinkageHealth(supabase, req.user.userId)
+      res.json(health)
+    } catch (error) {
+      logger.error('[LB] linkage-health error:', error.message)
+      res.status(500).json({ error: 'Failed to fetch linkage health' })
     }
   })
 
