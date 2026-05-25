@@ -242,16 +242,45 @@ async function processRow({ supabase, logger, row, lbBaseUrl }) {
   const body = resp.data || {}
 
   if (status === 200) {
+    // LB returns 200 even when its guard chain rejected our write — the HTTP
+    // exchange succeeded but the lifecycle update didn't apply. Treat
+    // `result='noop'` / `result='stale'` as lifecycle_drift so on-call sees
+    // the divergence (e.g. SF says scheduled, LB still archived) instead of
+    // silently counting it as a successful send.
+    //
+    // LB MAY enrich the response body with `skipReason` (e.g. 'hard_terminal')
+    // and `currentStatus`/`currentPlatformStatus` to surface the precise drift
+    // reason. This classifier reads those fields when present and falls back to
+    // 'unknown' when they're not, so it works against both old and enriched LB
+    // responses.
+    const lbResult = body?.result || 'applied'
+    const isDrift = lbResult === 'noop' || lbResult === 'stale'
+    if (isDrift) {
+      const desired = row.payload_json?.status?.new ?? 'unknown'
+      const actual = body?.currentStatus ?? 'unknown'
+      const reason = body?.skipReason ?? 'unknown'
+      await transition(supabase, row.id, {
+        state: 'sent',                              // HTTP exchange succeeded
+        result: `lifecycle_drift:${lbResult}`,      // distinct from applied/duplicate
+        attempts,
+        terminal_at: nowIso(),
+        defer_reason: null,
+        last_error: `lifecycle_drift desired=${desired} actual=${actual} reason=${reason}`,
+      })
+      await touchLastEventAt(supabase, row.user_id)
+      driftLog(supabase, logger, { row, attempts, desired, actual, reason, lbResult })
+      return
+    }
     await transition(supabase, row.id, {
       state: 'sent',
-      result: body?.result || 'applied',
+      result: lbResult,
       attempts,
       terminal_at: nowIso(),
       defer_reason: null,
       last_error: null,
     })
     await touchLastEventAt(supabase, row.user_id)
-    logLine(supabase, logger, { row, to: 'sent', result: body?.result || 'applied', attempts })
+    logLine(supabase, logger, { row, to: 'sent', result: lbResult, attempts })
     return
   }
 
@@ -393,6 +422,48 @@ function logLine(supabase, logger, { row, to, result, attempts, note }) {
 }
 
 /**
+ * lifecycle_drift logger. Emits the structured Loki anchor on the spec-shaped
+ * line plus a `delivery_log` row with status='rejected' (the closest existing
+ * enum value — drift means LB rejected our intent, not a network failure).
+ *
+ * Loki anchor format (greppable):
+ *   [SF → LB] lifecycle_drift event=<id> job=<id> user=<id>
+ *     desired=<canonical> actual=<lb-current-or-unknown>
+ *     reason=<skipReason-or-unknown> attempts=<n> lb_result=<noop|stale>
+ */
+function driftLog(supabase, logger, { row, attempts, desired, actual, reason, lbResult }) {
+  logger.log(
+    `[SF → LB] lifecycle_drift event=${row.event_id} job=${row.sf_job_id} user=${row.user_id} ` +
+    `desired=${desired} actual=${actual} reason=${reason} attempts=${attempts} lb_result=${lbResult}`
+  )
+  if (!supabase) return
+  logDelivery(supabase, {
+    userId: row.user_id,
+    sourceSystem: 'service_flow',
+    destinationSystem: 'leadbridge',
+    channel: 'webhook',
+    eventType: `lb_outbound.${row.payload_json?.event_type || row.payload_json?.event || 'unknown'}`,
+    correlationId: row.event_id,
+    deliveryDirection: 'outbound',
+    status: 'rejected',
+    retryCount: attempts || 0,
+    provider: 'leadbridge',
+    errorMessage: `lifecycle_drift:${lbResult} desired=${desired} actual=${actual} reason=${reason}`,
+    context: {
+      sf_job_id: row.sf_job_id || null,
+      to_state: 'sent',
+      result: `lifecycle_drift:${lbResult}`,
+      drift: {
+        desired,
+        actual,
+        reason,
+        lb_result: lbResult,
+      },
+    },
+  }, logger).catch(() => {})
+}
+
+/**
  * Start the drainer loop. Returns a handle with stop().
  */
 function startDrainer({ supabase, logger = console }) {
@@ -437,6 +508,7 @@ module.exports = {
   // exposed for tests
   processRow,
   verbForState,
+  driftLog,
   networkBackoff,
   deferBackoff,
   NETWORK_MAX_ATTEMPTS,
