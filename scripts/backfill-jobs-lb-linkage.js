@@ -919,6 +919,7 @@ module.exports = {
   classifyRecurring,
   pickAcquisitionJob,
   mergeProposals,
+  applyHigh,
   applyRecurringHigh,
   fetchUnlinkedJobs,
   fetchLeadsForCustomers,
