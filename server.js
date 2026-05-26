@@ -10331,22 +10331,33 @@ app.post('/api/leads/:id/convert', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Lead already converted' });
     }
     
-    // Create customer from lead (include source so it is available on customer card and for jobs)
+    // Create customer from lead (include source so it is available on customer card and for jobs).
+    // Migration 054: also stamp acquisition_* from the lead's LB linkage,
+    // write-once at INSERT. The customer's first acquisition is sticky;
+    // later syncs MUST NOT overwrite these fields.
+    const customerInsert = {
+      user_id: userId,
+      first_name: lead.first_name,
+      last_name: lead.last_name,
+      email: lead.email,
+      phone: lead.phone,
+      address: lead.address || null,
+      source: lead.source || null,
+      notes: lead.notes || (lead.source ? `Converted from lead (${lead.source})` : 'Converted from lead'),
+    };
+    if (lead.lb_external_request_id) {
+      customerInsert.acquisition_source = 'leadbridge';
+      customerInsert.acquisition_channel = lead.lb_channel || null;
+      customerInsert.acquisition_business_id = lead.lb_business_id || null;
+      customerInsert.acquisition_external_request_id = String(lead.lb_external_request_id);
+      customerInsert.acquisition_at = lead.created_at || new Date().toISOString();
+    }
     const { data: customer, error: customerError } = await supabase
       .from('customers')
-      .insert({
-        user_id: userId,
-        first_name: lead.first_name,
-        last_name: lead.last_name,
-        email: lead.email,
-        phone: lead.phone,
-        address: lead.address || null,
-        source: lead.source || null,
-        notes: lead.notes || (lead.source ? `Converted from lead (${lead.source})` : 'Converted from lead')
-      })
+      .insert(customerInsert)
       .select()
       .single();
-    
+
     if (customerError) {
       console.error('Error creating customer:', customerError);
       return res.status(500).json({ error: 'Failed to create customer' });

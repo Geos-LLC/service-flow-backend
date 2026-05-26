@@ -30,6 +30,7 @@ const { setIdentityLead, setIdentityCustomer } = require('./lib/identity-linker'
 const { makeAdapter: makeLbEngineAdapter } = require('./lib/lb-engine-adapter')
 const { authenticateWebhook } = require('./lib/webhook-signature')
 const { pickLBSource, pickLBSources, pickLbLink, buildEnrichLeadPatch, assertCreateLeadInvariant, assertCreateChildLeadInvariant } = require('./lib/lb-ingestion')
+const { setCustomerAcquisitionIfMissing } = require('./lib/lb-linkage-resolver')
 const { loadSourceMappings } = require('./lib/integration-sync-orchestrator')
 const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./services/lb-inbound-status-map')
 const { updateJobStatus } = require('./services/job-status-service')
@@ -550,6 +551,21 @@ module.exports = (supabase, logger) => {
     // graph is unchanged (same identity row, new sf_lead_id pointer).
     // When flag OFF, legacy: suppress lead.
     if (identity.sf_customer_id) {
+      // Migration 054 — stamp customer.acquisition_* write-once. If the
+      // customer already has an acquisition recorded, this is a no-op.
+      // If they don't, we record this LB lead as their first acquisition
+      // source for recurring-customer analytics + Strategy-4 resolver.
+      const link = pickLbLink(input)
+      if (link.lb_external_request_id) {
+        try {
+          await setCustomerAcquisitionIfMissing(supabase, userId, identity.sf_customer_id, {
+            ...link,
+            acquired_at: input.lbCreatedAt || new Date().toISOString(),
+          })
+        } catch (e) {
+          logger.warn(`[LB Lead] setCustomerAcquisitionIfMissing failed cust=${identity.sf_customer_id}: ${e?.message}`)
+        }
+      }
       if (isEnabledForTenant(FLAGS.LEAD_CARDINALITY_CHILD_LEADS, userId)) {
         // Note: assertCreateLeadInvariant inside createLeadFromLB will throw
         // if identity.sf_lead_id is set (it isn't here), so this is safe.
@@ -581,6 +597,20 @@ module.exports = (supabase, logger) => {
             allowStageMove: false,
           },
         })
+        // Migration 054 — write-once customer acquisition stamp. Closes
+        // the historical leak: pre-PR, this branch silently linked the
+        // identity but never recorded that the customer was LB-acquired.
+        const link = pickLbLink(input)
+        if (link.lb_external_request_id) {
+          try {
+            await setCustomerAcquisitionIfMissing(supabase, userId, customer.id, {
+              ...link,
+              acquired_at: input.lbCreatedAt || new Date().toISOString(),
+            })
+          } catch (e) {
+            logger.warn(`[LB Lead] setCustomerAcquisitionIfMissing (phone-match) failed cust=${customer.id}: ${e?.message}`)
+          }
+        }
         return { type: 'customer', id: customer.id, created: false, action: 'linked_customer' }
       }
 
