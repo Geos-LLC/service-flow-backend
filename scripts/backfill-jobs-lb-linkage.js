@@ -59,6 +59,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  classifyRecurring,
+  pickAcquisitionJob,
+} = require('../lib/lb-recurring-classifier');
 
 function parseArgs(argv) {
   const out = {
@@ -72,6 +76,7 @@ function parseArgs(argv) {
     lbLeadsFile: process.env.LB_LEADS_FILE || null,
     lbToken: process.env.LB_INTEGRATION_TOKEN || null,
     skipPart2: false,
+    mode: 'standard',  // 'standard' (Stage-1: 1:1 lead↔job) | 'recurring' (Stage-3 customer-level) | 'both'
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -80,6 +85,7 @@ function parseArgs(argv) {
     else if (a === '--json') out.json = true;
     else if (a === '--confirm-apply') out.confirm = true;
     else if (a === '--skip-part2') out.skipPart2 = true;
+    else if (a === '--mode') out.mode = String(argv[++i] || '').toLowerCase();
     else if (a === '--user' || a === '-u') out.userId = argv[++i];
     else if (a === '--account') out.accountBusinessId = argv[++i];
     else if (a === '--platform') out.accountPlatform = argv[++i];
@@ -432,6 +438,70 @@ async function fetchPart2Context(supabase, userId, phone10s) {
 }
 
 // ──────────────────────────────────────────────────────────────────
+// Recurring-mode apply (Stage 3 / Recovery C2).
+// Writes:
+//   1. customers.acquisition_* (write-once, guarded by IS NULL)
+//   2. jobs.lb_external_request_id on the chosen acquisition job
+//      (the first job in window OR earliest overall) — same SQL guard
+//      as the standard mode.
+// Returns { ok, customerWrote, jobWrote, refused? }.
+// ──────────────────────────────────────────────────────────────────
+async function applyRecurringHigh(supabase, proposal, logger) {
+  // Step 1 — customer-level acquisition stamp. Write-once.
+  const custUpdate = {
+    acquisition_source: 'leadbridge',
+    acquisition_channel: proposal.link.lb_channel,
+    acquisition_business_id: proposal.link.lb_business_id,
+    acquisition_external_request_id: proposal.link.lb_external_request_id,
+    acquisition_at: proposal.acquired_at || new Date().toISOString(),
+  };
+  const { data: custResult, error: custErr } = await supabase
+    .from('customers')
+    .update(custUpdate)
+    .eq('id', proposal.cust_id)
+    .eq('user_id', proposal.userId)
+    .is('acquisition_external_request_id', null)
+    .select('id, acquisition_external_request_id')
+    .maybeSingle();
+  if (custErr) return { ok: false, refused: 'customer_update_failed', error: custErr.message };
+  const customerWrote = !!custResult;
+  if (!customerWrote) {
+    // Customer already has acquisition recorded — could be from a prior
+    // run or an earlier LB ingest. We DO NOT overwrite. Continue to the
+    // job stamp check anyway; the operator's intent ("link this LB ext
+    // to a job") may still be safe even if the customer-level stamp is
+    // declined.
+    logger.log(`[backfill] recurring: customer ${proposal.cust_id} already has acquisition; skipping customer stamp`);
+  }
+
+  // Step 2 — job stamp. Standard apply, IS NULL guard.
+  if (!proposal.acquisitionJobId) {
+    logger.log(`[backfill] recurring: cust=${proposal.cust_id} ext=${proposal.link.lb_external_request_id} customer_wrote=${customerWrote} (no acquisition job to stamp)`);
+    return { ok: true, customerWrote, jobWrote: false };
+  }
+  const jobUpdate = {
+    lb_external_request_id: proposal.link.lb_external_request_id,
+    lb_channel: proposal.link.lb_channel,
+  };
+  if (proposal.link.lb_business_id != null) jobUpdate.lb_business_id = proposal.link.lb_business_id;
+  const { data: jobResult, error: jobErr } = await supabase
+    .from('jobs')
+    .update(jobUpdate)
+    .eq('id', proposal.acquisitionJobId)
+    .eq('user_id', proposal.userId)
+    .is('lb_external_request_id', null)
+    .select('id')
+    .maybeSingle();
+  if (jobErr) return { ok: false, refused: 'job_update_failed', error: jobErr.message, customerWrote };
+  const jobWrote = !!jobResult;
+  logger.log(
+    `[backfill] recurring: cust=${proposal.cust_id} ext=${proposal.link.lb_external_request_id} ` +
+    `customer_wrote=${customerWrote} job=${proposal.acquisitionJobId} job_wrote=${jobWrote}`
+  );
+  return { ok: true, customerWrote, jobWrote };
+}
+
+// ──────────────────────────────────────────────────────────────────
 // Apply — writes 3 columns, double-guarded by IS NULL.
 // ──────────────────────────────────────────────────────────────────
 async function applyHigh(supabase, candidate, logger) {
@@ -599,6 +669,17 @@ async function main() {
   let part2Proposals = [];
   let part2Tally = { HIGH: 0, MEDIUM: 0, LOW: 0, AMBIGUOUS: 0, no_matching_customer: 0, already_linked: 0 };
   let part2Available = false;
+  // Recurring-mode (Stage-3) results — only populated when --mode recurring|both.
+  let recurringProposals = [];
+  const recurringTally = {
+    recurring_customer_high_confidence: 0,
+    true_multi_candidate_ambiguity: 0,
+    weak_identity: 0,
+    weak_timing: 0,
+    duplicate_phone_collision: 0,
+    conflicting_acquisition_source: 0,
+  };
+  const recurringEnabled = args.mode === 'recurring' || args.mode === 'both';
 
   if (!args.skipPart2) {
     const lbLeads = await fetchLbLeadsForPart2(args);
@@ -635,6 +716,17 @@ async function main() {
       const phone10s = [...new Set(gap.map(l => last10(l.customerPhone)).filter(Boolean))];
       const ctx = await fetchPart2Context(supabase, args.userId, phone10s);
 
+      // Phone-collision map — built from the FULL pulled set (not just
+      // the gap) so we detect that e.g. an LB-completed lead's phone is
+      // also shared by an LB-lost lead that already landed in SF.
+      const phoneCollisionMap = new Map();
+      for (const l of scoped) {
+        const p = last10(l.customerPhone);
+        if (!p) continue;
+        if (!phoneCollisionMap.has(p)) phoneCollisionMap.set(p, []);
+        phoneCollisionMap.get(p).push(l.externalRequestId);
+      }
+
       for (const lb of gap) {
         const p10 = last10(lb.customerPhone);
         const custMatches = p10 ? (ctx.customersByPhone.get(p10) || []) : [];
@@ -651,7 +743,48 @@ async function main() {
             reason: cls.reason,
             cust_id: cls.cust_id,
           });
+        } else if (recurringEnabled && (cls.tier === 'MEDIUM' || cls.tier === 'LOW')) {
+          // Stage-3 recurring-customer reclassification. Only runs on rows
+          // Stage-1 (Part-2 HIGH) did NOT capture; idempotent w.r.t. Stage-1.
+          const cust = (custMatches || [])[0] || null;
+          const jobs = cust ? (ctx.jobsByCust.get(String(cust.id)) || []) : [];
+          const identities = cust ? (ctx.identitiesByCust.get(String(cust.id)) || []) : [];
+          const phoneCollisionExts = p10 ? (phoneCollisionMap.get(p10) || []) : [];
+          const rec = classifyRecurring({
+            lbLead: lb,
+            custMatch: cust,
+            peers: custMatches,
+            jobs,
+            identities,
+            phoneCollisionExts,
+          });
+          recurringTally[rec.subtier] = (recurringTally[rec.subtier] || 0) + 1;
+          if (rec.subtier === 'recurring_customer_high_confidence' && cust) {
+            const acqJob = pickAcquisitionJob(lb.createdAt, jobs);
+            recurringProposals.push({
+              ext: lb.externalRequestId,
+              lb_name: lb.customerName,
+              lb_phone10: p10,
+              userId: args.userId,
+              cust_id: cust.id,
+              acquisitionJobId: acqJob?.id || null,
+              acquired_at: lb.createdAt,
+              link: {
+                lb_external_request_id: lb.externalRequestId,
+                lb_channel: lb.platform,
+                lb_business_id: lb.businessId || null,
+              },
+              reason: rec.reason,
+              cadence: rec.cadence,
+              address: rec.address,
+              jobs_total: rec.jobs_total,
+            });
+          }
         }
+      }
+
+      if (recurringEnabled) {
+        console.log(`[backfill] recurring: ${recurringProposals.length} customer-level proposals (subtier histogram: ${JSON.stringify(recurringTally)})`);
       }
     }
   } else {
@@ -665,6 +798,7 @@ async function main() {
   // ── REPORT ──────────────────────────────────────────────────────
   const summary = {
     mode: args.apply ? 'APPLY' : 'DRY-RUN',
+    backfill_mode: args.mode,
     user_id: args.userId,
     account_business_id: args.accountBusinessId,
     account_platform: args.accountPlatform,
@@ -678,6 +812,12 @@ async function main() {
       both:       merge.proposals.filter(p => p.source === 'both').length,
     },
     ambiguous_after_merge: merge.ambiguous.length,
+    recurring: recurringEnabled ? {
+      tally: recurringTally,
+      proposals_total: recurringProposals.length,
+      with_acquisition_job: recurringProposals.filter(r => r.acquisitionJobId != null).length,
+      customer_level_only: recurringProposals.filter(r => r.acquisitionJobId == null).length,
+    } : null,
   };
 
   if (args.json) {
@@ -685,21 +825,32 @@ async function main() {
       summary,
       proposals: merge.proposals.slice(0, 200),
       ambiguous: merge.ambiguous.slice(0, 100),
+      recurring_proposals: recurringEnabled ? recurringProposals.slice(0, 200) : null,
       part1_sample: part1Candidates.slice(0, 30).map(c => ({ tier: c.tier, reason: c.reason, job_id: c.job.id, leadId: c.leadId, link: c.link })),
     }, null, 2));
   } else {
     console.log('────────────────────── SUMMARY ──────────────────────');
-    console.log(`mode:                  ${summary.mode}`);
+    console.log(`mode:                  ${summary.mode}  (backfill_mode=${summary.backfill_mode})`);
     console.log(`user_id:               ${summary.user_id}`);
     console.log(`account:               ${summary.account_business_id || '*'}/${summary.account_platform || '*'}`);
     console.log(`Part-1 tiers:          ${JSON.stringify(summary.part1)}`);
     console.log(`Part-2 tiers:          ${JSON.stringify(summary.part2)}`);
     console.log(`merged HIGH proposals: ${summary.proposals_total}  (part1_only=${summary.proposals_by_source.part1_only}, part2_only=${summary.proposals_by_source.part2_only}, both=${summary.proposals_by_source.both})`);
     console.log(`ambiguous after merge: ${summary.ambiguous_after_merge}`);
+    if (summary.recurring) {
+      console.log(`Recurring tiers:       ${JSON.stringify(summary.recurring.tally)}`);
+      console.log(`Recurring proposals:   ${summary.recurring.proposals_total}  (with_acquisition_job=${summary.recurring.with_acquisition_job}, customer_only=${summary.recurring.customer_level_only})`);
+    }
     console.log('──────────────────────────────────────────────────────');
-    console.log(`First 20 proposals:`);
+    console.log(`First 20 proposals (standard):`);
     for (const p of merge.proposals.slice(0, 20)) {
       console.log(`  job=${p.jobId} user=${p.userId} ext=${p.link.lb_external_request_id} chan=${p.link.lb_channel} biz=${p.link.lb_business_id||'null'} src=${p.source} reasons=${p.reasons.join('|')}`);
+    }
+    if (recurringEnabled && recurringProposals.length > 0) {
+      console.log(`\nFirst 20 recurring (Stage-3) proposals:`);
+      for (const r of recurringProposals.slice(0, 20)) {
+        console.log(`  cust=${r.cust_id} ext=${r.ext} job=${r.acquisitionJobId||'none'} name='${r.lb_name||''}' jobs_total=${r.jobs_total} cadence=${JSON.stringify(r.cadence)} addr_mode_share=${r.address?.modeShare}`);
+      }
     }
     if (merge.ambiguous.length > 0) {
       console.log(`\nAmbiguous (will NOT auto-apply, first 10):`);
@@ -715,7 +866,8 @@ async function main() {
   }
 
   // ── APPLY ────────────────────────────────────────────────────────
-  console.log(`[backfill] APPLY phase — ${merge.proposals.length} proposals`);
+  // Standard (Stage-1) proposals
+  console.log(`[backfill] APPLY standard — ${merge.proposals.length} proposals`);
   let applied = 0, refused = 0;
   const refusals = [];
   for (const p of merge.proposals) {
@@ -728,6 +880,30 @@ async function main() {
     }
   }
   console.log(`[backfill] applied=${applied} refused=${refused} total=${merge.proposals.length}`);
+
+  // Recurring (Stage-3) proposals — customer-level acquisition stamp +
+  // acquisition-job stamp. Only runs when --mode recurring|both.
+  if (recurringEnabled && recurringProposals.length > 0) {
+    console.log(`[backfill] APPLY recurring — ${recurringProposals.length} customer-level proposals`);
+    let custApplied = 0, jobApplied = 0, recRefused = 0;
+    const recRefusals = [];
+    for (const r of recurringProposals) {
+      const res = await applyRecurringHigh(supabase, r, console);
+      if (!res.ok) {
+        recRefused++;
+        recRefusals.push({ cust_id: r.cust_id, ext: r.ext, reason: res.refused, error: res.error });
+        console.warn(`[backfill] recurring refused cust=${r.cust_id} ext=${r.ext} reason=${res.refused} error=${res.error || ''}`);
+        continue;
+      }
+      if (res.customerWrote) custApplied++;
+      if (res.jobWrote) jobApplied++;
+    }
+    console.log(`[backfill] recurring: customer_stamps=${custApplied} job_stamps=${jobApplied} refused=${recRefused} total=${recurringProposals.length}`);
+    if (args.json && recRefusals.length > 0) {
+      console.log(JSON.stringify({ recurring_refusals: recRefusals }, null, 2));
+    }
+  }
+
   if (args.json && refusals.length > 0) {
     console.log(JSON.stringify({ refusals }, null, 2));
   }
@@ -740,7 +916,10 @@ if (require.main === module) {
 module.exports = {
   classify,
   classifyPart2,
+  classifyRecurring,
+  pickAcquisitionJob,
   mergeProposals,
+  applyRecurringHigh,
   fetchUnlinkedJobs,
   fetchLeadsForCustomers,
   fetchIdentityGraph,
