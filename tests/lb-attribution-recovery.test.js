@@ -343,3 +343,105 @@ describe('runAttributionRecovery — summary shape', () => {
     await expect(runAttributionRecovery(makeStub(), { lbLeads: [], logger: SILENT })).rejects.toThrow(/userId/);
   });
 });
+
+// ──────────────────────────────────────────────────────────────────
+// Acquisition-domain semantic view (post-refactor model).
+// LB and SF/ZB are independent lifecycles. Attribution is intelligence-
+// sync, not status-sync. An LB-completed lead without an SF customer is
+// not a failure — it's a normal unconverted / marketplace-only lead.
+// ──────────────────────────────────────────────────────────────────
+describe('runAttributionRecovery — acquisition_review semantics', () => {
+  test('summary.acquisition_review carries the new semantic keys', async () => {
+    const out = await runAttributionRecovery(makeStub(), {
+      userId: 2, lbLeads: [], mode: 'both', apply: false, logger: SILENT,
+    });
+    const r = out.summary.acquisition_review;
+    expect(r).toBeDefined();
+    for (const k of [
+      'high_confidence_attribution_proposed',
+      'recurring_attribution_proposed',
+      'unconverted_or_marketplace_only_lead',
+      'ambiguous_skipped',
+      'weak_signals_skipped',
+      'conflicting_acquisition_source',
+      'already_linked',
+    ]) {
+      expect(r).toHaveProperty(k);
+      expect(typeof r[k]).toBe('number');
+    }
+  });
+
+  test('LB-completed lead with no SF customer match is reported as unconverted_or_marketplace_only_lead, NOT a failure', async () => {
+    // Phone last-10 has no matching SF customer → classifier returns
+    // tier='no_matching_customer'. Under the new model this is a normal
+    // unconverted lead, surfaced under acquisition_review.
+    const supabase = makeStub({ customers: [], jobs: [] });
+    const out = await runAttributionRecovery(supabase, {
+      userId: 2,
+      lbLeads: [lbLead({ customerPhone: '+19999999999' })],
+      mode: 'both',
+      apply: false,
+      logger: SILENT,
+    });
+    expect(out.summary.acquisition_review.unconverted_or_marketplace_only_lead).toBeGreaterThanOrEqual(1);
+    // Legacy key still populated
+    expect(out.summary.part2_tally.no_matching_customer).toBeGreaterThanOrEqual(1);
+    // It's a healthy classification, not a refusal / error
+    expect(out.summary.standard_high_proposals).toBe(0);
+    expect(out.summary.recurring_high_proposals).toBe(0);
+    expect(supabase._writes).toHaveLength(0);
+  });
+
+  test('marketplace-only LB-completed lead never produces an attribution write (dry-run or apply)', async () => {
+    const supabase = makeStub({ customers: [], jobs: [] });
+    // Apply mode — still must not write because nothing matched.
+    const out = await runAttributionRecovery(supabase, {
+      userId: 2,
+      lbLeads: [lbLead({ customerPhone: '+19999999999' })],
+      mode: 'both',
+      apply: true,
+      logger: SILENT,
+    });
+    expect(supabase._writes).toHaveLength(0);
+    expect(out.summary.applied.standard_high).toBe(0);
+    expect(out.summary.applied.recurring_customers).toBe(0);
+    expect(out.summary.acquisition_review.unconverted_or_marketplace_only_lead).toBeGreaterThanOrEqual(1);
+  });
+
+  test('weak_signals_skipped aggregates weak_identity + weak_timing + duplicate_phone_collision', async () => {
+    const out = await runAttributionRecovery(makeStub(), {
+      userId: 2, lbLeads: [], mode: 'both', apply: false, logger: SILENT,
+    });
+    const r = out.summary.acquisition_review;
+    const legacy = out.summary.skipped;
+    expect(r.weak_signals_skipped).toBe(
+      (legacy.weak_identity || 0) + (legacy.weak_timing || 0) + (legacy.duplicate_phone_collision || 0)
+    );
+  });
+
+  test('attribution still works: HIGH proposals still flow under the new view', async () => {
+    // Recurring HIGH fixture (same shape as the apply-mode test above).
+    const customers = [{
+      id: 100, user_id: 2, first_name: 'Jane', last_name: 'Doe',
+      phone: '+15125551111', source: 'Thumbtack Tampa',
+      zenbooker_id: 'zb-100', acquisition_external_request_id: null, created_at: '2025-08-01',
+    }];
+    const jobs = [
+      { id: 901, user_id: 2, customer_id: 100, status: 'completed', created_at: '2024-01-15', scheduled_date: '2024-01-15', is_recurring: false, lb_external_request_id: null, lb_channel: null, lb_business_id: null, service_address_street: '1 Main', service_address_zip: '33701' },
+      { id: 902, user_id: 2, customer_id: 100, status: 'completed', created_at: '2024-06-15', scheduled_date: '2024-06-15', is_recurring: false, lb_external_request_id: null, lb_channel: null, lb_business_id: null, service_address_street: '1 Main', service_address_zip: '33701' },
+      { id: 903, user_id: 2, customer_id: 100, status: 'completed', created_at: '2024-12-15', scheduled_date: '2024-12-15', is_recurring: false, lb_external_request_id: null, lb_channel: null, lb_business_id: null, service_address_street: '1 Main', service_address_zip: '33701' },
+    ];
+    const supabase = makeStub({ customers, jobs });
+    const out = await runAttributionRecovery(supabase, {
+      userId: 2,
+      lbLeads: [lbLead({ createdAt: '2026-01-01T00:00:00Z' })],
+      mode: 'both', apply: false, logger: SILENT,
+    });
+    // Legacy keys still populated
+    expect(out.summary.recurring_high_proposals).toBe(1);
+    // New view surfaces same count under semantic name
+    expect(out.summary.acquisition_review.recurring_attribution_proposed).toBe(1);
+    // Dry-run preserved
+    expect(supabase._writes).toHaveLength(0);
+  });
+});

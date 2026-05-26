@@ -389,3 +389,93 @@ describe('reconcileTenantWithLb — orchestrator', () => {
     expect(out.summary.skipped_no_lb_lead).toBe(1);
   });
 });
+
+// ──────────────────────────────────────────────────────────────────
+// Cross-domain semantic view (post-refactor model).
+// LB acquisition lifecycle and SF/ZB operational lifecycle are
+// independent. Differences between them are NOT synchronization
+// failures — they're cross-domain differences. The reconcile summary
+// now exposes that under additive keys.
+// ──────────────────────────────────────────────────────────────────
+describe('reconcileTenantWithLb — cross-domain semantics', () => {
+  test('summary exposes cross_domain_difference + not_applicable_to_lb (additive keys)', async () => {
+    const supabase = makeFullStub();
+    const out = await reconcileTenantWithLb(supabase, 2, [], { dryRun: true, logger: SILENT });
+    expect(out.summary).toHaveProperty('cross_domain_difference');
+    expect(out.summary).toHaveProperty('not_applicable_to_lb');
+    expect(typeof out.summary.cross_domain_difference).toBe('number');
+    expect(typeof out.summary.not_applicable_to_lb).toBe('number');
+  });
+
+  test('SF.cancelled vs LB.scheduled → counted under cross_domain_difference, NOT a failure', async () => {
+    // SF cancelled the job; LB still thinks the lead is scheduled.
+    // Legitimate cross-domain difference (SF ahead), pushed forward.
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 1, user_id: 2, status: 'cancelled', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' },
+      ],
+    });
+    const lbLeads = [{ id: 'lb1', externalRequestId: 'EXT', status: 'scheduled' }];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+    expect(out.summary.cross_domain_difference).toBe(1);
+    expect(out.summary.failures).toBe(0);
+    // Legacy key preserved for backwards compat
+    expect(out.summary.lifecycle_drift).toBe(1);
+  });
+
+  test('SF.scheduled vs LB.completed → cross_domain_difference, not failure (LB ahead of SF)', async () => {
+    // The "marketplace-only completed" case: LB marked the lead completed
+    // (Thumbtack auto-close, prior pro outbound, or marketplace
+    // operations) but the SF operational job is still scheduled. This
+    // must NOT be reported as drift or failure — both states are valid
+    // in their own domains.
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 5, user_id: 2, status: 'pending', lb_external_request_id: 'EXT-FUTURE', lb_channel: 'thumbtack' },
+      ],
+    });
+    // SF 'pending' maps to canonical 'scheduled'. LB says 'completed' (LB ahead).
+    const lbLeads = [{ id: 'lbF', externalRequestId: 'EXT-FUTURE', status: 'completed' }];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+    expect(out.summary.failures).toBe(0);
+    expect(out.summary.cross_domain_difference).toBeGreaterThanOrEqual(1);
+    // Internally this is a pipeline_regression (SF would push backwards);
+    // the legacy key is preserved.
+    expect(out.summary.skipped_regression).toBe(1);
+    expect(out.plan[0].action).toBe('skipped');
+  });
+
+  test('cross_domain_difference equals legacy lifecycle_drift + skipped_regression', async () => {
+    // Mix: 1 SF-ahead (lifecycle_drift) + 1 LB-ahead (pipeline_regression).
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 1, user_id: 2, status: 'cancelled',   lb_external_request_id: 'A', lb_channel: 'thumbtack' },
+        { id: 2, user_id: 2, status: 'in-progress', lb_external_request_id: 'B', lb_channel: 'thumbtack' },
+      ],
+    });
+    const lbLeads = [
+      { id: 'lbA', externalRequestId: 'A', status: 'scheduled' },   // SF-ahead → lifecycle_drift
+      { id: 'lbB', externalRequestId: 'B', status: 'completed' },   // LB-ahead → pipeline_regression
+    ];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+    expect(out.summary.cross_domain_difference).toBe(
+      (out.summary.lifecycle_drift || 0) + (out.summary.skipped_regression || 0)
+    );
+    expect(out.summary.cross_domain_difference).toBe(2);
+    expect(out.summary.failures).toBe(0);
+  });
+
+  test('not_applicable_to_lb is the renamed skipped_unsupported (additive)', async () => {
+    // SF status with no LB canonical mapping. Counted under both names.
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 1, user_id: 2, status: 'weird_unknown_status', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' },
+      ],
+    });
+    const lbLeads = [{ id: 'lb1', externalRequestId: 'EXT', status: 'scheduled' }];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+    expect(out.summary.not_applicable_to_lb).toBe(1);
+    expect(out.summary.skipped_unsupported).toBe(1);
+    expect(out.summary.failures).toBe(0);
+  });
+});
