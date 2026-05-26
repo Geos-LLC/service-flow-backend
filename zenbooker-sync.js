@@ -934,6 +934,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           if (zbLbResolution.link.lb_external_request_id) {
             mapped.lb_external_request_id = zbLbResolution.link.lb_external_request_id
             mapped.lb_channel = zbLbResolution.link.lb_channel
+            mapped.lb_business_id = zbLbResolution.link.lb_business_id
           }
         } catch (lbErr) {
           logger.warn(`[LBLinkage] ZB-bulk resolver threw user=${userId} zb_job=${zb.id}: ${lbErr?.message}`)
@@ -1156,6 +1157,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
           if (webhookLbResolution.link.lb_external_request_id) {
             mapped.lb_external_request_id = webhookLbResolution.link.lb_external_request_id
             mapped.lb_channel = webhookLbResolution.link.lb_channel
+            mapped.lb_business_id = webhookLbResolution.link.lb_business_id
           }
         } catch (lbErr) {
           logger.warn(`[LBLinkage] ZB-webhook resolver threw user=${userId} zb=${data.id}: ${lbErr?.message}`)

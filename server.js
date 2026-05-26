@@ -5645,6 +5645,7 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         customer_id: customerId,
         lb_external_request_id: lbLink.lb_external_request_id,
         lb_channel: lbLink.lb_channel,
+        lb_business_id: lbLink.lb_business_id,
         service_id: serviceId, // Keep for backward compatibility
         // Note: service_ids and service_names columns don't exist yet, storing in service_name for now
         team_member_id: teamMemberIdValue,
@@ -7172,17 +7173,19 @@ app.post('/api/jobs/:id/duplicate', authenticateToken, async (req, res) => {
       return date;
     };
     
-    // LB linkage (migration 051) — duplicate inherits the parent's
-    // linkage verbatim. linkageFromParentJob is null when the parent
-    // has no linkage, so spreading {...null} is a no-op (the duplicate
-    // INSERT gets no lb_* columns, same as today).
+    // LB linkage (migration 051 + 053) — duplicate inherits the parent's
+    // linkage. We pick only the three job-side columns (lb_external_request_id,
+    // lb_channel, lb_business_id) instead of spreading the resolver's 4-field
+    // shape — lb_provider_account_id lives only on `leads`, not `jobs`.
     const parentLbLink = linkageFromParentJob(existingJob);
 
     // Create duplicate job data (excluding id and timestamps)
     const duplicateJobData = {
       user_id: existingJob.user_id,
       customer_id: existingJob.customer_id,
-      ...(parentLbLink || {}),
+      lb_external_request_id: parentLbLink ? parentLbLink.lb_external_request_id : null,
+      lb_channel: parentLbLink ? parentLbLink.lb_channel : null,
+      lb_business_id: parentLbLink ? parentLbLink.lb_business_id : null,
       service_id: existingJob.service_id,
       team_member_id: existingJob.team_member_id,
       scheduled_date: existingJob.scheduled_date,
