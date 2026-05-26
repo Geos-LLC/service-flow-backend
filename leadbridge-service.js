@@ -36,6 +36,7 @@ const { mapLbToSfStatus, isKnownLbStatus, normalizeLbStatus } = require('./servi
 const { updateJobStatus } = require('./services/job-status-service')
 const { getLinkageHealth } = require('./lib/lb-linkage-health')
 const { reconcileTenantWithLb } = require('./lib/lb-reconcile')
+const { runAttributionRecovery } = require('./lib/lb-attribution-recovery')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1437,6 +1438,10 @@ module.exports = (supabase, logger) => {
       const modeRaw = String(req.query.mode || req.body?.mode || 'apply').toLowerCase()
       const dryRun = modeRaw === 'dryrun' || modeRaw === 'dry-run' || modeRaw === 'plan'
       const reconcile = req.body?.reconcile === false ? false : true
+      // attribution recovery: opt-out via body.attribution=false (e.g. for
+      // operators who want LB pull only). Defaults ON for the product
+      // workflow.
+      const attribution = req.body?.attribution === false ? false : true
 
       const settings = await getLbSettings(userId)
       if (!settings?.leadbridge_connected || !settings.leadbridge_integration_token) {
@@ -1447,16 +1452,17 @@ module.exports = (supabase, logger) => {
         return res.json({ started: false, message: 'Sync already in progress', progress: syncProgress[userId] })
       }
 
-      // Start sync in background. Reconcile output lands in syncProgress.reconcile
-      // once the background job finishes. Clients poll GET /sync/progress.
+      // Start sync in background. Attribution + reconcile output lands in
+      // syncProgress.{attribution_recovery,reconcile} once the background
+      // job finishes. Clients poll GET /sync/progress.
       setImmediate(() => runLbSync(
         userId,
         settings.leadbridge_integration_token,
         accountId,
         parseInt(limit) || 0,
-        { reconcile, dryRun }
+        { reconcile, dryRun, attribution }
       ))
-      res.json({ started: true, mode: dryRun ? 'dryRun' : 'apply', reconcile })
+      res.json({ started: true, mode: dryRun ? 'dryRun' : 'apply', reconcile, attribution })
     } catch (error) {
       res.status(500).json({ error: 'Failed to start sync' })
     }
@@ -2030,7 +2036,11 @@ module.exports = (supabase, logger) => {
     // explicitly pass { reconcile: false }.
     const reconcile = opts.reconcile !== false
     const reconcileDryRun = !!opts.dryRun
-    syncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching', reconcile: null }
+    // attribution_recovery defaults ON unless explicitly disabled. Same
+    // dryRun signal — when /sync runs in dry-run mode, attribution is
+    // planned but not applied.
+    const attributionEnabled = opts.attribution !== false
+    syncProgress[userId] = { status: 'running', total: 0, synced: 0, messages: 0, errors: 0, phase: 'fetching', attribution_recovery: null, reconcile: null }
     const t0 = Date.now()
 
     try {
@@ -2279,7 +2289,38 @@ module.exports = (supabase, logger) => {
         }
       }
 
-      // ── Phase 2/3: Reconcile SF lifecycle → LB ─────────────────────
+      // ── Phase 2: Attribution recovery ──────────────────────────────
+      // Stage-1 standard HIGH + Stage-3 recurring HIGH safe attribution
+      // backfills, productized. Mirror of scripts/backfill-jobs-lb-linkage.js
+      // logic — same library helpers under the hood. Runs after Phase 1
+      // (which may have created/enriched leads) so the new leads are
+      // available for the converted_customer_id walk. Runs BEFORE Phase 3
+      // (lifecycle reconcile) so newly-stamped jobs are eligible for
+      // status pushes in the same /sync call.
+      //
+      // Dry-run + apply share the same code path; only the `apply` flag
+      // gates the mutation step. Idempotent — write-once guards at SQL
+      // layer make repeated /sync a no-op.
+      let attributionResult = null
+      if (attributionEnabled) {
+        try {
+          syncProgress[userId] = { ...syncProgress[userId], phase: reconcileDryRun ? 'attribution_dry_run' : 'attribution' }
+          logger.log(`[LB Attribution] phase=start lb_leads=${allLeads.length} user=${userId} dryRun=${reconcileDryRun}`)
+          attributionResult = await runAttributionRecovery(supabase, {
+            userId,
+            apply: !reconcileDryRun,
+            mode: 'both',
+            lbLeads: allLeads,
+            logger,
+          })
+        } catch (attrErr) {
+          logger.error(`[LB Attribution] failed user=${userId}: ${attrErr.message}`)
+          attributionResult = { summary: { error: attrErr.message }, standard: {}, recurring: {} }
+        }
+      }
+      syncProgress[userId] = { ...syncProgress[userId], attribution_recovery: attributionResult }
+
+      // ── Phase 3: Reconcile SF lifecycle → LB ───────────────────────
       // After Phase 1 (LB → SF pull) finishes, find LB-linked SF jobs
       // and push safe SF lifecycle statuses back to LB via the existing
       // outbound queue. Uses the `allLeads` already fetched in Phase 1
@@ -2305,9 +2346,14 @@ module.exports = (supabase, logger) => {
         status: 'complete', total: syncProgress[userId].total,
         synced: totalSynced, messages: totalMessages,
         errors: syncProgress[userId].errors, phase: 'done',
+        attribution_recovery: attributionResult,
         reconcile: reconcileResult,
       }
-      logger.log(`[LB Sync] DONE in ${Date.now() - t0}ms: ${totalSynced} conversations, ${totalMessages} messages${reconcileResult ? `, reconcile=${JSON.stringify(reconcileResult.summary)}` : ''}`)
+      const attrSummary = attributionResult ? attributionResult.summary : null
+      const attrTag = attrSummary
+        ? ` attribution=${JSON.stringify({ std_high: attrSummary.standard_high_proposals, rec_high: attrSummary.recurring_high_proposals, applied: attrSummary.applied || null })}`
+        : ''
+      logger.log(`[LB Sync] DONE in ${Date.now() - t0}ms: ${totalSynced} conversations, ${totalMessages} messages${attrTag}${reconcileResult ? `, reconcile=${JSON.stringify(reconcileResult.summary)}` : ''}`)
     } catch (error) {
       logger.error('[LB Sync] Error:', error.message)
       syncProgress[userId] = { status: 'error', error: error.message }
