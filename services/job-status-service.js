@@ -277,9 +277,58 @@ async function maybeEmitInsertEvent(supabase, inserted, actor) {
   }
 }
 
+/**
+ * Phase 2B authoritative orchestration emission for newly-inserted
+ * LB-linked jobs.
+ *
+ * MUST be called AFTER the jobs INSERT has committed. The orchestration
+ * `service_scheduled` event is owned by the operational write path
+ * (this module), NOT by the API handler that requested the booking.
+ * This ensures the event is only emitted when canonical operational
+ * state exists, preventing rollback/partial-success inconsistencies.
+ *
+ * Skipped when:
+ *   - feature flag off for tenant
+ *   - inserted row missing lb_external_request_id
+ *   - inserted row missing required fields
+ *
+ * Idempotent: deterministic event_id absorbs duplicate calls via the
+ * outbound table's UNIQUE constraint on event_id.
+ *
+ * @param {object} supabase
+ * @param {object} inserted   freshly-inserted jobs row (must include
+ *                            id, user_id, lb_external_request_id,
+ *                            scheduled_date, [lb_channel, lb_business_id])
+ * @param {object} actor
+ * @param {object} [opts]
+ * @param {string} [opts.orchestrationSessionId]
+ * @param {object} [opts.extraPayload]
+ */
+async function maybeEmitOrchestrationInsertEvent(supabase, inserted, actor, opts = {}) {
+  if (!inserted || !inserted.id) return { action: 'skipped', reason: 'no_row' }
+  if (!inserted.lb_external_request_id) {
+    return { action: 'skipped', reason: 'not_lb_attributed' }
+  }
+  try {
+    const { recordOrchestrationOutbound } = require('../lib/lb-orchestration-events')
+    return await recordOrchestrationOutbound(supabase, {
+      eventType: 'service_scheduled',
+      job: inserted,
+      actor,
+      source: 'lb_orchestration',
+      orchestrationSessionId: opts.orchestrationSessionId || inserted.orchestration_session_id || null,
+      extraPayload: opts.extraPayload || {},
+    })
+  } catch (e) {
+    console.error('[LB Orch] maybeEmitOrchestrationInsertEvent failed:', e.message, { jobId: inserted.id })
+    return { action: 'error', reason: e.message }
+  }
+}
+
 module.exports = {
   updateJobStatus,
   maybeEmitInsertEvent,
+  maybeEmitOrchestrationInsertEvent,
   VALID_SOURCES,
   getMetrics,
 }

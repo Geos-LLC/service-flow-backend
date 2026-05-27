@@ -259,7 +259,7 @@ describe('booking-request handler', () => {
     };
   }
 
-  test('happy path: 201 + customer + job + service_scheduled', async () => {
+  test('happy path: 201 + customer + job created; emission delegated to operational write path', async () => {
     const stub = makeStub({ jobs: [], customers: [] });
     const handler = makeBookingRequestHandler({
       supabase: stub, logger: SILENT,
@@ -272,16 +272,57 @@ describe('booking-request handler', () => {
     expect(res._body.status).toBe('confirmed');
     expect(res._body.customer_id).toBeDefined();
     expect(res._body.orchestration_session_id).toBe('conv-789');
-    // Outbound event inserted
+    // Outbound event inserted via maybeEmitOrchestrationInsertEvent
+    // (which calls recordOrchestrationOutbound under the hood)
     const outbound = stub._inserts.find(i => i.table === 'leadbridge_outbound_events');
     expect(outbound).toBeTruthy();
     expect(outbound.row.event_type).toBe('service_scheduled');
+    // Post-correction payload shape — operational outcome only
+    expect(outbound.row.payload_json.source).toBe('service_flow_orchestration');
+    expect(outbound.row.payload_json.integration_mode).toBe('orchestration');
     expect(outbound.row.payload_json.external_request_id).toBe('EXT-A');
+    expect(outbound.row.payload_json.job.outcome).toBe('scheduled');
+    expect(outbound.row.payload_json.job.sf_job_id).toBeDefined();
+    expect(outbound.row.payload_json.job.scheduled_start).toBe('2026-06-01T10:00:00Z');
+    expect(outbound.row.payload_json.job.status).toBeUndefined();  // no SF lifecycle leak
     expect(outbound.row.orchestration_session_id).toBe('conv-789');
     // Audit row landed
     const audit = stub._inserts.find(i => i.table === 'lb_orchestration_attempts');
     expect(audit.row.result).toBe('success');
     expect(audit.row.sf_job_id).toBeDefined();
+  });
+
+  test('emission ownership: if job INSERT fails, no service_scheduled event leaks', async () => {
+    // Force a job-insert failure by making the customers insert succeed
+    // but jobs insert error out via a stub that returns null + error.
+    const stub = makeStub({ jobs: [], customers: [] });
+    // Wrap the .from('jobs').insert to simulate failure
+    const origFrom = stub.from.bind(stub);
+    stub.from = (table) => {
+      if (table !== 'jobs') return origFrom(table);
+      const chain = origFrom(table);
+      const origInsert = chain.insert.bind(chain);
+      chain.insert = (row) => {
+        const c = origInsert(row);
+        const origMaybeSingle = c.maybeSingle.bind(c);
+        c.maybeSingle = () => Promise.resolve({ data: null, error: { message: 'simulated insert failure' } });
+        return c;
+      };
+      return chain;
+    };
+    const handler = makeBookingRequestHandler({
+      supabase: stub, logger: SILENT,
+      setCustomerAcquisitionIfMissing: SET_ACQUISITION_NOOP,
+    });
+    const res = mockRes();
+    await handler({ user: { userId: 2 }, body: mkBody() }, res);
+    expect(res._status).toBe(500);
+    // The critical invariant: NO outbound event was emitted because the
+    // job didn't persist. Authoritative-write-path emission means the
+    // event only fires when canonical state exists.
+    const outbound = stub._inserts.find(i =>
+      i.table === 'leadbridge_outbound_events' && i.row.event_type === 'service_scheduled');
+    expect(outbound).toBeUndefined();
   });
 
   test('expired slot_token → 410 + stale_slot', async () => {

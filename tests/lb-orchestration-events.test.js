@@ -136,7 +136,7 @@ describe('recordOrchestrationOutbound', () => {
     expect(stub._inserts).toHaveLength(0);
   });
 
-  test('happy path: emits with deterministic event_id', async () => {
+  test('happy path: emits with deterministic event_id + correct payload shape', async () => {
     jest.resetModules();
     process.env.LB_ORCHESTRATION_ENABLED_TENANTS = '2';
     const { recordOrchestrationOutbound: fn } = require('../lib/lb-orchestration-events');
@@ -144,6 +144,7 @@ describe('recordOrchestrationOutbound', () => {
     const out = await fn(stub, {
       eventType: 'service_cancelled',
       job: { id: 142, user_id: 2, status: 'cancelled',
+             scheduled_date: '2026-06-01T10:00:00Z',
              lb_external_request_id: 'EXT-A', lb_channel: 'thumbtack', lb_business_id: 'BIZ' },
       source: 'account_owner',
       logger: SILENT,
@@ -156,8 +157,41 @@ describe('recordOrchestrationOutbound', () => {
     expect(r.event_type).toBe('service_cancelled');
     expect(r.user_id).toBe(2);
     expect(r.sf_job_id).toBe('142');
+    // Post-correction payload: operational-outcome only, no SF status leak
+    expect(r.payload_json.source).toBe('service_flow_orchestration');
+    expect(r.payload_json.integration_mode).toBe('orchestration');
     expect(r.payload_json.external_request_id).toBe('EXT-A');
     expect(r.payload_json.channel).toBe('thumbtack');
+    expect(r.payload_json.job).toEqual({
+      sf_job_id: '142',
+      scheduled_start: '2026-06-01T10:00:00Z',
+      outcome: 'cancelled',
+    });
+    // CRITICAL: SF-internal lifecycle field MUST NOT appear in payload
+    expect(r.payload_json.job.status).toBeUndefined();
+    expect(r.payload_json.sf_user_id).toBeUndefined();
+  });
+
+  test('outcome derives from event_type for all four event types', async () => {
+    jest.resetModules();
+    process.env.LB_ORCHESTRATION_ENABLED_TENANTS = '2';
+    const { recordOrchestrationOutbound: fn, OUTCOME_BY_EVENT_TYPE } = require('../lib/lb-orchestration-events');
+    expect(OUTCOME_BY_EVENT_TYPE).toEqual({
+      service_scheduled:   'scheduled',
+      service_rescheduled: 'rescheduled',
+      service_cancelled:   'cancelled',
+      service_completed:   'completed',
+    });
+    for (const [eventType, outcome] of Object.entries(OUTCOME_BY_EVENT_TYPE)) {
+      const stub = makeStub();
+      const baseId = { service_scheduled: 1, service_rescheduled: 2, service_cancelled: 3, service_completed: 4 }[eventType];
+      await fn(stub, {
+        eventType,
+        job: { id: baseId, user_id: 2, status: 'whatever', lb_external_request_id: 'X' },
+        source: 'system', logger: SILENT,
+      });
+      expect(stub._inserts[0].row.payload_json.job.outcome).toBe(outcome);
+    }
   });
 
   test('UNIQUE constraint duplicate → action=duplicate, no failure', async () => {
