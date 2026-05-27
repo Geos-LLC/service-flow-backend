@@ -37,6 +37,7 @@ const { updateJobStatus } = require('./services/job-status-service')
 const { getLinkageHealth } = require('./lib/lb-linkage-health')
 const { reconcileTenantWithLb } = require('./lib/lb-reconcile')
 const { runAttributionRecovery } = require('./lib/lb-attribution-recovery')
+const { buildSemanticSummary, buildEntitySemanticState } = require('./lib/lb-semantic-summary')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1419,6 +1420,50 @@ module.exports = (supabase, logger) => {
     } catch (error) {
       logger.error('[LB] linkage-health error:', error.message)
       res.status(500).json({ error: 'Failed to fetch linkage health' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // Phase 1.5 — semantic observability
+  //
+  // GET /semantic-summary
+  //   Tenant-wide diagnostic showing attribution / operational lifecycle /
+  //   LB conversation as separate concepts. READ-ONLY. No LB API calls.
+  //   No mutations. Cross-domain comparison counts (cross_domain_difference,
+  //   not_applicable_to_lb, marketplace_only_lead) require a live LB pull
+  //   and are surfaced via /sync?mode=dryRun instead.
+  //
+  // GET /entity/:type/:id/semantic-state
+  //   Per-entity diagnostic — type ∈ {job, lead, customer}. Returns the
+  //   classification, SF/ZB/LB state, and whether the entity should sync
+  //   to LB. No mutations. No outbound events.
+  // ══════════════════════════════════════
+  router.get('/semantic-summary', authenticateToken, async (req, res) => {
+    try {
+      const summary = await buildSemanticSummary(supabase, req.user.userId)
+      res.json(summary)
+    } catch (error) {
+      logger.error('[LB] semantic-summary error:', error.message)
+      res.status(500).json({ error: 'Failed to build semantic summary' })
+    }
+  })
+
+  router.get('/entity/:type/:id/semantic-state', authenticateToken, async (req, res) => {
+    try {
+      const { type, id } = req.params
+      if (!['job', 'lead', 'customer'].includes(type)) {
+        return res.status(400).json({ error: `type must be one of job|lead|customer, got '${type}'` })
+      }
+      const numericId = Number(id)
+      if (!Number.isFinite(numericId) || numericId <= 0) {
+        return res.status(400).json({ error: `id must be a positive integer, got '${id}'` })
+      }
+      const state = await buildEntitySemanticState(supabase, req.user.userId, type, numericId)
+      if (!state.found) return res.status(404).json({ error: `${type} ${id} not found`, ...state })
+      res.json(state)
+    } catch (error) {
+      logger.error('[LB] entity semantic-state error:', error.message)
+      res.status(500).json({ error: 'Failed to build entity semantic state' })
     }
   })
 
