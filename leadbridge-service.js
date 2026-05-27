@@ -38,6 +38,16 @@ const { getLinkageHealth } = require('./lib/lb-linkage-health')
 const { reconcileTenantWithLb } = require('./lib/lb-reconcile')
 const { runAttributionRecovery } = require('./lib/lb-attribution-recovery')
 const { buildSemanticSummary, buildEntitySemanticState } = require('./lib/lb-semantic-summary')
+// Phase 2B — LB orchestration (additive, feature-flagged)
+const { requireOrchestrationEnabled } = require('./lib/lb-orchestration-feature-flag')
+const {
+  makeAvailabilityHandler,
+  makeBookingRequestHandler,
+  makeBookingCancelHandler,
+  makeHandoffHandler,
+} = require('./lib/lb-orchestration-handlers')
+const { setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B } = require('./lib/lb-linkage-resolver')
+const { updateJobStatus: _updateJobStatus2B } = require('./services/job-status-service')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1466,6 +1476,32 @@ module.exports = (supabase, logger) => {
       res.status(500).json({ error: 'Failed to build entity semantic state' })
     }
   })
+
+  // ══════════════════════════════════════
+  // Phase 2B — LB orchestration endpoints (additive, feature-flagged)
+  //
+  // All four endpoints are gated by isOrchestrationEnabledForTenant
+  // (LB_ORCHESTRATION_ENABLED_TENANTS env var). Tenants not on the list
+  // get a 403. Old sync/reconcile flows are completely untouched.
+  // ══════════════════════════════════════
+  const orchAvailabilityHandler = makeAvailabilityHandler({ supabase, logger })
+  const orchBookingRequestHandler = makeBookingRequestHandler({
+    supabase, logger, setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B,
+  })
+  const orchBookingCancelHandler = makeBookingCancelHandler({
+    supabase, logger,
+    updateJobStatus: (args) => _updateJobStatus2B(supabase, args),
+  })
+  const orchHandoffHandler = makeHandoffHandler({ supabase, logger })
+
+  router.get('/orchestration/availability',
+    authenticateToken, requireOrchestrationEnabled, orchAvailabilityHandler)
+  router.post('/orchestration/booking-request',
+    authenticateToken, requireOrchestrationEnabled, orchBookingRequestHandler)
+  router.post('/orchestration/booking-cancel',
+    authenticateToken, requireOrchestrationEnabled, orchBookingCancelHandler)
+  router.post('/orchestration/handoff',
+    authenticateToken, requireOrchestrationEnabled, orchHandoffHandler)
 
   // ══════════════════════════════════════
   // POST /sync — Sync conversations from LB
