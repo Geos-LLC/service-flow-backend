@@ -25,6 +25,15 @@ const ROOT = path.resolve(__dirname, '..');
 const ALLOWED_INSERT_SITES = new Set([
   // test-sync.js is a developer tool, not prod code (not require'd by server.js)
   'test-sync.js',
+  // lib/lb-orchestration-handlers.js (Phase 2B):
+  // The booking-request handler receives an explicit marketplace_attribution
+  // payload from the LB orchestration layer (lb_external_request_id +
+  // lb_channel + lb_business_id) and stamps these directly on the new job.
+  // This is authoritative linkage from the upstream system — the resolver's
+  // pattern (derive from customer leads) doesn't apply because there is
+  // no SF lead yet; LB IS the lead source. Acquisition is also stamped on
+  // the customer via setCustomerAcquisitionIfMissing in the same path.
+  'lib/lb-orchestration-handlers.js',
 ]);
 
 const SKIP_DIRS = new Set(['node_modules', 'tests', '__tests__', '.git', 'dist', 'build', 'uploads', 'docs', 'migrations', 'scripts', 'lib/zb-cleanup']);

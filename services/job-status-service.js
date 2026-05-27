@@ -34,6 +34,9 @@ const VALID_SOURCES = new Set([
   'system',
   'service_flow',
   'leadbridge',
+  // Phase 2B: LB orchestration handlers update job status via this
+  // source. Distinct from 'leadbridge' (the legacy webhook source).
+  'lb_orchestration',
 ])
 
 // In-process metric counters. Exposed via getMetrics() for the
@@ -190,6 +193,34 @@ async function updateJobStatus(supabase, {
     // update. The status write already committed; a failed outbox
     // insert is exposed in logs + metrics and can be replayed.
     console.error('[LB Outbound] Outbox insert failed:', e.message, { jobId, newStatus, source })
+  }
+
+  // ── Phase 2B parallel emission ────────────────────────────────────
+  // For LB-linked jobs whose tenant is enrolled in orchestration, also
+  // emit a service_* event for the appropriate transition. Runs ALONGSIDE
+  // the legacy job.status_changed emission above; UNIQUE constraint on
+  // event_id absorbs duplicates when a handler also fires explicitly.
+  // Never fails the status update — emission errors are logged + metric.
+  try {
+    const {
+      classifyStatusTransitionForOrchestration,
+      recordOrchestrationOutbound,
+    } = require('../lib/lb-orchestration-events')
+    const orchType = classifyStatusTransitionForOrchestration(previousStatus, newStatus)
+    if (orchType) {
+      const orchRes = await recordOrchestrationOutbound(supabase, {
+        eventType: orchType,
+        job: { ...job, status: newStatus },
+        actor,
+        source,
+        orchestrationSessionId: job.orchestration_session_id || null,
+      })
+      if (orchRes.action === 'enqueued') metrics.orchestration_enqueued = (metrics.orchestration_enqueued || 0) + 1
+      else if (orchRes.action === 'duplicate') metrics.orchestration_dedup = (metrics.orchestration_dedup || 0) + 1
+      else if (orchRes.action === 'skipped') metrics.orchestration_skipped = (metrics.orchestration_skipped || 0) + 1
+    }
+  } catch (e) {
+    console.error('[LB Orch] parallel emission failed:', e.message, { jobId, newStatus, source })
   }
 
   return {
