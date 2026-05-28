@@ -48,6 +48,7 @@ const { resolveLbLinkage, linkageFromParentJob, logResolution: logLbLinkage, REA
 const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-metrics');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
+const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
@@ -37837,6 +37838,17 @@ app.listen(PORT, async () => {
     startZbOutboundDrainer({ supabase, logger });
   } catch (e) {
     logger.error(`[ZB Outbound] Failed to start drainer: ${e.message}`);
+  }
+
+  // Periodic sweep for orchestration credentials whose 5-minute
+  // rotation grace has expired. No-ops on every tick while
+  // lb_orchestration_credentials has no `rotating` rows (current dark-
+  // launch state). Companion to the lazy cleanup in
+  // verifyCredentialToken.
+  try {
+    startLbOrchestrationGraceSweeper({ supabase, logger });
+  } catch (e) {
+    logger.error(`[Orch Grace Sweeper] Failed to start: ${e.message}`);
   }
 });
 } // end if (require.main === module)
