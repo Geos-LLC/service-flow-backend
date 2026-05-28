@@ -298,6 +298,13 @@ describe('webhook drainer', () => {
     expect(deliveries[0].headers['X-SF-Signature']).toMatch(/^[0-9a-f]{64}$/);
     expect(deliveries[0].headers['X-SF-Event-Type']).toBe('connection.connected');
     expect(deliveries[0].headers['X-SF-Tenant-Id']).toBe('2');
+    // Option 1 contract: signature MUST recompute over `${X-SF-Timestamp}.${body}`,
+    // not body-only. Decrypt the snapshotted secret + reproduce LB-side.
+    const { decryptIntegrationSecret } = require('../services/lb-encryption');
+    const { signWebhookCanonical } = require('../lib/lb-orchestration-outbound-delivery');
+    const plaintextSecret = decryptIntegrationSecret(store._rows[OUTBOX_TABLE][0].webhook_secret_enc);
+    const expectedSig = signWebhookCanonical(plaintextSecret, deliveries[0].headers['X-SF-Timestamp'], deliveries[0].body);
+    expect(deliveries[0].headers['X-SF-Signature']).toBe(expectedSig);
     expect(store._rows[OUTBOX_TABLE][0].state).toBe('sent');
     expect(store._rows[OUTBOX_TABLE][0].sent_at).toBeTruthy();
   });
