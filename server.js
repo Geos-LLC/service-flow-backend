@@ -49,6 +49,7 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
+const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
@@ -37849,6 +37850,18 @@ app.listen(PORT, async () => {
     startLbOrchestrationGraceSweeper({ supabase, logger });
   } catch (e) {
     logger.error(`[Orch Grace Sweeper] Failed to start: ${e.message}`);
+  }
+
+  // S4 — Orchestration webhook outbox drainer.
+  // Delivers connection.connected / credential.rotated / connection.revoked
+  // events to the tenant's webhook URL, signed with the per-tenant
+  // webhook secret. No-ops on every tick while lb_orchestration_outbox
+  // has no pending rows (current dark state — no tenant has yet
+  // performed the OAuth handshake).
+  try {
+    startLbOrchestrationWebhookDrainer({ supabase, logger });
+  } catch (e) {
+    logger.error(`[Orch Webhook Drainer] Failed to start: ${e.message}`);
   }
 });
 } // end if (require.main === module)
