@@ -146,11 +146,27 @@ async function drainOnce(supabase, opts) {
       now:            dispatchNow,            // ← regenerated per attempt
     });
 
+    // Wire-level diagnostic: log the EXACT value of X-SF-Timestamp + first 16 chars
+    // of X-SF-Signature that we're about to put on the wire. Process-time also
+    // captured so we can compare against LB's receive time to bound network +
+    // proxy delay. Body bytes captured to verify the same body is signed and
+    // sent.
+    try {
+      logger.log(`[orch-webhook-drainer] DISPATCH id=${row.id} event=${row.event_id} attempt=${(row.attempts || 0) + 1} wire_ts=${headers['X-SF-Timestamp']} sig_head=${headers['X-SF-Signature'].slice(0, 16)} body_bytes=${Buffer.byteLength(body, 'utf8')} process_now=${new Date().toISOString()}`);
+    } catch (_) {}
+
     const delivery = await deliver({
       url:      row.webhook_url,
       headers,
       body,
     });
+
+    // Post-delivery: log the response status + time. Together with the DISPATCH
+    // line above, this gives us the exact wire-clock-time pair (SF-side ts vs
+    // LB-side response time) so we can prove drift came from us vs network.
+    try {
+      logger.log(`[orch-webhook-drainer] RESPONSE id=${row.id} event=${row.event_id} attempt=${(row.attempts || 0) + 1} resp_status=${delivery.status || 'network_error'} resp_received_at=${new Date().toISOString()}`);
+    } catch (_) {}
 
     if (delivery.ok) {
       const { error: updErr } = await supabase
