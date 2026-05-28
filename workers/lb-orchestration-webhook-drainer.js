@@ -129,6 +129,11 @@ async function drainOnce(supabase, opts) {
     }
 
     const body = JSON.stringify(row.payload_json);
+    // CRITICAL: dispatchNow is generated HERE, immediately before signing
+    // and delivery. Regenerated on every retry (each tick that picks up
+    // this row gets a fresh Date). This is what makes X-SF-Timestamp
+    // pass LB's ±300s window check on every attempt.
+    const dispatchNow = new Date();
     const headers = buildOutboundHeaders({
       secret,
       body,
@@ -138,6 +143,7 @@ async function drainOnce(supabase, opts) {
       kid:            getCurrentKid(),
       subscriptionId: row.subscription_id || undefined,
       stateRef:       row.state_ref || undefined,
+      now:            dispatchNow,            // ← regenerated per attempt
     });
 
     const delivery = await deliver({
@@ -159,7 +165,7 @@ async function drainOnce(supabase, opts) {
       if (updErr) {
         try { logger.warn(`[orch-webhook-drainer] sent-update failed id=${row.id}: ${updErr.message}`); } catch (_) {}
       } else {
-        try { logger.log(`[orch-webhook-drainer] delivered id=${row.id} event=${row.event_id} status=${delivery.status}`); } catch (_) {}
+        try { logger.log(`[orch-webhook-drainer] delivered id=${row.id} event=${row.event_id} ts=${dispatchNow.toISOString()} attempt=${(row.attempts || 0) + 1} status=${delivery.status}`); } catch (_) {}
       }
       succeeded++;
       continue;
@@ -169,7 +175,7 @@ async function drainOnce(supabase, opts) {
     const newAttempts = (row.attempts || 0) + 1;
     if (newAttempts >= maxAttempts) {
       await markPermanentFailure(supabase, row, summarizeError(delivery), 'dlq');
-      try { logger.warn(`[orch-webhook-drainer] dlq id=${row.id} event=${row.event_id} attempts=${newAttempts}`); } catch (_) {}
+      try { logger.warn(`[orch-webhook-drainer] dlq id=${row.id} event=${row.event_id} ts=${dispatchNow.toISOString()} attempts=${newAttempts}`); } catch (_) {}
       dlqd++;
       continue;
     }
@@ -187,7 +193,8 @@ async function drainOnce(supabase, opts) {
     if (retryErr) {
       try { logger.warn(`[orch-webhook-drainer] retry-update failed id=${row.id}: ${retryErr.message}`); } catch (_) {}
     } else {
-      try { logger.log(`[orch-webhook-drainer] retry-scheduled id=${row.id} event=${row.event_id} attempts=${newAttempts} delay_ms=${delayMs}`); } catch (_) {}
+      // Surface ts + attempt # so Loki can prove retries get fresh timestamps.
+      try { logger.log(`[orch-webhook-drainer] retry-scheduled id=${row.id} event=${row.event_id} ts=${dispatchNow.toISOString()} attempt=${newAttempts} delay_ms=${delayMs} status=${delivery.status || 'network'}`); } catch (_) {}
     }
     failed++;
   }

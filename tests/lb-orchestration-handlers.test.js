@@ -58,6 +58,7 @@ function makeStub({ jobs = [], customers = [], attempts = [], priorAttempt = nul
       const chain = {
         select() { return chain; },
         eq(k, v) { filter[k] = v; return chain; },
+        neq(k, v) { filter[`__neq_${k}`] = v; return chain; },
         ilike() { return chain; },
         gte(k, v) { filter[`__gte_${k}`] = v; return chain; },
         lte(k, v) { filter[`__lte_${k}`] = v; return chain; },
@@ -136,6 +137,9 @@ function makeStub({ jobs = [], customers = [], attempts = [], priorAttempt = nul
         const c = k.slice(6); if (new Date(r[c]).getTime() < new Date(v).getTime()) return false;
       } else if (k.startsWith('__lte_')) {
         const c = k.slice(6); if (new Date(r[c]).getTime() > new Date(v).getTime()) return false;
+      } else if (k.startsWith('__neq_')) {
+        const c = k.slice(6);
+        if (String(r[c]) === String(v)) return false;
       } else if (k.startsWith('__not_')) {
         const c = k.slice(6);
         if (v.op === 'in') {
