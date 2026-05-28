@@ -254,26 +254,54 @@ describe('lb-orchestration-oauth-codes', () => {
 // ─────────────────────────────────────────────────────────────────
 // 3. Outbound delivery (signing, jitter, headers)
 // ─────────────────────────────────────────────────────────────────
-describe('outbound delivery', () => {
-  test('signWebhookBody is deterministic and HMAC-SHA256 hex', () => {
-    const a = delivery.signWebhookBody('secret', 'body');
-    const b = delivery.signWebhookBody('secret', 'body');
+describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
+  test('buildCanonicalSigningString concatenates with literal dot', () => {
+    const s = delivery.buildCanonicalSigningString('2026-05-28T12:00:00.000Z', '{"x":1}');
+    expect(s).toBe('2026-05-28T12:00:00.000Z.{"x":1}');
+  });
+
+  test('buildCanonicalSigningString rejects missing timestamp', () => {
+    expect(() => delivery.buildCanonicalSigningString('', '{}')).toThrow(/timestamp/);
+  });
+
+  test('signWebhookCanonical is deterministic + HMAC-SHA256 hex', () => {
+    const a = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:00.000Z', '{"x":1}');
+    const b = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:00.000Z', '{"x":1}');
     expect(a).toBe(b);
     expect(a).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  test('signWebhookBody is sensitive to body changes', () => {
-    expect(delivery.signWebhookBody('s', 'body')).not.toBe(delivery.signWebhookBody('s', 'body!'));
+  test('signWebhookCanonical: timestamp change → different signature (binds timestamp into sig)', () => {
+    const a = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:00.000Z', '{"x":1}');
+    const b = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:01.000Z', '{"x":1}');
+    expect(a).not.toBe(b);
   });
 
-  test('signWebhookBody is sensitive to secret changes', () => {
-    expect(delivery.signWebhookBody('s1', 'body')).not.toBe(delivery.signWebhookBody('s2', 'body'));
+  test('signWebhookCanonical: body change → different signature', () => {
+    const a = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:00.000Z', '{"x":1}');
+    const b = delivery.signWebhookCanonical('secret', '2026-05-28T12:00:00.000Z', '{"x":2}');
+    expect(a).not.toBe(b);
   });
 
-  test('buildOutboundHeaders includes required headers', () => {
+  test('signWebhookCanonical: secret change → different signature', () => {
+    const a = delivery.signWebhookCanonical('s1', '2026-05-28T12:00:00.000Z', '{"x":1}');
+    const b = delivery.signWebhookCanonical('s2', '2026-05-28T12:00:00.000Z', '{"x":1}');
+    expect(a).not.toBe(b);
+  });
+
+  test('signWebhookCanonical matches the manual HMAC over `${ts}.${body}`', () => {
+    const crypto = require('crypto');
+    const ts = '2026-05-28T12:00:00.000Z';
+    const body = '{"event_id":"x"}';
+    const expected = crypto.createHmac('sha256', 'secret').update(`${ts}.${body}`, 'utf8').digest('hex');
+    expect(delivery.signWebhookCanonical('secret', ts, body)).toBe(expected);
+  });
+
+  test('buildOutboundHeaders signs `${X-SF-Timestamp}.${body}` (verifies LB-side regen reproduces)', () => {
+    const body = '{"event_id":"x"}';
     const h = delivery.buildOutboundHeaders({
       secret:    'shh',
-      body:      '{"event_id":"x"}',
+      body,
       eventId:   'x',
       eventType: 'connection.connected',
       tenantId:  42,
@@ -284,12 +312,27 @@ describe('outbound delivery', () => {
     });
     expect(h['X-SF-Signature']).toMatch(/^[0-9a-f]{64}$/);
     expect(h['X-SF-Timestamp']).toBe('2026-05-28T12:00:00.000Z');
+    // LB-side reconstruction: take the headers + body verbatim, recompute.
+    const expectedSig = delivery.signWebhookCanonical('shh', h['X-SF-Timestamp'], body);
+    expect(h['X-SF-Signature']).toBe(expectedSig);
+    // Other headers
     expect(h['X-SF-Event-Id']).toBe('x');
     expect(h['X-SF-Event-Type']).toBe('connection.connected');
     expect(h['X-SF-Tenant-Id']).toBe('42');
     expect(h['X-SF-Kid']).toBe('k1');
     expect(h['X-LB-Subscription-Id']).toBe('sub1');
     expect(h['X-LB-State-Ref']).toBe('sr1');
+  });
+
+  test('legacy signWebhookBody export still functional (body-only HMAC, not used by header builder)', () => {
+    // Kept until all in-process callers migrate. Asserts the legacy
+    // and canonical paths are DIFFERENT — proves header builder uses
+    // the new one.
+    const body = '{"x":1}';
+    const ts = '2026-05-28T12:00:00.000Z';
+    const legacy = delivery.signWebhookBody('secret', body);
+    const canonical = delivery.signWebhookCanonical('secret', ts, body);
+    expect(legacy).not.toBe(canonical);
   });
 
   test('nextAttemptDelayMs follows base schedule with ±15% jitter (using fixed rng)', () => {
@@ -371,7 +414,7 @@ describe('event builders', () => {
 // 5. Provisioning payload
 // ─────────────────────────────────────────────────────────────────
 describe('provisioning payload', () => {
-  test('shape includes all required v1 blocks (refinement 4)', () => {
+  test('shape includes all required v1 blocks (refinement 4) + Option 1 signing metadata', () => {
     process.env.SF_SOURCE_INSTANCE = 'sf-test';
     process.env.SF_API_REGION = 'us-east-1';
     const p = payload.buildProvisioningPayload({
@@ -392,6 +435,9 @@ describe('provisioning payload', () => {
     expect(p.event_types).toContain('credential.rotated');
     expect(p.event_types).toContain('connection.revoked');
     expect(p.signature_metadata.algorithm).toBe('hmac-sha256-hex');
+    // Option 1 signing — timestamp bound into signature
+    expect(p.signature_metadata.signed_string_format).toBe('${X-SF-Timestamp}.${raw_body}');
+    expect(p.signature_metadata.body_canonical_form).toBe('timestamp_dot_raw_utf8_request_body');
     expect(p.signature_metadata.max_clock_skew_seconds).toBe(300);
     expect(p.webhook.url).toBe('https://lb/h');
     expect(p.webhook.secret_set).toBe(true);
