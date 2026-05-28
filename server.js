@@ -43051,6 +43051,27 @@ function authenticateAdmin(req, res, next) {
   });
 }
 
+// S3A — Internal orchestration credential admin router. Mounts:
+//   POST /api/internal/lb-orchestration/credentials/mint
+//   POST /api/internal/lb-orchestration/credentials/rotate
+//   POST /api/internal/lb-orchestration/credentials/revoke
+//   GET  /api/internal/lb-orchestration/credentials/status?user_id=N
+// Double-gated: authenticateAdmin + requireAdminFlag(ENABLE_ADMIN_ORCH_CREDENTIALS).
+// Flag defaults OFF; flip via Railway env per-environment when minting is needed.
+// NOT mounted under /api/integrations/leadbridge to keep this surface clearly
+// admin-only — tenant-facing routers must never expose these.
+try {
+  const { makeAdminCredentialRouter } = require('./lib/lb-orchestration-admin-router');
+  app.use('/api/internal/lb-orchestration', makeAdminCredentialRouter({
+    supabase, logger,
+    authenticateAdmin,
+    requireAdminFlag,
+    flagName: FLAGS.ENABLE_ADMIN_ORCH_CREDENTIALS,
+  }));
+} catch (e) {
+  logger.error(`[Orch Admin Router] Failed to mount: ${e.message}`);
+}
+
 // GET /api/admin/global-settings — Sigcore connection config
 app.get('/api/admin/global-settings', authenticateAdmin, async (req, res) => {
   try {
