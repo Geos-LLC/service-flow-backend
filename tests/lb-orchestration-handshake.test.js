@@ -326,6 +326,48 @@ describe('webhook drainer', () => {
     expect(Date.parse(row.next_attempt_at)).toBeGreaterThan(Date.now() + 40_000);   // ~1 minute scheduled
   });
 
+  test('retry regression: attempt 2 produces FRESH X-SF-Timestamp + FRESH X-SF-Signature (not reused from attempt 1)', async () => {
+    const store = makeStore({ settings: [{ user_id: 2 }] });
+    await handshake.performHandshake(store, {
+      userId: 2, webhookUrl: 'https://lb.example.com/h', webhookSecret: VALID_SECRET, logger: SILENT,
+    });
+
+    // Capture headers on every delivery attempt.
+    const calls = [];
+    const failTwice = async ({ headers, body }) => {
+      calls.push({ ts: headers['X-SF-Timestamp'], sig: headers['X-SF-Signature'], body });
+      return { ok: false, status: 503, transient: true, response_body: 'lb_down' };
+    };
+    const d = drainer.startDrainer({ supabase: store, logger: SILENT, deliver: failTwice, tickMs: 60_000, rng: () => 0.5 });
+
+    // Tick 1 → attempt 1 fires, fails, retry scheduled at +1m.
+    await d._tickForTest();
+    expect(calls).toHaveLength(1);
+    expect(store._rows[OUTBOX_TABLE][0].attempts).toBe(1);
+
+    // Force the row due immediately so tick 2 picks it up without waiting 1min.
+    store._rows[OUTBOX_TABLE][0].next_attempt_at = new Date(0).toISOString();
+    // Advance wall clock by 1ms to guarantee Date.now() differs (Jest is fast).
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Tick 2 → attempt 2 fires with FRESH timestamp + FRESH signature.
+    await d._tickForTest();
+    d.stop();
+    expect(calls).toHaveLength(2);
+
+    // CRITICAL assertions — these are exactly the conditions LB observed
+    // failing on in staging. If either is true again, LB rejects with
+    // timestamp_drift / bad_signature.
+    expect(calls[1].ts).not.toBe(calls[0].ts);   // X-SF-Timestamp regenerated
+    expect(calls[1].sig).not.toBe(calls[0].sig);  // X-SF-Signature regenerated
+    expect(calls[1].body).toBe(calls[0].body);    // body unchanged (same event)
+
+    // Both timestamps must be within 5s of test wall clock (i.e. truly "now-ish")
+    const now = Date.now();
+    expect(Math.abs(now - Date.parse(calls[0].ts))).toBeLessThan(5_000);
+    expect(Math.abs(now - Date.parse(calls[1].ts))).toBeLessThan(5_000);
+  });
+
   test('after MAX_ATTEMPTS failures → state=dlq', async () => {
     const store = makeStore({ settings: [{ user_id: 2 }] });
     await handshake.performHandshake(store, {

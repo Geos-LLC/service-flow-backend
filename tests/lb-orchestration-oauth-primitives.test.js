@@ -324,6 +324,33 @@ describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
     expect(h['X-LB-State-Ref']).toBe('sr1');
   });
 
+  test('buildOutboundHeaders REJECTS missing args.now (defensive: prevents stale-timestamp regression)', () => {
+    const baseArgs = {
+      secret: 'shh', body: '{}', eventId: 'x',
+      eventType: 'connection.connected', tenantId: 42,
+    };
+    // No `now` provided — should throw.
+    expect(() => delivery.buildOutboundHeaders(baseArgs)).toThrow(/now/);
+    // `now` not a Date — should throw.
+    expect(() => delivery.buildOutboundHeaders({ ...baseArgs, now: '2026-05-28T12:00:00Z' })).toThrow(/now/);
+    // Invalid Date — should throw.
+    expect(() => delivery.buildOutboundHeaders({ ...baseArgs, now: new Date('not-a-date') })).toThrow(/now/);
+  });
+
+  test('two successive buildOutboundHeaders calls with DIFFERENT `now` produce DIFFERENT timestamp AND DIFFERENT signature', () => {
+    const baseArgs = {
+      secret: 'shh', body: '{"event_id":"x"}', eventId: 'x',
+      eventType: 'connection.connected', tenantId: 42, kid: 'k1',
+    };
+    const h1 = delivery.buildOutboundHeaders({ ...baseArgs, now: new Date('2026-05-28T12:00:00Z') });
+    const h2 = delivery.buildOutboundHeaders({ ...baseArgs, now: new Date('2026-05-28T12:01:00Z') });
+    expect(h1['X-SF-Timestamp']).not.toBe(h2['X-SF-Timestamp']);
+    expect(h1['X-SF-Signature']).not.toBe(h2['X-SF-Signature']);
+    // Each signature still self-reproduces with its own timestamp.
+    expect(h1['X-SF-Signature']).toBe(delivery.signWebhookCanonical(baseArgs.secret, h1['X-SF-Timestamp'], baseArgs.body));
+    expect(h2['X-SF-Signature']).toBe(delivery.signWebhookCanonical(baseArgs.secret, h2['X-SF-Timestamp'], baseArgs.body));
+  });
+
   test('legacy signWebhookBody export still functional (body-only HMAC, not used by header builder)', () => {
     // Kept until all in-process callers migrate. Asserts the legacy
     // and canonical paths are DIFFERENT — proves header builder uses
