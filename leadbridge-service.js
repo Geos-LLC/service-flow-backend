@@ -39,7 +39,12 @@ const { reconcileTenantWithLb } = require('./lib/lb-reconcile')
 const { runAttributionRecovery } = require('./lib/lb-attribution-recovery')
 const { buildSemanticSummary, buildEntitySemanticState } = require('./lib/lb-semantic-summary')
 // Phase 2B — LB orchestration (additive, feature-flagged)
-const { requireOrchestrationEnabled } = require('./lib/lb-orchestration-feature-flag')
+// S2: switch the 4 endpoints to (a) auth dispatcher (user JWT OR
+// orchestration token), and (b) layered enablement (env override OR
+// connection-state + active credential). With zero credentials and
+// empty env, behavior is identical to today (403 for valid user JWT).
+const { makeRequireOrchestrationEnabled } = require('./lib/lb-orchestration-feature-flag')
+const { makeOrchestrationAuthDispatcher } = require('./lib/lb-orchestration-auth')
 const {
   makeAvailabilityHandler,
   makeBookingRequestHandler,
@@ -1480,9 +1485,11 @@ module.exports = (supabase, logger) => {
   // ══════════════════════════════════════
   // Phase 2B — LB orchestration endpoints (additive, feature-flagged)
   //
-  // All four endpoints are gated by isOrchestrationEnabledForTenant
-  // (LB_ORCHESTRATION_ENABLED_TENANTS env var). Tenants not on the list
-  // get a 403. Old sync/reconcile flows are completely untouched.
+  // S2: each route runs auth dispatcher (user JWT or sfo_v1 token) then
+  // layered enablement (env override or connection-state + live cred).
+  // With zero credentials and empty env, behavior is identical to today
+  // (valid user JWT → 403 orchestration_not_enabled_for_tenant).
+  // Old sync/reconcile flows are completely untouched.
   // ══════════════════════════════════════
   const orchAvailabilityHandler = makeAvailabilityHandler({ supabase, logger })
   const orchBookingRequestHandler = makeBookingRequestHandler({
@@ -1494,14 +1501,19 @@ module.exports = (supabase, logger) => {
   })
   const orchHandoffHandler = makeHandoffHandler({ supabase, logger })
 
+  const orchAuthDispatcher = makeOrchestrationAuthDispatcher({
+    authenticateToken, supabase, logger,
+  })
+  const layeredRequireOrchestrationEnabled = makeRequireOrchestrationEnabled({ supabase })
+
   router.get('/orchestration/availability',
-    authenticateToken, requireOrchestrationEnabled, orchAvailabilityHandler)
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchAvailabilityHandler)
   router.post('/orchestration/booking-request',
-    authenticateToken, requireOrchestrationEnabled, orchBookingRequestHandler)
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingRequestHandler)
   router.post('/orchestration/booking-cancel',
-    authenticateToken, requireOrchestrationEnabled, orchBookingCancelHandler)
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingCancelHandler)
   router.post('/orchestration/handoff',
-    authenticateToken, requireOrchestrationEnabled, orchHandoffHandler)
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchHandoffHandler)
 
   // ══════════════════════════════════════
   // POST /sync — Sync conversations from LB
