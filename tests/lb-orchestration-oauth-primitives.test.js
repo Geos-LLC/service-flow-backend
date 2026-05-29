@@ -297,8 +297,11 @@ describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
     expect(delivery.signWebhookCanonical('secret', ts, body)).toBe(expected);
   });
 
-  test('buildOutboundHeaders signs `${X-SF-Timestamp}.${body}` (verifies LB-side regen reproduces)', () => {
+  test('buildOutboundHeaders signs `${X-SF-Timestamp}.${body}` with EPOCH SECONDS ts (verifies LB-side regen reproduces)', () => {
     const body = '{"event_id":"x"}';
+    const fixedNow = new Date('2026-05-28T12:00:00Z');
+    const expectedEpochSec = Math.floor(fixedNow.getTime() / 1000);   // e.g. 1779976800
+
     const h = delivery.buildOutboundHeaders({
       secret:    'shh',
       body,
@@ -308,10 +311,14 @@ describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
       kid:       'k1',
       subscriptionId: 'sub1',
       stateRef:  'sr1',
-      now:       new Date('2026-05-28T12:00:00Z'),
+      now:       fixedNow,
     });
     expect(h['X-SF-Signature']).toMatch(/^[0-9a-f]{64}$/);
-    expect(h['X-SF-Timestamp']).toBe('2026-05-28T12:00:00.000Z');
+    // X-SF-Timestamp is Unix epoch seconds AS A STRING (parseInt-friendly).
+    // NOT ISO 8601 — LB's verifier parseInts the header value and ISO
+    // strings parseInt to "2026" which breaks the drift window.
+    expect(h['X-SF-Timestamp']).toBe(String(expectedEpochSec));
+    expect(h['X-SF-Timestamp']).toMatch(/^\d{10}$/);   // 10-digit epoch seconds
     // LB-side reconstruction: take the headers + body verbatim, recompute.
     const expectedSig = delivery.signWebhookCanonical('shh', h['X-SF-Timestamp'], body);
     expect(h['X-SF-Signature']).toBe(expectedSig);
@@ -322,6 +329,21 @@ describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
     expect(h['X-SF-Kid']).toBe('k1');
     expect(h['X-LB-Subscription-Id']).toBe('sub1');
     expect(h['X-LB-State-Ref']).toBe('sr1');
+  });
+
+  test('regression: X-SF-Timestamp NEVER takes ISO 8601 form', () => {
+    const h = delivery.buildOutboundHeaders({
+      secret: 'shh', body: '{}', eventId: 'x',
+      eventType: 'connection.connected', tenantId: 42,
+      now: new Date('2026-05-28T12:00:00Z'),
+    });
+    expect(h['X-SF-Timestamp']).not.toContain('T');
+    expect(h['X-SF-Timestamp']).not.toContain('Z');
+    expect(h['X-SF-Timestamp']).not.toContain('-');
+    expect(h['X-SF-Timestamp']).not.toContain(':');
+    expect(h['X-SF-Timestamp']).not.toContain('.');
+    // parseInt-safe (the LB-side parse must yield the actual epoch seconds, not a year prefix).
+    expect(parseInt(h['X-SF-Timestamp'], 10)).toBe(Math.floor(new Date('2026-05-28T12:00:00Z').getTime() / 1000));
   });
 
   test('buildOutboundHeaders REJECTS missing args.now (defensive: prevents stale-timestamp regression)', () => {
@@ -349,6 +371,8 @@ describe('outbound delivery — signing (Option 1: timestamp.body)', () => {
     // Each signature still self-reproduces with its own timestamp.
     expect(h1['X-SF-Signature']).toBe(delivery.signWebhookCanonical(baseArgs.secret, h1['X-SF-Timestamp'], baseArgs.body));
     expect(h2['X-SF-Signature']).toBe(delivery.signWebhookCanonical(baseArgs.secret, h2['X-SF-Timestamp'], baseArgs.body));
+    // Both timestamps are epoch seconds (10-digit numeric strings) — exactly 60s apart.
+    expect(parseInt(h2['X-SF-Timestamp'], 10) - parseInt(h1['X-SF-Timestamp'], 10)).toBe(60);
   });
 
   test('legacy signWebhookBody export still functional (body-only HMAC, not used by header builder)', () => {
@@ -465,6 +489,9 @@ describe('provisioning payload', () => {
     // Option 1 signing — timestamp bound into signature
     expect(p.signature_metadata.signed_string_format).toBe('${X-SF-Timestamp}.${raw_body}');
     expect(p.signature_metadata.body_canonical_form).toBe('timestamp_dot_raw_utf8_request_body');
+    // X-SF-Timestamp is Unix epoch seconds (string), NOT ISO 8601
+    expect(p.signature_metadata.timestamp_format).toBe('unix_seconds');
+    expect(p.signature_metadata.timestamp_example).toMatch(/^\d{10}$/);
     expect(p.signature_metadata.max_clock_skew_seconds).toBe(300);
     expect(p.webhook.url).toBe('https://lb/h');
     expect(p.webhook.secret_set).toBe(true);
