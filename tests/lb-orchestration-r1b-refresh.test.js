@@ -301,7 +301,7 @@ describe('performMarkForRotation wrapper', () => {
     expect(r.ok).toBe(true);
     expect(r.credentialId).toBeDefined();
     expect(r.needsRefreshAt).toMatch(/T/);
-    expect(r.event_id).toMatch(/^evt_credential_rotated_2_/);
+    expect(r.event_id).toMatch(/^evt_credential_rotated_2_\d+_refresh_\d{10}$/);
     expect(r.event_enqueued).toBe(true);
 
     const outboxRow = store._rows[OUTBOX_TABLE][0];
@@ -414,11 +414,12 @@ describe('performRefresh wrapper', () => {
 // 5. buildCredentialRotationRequiredEvent
 // ─────────────────────────────────────────────────────────────────
 describe('buildCredentialRotationRequiredEvent', () => {
-  test('envelope shape + refresh_required flag', () => {
+  test('envelope shape + refresh_required flag + event_id format', () => {
     const e = events.buildCredentialRotationRequiredEvent({
       tenantId: 2, currentCredentialId: 173, reason: 'operator_request',
+      tsSeconds: 1780011918,                                   // injectable for determinism
     });
-    expect(e.event_id).toBe('evt_credential_rotated_2_173');
+    expect(e.event_id).toBe('evt_credential_rotated_2_173_refresh_1780011918');
     expect(e.event_type).toBe('credential.rotated');
     expect(e.sf_tenant_id).toBe(2);
     expect(e.source).toBe('service_flow_orchestration');
@@ -427,6 +428,28 @@ describe('buildCredentialRotationRequiredEvent', () => {
     expect(e.data.previous_grace_expires_at).toBeNull();
     expect(e.data.reason).toBe('operator_request');
     expect(e.data.refresh_endpoint).toBe('/api/integrations/leadbridge/orchestration/credentials/refresh');
+  });
+
+  test('event_id default ts uses current epoch seconds', () => {
+    const before = Math.floor(Date.now() / 1000);
+    const e = events.buildCredentialRotationRequiredEvent({
+      tenantId: 2, currentCredentialId: 173,
+    });
+    const after = Math.floor(Date.now() / 1000);
+    expect(e.event_id).toMatch(/^evt_credential_rotated_2_173_refresh_\d{10}$/);
+    const tsInId = parseInt(e.event_id.split('_').pop(), 10);
+    expect(tsInId).toBeGreaterThanOrEqual(before);
+    expect(tsInId).toBeLessThanOrEqual(after);
+  });
+
+  test('two consecutive calls with different tsSeconds produce different event_ids', () => {
+    const e1 = events.buildCredentialRotationRequiredEvent({
+      tenantId: 2, currentCredentialId: 173, tsSeconds: 1780011918,
+    });
+    const e2 = events.buildCredentialRotationRequiredEvent({
+      tenantId: 2, currentCredentialId: 173, tsSeconds: 1780011919,
+    });
+    expect(e1.event_id).not.toBe(e2.event_id);
   });
 
   test('throws on missing required fields', () => {
