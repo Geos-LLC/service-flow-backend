@@ -61,6 +61,10 @@ const { buildProvisioningPayload } = require('./lib/lb-orchestration-provisionin
 const { attachCredentialToCode } = lbOrchOauthCodes
 // R1B — LB-facing pull-style credential refresh.
 const { performRefresh: orchPerformRefresh } = lbOrchHandshake
+// Direct (email/password) orchestration provisioning — supersedes the
+// OAuth browser-redirect path for tenant-driven Connect. See
+// lib/lb-orchestration-direct-provision.js for the contract.
+const lbOrchDirectProvision = require('./lib/lb-orchestration-direct-provision')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -951,68 +955,60 @@ module.exports = (supabase, logger) => {
         logger.warn(`[LB] Inbound subscription NOT registered for user ${userId}: ${inboundResult.reason}`)
       }
 
-      // S4 — Optional orchestration handshake (manual canary path).
-      // Triggered when the caller supplies a `webhook` block in the
-      // request body. Augments the existing LB connect with the
-      // orchestration credential + enablement + outbound event.
-      let orchestrationProvisioning = null
-      if (req.body?.webhook && typeof req.body.webhook === 'object') {
-        const wh = req.body.webhook
-        if (!wh.url || !wh.secret) {
-          // Don't fail the connect — the LB direction is already wired.
-          // Just surface the issue so the caller can retry.
-          logger.warn(`[LB] /connect webhook block missing url/secret for user ${userId}`)
+      // Phase 2C — Orchestration provisioning (server-to-server).
+      // After the legacy connect succeeds, run the new SF→LB direct
+      // provisioning chain: verify-credentials → mint SF cred → LB
+      // provision → store webhook + enable + enqueue connection.connected.
+      //
+      // Email/password are forwarded to LB ONCE for verify-credentials
+      // and never logged or persisted. On any failure here we surface
+      // `orchestration_status='failed'` in the response so the UI can
+      // show a Retry banner. The legacy lead-sync path above remains
+      // committed regardless — message ingest keeps working.
+      let orchestration = { status: 'not_attempted' }
+      try {
+        // Lookup tenant info for the LB provisioning payload metadata.
+        const { data: sfUser } = await supabase.from('users').select('first_name,last_name,email,business_name').eq('id', userId).maybeSingle()
+        const sfTenantName = sfUser
+          ? (sfUser.business_name || [sfUser.first_name, sfUser.last_name].filter(Boolean).join(' ') || sfUser.email)
+          : null
+        const sfTenantEmail = sfUser ? sfUser.email : null
+
+        const dp = await lbOrchDirectProvision.performDirectProvision(supabase, {
+          tenantId:    userId,
+          lbEmail:     email,
+          lbPassword:  password,
+          tenantName:  sfTenantName,
+          tenantEmail: sfTenantEmail,
+          createdBy:   'connect_direct',
+          logger,
+        })
+        if (dp.ok) {
+          orchestration = {
+            status:           'connected',
+            credential_id:    dp.credential.credentialId,
+            token_prefix:     dp.credential.tokenPrefix,
+            kid:              dp.credential.kid,
+            issued_at:        dp.credential.issuedAt,
+            expires_at:       dp.credential.expiresAt,
+            lb_account_id:    dp.lbAccountId,
+            lb_account_name:  dp.lbAccountName,
+            subscription_id:  dp.subscriptionId,
+            event_id:         dp.event_id,
+            event_enqueued:   dp.event_enqueued,
+          }
         } else {
-          // For the canary path, allow any LB host (no client_id provided
-          // means we cannot enforce host-suffix check via lb_oauth_clients).
-          // We still require https + valid hostname.
-          let okUrl = false
-          try {
-            const u = new URL(wh.url)
-            okUrl = u.protocol === 'https:' && !!u.hostname && u.hostname.length > 0
-          } catch (_) {}
-          const secretCheck = lbOrchClients.verifyWebhookSecret(wh.secret)
-          if (!okUrl) {
-            logger.warn(`[LB] /connect webhook url invalid for user ${userId}`)
-          } else if (!secretCheck.ok) {
-            logger.warn(`[LB] /connect webhook secret invalid (${secretCheck.reason}) for user ${userId}`)
-          } else {
-            const handshake = await lbOrchHandshake.performHandshake(supabase, {
-              userId,
-              webhookUrl:     wh.url,
-              webhookSecret:  wh.secret,
-              subscriptionId: wh.subscription_id || null,
-              stateRef:       wh.state_ref || null,
-              createdBy:      'connect_canary',
-              logger,
-            })
-            if (handshake.ok) {
-              // Lookup tenant info for the provisioning payload.
-              const { data: user } = await supabase.from('users').select('first_name,last_name,email').eq('id', userId).maybeSingle()
-              const sfTenantName = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email : null
-              orchestrationProvisioning = buildProvisioningPayload({
-                tenant: { sf_tenant_id: userId, sf_tenant_name: sfTenantName, sf_workspace_id: userId },
-                credential: {
-                  token:        handshake.credential.token,
-                  token_prefix: handshake.credential.tokenPrefix,
-                  kid:          handshake.credential.kid,
-                  scope:        'lb_orchestration',
-                  issued_at:    handshake.credential.issuedAt,
-                  expires_at:   handshake.credential.expiresAt,
-                },
-                webhook: {
-                  url:    wh.url,
-                  set_at: handshake.settings && handshake.settings.lb_orchestration_webhook_set_at,
-                  subscription_id: wh.subscription_id || null,
-                  state_ref:       wh.state_ref || null,
-                },
-              })
-              logger.log(`[LB] /connect canary handshake ok user=${userId} cred=${handshake.credential.credentialId} prefix=${handshake.credential.tokenPrefix}`)
-            } else {
-              logger.warn(`[LB] /connect canary handshake failed user=${userId} reason=${handshake.reason}`)
-            }
+          orchestration = {
+            status:            'failed',
+            reason:            dp.reason,
+            step:              dp.step,
+            http_status:       dp.status || null,
+            error_description: dp.errorDescription || null,
           }
         }
+      } catch (e) {
+        logger.error(`[LB] /connect direct-provision threw: ${e && e.message}`)
+        orchestration = { status: 'failed', reason: 'unexpected_error', step: 'provision' }
       }
 
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
@@ -1044,8 +1040,9 @@ module.exports = (supabase, logger) => {
           webhook_url: leadStatusResult.webhookUrl || null,
           error: leadStatusResult.registered ? null : leadStatusResult.reason,
         },
-        // S4 — present iff a webhook block was provided AND the handshake succeeded.
-        orchestration_provisioning: orchestrationProvisioning,
+        // Phase 2C — orchestration provisioning result.
+        // status: 'connected' | 'failed' | 'not_attempted'.
+        orchestration,
         reconnect_required:
           !outboundResult.registered ||
           !leadStatusResult.registered ||
@@ -1617,6 +1614,95 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingCancelHandler)
   router.post('/orchestration/handoff',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchHandoffHandler)
+
+  // ══════════════════════════════════════
+  // POST /orchestration/provision-retry — Tenant-initiated retry for the
+  // direct-provision chain.
+  //
+  // Use case: /connect's legacy lead-sync committed but the orchestration
+  // provisioning step (verify-credentials or LB /provision) failed
+  // (e.g. transient LB outage). UI shows a Retry banner; clicking it
+  // re-collects email/password and hits this endpoint.
+  //
+  // Auth: tenant Bearer JWT (NOT the orchestration bearer — there's no
+  // credential yet to authenticate with).
+  //
+  // Preconditions: tenant must already have leadbridge_connected=true
+  // (i.e. legacy connect succeeded). If not, return 409 — they should
+  // hit /connect, not retry.
+  //
+  // Behavior: exactly the same call as /connect's orchestration step,
+  // factored out for retry. Password is forwarded once to LB, never
+  // logged.
+  // ══════════════════════════════════════
+  router.post('/orchestration/provision-retry', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const { email, password } = req.body || {}
+      if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' })
+
+      const { data: setting } = await supabase
+        .from('communication_settings')
+        .select('leadbridge_connected,lb_orchestration_enabled_at')
+        .eq('user_id', userId)
+        .maybeSingle()
+      if (!setting || !setting.leadbridge_connected) {
+        return res.status(409).json({ error: 'not_connected', message: 'Run /connect first.' })
+      }
+      if (setting.lb_orchestration_enabled_at) {
+        return res.status(409).json({ error: 'already_provisioned' })
+      }
+
+      const { data: sfUser } = await supabase
+        .from('users').select('first_name,last_name,email,business_name').eq('id', userId).maybeSingle()
+      const sfTenantName = sfUser
+        ? (sfUser.business_name || [sfUser.first_name, sfUser.last_name].filter(Boolean).join(' ') || sfUser.email)
+        : null
+      const sfTenantEmail = sfUser ? sfUser.email : null
+
+      const dp = await lbOrchDirectProvision.performDirectProvision(supabase, {
+        tenantId:    userId,
+        lbEmail:     email,
+        lbPassword:  password,
+        tenantName:  sfTenantName,
+        tenantEmail: sfTenantEmail,
+        createdBy:   'provision_retry',
+        logger,
+      })
+
+      if (dp.ok) {
+        return res.json({
+          ok: true,
+          orchestration: {
+            status:           'connected',
+            credential_id:    dp.credential.credentialId,
+            token_prefix:     dp.credential.tokenPrefix,
+            kid:              dp.credential.kid,
+            issued_at:        dp.credential.issuedAt,
+            expires_at:       dp.credential.expiresAt,
+            lb_account_id:    dp.lbAccountId,
+            lb_account_name:  dp.lbAccountName,
+            subscription_id:  dp.subscriptionId,
+            event_id:         dp.event_id,
+            event_enqueued:   dp.event_enqueued,
+          },
+        })
+      }
+      return res.status(422).json({
+        ok: false,
+        orchestration: {
+          status:            'failed',
+          reason:            dp.reason,
+          step:              dp.step,
+          http_status:       dp.status || null,
+          error_description: dp.errorDescription || null,
+        },
+      })
+    } catch (e) {
+      logger.error(`[LB] /orchestration/provision-retry threw: ${e && e.message}`)
+      return res.status(500).json({ error: 'unexpected_error' })
+    }
+  })
 
   // ══════════════════════════════════════
   // R1B — LB-facing pull-style credential refresh.
