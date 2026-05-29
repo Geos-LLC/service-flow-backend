@@ -347,8 +347,11 @@ describe('webhook drainer', () => {
 
     // Force the row due immediately so tick 2 picks it up without waiting 1min.
     store._rows[OUTBOX_TABLE][0].next_attempt_at = new Date(0).toISOString();
-    // Advance wall clock by 1ms to guarantee Date.now() differs (Jest is fast).
-    await new Promise((r) => setTimeout(r, 5));
+    // Sleep ≥1.1s so the epoch-second timestamp advances between attempts.
+    // (X-SF-Timestamp is now Unix epoch SECONDS — two retries within the
+    // same second legitimately produce the same ts, which would not be
+    // a regression.)
+    await new Promise((r) => setTimeout(r, 1100));
 
     // Tick 2 → attempt 2 fires with FRESH timestamp + FRESH signature.
     await d._tickForTest();
@@ -362,10 +365,17 @@ describe('webhook drainer', () => {
     expect(calls[1].sig).not.toBe(calls[0].sig);  // X-SF-Signature regenerated
     expect(calls[1].body).toBe(calls[0].body);    // body unchanged (same event)
 
-    // Both timestamps must be within 5s of test wall clock (i.e. truly "now-ish")
-    const now = Date.now();
-    expect(Math.abs(now - Date.parse(calls[0].ts))).toBeLessThan(5_000);
-    expect(Math.abs(now - Date.parse(calls[1].ts))).toBeLessThan(5_000);
+    // X-SF-Timestamp must be epoch seconds (10-digit string), not ISO 8601.
+    expect(calls[0].ts).toMatch(/^\d{10}$/);
+    expect(calls[1].ts).toMatch(/^\d{10}$/);
+
+    // Both timestamps must be within 5s of test wall clock (i.e. truly "now-ish").
+    const nowSec = Math.floor(Date.now() / 1000);
+    expect(Math.abs(nowSec - parseInt(calls[0].ts, 10))).toBeLessThan(5);
+    expect(Math.abs(nowSec - parseInt(calls[1].ts, 10))).toBeLessThan(5);
+
+    // Attempt 2's ts must be strictly LATER than attempt 1's (monotonic).
+    expect(parseInt(calls[1].ts, 10)).toBeGreaterThan(parseInt(calls[0].ts, 10));
   });
 
   test('after MAX_ATTEMPTS failures → state=dlq', async () => {
