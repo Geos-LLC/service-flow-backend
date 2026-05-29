@@ -49,6 +49,7 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
+const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
 
 const { resolveIdentity } = require('./lib/identity-resolver');
 const identityGraphViolation = require('./lib/identity-graph-violation');
@@ -37850,6 +37851,18 @@ app.listen(PORT, async () => {
   } catch (e) {
     logger.error(`[Orch Grace Sweeper] Failed to start: ${e.message}`);
   }
+
+  // S4 — Orchestration webhook outbox drainer.
+  // Delivers connection.connected / credential.rotated / connection.revoked
+  // events to the tenant's webhook URL, signed with the per-tenant
+  // webhook secret. No-ops on every tick while lb_orchestration_outbox
+  // has no pending rows (current dark state — no tenant has yet
+  // performed the OAuth handshake).
+  try {
+    startLbOrchestrationWebhookDrainer({ supabase, logger });
+  } catch (e) {
+    logger.error(`[Orch Webhook Drainer] Failed to start: ${e.message}`);
+  }
 });
 } // end if (require.main === module)
 
@@ -43049,6 +43062,27 @@ function authenticateAdmin(req, res, next) {
     req.admin = decoded;
     next();
   });
+}
+
+// S3A — Internal orchestration credential admin router. Mounts:
+//   POST /api/internal/lb-orchestration/credentials/mint
+//   POST /api/internal/lb-orchestration/credentials/rotate
+//   POST /api/internal/lb-orchestration/credentials/revoke
+//   GET  /api/internal/lb-orchestration/credentials/status?user_id=N
+// Double-gated: authenticateAdmin + requireAdminFlag(ENABLE_ADMIN_ORCH_CREDENTIALS).
+// Flag defaults OFF; flip via Railway env per-environment when minting is needed.
+// NOT mounted under /api/integrations/leadbridge to keep this surface clearly
+// admin-only — tenant-facing routers must never expose these.
+try {
+  const { makeAdminCredentialRouter } = require('./lib/lb-orchestration-admin-router');
+  app.use('/api/internal/lb-orchestration', makeAdminCredentialRouter({
+    supabase, logger,
+    authenticateAdmin,
+    requireAdminFlag,
+    flagName: FLAGS.ENABLE_ADMIN_ORCH_CREDENTIALS,
+  }));
+} catch (e) {
+  logger.error(`[Orch Admin Router] Failed to mount: ${e.message}`);
 }
 
 // GET /api/admin/global-settings — Sigcore connection config

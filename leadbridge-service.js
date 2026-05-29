@@ -53,6 +53,14 @@ const {
 } = require('./lib/lb-orchestration-handlers')
 const { setCustomerAcquisitionIfMissing: _setCustomerAcquisitionIfMissing2B } = require('./lib/lb-linkage-resolver')
 const { updateJobStatus: _updateJobStatus2B } = require('./services/job-status-service')
+// S4 — OAuth handshake + provisioning payload.
+const lbOrchClients   = require('./lib/lb-orchestration-clients')
+const lbOrchOauthCodes = require('./lib/lb-orchestration-oauth-codes')
+const lbOrchHandshake  = require('./lib/lb-orchestration-handshake')
+const { buildProvisioningPayload } = require('./lib/lb-orchestration-provisioning-payload')
+const { attachCredentialToCode } = lbOrchOauthCodes
+// R1B — LB-facing pull-style credential refresh.
+const { performRefresh: orchPerformRefresh } = lbOrchHandshake
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -943,6 +951,70 @@ module.exports = (supabase, logger) => {
         logger.warn(`[LB] Inbound subscription NOT registered for user ${userId}: ${inboundResult.reason}`)
       }
 
+      // S4 — Optional orchestration handshake (manual canary path).
+      // Triggered when the caller supplies a `webhook` block in the
+      // request body. Augments the existing LB connect with the
+      // orchestration credential + enablement + outbound event.
+      let orchestrationProvisioning = null
+      if (req.body?.webhook && typeof req.body.webhook === 'object') {
+        const wh = req.body.webhook
+        if (!wh.url || !wh.secret) {
+          // Don't fail the connect — the LB direction is already wired.
+          // Just surface the issue so the caller can retry.
+          logger.warn(`[LB] /connect webhook block missing url/secret for user ${userId}`)
+        } else {
+          // For the canary path, allow any LB host (no client_id provided
+          // means we cannot enforce host-suffix check via lb_oauth_clients).
+          // We still require https + valid hostname.
+          let okUrl = false
+          try {
+            const u = new URL(wh.url)
+            okUrl = u.protocol === 'https:' && !!u.hostname && u.hostname.length > 0
+          } catch (_) {}
+          const secretCheck = lbOrchClients.verifyWebhookSecret(wh.secret)
+          if (!okUrl) {
+            logger.warn(`[LB] /connect webhook url invalid for user ${userId}`)
+          } else if (!secretCheck.ok) {
+            logger.warn(`[LB] /connect webhook secret invalid (${secretCheck.reason}) for user ${userId}`)
+          } else {
+            const handshake = await lbOrchHandshake.performHandshake(supabase, {
+              userId,
+              webhookUrl:     wh.url,
+              webhookSecret:  wh.secret,
+              subscriptionId: wh.subscription_id || null,
+              stateRef:       wh.state_ref || null,
+              createdBy:      'connect_canary',
+              logger,
+            })
+            if (handshake.ok) {
+              // Lookup tenant info for the provisioning payload.
+              const { data: user } = await supabase.from('users').select('first_name,last_name,email').eq('id', userId).maybeSingle()
+              const sfTenantName = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email : null
+              orchestrationProvisioning = buildProvisioningPayload({
+                tenant: { sf_tenant_id: userId, sf_tenant_name: sfTenantName, sf_workspace_id: userId },
+                credential: {
+                  token:        handshake.credential.token,
+                  token_prefix: handshake.credential.tokenPrefix,
+                  kid:          handshake.credential.kid,
+                  scope:        'lb_orchestration',
+                  issued_at:    handshake.credential.issuedAt,
+                  expires_at:   handshake.credential.expiresAt,
+                },
+                webhook: {
+                  url:    wh.url,
+                  set_at: handshake.settings && handshake.settings.lb_orchestration_webhook_set_at,
+                  subscription_id: wh.subscription_id || null,
+                  state_ref:       wh.state_ref || null,
+                },
+              })
+              logger.log(`[LB] /connect canary handshake ok user=${userId} cred=${handshake.credential.credentialId} prefix=${handshake.credential.tokenPrefix}`)
+            } else {
+              logger.warn(`[LB] /connect canary handshake failed user=${userId} reason=${handshake.reason}`)
+            }
+          }
+        }
+      }
+
       logger.log(`[LB] Connected for user ${userId}, ${accounts.length} accounts`)
       res.json({
         success: true,
@@ -972,6 +1044,8 @@ module.exports = (supabase, logger) => {
           webhook_url: leadStatusResult.webhookUrl || null,
           error: leadStatusResult.registered ? null : leadStatusResult.reason,
         },
+        // S4 — present iff a webhook block was provided AND the handshake succeeded.
+        orchestration_provisioning: orchestrationProvisioning,
         reconnect_required:
           !outboundResult.registered ||
           !leadStatusResult.registered ||
@@ -1309,7 +1383,32 @@ module.exports = (supabase, logger) => {
     try {
       const userId = req.user.userId
 
-      // Deactivate provider accounts
+      // S4 — Orchestration disconnect first.
+      // performDisconnect snapshots the webhook config, enqueues a
+      // `connection.revoked` event with that snapshot, revokes
+      // credentials, then clears the orchestration webhook fields.
+      // Runs in this order so the drainer can deliver the revoked
+      // event using the captured config even after the settings row
+      // is cleared.
+      let orchestrationDisconnect = null
+      try {
+        const orchRes = await lbOrchHandshake.performDisconnect(supabase, {
+          userId,
+          actor:  'user',
+          reason: 'user_initiated',
+          logger,
+        })
+        orchestrationDisconnect = {
+          revoked_count:  orchRes.revoked_count || 0,
+          event_id:       orchRes.event_id || null,
+          event_enqueued: !!orchRes.event_enqueued,
+        }
+      } catch (e) {
+        logger.warn(`[LB] /disconnect orchestration teardown failed user=${userId}: ${e.message}`)
+        orchestrationDisconnect = { error: 'orchestration_teardown_failed' }
+      }
+
+      // Deactivate provider accounts (existing LB integration teardown).
       await supabase.from('communication_provider_accounts')
         .update({ status: 'disconnected', updated_at: new Date().toISOString() })
         .eq('user_id', userId).eq('provider', 'leadbridge')
@@ -1319,6 +1418,9 @@ module.exports = (supabase, logger) => {
       // the drainer will keep deferring them with
       // defer_reason='no_outbound_subscription' on the long backoff
       // until the user reconnects (or the per-row DLQ cap fires).
+      // (performDisconnect above already cleared the orchestration
+      // webhook fields + lb_orchestration_enabled_at + leadbridge_connected.
+      // This UPDATE clears the legacy subscription columns.)
       const patch = {
         leadbridge_connected: false,
         leadbridge_integration_token: null,
@@ -1330,12 +1432,13 @@ module.exports = (supabase, logger) => {
       for (const col of INBOUND_COLUMNS) patch[col] = null
       await supabase.from('communication_settings').update(patch).eq('user_id', userId)
 
-      logger.log(`[LB] Disconnected for user ${userId} (all directions cleared)`)
+      logger.log(`[LB] Disconnected for user ${userId} (all directions cleared, orch=${JSON.stringify(orchestrationDisconnect)})`)
       res.json({
         success: true,
         direction_inbound: { active: false, accounts: 0, subscription: { active: false } },
         direction_outbound: { active: false },
         direction_lead_status: { active: false },
+        orchestration: orchestrationDisconnect,
       })
     } catch (error) {
       res.status(500).json({ error: 'Failed to disconnect LeadBridge' })
@@ -1514,6 +1617,356 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingCancelHandler)
   router.post('/orchestration/handoff',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchHandoffHandler)
+
+  // ══════════════════════════════════════
+  // R1B — LB-facing pull-style credential refresh.
+  //
+  // POST /api/integrations/leadbridge/orchestration/credentials/refresh
+  // Authorization: Bearer sfo_v1.<current orchestration token>
+  // body: {} (optional `reason`)
+  //
+  // Authenticates via the orchestration bearer (same dispatcher as the
+  // other orchestration routes; user JWT path NOT permitted — refresh
+  // is exclusively LB-initiated). Layered enablement also enforced so
+  // a disconnected tenant can't refresh.
+  //
+  // Behavior:
+  //   - bearer is active AND needs_refresh_at IS NOT NULL → rotate
+  //     atomically, return new plaintext token ONCE
+  //   - bearer is active AND needs_refresh_at IS NULL → 409 no_pending_rotation
+  //   - bearer is rotating → 409 already_rotated_this_cycle
+  //   - bearer is revoked → 401 credential_revoked (handled by auth middleware)
+  //   - connection cleared (leadbridge_connected=false) → 410 connection_revoked
+  //   - signing key missing → 503
+  //   - DB error → 503
+  // ══════════════════════════════════════
+  router.post('/orchestration/credentials/refresh',
+    orchAuthDispatcher,
+    layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      // Auth middleware already verified the bearer. req.user.cred_id
+      // is the credential id LB is presenting. We restrict refresh to
+      // the orchestration-token auth path only — a user JWT would have
+      // populated req.user.userId but not cred_id (or with a different
+      // source tag); the explicit source check below makes that path 401.
+      if (!req.user || req.user.source !== 'lb_orchestration_token') {
+        return res.status(401).json({
+          error: 'invalid_orchestration_token',
+          message: 'Refresh requires an orchestration bearer token (sfo_v1.*).',
+        })
+      }
+      if (req.user.cred_id == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+
+      const reason = (req.body && typeof req.body.reason === 'string') ? req.body.reason : 'lb_initiated'
+      const allowedReasons = ['scheduled', 'rotation_event', 'pre_expiry', 'operator_request', 'lb_initiated']
+      if (!allowedReasons.includes(reason)) {
+        return res.status(400).json({ error: 'invalid_reason', allowed: allowedReasons })
+      }
+
+      try {
+        const out = await orchPerformRefresh(supabase, {
+          userId:             req.user.userId,
+          bearerCredentialId: req.user.cred_id,
+          reason,
+          logger,
+        })
+        if (!out.ok) {
+          if (out.reason === 'no_pending_rotation')         return res.status(409).json({ error: 'no_pending_rotation' })
+          if (out.reason === 'already_rotated_this_cycle')  return res.status(409).json({ error: 'already_rotated_this_cycle' })
+          if (out.reason === 'connection_revoked')          return res.status(410).json({ error: 'connection_revoked' })
+          if (out.reason === 'credential_revoked')          return res.status(401).json({ error: 'credential_revoked' })
+          if (out.reason === 'unknown_credential')          return res.status(401).json({ error: 'invalid_orchestration_token' })
+          if (out.reason && out.reason.startsWith('mint_failed:')) {
+            if (out.reason.includes('signing_key_not_configured')) {
+              return res.status(503).json({ error: 'signing_key_not_configured' })
+            }
+            return res.status(503).json({ error: 'service_unavailable', reason: out.reason })
+          }
+          if (out.reason === 'db_error' || out.reason === 'db_update_failed' || out.reason === 'db_lookup_failed') {
+            return res.status(503).json({ error: 'service_unavailable' })
+          }
+          logger.error(`[orch-refresh] unknown reason user=${req.user.userId} bearer_cred=${req.user.cred_id} reason=${out.reason}`)
+          return res.status(500).json({ error: 'internal_error', reason: out.reason })
+        }
+
+        // SUCCESS. Plaintext returned ONCE; never logged (only token_prefix).
+        logger.log(`[orch-refresh] ok user=${req.user.userId} prev_cred=${out.rotation.previous_credential_id} new_prefix=${out.credential.token_prefix}`)
+        return res.status(200).json({
+          credential: out.credential,
+          rotation:   out.rotation,
+        })
+      } catch (err) {
+        logger.error(`[orch-refresh] threw: ${err && err.message}`)
+        return res.status(500).json({ error: 'internal_error' })
+      }
+    })
+
+  // ══════════════════════════════════════
+  // S4 — OAuth-style provisioning (staging dark)
+  //
+  // GET  /authorize       — consent screen. Requires SF user JWT.
+  //                          Validates client_id + redirect_uri.
+  //                          On approve → 302 to redirect_uri with code.
+  // POST /oauth/exchange  — server-to-server exchange. Requires
+  //                          client_id + client_secret. Atomically:
+  //                          consumes code, mints credential, persists
+  //                          webhook, opens enablement gate.
+  // POST /oauth/consent   — approve action from the consent screen
+  //                          (browser form POST). Identical auth as
+  //                          /authorize.
+  //
+  // No tenant self-service: the SF user must hold a valid SF JWT to
+  // render /authorize. The browser flow eventually replaces this with
+  // a session cookie + Vercel-rendered consent page, but for S4 the
+  // server-rendered minimalist page is sufficient.
+  // ══════════════════════════════════════
+
+  // Minimal consent page renderer.
+  function renderConsentPage({ clientId, redirectUri, state, scope, displayName, sfTenantId, sfTenantName, lbHost }) {
+    const safeName  = String(displayName  || clientId).replace(/[<>'"&]/g, '_')
+    const safeHost  = String(lbHost || '').replace(/[<>'"&]/g, '_')
+    const safeState = String(state || '').replace(/[<>'"&]/g, '_')
+    const formAction = '/api/integrations/leadbridge/oauth/consent'
+    return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Authorize ${safeName}</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:560px;margin:48px auto;padding:0 16px;color:#1f2937;}
+h1{font-size:20px;margin:0 0 8px}h2{font-size:14px;color:#6b7280;font-weight:500;margin:0 0 24px}
+.scope{background:#f3f4f6;padding:16px;border-radius:8px;margin:16px 0;font-size:14px;line-height:1.5}
+button{padding:10px 16px;border-radius:6px;font-size:14px;cursor:pointer;border:1px solid transparent;margin-right:8px}
+.approve{background:#1f2937;color:#fff}.cancel{background:#fff;color:#1f2937;border-color:#d1d5db}
+.tenant{font-weight:600}.host{font-family:monospace;font-size:12px;color:#6b7280}</style>
+</head><body>
+<h1>Authorize ${safeName}</h1>
+<h2>ServiceFlow tenant <span class="tenant">#${sfTenantId}</span>${sfTenantName ? ' &middot; ' + sfTenantName : ''}</h2>
+<div class="scope"><strong>${safeName}</strong> will be able to:
+<ul>
+<li>Read your service catalog and availability</li>
+<li>Request bookings on your behalf</li>
+<li>Cancel bookings it has previously created</li>
+<li>Receive operational lifecycle events for jobs it has booked</li>
+</ul>
+${safeName} <strong>cannot</strong> access your customers, payroll, financials, or jobs it has not booked.
+Access expires after 90 days. You can revoke at any time from ServiceFlow Settings → Integrations.
+${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</span></div>' : ''}
+</div>
+<form method="POST" action="${formAction}">
+  <input type="hidden" name="client_id" value="${clientId}">
+  <input type="hidden" name="redirect_uri" value="${redirectUri}">
+  <input type="hidden" name="state" value="${safeState}">
+  <input type="hidden" name="scope" value="${scope}">
+  <input type="hidden" name="decision" value="approve">
+  <button type="submit" class="approve">Approve</button>
+  <button type="submit" name="decision" value="cancel" class="cancel">Cancel</button>
+</form>
+</body></html>`
+  }
+
+  // GET /authorize — browser consent screen.
+  router.get('/authorize', authenticateToken, async (req, res) => {
+    const clientId    = String(req.query.client_id || '')
+    const redirectUri = String(req.query.redirect_uri || '')
+    const state       = String(req.query.state || '')
+    const scope       = String(req.query.scope || 'lb_orchestration')
+    const responseType = String(req.query.response_type || 'code')
+
+    if (!clientId)    return res.status(400).json({ error: 'invalid_request', error_description: 'client_id is required' })
+    if (!redirectUri) return res.status(400).json({ error: 'invalid_request', error_description: 'redirect_uri is required' })
+    if (responseType !== 'code') return res.status(400).json({ error: 'unsupported_response_type' })
+    if (!state || state.length < 16) return res.status(400).json({ error: 'invalid_request', error_description: 'state must be at least 16 chars' })
+    if (scope !== 'lb_orchestration') return res.status(400).json({ error: 'invalid_scope' })
+
+    let client
+    try {
+      client = await lbOrchClients.lookupClient(supabase, clientId)
+    } catch (e) {
+      logger.error(`[orch-oauth] authorize lookup failed: ${e.message}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    if (!client) return res.status(400).json({ error: 'invalid_client' })
+    if (!lbOrchClients.verifyRedirectUri(client, redirectUri)) {
+      return res.status(400).json({ error: 'invalid_redirect_uri' })
+    }
+
+    // Fetch tenant info for display.
+    const { data: user } = await supabase.from('users').select('id,first_name,last_name,email').eq('id', req.user.userId).maybeSingle()
+    const sfTenantName = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email : null
+    let lbHost = ''
+    try { lbHost = new URL(redirectUri).host } catch (_) {}
+
+    const html = renderConsentPage({
+      clientId, redirectUri, state, scope,
+      displayName: client.display_name,
+      sfTenantId:   req.user.userId,
+      sfTenantName,
+      lbHost,
+    })
+    res.set('Content-Type', 'text/html; charset=utf-8').status(200).send(html)
+  })
+
+  // POST /oauth/consent — handle the form submission from /authorize.
+  // Express needs urlencoded body parser; server.js mounts it globally.
+  router.post('/oauth/consent', authenticateToken, async (req, res) => {
+    const clientId    = String(req.body?.client_id || '')
+    const redirectUri = String(req.body?.redirect_uri || '')
+    const state       = String(req.body?.state || '')
+    const scope       = String(req.body?.scope || 'lb_orchestration')
+    const decision    = String(req.body?.decision || '')
+
+    if (!clientId || !redirectUri) {
+      return res.status(400).json({ error: 'invalid_request' })
+    }
+    if (decision !== 'approve') {
+      const sep = redirectUri.includes('?') ? '&' : '?'
+      return res.redirect(302, `${redirectUri}${sep}error=access_denied&error_description=user_declined&state=${encodeURIComponent(state)}`)
+    }
+
+    let client
+    try {
+      client = await lbOrchClients.lookupClient(supabase, clientId)
+    } catch (e) {
+      logger.error(`[orch-oauth] consent client lookup failed: ${e.message}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    if (!client) return res.status(400).json({ error: 'invalid_client' })
+    if (!lbOrchClients.verifyRedirectUri(client, redirectUri)) {
+      return res.status(400).json({ error: 'invalid_redirect_uri' })
+    }
+    if (scope !== 'lb_orchestration') return res.status(400).json({ error: 'invalid_scope' })
+
+    const issued = await lbOrchOauthCodes.issueCode(supabase, {
+      clientId, redirectUri, userId: req.user.userId, scope, state,
+    })
+    if (!issued.ok) {
+      logger.error(`[orch-oauth] code issue failed: ${issued.reason} ${issued.dbError || ''}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+
+    // Lookup tenant display name for redirect convenience.
+    const { data: user } = await supabase.from('users').select('first_name,last_name,email').eq('id', req.user.userId).maybeSingle()
+    const sfTenantName = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email : ''
+    const sfBaseUrl = process.env.SF_PUBLIC_BASE_URL || ''
+
+    const sep = redirectUri.includes('?') ? '&' : '?'
+    const params = new URLSearchParams({
+      code: issued.code,
+      state,
+      sf_tenant_id: String(req.user.userId),
+    })
+    if (sfTenantName) params.set('sf_tenant_name', sfTenantName)
+    if (sfBaseUrl)    params.set('sf_base_url', sfBaseUrl)
+    logger.log(`[orch-oauth] consent approve user=${req.user.userId} client=${clientId} code_prefix=${issued.code.slice(0, 13)}`)
+    return res.redirect(302, `${redirectUri}${sep}${params.toString()}`)
+  })
+
+  // POST /oauth/exchange — server-to-server exchange. NO SF user JWT
+  // required (LB authenticates via client_id + client_secret).
+  router.post('/oauth/exchange', async (req, res) => {
+    const { client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri, webhook } = req.body || {}
+
+    if (!clientId || !clientSecret || !code || !redirectUri) {
+      return res.status(400).json({ error: 'invalid_request', error_description: 'client_id, client_secret, code, redirect_uri required' })
+    }
+    if (!webhook || typeof webhook !== 'object' || !webhook.url || !webhook.secret) {
+      return res.status(400).json({ error: 'invalid_webhook', error_description: 'webhook.{url,secret} required' })
+    }
+
+    let client
+    try {
+      client = await lbOrchClients.lookupClient(supabase, clientId)
+    } catch (e) {
+      logger.error(`[orch-oauth] exchange client lookup failed: ${e.message}`)
+      return res.status(503).json({ error: 'service_unavailable' })
+    }
+    if (!client) return res.status(401).json({ error: 'invalid_client' })
+    if (!lbOrchClients.verifyClientSecret(client, clientSecret)) {
+      logger.warn(`[orch-oauth] exchange bad secret client=${clientId}`)
+      return res.status(401).json({ error: 'invalid_client' })
+    }
+
+    // Validate webhook BEFORE consuming the code so a malformed webhook
+    // doesn't burn the user's single-use code.
+    const urlCheck = lbOrchClients.verifyWebhookUrl(client, webhook.url)
+    if (!urlCheck.ok) return res.status(400).json({ error: urlCheck.reason })
+    const secretCheck = lbOrchClients.verifyWebhookSecret(webhook.secret)
+    if (!secretCheck.ok) return res.status(400).json({ error: secretCheck.reason })
+
+    // Consume code. Replay → 409 + preserve prior credential (refinement 2).
+    const consumed = await lbOrchOauthCodes.consumeCode(supabase, { code, clientId, redirectUri })
+    if (!consumed.ok) {
+      if (consumed.reason === 'code_already_used') {
+        logger.warn(`[orch-oauth] exchange replay client=${clientId} prior_cred=${consumed.issuedCredentialId || 'unknown'}`)
+        return res.status(409).json({ error: 'code_already_used', prior_credential_id: consumed.issuedCredentialId || null })
+      }
+      if (consumed.reason === 'redirect_uri_mismatch') return res.status(400).json({ error: 'redirect_uri_mismatch' })
+      if (consumed.reason === 'invalid_client_for_code') return res.status(400).json({ error: 'invalid_client_for_code' })
+      if (consumed.reason === 'code_expired') return res.status(400).json({ error: 'code_expired' })
+      if (consumed.reason === 'unknown_code') return res.status(400).json({ error: 'invalid_code' })
+      return res.status(503).json({ error: 'service_unavailable', reason: consumed.reason })
+    }
+
+    // Perform handshake.
+    const handshakeResult = await lbOrchHandshake.performHandshake(supabase, {
+      userId:          consumed.row.user_id,
+      webhookUrl:      webhook.url,
+      webhookSecret:   webhook.secret,
+      subscriptionId:  webhook.subscription_id || null,
+      stateRef:        webhook.state_ref || null,
+      createdBy:       `oauth_exchange:${clientId}`,
+      logger,
+    })
+
+    if (!handshakeResult.ok) {
+      logger.warn(`[orch-oauth] handshake failed user=${consumed.row.user_id} reason=${handshakeResult.reason} step=${handshakeResult.step}`)
+      // Map handshake errors to HTTP.
+      if (handshakeResult.reason === 'already_connected') {
+        return res.status(409).json({ error: 'already_connected' })
+      }
+      if (handshakeResult.reason === 'communication_settings_not_found') {
+        return res.status(404).json({ error: 'communication_settings_not_found' })
+      }
+      if (handshakeResult.reason === 'signing_key_not_configured') {
+        return res.status(503).json({ error: 'signing_key_not_configured' })
+      }
+      return res.status(500).json({ error: 'handshake_failed', reason: handshakeResult.reason })
+    }
+
+    // Stamp credential id on the code (best-effort).
+    await attachCredentialToCode(supabase, code, handshakeResult.credential.credentialId)
+
+    // Get tenant info for the payload.
+    const { data: user } = await supabase.from('users').select('id,first_name,last_name,email').eq('id', consumed.row.user_id).maybeSingle()
+    const sfTenantName = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email : null
+
+    const payload = buildProvisioningPayload({
+      tenant: {
+        sf_tenant_id:    consumed.row.user_id,
+        sf_tenant_name:  sfTenantName,
+        sf_workspace_id: consumed.row.user_id,
+      },
+      credential: {
+        token:         handshakeResult.credential.token,
+        token_prefix:  handshakeResult.credential.tokenPrefix,
+        kid:           handshakeResult.credential.kid,
+        scope:         'lb_orchestration',
+        issued_at:     handshakeResult.credential.issuedAt,
+        expires_at:    handshakeResult.credential.expiresAt,
+      },
+      webhook: {
+        url:             webhook.url,
+        set_at:          handshakeResult.settings && handshakeResult.settings.lb_orchestration_webhook_set_at,
+        subscription_id: webhook.subscription_id || null,
+        state_ref:       webhook.state_ref || null,
+      },
+    })
+
+    logger.log(`[orch-oauth] exchange ok user=${consumed.row.user_id} cred=${handshakeResult.credential.credentialId} prefix=${handshakeResult.credential.tokenPrefix} event=${handshakeResult.event_id}`)
+    return res.status(200).json({
+      connected: true,
+      provisioning: payload,
+    })
+  })
 
   // ══════════════════════════════════════
   // POST /sync — Sync conversations from LB
