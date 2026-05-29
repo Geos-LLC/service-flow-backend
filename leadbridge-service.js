@@ -59,6 +59,8 @@ const lbOrchOauthCodes = require('./lib/lb-orchestration-oauth-codes')
 const lbOrchHandshake  = require('./lib/lb-orchestration-handshake')
 const { buildProvisioningPayload } = require('./lib/lb-orchestration-provisioning-payload')
 const { attachCredentialToCode } = lbOrchOauthCodes
+// R1B — LB-facing pull-style credential refresh.
+const { performRefresh: orchPerformRefresh } = lbOrchHandshake
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1615,6 +1617,91 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingCancelHandler)
   router.post('/orchestration/handoff',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchHandoffHandler)
+
+  // ══════════════════════════════════════
+  // R1B — LB-facing pull-style credential refresh.
+  //
+  // POST /api/integrations/leadbridge/orchestration/credentials/refresh
+  // Authorization: Bearer sfo_v1.<current orchestration token>
+  // body: {} (optional `reason`)
+  //
+  // Authenticates via the orchestration bearer (same dispatcher as the
+  // other orchestration routes; user JWT path NOT permitted — refresh
+  // is exclusively LB-initiated). Layered enablement also enforced so
+  // a disconnected tenant can't refresh.
+  //
+  // Behavior:
+  //   - bearer is active AND needs_refresh_at IS NOT NULL → rotate
+  //     atomically, return new plaintext token ONCE
+  //   - bearer is active AND needs_refresh_at IS NULL → 409 no_pending_rotation
+  //   - bearer is rotating → 409 already_rotated_this_cycle
+  //   - bearer is revoked → 401 credential_revoked (handled by auth middleware)
+  //   - connection cleared (leadbridge_connected=false) → 410 connection_revoked
+  //   - signing key missing → 503
+  //   - DB error → 503
+  // ══════════════════════════════════════
+  router.post('/orchestration/credentials/refresh',
+    orchAuthDispatcher,
+    layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      // Auth middleware already verified the bearer. req.user.cred_id
+      // is the credential id LB is presenting. We restrict refresh to
+      // the orchestration-token auth path only — a user JWT would have
+      // populated req.user.userId but not cred_id (or with a different
+      // source tag); the explicit source check below makes that path 401.
+      if (!req.user || req.user.source !== 'lb_orchestration_token') {
+        return res.status(401).json({
+          error: 'invalid_orchestration_token',
+          message: 'Refresh requires an orchestration bearer token (sfo_v1.*).',
+        })
+      }
+      if (req.user.cred_id == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+
+      const reason = (req.body && typeof req.body.reason === 'string') ? req.body.reason : 'lb_initiated'
+      const allowedReasons = ['scheduled', 'rotation_event', 'pre_expiry', 'operator_request', 'lb_initiated']
+      if (!allowedReasons.includes(reason)) {
+        return res.status(400).json({ error: 'invalid_reason', allowed: allowedReasons })
+      }
+
+      try {
+        const out = await orchPerformRefresh(supabase, {
+          userId:             req.user.userId,
+          bearerCredentialId: req.user.cred_id,
+          reason,
+          logger,
+        })
+        if (!out.ok) {
+          if (out.reason === 'no_pending_rotation')         return res.status(409).json({ error: 'no_pending_rotation' })
+          if (out.reason === 'already_rotated_this_cycle')  return res.status(409).json({ error: 'already_rotated_this_cycle' })
+          if (out.reason === 'connection_revoked')          return res.status(410).json({ error: 'connection_revoked' })
+          if (out.reason === 'credential_revoked')          return res.status(401).json({ error: 'credential_revoked' })
+          if (out.reason === 'unknown_credential')          return res.status(401).json({ error: 'invalid_orchestration_token' })
+          if (out.reason && out.reason.startsWith('mint_failed:')) {
+            if (out.reason.includes('signing_key_not_configured')) {
+              return res.status(503).json({ error: 'signing_key_not_configured' })
+            }
+            return res.status(503).json({ error: 'service_unavailable', reason: out.reason })
+          }
+          if (out.reason === 'db_error' || out.reason === 'db_update_failed' || out.reason === 'db_lookup_failed') {
+            return res.status(503).json({ error: 'service_unavailable' })
+          }
+          logger.error(`[orch-refresh] unknown reason user=${req.user.userId} bearer_cred=${req.user.cred_id} reason=${out.reason}`)
+          return res.status(500).json({ error: 'internal_error', reason: out.reason })
+        }
+
+        // SUCCESS. Plaintext returned ONCE; never logged (only token_prefix).
+        logger.log(`[orch-refresh] ok user=${req.user.userId} prev_cred=${out.rotation.previous_credential_id} new_prefix=${out.credential.token_prefix}`)
+        return res.status(200).json({
+          credential: out.credential,
+          rotation:   out.rotation,
+        })
+      } catch (err) {
+        logger.error(`[orch-refresh] threw: ${err && err.message}`)
+        return res.status(500).json({ error: 'internal_error' })
+      }
+    })
 
   // ══════════════════════════════════════
   // S4 — OAuth-style provisioning (staging dark)
