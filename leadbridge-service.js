@@ -68,6 +68,7 @@ const lbOrchDirectProvision = require('./lib/lb-orchestration-direct-provision')
 // Migration-060 — LB-initiated historical lead link.
 const lbLeadLinkMatcher = require('./lib/lb-lead-link-matcher')
 const lbLeadLinkAttacher = require('./lib/lb-lead-link-attacher')
+const lbLeadLinkBulk = require('./lib/lb-lead-link-bulk')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1736,6 +1737,56 @@ module.exports = (supabase, logger) => {
         return res.json(out)
       } catch (e) {
         logger.error(`[lb-link/attach] tenant=${req.user.userId} error: ${e && e.message}`)
+        return res.status(500).json({ ok: false, error: 'internal_error' })
+      }
+    })
+
+  // ══════════════════════════════════════
+  // POST /orchestration/bulk-reconcile
+  //
+  // Automatic historical reconciliation. LB sends a batch of leads (up
+  // to 50 per call). SF runs the matcher per-lead; for any lead with
+  // exactly one unambiguous high-confidence candidate, SF auto-attaches
+  // (writes audit row, updates the SF job, enqueues synthetic
+  // job.status_changed). Ambiguous / low-confidence / multi-candidate /
+  // already-linked-to-different-id leads come back as `needs_review`
+  // with the candidate list so LB can drive a manual attach.
+  //
+  // Body:
+  //   { leads: [{ lb_lead_id, lb_external_request_id, lb_channel,
+  //               lb_business_id, customer_phone, customer_email,
+  //               customer_name, lead_created_at }, …],
+  //     dry_run: false }
+  //
+  // Response: per-lead { outcome: 'auto_attached' | 'needs_review' |
+  //                                 'no_match' | 'auto_attach_preview' |
+  //                                 'error' } plus a roll-up summary.
+  // ══════════════════════════════════════
+  router.post('/orchestration/bulk-reconcile',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      if (!req.user || req.user.userId == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+      const body = req.body || {}
+      const leads = Array.isArray(body.leads) ? body.leads : null
+      if (!leads) {
+        return res.status(400).json({ ok: false, error: 'invalid_arguments', detail: 'leads array required' })
+      }
+      try {
+        const out = await lbLeadLinkBulk.reconcileBatch(supabase, {
+          userId: req.user.userId,
+          leads,
+          dryRun: body.dry_run === true,
+          logger,
+        })
+        if (!out.ok) {
+          return res.status(out.status || 400).json(out)
+        }
+        logger.log(`[lb-bulk-reconcile] tenant=${req.user.userId} dry_run=${out.dry_run} total=${out.summary.total} auto_attached=${out.summary.auto_attached} preview=${out.summary.auto_attach_preview} needs_review=${out.summary.needs_review} no_match=${out.summary.no_match} error=${out.summary.error}`)
+        return res.json(out)
+      } catch (e) {
+        logger.error(`[lb-bulk-reconcile] tenant=${req.user.userId} error: ${e && e.message}`)
         return res.status(500).json({ ok: false, error: 'internal_error' })
       }
     })
