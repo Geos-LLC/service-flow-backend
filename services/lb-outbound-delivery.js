@@ -46,6 +46,23 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
   // like `evt_reconcile_<job>_<canonical>` so a repeat sync collides on
   // the outbox UNIQUE(event_id) and is treated as duplicate / no-op.
   // Status-change-triggered events leave it unset → fresh uuidv7.
+  //
+  // Fields added by migration 060 (LB historical lead link):
+  //   - lb_lead_id                — LB's own UUID, propagated from the
+  //                                  jobs row when present
+  //   - job.payment_status / .payment_date — gives LB the
+  //                                          completion-and-paid signal
+  //                                          retroactive attaches need
+  //   - job.customer_phone_last4 / .customer_email_present —
+  //                                          de-identified verifiers LB
+  //                                          can use to confirm the
+  //                                          attach landed on the right
+  //                                          row, without echoing PII
+  const customerPhoneLast4 = (typeof job.customer_phone === 'string')
+    ? (job.customer_phone.replace(/\D+/g, '').slice(-4) || null)
+    : null
+  const customerEmailPresent = !!(typeof job.customer_email === 'string' && job.customer_email.length > 0)
+
   return {
     event_id: eventIdOverride || `evt_${uuidv7()}`,
     event_type: 'job.status_changed',
@@ -56,6 +73,7 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
     sf_user_id: job.user_id,
     external_request_id: job.lb_external_request_id,
     channel: job.lb_channel,
+    lb_lead_id: job.lb_lead_id ?? null,
     status: {
       new: normalizeStatus(newStatus),
       previous: oldStatus == null ? null : normalizeStatus(oldStatus),
@@ -71,6 +89,10 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
       scheduled_date: job.scheduled_date ?? null,
       customer_name: job.customer_name ?? null,
       amount: job.invoice_amount != null ? Number(job.invoice_amount) : (job.total_amount != null ? Number(job.total_amount) : null),
+      payment_status: job.payment_status ?? null,
+      payment_date: job.payment_date ?? null,
+      customer_phone_last4: customerPhoneLast4,
+      customer_email_present: customerEmailPresent,
     },
     raw: {},
   }
