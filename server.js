@@ -25420,10 +25420,33 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     }
 
     if (newEntries.length > 0) {
+      let insertedCount = 0;
       for (let c = 0; c < newEntries.length; c += 100) {
-        await supabase.from('cleaner_ledger').insert(newEntries.slice(c, c + 100));
+        const chunk = newEntries.slice(c, c + 100);
+        const { error: insErr } = await supabase.from('cleaner_ledger').insert(chunk);
+        if (insErr) {
+          if (insErr.code === '23505') {
+            // Race: another payroll request already inserted some of these
+            // rows (partial unique index on idx_cleaner_ledger_unique_mgr_*).
+            // Retry one row at a time so non-conflicting rows still land.
+            for (const row of chunk) {
+              const { error: rowErr } = await supabase.from('cleaner_ledger').insert(row);
+              if (!rowErr) {
+                insertedCount += 1;
+              } else if (rowErr.code !== '23505') {
+                console.error(`[Payroll] Manager ledger insert error for ${mgr.first_name} ${mgr.last_name}:`, rowErr.message);
+              }
+            }
+          } else {
+            console.error(`[Payroll] Manager ledger insert error for ${mgr.first_name} ${mgr.last_name}:`, insErr.message);
+          }
+        } else {
+          insertedCount += chunk.length;
+        }
       }
-      console.log(`[Payroll] Auto-generated ${newEntries.length} manager entries for ${mgr.first_name} ${mgr.last_name} (${effectiveStart} to ${effectiveEnd})`);
+      if (insertedCount > 0) {
+        console.log(`[Payroll] Auto-generated ${insertedCount}/${newEntries.length} manager entries for ${mgr.first_name} ${mgr.last_name} (${effectiveStart} to ${effectiveEnd})`);
+      }
     }
   }
 }
