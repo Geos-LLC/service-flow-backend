@@ -351,7 +351,9 @@ describe('P1.6 — surfaces wired in this round', () => {
     expect(ZB_SYNC).toMatch(/require\(['"]\.\/lib\/delivery-log['"]\)/);
     const whIdx = ZB_SYNC.indexOf("router.post('/webhook'");
     expect(whIdx).toBeGreaterThan(0);
-    const block = ZB_SYNC.slice(whIdx, whIdx + 8000);
+    // Window sized generously so additive handlers (e.g. recurring_booking
+    // reconciler) don't push the per-user logDelivery call past it.
+    const block = ZB_SYNC.slice(whIdx, whIdx + 12000);
     // Auth-rejected path logs
     expect(block).toMatch(/zb_inbound\.auth_rejected/);
     // Per-user processing logs
