@@ -38253,6 +38253,22 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
   const memberCount = memberIdsForCount.size;
   const effectiveDate = job.scheduled_date ? job.scheduled_date.split(' ')[0].split('T')[0] : new Date().toISOString().split('T')[0];
 
+  // Late-addition handling for tip/incentive: if a member already has any
+  // settled (paid-out) row for this job, the original pay period is closed.
+  // New tip/incentive rows for that member must land in the CURRENT period
+  // (today) instead of the job date — same rule as syncJobIncentiveLedger.
+  // Earning rows still use the job date: earnings are derived from the
+  // work itself, not from a user mutation that can happen "late".
+  const { data: jobSettledRows } = await supabase
+    .from('cleaner_ledger')
+    .select('team_member_id')
+    .eq('job_id', jobId)
+    .not('payout_batch_id', 'is', null);
+  const settledMembersForJob = new Set((jobSettledRows || []).map(r => r.team_member_id));
+  const todayDate = new Date().toISOString().split('T')[0];
+  const lateEffectiveDateFor = (memberId) =>
+    settledMembersForJob.has(memberId) ? todayDate : effectiveDate;
+
   // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
   // Subtract third-party fees (Stripe processing, etc.) — cleaners don't earn commission on those
   // Falls back to total/total_amount if service_price is missing
@@ -38377,15 +38393,20 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
     const memberTip = jobTip / Math.max(1, memberCount);
 
     if (memberTip > 0 && !shouldSkip(member.id, 'tip')) {
+      const memberTipEffectiveDate = lateEffectiveDateFor(member.id);
       ledgerEntries.push({
         user_id: userId,
         team_member_id: member.id,
         job_id: jobId,
         type: 'tip',
         amount: parseFloat(memberTip.toFixed(2)),
-        effective_date: effectiveDate,
+        effective_date: memberTipEffectiveDate,
         note: `Tip for job #${jobId}`,
-        metadata: { ...splitSnapshot, job_tip: jobTip },
+        metadata: {
+          ...splitSnapshot,
+          job_tip: jobTip,
+          late_addition: memberTipEffectiveDate !== effectiveDate ? true : undefined,
+        },
         created_by: userId
       });
     }
@@ -38399,19 +38420,21 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
       ? assignmentIncentive
       : (jobIncentive > 0 ? parseFloat((jobIncentive / Math.max(1, memberCount)).toFixed(2)) : 0);
     if (memberIncentive > 0 && !shouldSkip(member.id, 'incentive')) {
+      const memberIncEffectiveDate = lateEffectiveDateFor(member.id);
       ledgerEntries.push({
         user_id: userId,
         team_member_id: member.id,
         job_id: jobId,
         type: 'incentive',
         amount: memberIncentive,
-        effective_date: effectiveDate,
+        effective_date: memberIncEffectiveDate,
         note: `Incentive for job #${jobId}`,
         metadata: {
           ...splitSnapshot,
           job_incentive: jobIncentive,
           per_assignment: hasPerAssignmentIncentives ? assignmentIncentive : null,
           incentive_lines: incentiveLinesByMember[member.id] || [],
+          late_addition: memberIncEffectiveDate !== effectiveDate ? true : undefined,
         },
         created_by: userId
       });
@@ -38622,9 +38645,23 @@ async function syncJobIncentiveLedger(jobId, userId) {
     }
   }
 
-  const effectiveDate = job.scheduled_date
+  // Late-addition handling: if a member's earnings on this job were already
+  // settled in a paid batch, that pay period is closed. A newly-added
+  // incentive must land in the CURRENT period (effective_date = today)
+  // instead of the job's scheduled date — otherwise it disappears into
+  // prior-balance carryover rather than appearing in this week's payroll.
+  const { data: settledRows } = await supabase
+    .from('cleaner_ledger')
+    .select('team_member_id')
+    .eq('job_id', jobId)
+    .not('payout_batch_id', 'is', null);
+  const settledMembers = new Set((settledRows || []).map(r => r.team_member_id));
+  const today = new Date().toISOString().split('T')[0];
+  const jobDate = job.scheduled_date
     ? String(job.scheduled_date).split('T')[0].split(' ')[0]
-    : new Date().toISOString().split('T')[0];
+    : today;
+  const effectiveDateFor = (memberId) =>
+    settledMembers.has(memberId) ? today : jobDate;
 
   const memberIdsToProcess = new Set([
     ...teamMemberIds,
@@ -38637,6 +38674,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
 
     if (desired > 0) {
       const memberDescriptions = descriptionsByMember[memberId] || [];
+      const memberEffectiveDate = effectiveDateFor(memberId);
       if (existing) {
         if (existing.payout_batch_id) {
           console.log(
@@ -38649,7 +38687,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
         if (Math.abs(currentAmount - desired) >= 0.01 || JSON.stringify(existing.metadata?.incentive_lines || []) !== JSON.stringify(memberDescriptions)) {
           const { error: updErr } = await supabase
             .from('cleaner_ledger')
-            .update({ amount: desired, effective_date: effectiveDate, metadata: mergedMeta })
+            .update({ amount: desired, effective_date: memberEffectiveDate, metadata: mergedMeta })
             .eq('id', existing.id);
           if (updErr) {
             console.error(`[Incentive Sync] Update failed for ledger ${existing.id}:`, updErr);
@@ -38662,9 +38700,12 @@ async function syncJobIncentiveLedger(jobId, userId) {
           job_id: jobId,
           type: 'incentive',
           amount: desired,
-          effective_date: effectiveDate,
+          effective_date: memberEffectiveDate,
           note: `Incentive for job #${jobId}`,
-          metadata: { incentive_lines: memberDescriptions },
+          metadata: {
+            incentive_lines: memberDescriptions,
+            late_addition: settledMembers.has(memberId) ? true : undefined,
+          },
           created_by: userId,
         });
         if (insErr) {
