@@ -146,11 +146,11 @@ function makeHttpClient({ verifyResponse, provisionResponse, verifyThrows = fals
     });
     if (req.url.endsWith('/v1/integrations/sf/verify-credentials')) {
       if (verifyThrows) throw new Error('network err');
-      return verifyResponse || { status: 200, data: { ok: true, link_token: VALID_LINK_TOKEN, lb_user_id: 'c3d14499-x', lb_account_name: 'info@spotless.homes' } };
+      return verifyResponse || { status: 200, data: { ok: true, link_token: VALID_LINK_TOKEN, lb_user_id: 'c3d14499-x', lb_user_email: 'info@spotless.homes' } };
     }
     if (req.url.endsWith('/v1/integrations/sf/provision')) {
       if (provisionThrows) throw new Error('network err');
-      return provisionResponse || { status: 200, data: { ok: true, webhook_url: VALID_WEBHOOK_URL, webhook_secret: VALID_WEBHOOK_SECRET, subscription_id: 'sub-1', state_ref: 'sr-1', lb_account_id: 'c3d14499-x', lb_account_name: 'info@spotless.homes' } };
+      return provisionResponse || { status: 200, data: { ok: true, connection_id: 'sub-1', sf_tenant_id: 2, lb_user_id: 'c3d14499-x', lb_user_email: 'info@spotless.homes', webhook: { url: VALID_WEBHOOK_URL, secret: VALID_WEBHOOK_SECRET } } };
     }
     return { status: 404, data: { error: 'unknown_path' } };
   };
@@ -191,7 +191,8 @@ describe('performDirectProvision — happy path', () => {
     expect(setting.lb_orchestration_webhook_url).toBe(VALID_WEBHOOK_URL);
     expect(setting.lb_orchestration_webhook_secret_enc).toMatch(/^v1:/);
     expect(setting.lb_orchestration_subscription_id).toBe('sub-1');
-    expect(setting.lb_orchestration_state_ref).toBe('sr-1');
+    // LB's /provision response doesn't return state_ref (verified against
+    // staging); SF persists null unless LB later adds it to the contract.
 
     // Outbox carries connection.connected.
     const outboxRow = store._rows[OUTBOX_TABLE][0];
@@ -223,21 +224,21 @@ describe('performDirectProvision — happy path', () => {
     expect(provisionCall.url).toBe('https://lb-test.example.com/api/v1/integrations/sf/provision');
     expect(provisionCall.headers['X-SF-LB-Signature']).toMatch(/^[0-9a-f]{64}$/);
     const pbody = JSON.parse(provisionCall.body);
-    expect(pbody.version).toBe('1');
     expect(pbody.link_token).toBe(VALID_LINK_TOKEN);
-    expect(pbody.tenant.sf_tenant_id).toBe(2);
-    expect(pbody.tenant.sf_base_url).toBe('https://sf-test.example.com');
-    expect(pbody.tenant.source_instance).toBe('sf-test');
-    expect(pbody.credential.token).toMatch(/^sfo_v1\./);
-    expect(pbody.credential.kid).toBe('sf_orch_test_kid');
-    expect(pbody.credential.scope).toBe('lb_orchestration');
-    expect(pbody.endpoints.availability).toBe('/api/integrations/leadbridge/orchestration/availability');
-    expect(pbody.endpoints.credentials_refresh).toBe('/api/integrations/leadbridge/orchestration/credentials/refresh');
-    expect(pbody.signature_metadata.algorithm).toBe('hmac-sha256-hex');
-    expect(pbody.signature_metadata.timestamp_format).toBe('unix_seconds');
-    expect(pbody.event_types).toContain('connection.connected');
-    expect(pbody.event_types).toContain('credential.rotated');
-    expect(pbody.event_types).toContain('connection.revoked');
+    expect(pbody.provisioning.version).toBe('1');
+    expect(pbody.provisioning.tenant.sf_tenant_id).toBe(2);
+    expect(pbody.provisioning.tenant.sf_base_url).toBe('https://sf-test.example.com');
+    expect(pbody.provisioning.tenant.source_instance).toBe('sf-test');
+    expect(pbody.provisioning.credential.token).toMatch(/^sfo_v1\./);
+    expect(pbody.provisioning.credential.kid).toBe('sf_orch_test_kid');
+    expect(pbody.provisioning.credential.scope).toBe('lb_orchestration');
+    expect(pbody.provisioning.endpoints.availability).toBe('/api/integrations/leadbridge/orchestration/availability');
+    expect(pbody.provisioning.endpoints.credentials_refresh).toBe('/api/integrations/leadbridge/orchestration/credentials/refresh');
+    expect(pbody.provisioning.signature_metadata.algorithm).toBe('hmac-sha256-hex');
+    expect(pbody.provisioning.signature_metadata.timestamp_format).toBe('unix_seconds');
+    expect(pbody.provisioning.event_types).toContain('connection.connected');
+    expect(pbody.provisioning.event_types).toContain('credential.rotated');
+    expect(pbody.provisioning.event_types).toContain('connection.revoked');
   });
 });
 
@@ -271,7 +272,7 @@ describe('secret hygiene', () => {
     const sniffingClient = async (req) => {
       const r = await client(req);
       if (req.url.endsWith('/v1/integrations/sf/provision')) {
-        mintedToken = JSON.parse(req.data).credential.token;
+        mintedToken = JSON.parse(req.data).provisioning.credential.token;
       }
       return r;
     };
