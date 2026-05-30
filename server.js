@@ -5214,10 +5214,27 @@ app.get('/api/jobs/:id', authenticateToken, async (req, res) => {
       const jobTotal = parseFloat(job.total) || parseFloat(job.total_amount) || parseFloat(job.price) || 0;
       const invoiceStatus = jobTotal === 0 ? 'paid' : (job.invoice_status || job.invoiceStatus);
 
+      // Multi-line incentives breakdown (one row per (job, member, line)).
+      // Used by the Financials card to render the editable list. Falls
+      // back to [] on error so callers don't have to handle null.
+      let incentivesList = [];
+      try {
+        const { data: incRows } = await supabase
+          .from('job_incentives')
+          .select('id, team_member_id, description, amount, created_at')
+          .eq('job_id', id)
+          .eq('user_id', userId)
+          .order('created_at', { ascending: true });
+        incentivesList = incRows || [];
+      } catch (e) {
+        console.error(`[GET job ${id}] incentives fetch failed (non-fatal):`, e?.message);
+      }
+
       const jobData = {
         ...job,
         invoice_status: invoiceStatus,
         team_assignments: teamAssignments,
+        incentives: incentivesList,
         intake_answers: parsedIntakeAnswers,
         service_intake_questions: intakeQuestionsAndAnswers // Use the questions from job_answers table
       };
@@ -25896,6 +25913,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           commission: parseFloat(jobCommission.toFixed(2)),
           tip: parseFloat((parseFloat(entries.tip?.amount) || 0).toFixed(2)),
           incentive: parseFloat((parseFloat(entries.incentive?.amount) || 0).toFixed(2)),
+          incentiveLines: Array.isArray(entries.incentive?.metadata?.incentive_lines)
+            ? entries.incentive.metadata.incentive_lines
+            : [],
           cashCollected: parseFloat((parseFloat(entries.cash_collected?.amount) || 0).toFixed(2)),
           reimbursement: parseFloat((parseFloat(entries.reimbursement?.amount) || 0).toFixed(2))
         };
@@ -26039,7 +26059,29 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
       const newVal = parseFloat(incentiveAmount) >= 0 ? parseFloat(incentiveAmount) : 0;
 
       if (teamMemberId) {
-        // Per-member incentive: update this member's assignment, then sync job total
+        // Per-member incentive override from payroll. Collapse any existing
+        // multi-line breakdown for this (job, member) into a single
+        // descriptionless line so job_incentives stays the source of truth.
+        // The user implicitly chose to flatten their breakdown by editing
+        // the total here instead of on the Job Financials card.
+        await supabase
+          .from('job_incentives')
+          .delete()
+          .eq('job_id', id)
+          .eq('team_member_id', teamMemberId)
+          .eq('user_id', userId);
+        if (newVal > 0) {
+          await supabase.from('job_incentives').insert({
+            user_id: userId,
+            job_id: parseInt(id),
+            team_member_id: parseInt(teamMemberId),
+            description: null,
+            amount: newVal,
+            created_by: userId,
+          });
+        }
+
+        // Mirror onto the per-assignment cache.
         const { error: assignErr } = await supabase
           .from('job_team_assignments')
           .update({ incentive_amount: newVal })
@@ -26114,6 +26156,198 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('[Payroll PATCH] Unexpected error:', error);
     res.status(500).json({ error: 'Failed to update job payroll data' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Multi-line job incentives
+//
+// job_incentives is the authoritative breakdown of incentives per (job,
+// team_member). jobs.incentive_amount and job_team_assignments.incentive_amount
+// are denormalized caches the existing ledger pipeline reads from, so every
+// mutating endpoint here calls recalcJobIncentiveTotals() before responding.
+// ─────────────────────────────────────────────────────────────────────────
+
+async function recalcJobIncentiveTotals(jobId, userId) {
+  // Pull every line for the job and bucket sums per team member.
+  const { data: lines, error: linesErr } = await supabase
+    .from('job_incentives')
+    .select('team_member_id, amount')
+    .eq('job_id', jobId);
+  if (linesErr) {
+    console.error(`[recalcJobIncentiveTotals] fetch lines failed for job ${jobId}:`, linesErr);
+    throw linesErr;
+  }
+
+  const perMember = {};
+  let jobTotal = 0;
+  for (const ln of (lines || [])) {
+    const amt = parseFloat(ln.amount) || 0;
+    if (!ln.team_member_id) continue;
+    perMember[ln.team_member_id] = (perMember[ln.team_member_id] || 0) + amt;
+    jobTotal += amt;
+  }
+
+  // Mirror per-member sums onto every existing assignment row. Members
+  // with no lines get 0 so a deleted incentive zeroes their assignment.
+  const { data: assignments } = await supabase
+    .from('job_team_assignments')
+    .select('team_member_id')
+    .eq('job_id', jobId);
+  for (const a of (assignments || [])) {
+    const desired = parseFloat((perMember[a.team_member_id] || 0).toFixed(2));
+    await supabase
+      .from('job_team_assignments')
+      .update({ incentive_amount: desired })
+      .eq('job_id', jobId)
+      .eq('team_member_id', a.team_member_id);
+  }
+
+  // Mirror job total.
+  await supabase
+    .from('jobs')
+    .update({ incentive_amount: parseFloat(jobTotal.toFixed(2)) })
+    .eq('id', jobId);
+
+  // Reconcile ledger (no-op if job not completed/paid).
+  try {
+    await syncJobIncentiveLedger(parseInt(jobId), userId);
+  } catch (e) {
+    console.error(`[recalcJobIncentiveTotals] ledger sync failed for job ${jobId}:`, e);
+  }
+}
+
+// GET /api/jobs/:id/incentives — list all incentive lines for a job
+app.get('/api/jobs/:id/incentives', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs').select('id').eq('id', id).eq('user_id', userId).single();
+    if (jobErr || !job) return res.status(404).json({ error: 'Job not found' });
+
+    const { data, error } = await supabase
+      .from('job_incentives')
+      .select('id, team_member_id, description, amount, created_at, updated_at')
+      .eq('job_id', id)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: 'Failed to fetch incentives' });
+    res.json({ incentives: data || [] });
+  } catch (e) {
+    console.error('GET /jobs/:id/incentives error:', e);
+    res.status(500).json({ error: 'Failed to fetch incentives' });
+  }
+});
+
+// POST /api/jobs/:id/incentives — add a new incentive line
+app.post('/api/jobs/:id/incentives', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id } = req.params;
+    const { teamMemberId, description, amount } = req.body;
+
+    if (!teamMemberId) return res.status(400).json({ error: 'teamMemberId is required' });
+    const parsedAmount = parseFloat(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount < 0) {
+      return res.status(400).json({ error: 'amount must be a non-negative number' });
+    }
+
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs').select('id').eq('id', id).eq('user_id', userId).single();
+    if (jobErr || !job) return res.status(404).json({ error: 'Job not found' });
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('job_incentives')
+      .insert({
+        user_id: userId,
+        job_id: parseInt(id),
+        team_member_id: parseInt(teamMemberId),
+        description: description ? String(description).slice(0, 500) : null,
+        amount: parsedAmount,
+        created_by: userId,
+      })
+      .select('id, team_member_id, description, amount, created_at, updated_at')
+      .single();
+    if (insErr) {
+      console.error('Insert incentive error:', insErr);
+      return res.status(500).json({ error: 'Failed to add incentive' });
+    }
+
+    await recalcJobIncentiveTotals(parseInt(id), userId);
+    res.json({ incentive: inserted });
+  } catch (e) {
+    console.error('POST /jobs/:id/incentives error:', e);
+    res.status(500).json({ error: 'Failed to add incentive' });
+  }
+});
+
+// PATCH /api/jobs/:id/incentives/:incentiveId — update a single line
+app.patch('/api/jobs/:id/incentives/:incentiveId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id, incentiveId } = req.params;
+    const { teamMemberId, description, amount } = req.body;
+
+    const update = { updated_at: new Date().toISOString() };
+    if (teamMemberId !== undefined) {
+      if (!teamMemberId) return res.status(400).json({ error: 'teamMemberId cannot be empty' });
+      update.team_member_id = parseInt(teamMemberId);
+    }
+    if (description !== undefined) {
+      update.description = description ? String(description).slice(0, 500) : null;
+    }
+    if (amount !== undefined) {
+      const parsedAmount = parseFloat(amount);
+      if (!Number.isFinite(parsedAmount) || parsedAmount < 0) {
+        return res.status(400).json({ error: 'amount must be a non-negative number' });
+      }
+      update.amount = parsedAmount;
+    }
+
+    const { data: updated, error: updErr } = await supabase
+      .from('job_incentives')
+      .update(update)
+      .eq('id', incentiveId)
+      .eq('job_id', id)
+      .eq('user_id', userId)
+      .select('id, team_member_id, description, amount, created_at, updated_at')
+      .single();
+    if (updErr || !updated) {
+      console.error('Update incentive error:', updErr);
+      return res.status(404).json({ error: 'Incentive not found' });
+    }
+
+    await recalcJobIncentiveTotals(parseInt(id), userId);
+    res.json({ incentive: updated });
+  } catch (e) {
+    console.error('PATCH /jobs/:id/incentives/:incentiveId error:', e);
+    res.status(500).json({ error: 'Failed to update incentive' });
+  }
+});
+
+// DELETE /api/jobs/:id/incentives/:incentiveId — remove a single line
+app.delete('/api/jobs/:id/incentives/:incentiveId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { id, incentiveId } = req.params;
+
+    const { error: delErr } = await supabase
+      .from('job_incentives')
+      .delete()
+      .eq('id', incentiveId)
+      .eq('job_id', id)
+      .eq('user_id', userId);
+    if (delErr) {
+      console.error('Delete incentive error:', delErr);
+      return res.status(500).json({ error: 'Failed to delete incentive' });
+    }
+
+    await recalcJobIncentiveTotals(parseInt(id), userId);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('DELETE /jobs/:id/incentives/:incentiveId error:', e);
+    res.status(500).json({ error: 'Failed to delete incentive' });
   }
 });
 
@@ -37972,6 +38206,22 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
     .select('team_member_id, is_primary, incentive_amount')
     .eq('job_id', jobId);
 
+  // Multi-line incentive descriptions, bucketed per member. Used to
+  // hydrate ledger metadata.incentive_lines so payroll can surface the
+  // WHY behind a member's incentive total.
+  const { data: incentiveLines } = await supabase
+    .from('job_incentives')
+    .select('team_member_id, description, amount')
+    .eq('job_id', jobId);
+  const incentiveLinesByMember = {};
+  for (const ln of (incentiveLines || [])) {
+    if (!ln.team_member_id) continue;
+    (incentiveLinesByMember[ln.team_member_id] ||= []).push({
+      description: ln.description || null,
+      amount: parseFloat(ln.amount) || 0,
+    });
+  }
+
   // Build list of team members assigned to this job
   let teamMemberIds = [];
   if (assignments && assignments.length > 0) {
@@ -38161,6 +38411,7 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
           ...splitSnapshot,
           job_incentive: jobIncentive,
           per_assignment: hasPerAssignmentIncentives ? assignmentIncentive : null,
+          incentive_lines: incentiveLinesByMember[member.id] || [],
         },
         created_by: userId
       });
@@ -38319,9 +38570,24 @@ async function syncJobIncentiveLedger(jobId, userId) {
     teamMemberIds = [job.team_member_id];
   }
 
+  // Per-line descriptions (multi-line incentives). Bucketed by member so
+  // the ledger row's metadata can carry the WHY behind the per-member sum.
+  const { data: incentiveLines } = await supabase
+    .from('job_incentives')
+    .select('team_member_id, description, amount')
+    .eq('job_id', jobId);
+  const descriptionsByMember = {};
+  for (const ln of (incentiveLines || [])) {
+    if (!ln.team_member_id) continue;
+    (descriptionsByMember[ln.team_member_id] ||= []).push({
+      description: ln.description || null,
+      amount: parseFloat(ln.amount) || 0,
+    });
+  }
+
   const { data: existingRows } = await supabase
     .from('cleaner_ledger')
-    .select('id, team_member_id, amount, payout_batch_id')
+    .select('id, team_member_id, amount, payout_batch_id, metadata')
     .eq('job_id', jobId)
     .eq('type', 'incentive');
 
@@ -38370,6 +38636,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
     const existing = existingByMember[memberId];
 
     if (desired > 0) {
+      const memberDescriptions = descriptionsByMember[memberId] || [];
       if (existing) {
         if (existing.payout_batch_id) {
           console.log(
@@ -38378,10 +38645,11 @@ async function syncJobIncentiveLedger(jobId, userId) {
           continue;
         }
         const currentAmount = parseFloat(existing.amount) || 0;
-        if (Math.abs(currentAmount - desired) >= 0.01) {
+        const mergedMeta = { ...(existing.metadata || {}), incentive_lines: memberDescriptions };
+        if (Math.abs(currentAmount - desired) >= 0.01 || JSON.stringify(existing.metadata?.incentive_lines || []) !== JSON.stringify(memberDescriptions)) {
           const { error: updErr } = await supabase
             .from('cleaner_ledger')
-            .update({ amount: desired, effective_date: effectiveDate })
+            .update({ amount: desired, effective_date: effectiveDate, metadata: mergedMeta })
             .eq('id', existing.id);
           if (updErr) {
             console.error(`[Incentive Sync] Update failed for ledger ${existing.id}:`, updErr);
@@ -38396,6 +38664,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
           amount: desired,
           effective_date: effectiveDate,
           note: `Incentive for job #${jobId}`,
+          metadata: { incentive_lines: memberDescriptions },
           created_by: userId,
         });
         if (insErr) {
