@@ -84,22 +84,48 @@ function startDrainer(args) {
 }
 
 /**
+ * Resolve the current SF_SOURCE_INSTANCE. Required at runtime — the
+ * drainer refuses to claim if unset so a misconfigured prod env can't
+ * accidentally pick up staging rows (or vice-versa).
+ *
+ * NOTE: the orchestration database is shared across SF environments
+ * (staging + prod hit the same Supabase project). Two drainers would
+ * race for every pending row, each signing with its own KID. This
+ * filter scopes claims to the rows whose `payload_json.source_instance`
+ * matches THIS drainer's instance, eliminating the race and the KID
+ * mismatch.
+ */
+function getDrainerInstance() {
+  const v = process.env.SF_SOURCE_INSTANCE;
+  return (typeof v === 'string' && v.length > 0) ? v : null;
+}
+
+/**
  * Single drain pass — claims + delivers up to batchSize rows.
  */
 async function drainOnce(supabase, opts) {
   const { logger, batchSize, maxAttempts, rng, deliver } = opts;
   const nowIso = new Date().toISOString();
 
-  // Claim: select pending rows due now. No advisory lock (orchestration
-  // outbox volume is too low to need it during S4 / canary). Each row
-  // is independently updated; concurrent drainers would re-attempt the
-  // same row, but since each delivery either succeeds (terminal) or
-  // schedules another retry, duplicate POSTs are bounded by LB's
-  // X-SF-Event-Id idempotency on the receiver.
+  const sourceInstance = getDrainerInstance();
+  if (!sourceInstance) {
+    // Fail closed: never claim cross-env rows by accident. Operator must
+    // set SF_SOURCE_INSTANCE on Railway.
+    try { logger.warn(`[orch-webhook-drainer] SF_SOURCE_INSTANCE unset — skipping claim (set on Railway to enable)`); } catch (_) {}
+    return { swept: 0, skipped: 'source_instance_unset' };
+  }
+
+  // Claim: select pending rows due now, SCOPED to this drainer's
+  // source_instance. Without this filter, prod and staging drainers
+  // both poll the same outbox table and race per row, each signing
+  // with its own KID. JSONB path filter is supported by Supabase /
+  // PostgREST: `payload_json->>source_instance` exposes the text
+  // value of the JSON field for `eq.` comparison.
   const { data: rows, error: claimErr } = await supabase
     .from(OUTBOX_TABLE)
     .select('id,user_id,event_id,event_type,payload_json,webhook_url,webhook_secret_enc,subscription_id,state_ref,attempts')
     .eq('state', 'pending')
+    .eq('payload_json->>source_instance', sourceInstance)
     .lte('next_attempt_at', nowIso)
     .order('next_attempt_at', { ascending: true })
     .limit(batchSize);

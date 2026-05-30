@@ -12,6 +12,7 @@
 process.env.SF_ORCH_SIGNING_KEY     = Buffer.alloc(32, 0xAB).toString('base64');
 process.env.SF_ORCH_SIGNING_KEY_KID = 'sf_orch_test_kid';
 process.env.SF_INTEGRATION_ENC_KEY  = Buffer.alloc(32, 0xCD).toString('base64');
+process.env.SF_SOURCE_INSTANCE      = 'sf-staging'; // matches event builders' default
 
 const handshake = require('../lib/lb-orchestration-handshake');
 const drainer   = require('../workers/lb-orchestration-webhook-drainer');
@@ -33,12 +34,25 @@ function makeStore({ settings = [], updateError = null } = {}) {
   let nextCredId = 1;
   let nextOutboxId = 1;
 
+  // Resolve a column reference that may be a JSON path like
+  // `payload_json->>source_instance`. Returns the value at that path or
+  // the column's direct value.
+  function resolveColumn(r, col) {
+    if (typeof col === 'string' && col.includes('->>')) {
+      const [base, key] = col.split('->>');
+      const o = r[base];
+      return o && typeof o === 'object' ? o[key] : undefined;
+    }
+    return r[col];
+  }
+
   function applyFilters(rs, filters) {
     return rs.filter((r) => filters.every((f) => {
-      if (f.type === 'eq') return String(r[f.col]) === String(f.val);
-      if (f.type === 'in') return f.vals.map(String).includes(String(r[f.col]));
+      if (f.type === 'eq') return String(resolveColumn(r, f.col)) === String(f.val);
+      if (f.type === 'in') return f.vals.map(String).includes(String(resolveColumn(r, f.col)));
       if (f.type === 'lte') {
-        const lhs = r[f.col] ? Date.parse(r[f.col]) : null;
+        const v = resolveColumn(r, f.col);
+        const lhs = v ? Date.parse(v) : null;
         return lhs != null && lhs <= Date.parse(f.val);
       }
       return true;
@@ -401,6 +415,72 @@ describe('webhook drainer', () => {
     const res = await d._tickForTest();
     d.stop();
     expect(res.swept).toBe(0);
+  });
+
+  test('SF_SOURCE_INSTANCE unset → skips claim (fail-closed cross-env guard)', async () => {
+    const store = makeStore({ settings: [{ user_id: 2 }] });
+    await handshake.performHandshake(store, {
+      userId: 2, webhookUrl: 'https://lb.example.com/h', webhookSecret: VALID_SECRET, logger: SILENT,
+    });
+    expect(store._rows[OUTBOX_TABLE]).toHaveLength(1);
+    const saved = process.env.SF_SOURCE_INSTANCE;
+    delete process.env.SF_SOURCE_INSTANCE;
+    try {
+      const fake = async () => { throw new Error('should not be called'); };
+      const d = drainer.startDrainer({ supabase: store, logger: SILENT, deliver: fake, tickMs: 60_000 });
+      const res = await d._tickForTest();
+      d.stop();
+      expect(res.swept).toBe(0);
+      expect(res.skipped).toBe('source_instance_unset');
+      // Row stays pending — not consumed by a misconfigured drainer.
+      expect(store._rows[OUTBOX_TABLE][0].state).toBe('pending');
+    } finally {
+      process.env.SF_SOURCE_INSTANCE = saved;
+    }
+  });
+
+  test('cross-env outbox row is NOT claimed (shared-Supabase guard)', async () => {
+    // Two outbox rows with different source_instance values. Only the
+    // one matching SF_SOURCE_INSTANCE (= sf-staging in this test env)
+    // should be claimed and delivered.
+    const store = makeStore({ settings: [{ user_id: 2 }] });
+    await handshake.performHandshake(store, {
+      userId: 2, webhookUrl: 'https://lb.example.com/h', webhookSecret: VALID_SECRET, logger: SILENT,
+    });
+    // Synthesize a prod-instance row directly (mirrors what prod env
+    // would have written before this fix).
+    store._rows[OUTBOX_TABLE].push({
+      id: 999,
+      user_id: 7,
+      event_id: 'evt_prod_only_event_42',
+      event_type: 'connection.connected',
+      payload_json: {
+        event_id: 'evt_prod_only_event_42',
+        event_type: 'connection.connected',
+        source_instance: 'sf-prod',
+        data: {},
+      },
+      webhook_url: 'https://lb-prod.example.com/h',
+      webhook_secret_enc: store._rows[OUTBOX_TABLE][0].webhook_secret_enc,
+      subscription_id: null,
+      state_ref: null,
+      state: 'pending',
+      attempts: 0,
+      next_attempt_at: new Date(0).toISOString(),
+    });
+
+    const deliveries = [];
+    const fakeDeliver = async ({ url }) => { deliveries.push(url); return { ok: true, status: 202 }; };
+    const d = drainer.startDrainer({ supabase: store, logger: SILENT, deliver: fakeDeliver, tickMs: 60_000 });
+    const res = await d._tickForTest();
+    d.stop();
+
+    // Only the sf-staging row delivered. The sf-prod row stays pending.
+    expect(res.swept).toBe(1);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toBe('https://lb.example.com/h');
+    const prodRow = store._rows[OUTBOX_TABLE].find((r) => r.event_id === 'evt_prod_only_event_42');
+    expect(prodRow.state).toBe('pending');
   });
 
   test('event_id idempotency: re-enqueue is absorbed by UNIQUE index', async () => {
