@@ -28,6 +28,7 @@ const { applyAtomicPaymentWrites } = require('./lib/zb-atomic-writes')
 const { recordZbImportAmbiguity, reconcileOrphans } = require('./lib/zb-orphan-reconciliation')
 const { normalizePhone: normalizePhoneCanon } = require('./lib/name-normalize')
 const { upsertTeamMemberProviderMappingFromZbSync } = require('./lib/team-member-provider-mapping')
+const { reconcileRecurringBooking } = require('./lib/zb-future-reconciler')
 
 const ZB_BASE = 'https://api.zenbooker.com/v1'
 
@@ -2556,9 +2557,41 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
                 logger.log(`[Zenbooker] Customer ${result.mode}: ${data.id} → SF #${result.id} (${event})`)
               } catch (custErr) { logger.error(`[Zenbooker] Customer sync error: ${custErr.message}`) }
             }
-          } else if (event === 'recurring_booking.created' || event === 'recurring_booking.canceled') {
-            // Recurring bookings generate jobs — those come via job.created webhook
+          } else if (event === 'recurring_booking.created') {
+            // Creation of a recurring booking generates per-instance jobs; those
+            // arrive via the regular `job.created` webhook.
             logger.log(`[Zenbooker] Recurring event: ${event} — jobs will arrive via job.created`)
+          } else if (event === 'recurring_booking.canceled') {
+            // ZB cancels the recurring SERIES with this single event but does
+            // NOT fire per-instance job.canceled webhooks. Reconcile every job
+            // in the booking against ZB so SF's future occurrences land at the
+            // correct status. Settled / completed instances are protected by
+            // the reconciler's hard-terminal guard.
+            const rbId = data?.id || data?.recurring_booking?.id
+            if (!rbId) {
+              logger.warn(`[Zenbooker] recurring_booking.canceled missing id; cannot reconcile`)
+            } else {
+              try {
+                const { summary, jobsFromZb } = await reconcileRecurringBooking({
+                  supabase,
+                  userId: user.id,
+                  apiKey: user.zenbooker_api_key,
+                  recurringBookingZbId: rbId,
+                  dryRun: false,
+                  logger,
+                  zbFetchFn: zbFetch,
+                  updateJobStatusFn: updateJobStatus,
+                })
+                logger.log(
+                  `[Zenbooker] recurring_booking.canceled rb=${rbId} jobs_from_zb=${jobsFromZb} ` +
+                  `summary=${JSON.stringify(summary)}`
+                )
+              } catch (rbErr) {
+                logger.error(
+                  `[Zenbooker] recurring_booking.canceled reconcile failed rb=${rbId}: ${rbErr.message || rbErr}`
+                )
+              }
+            }
           } else {
             logger.log(`[Zenbooker] Unhandled event: ${event}`)
           }

@@ -48,6 +48,8 @@ const { resolveLbLinkage, linkageFromParentJob, logResolution: logLbLinkage, REA
 const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-metrics');
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
+const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
+const { updateJobStatus: jobStatusServiceUpdate } = require('./services/job-status-service');
 const { startSweeper: startLbOrchestrationGraceSweeper } = require('./workers/lb-orchestration-grace-sweeper');
 const { startDrainer: startLbOrchestrationWebhookDrainer } = require('./workers/lb-orchestration-webhook-drainer');
 
@@ -38107,6 +38109,18 @@ app.listen(PORT, async () => {
     startLbOrchestrationGraceSweeper({ supabase, logger });
   } catch (e) {
     logger.error(`[Orch Grace Sweeper] Failed to start: ${e.message}`);
+  }
+
+  // ZB future-job reconciliation cron. Daily safety net for the silent-
+  // cancel case (ZB doesn't webhook us when a single recurring instance
+  // is cancelled). Multi-layered gating: ZB_FUTURE_RECONCILE_ENABLED must
+  // be 'true' for the cron to start at all; ZB_FUTURE_RECONCILE_APPLY
+  // must be 'true' for writes (otherwise dry-run). See
+  // workers/zb-future-reconcile-cron.js for env var details.
+  try {
+    startZbFutureReconcileCron({ supabase, logger, updateJobStatusFn: jobStatusServiceUpdate });
+  } catch (e) {
+    logger.error(`[ZBFutureReconcileCron] Failed to start: ${e.message}`);
   }
 
   // S4 — Orchestration webhook outbox drainer.
