@@ -223,20 +223,21 @@ describe('performDirectProvision — happy path', () => {
     expect(provisionCall.url).toBe('https://lb-test.example.com/api/v1/integrations/sf/provision');
     expect(provisionCall.headers['X-SF-LB-Signature']).toMatch(/^[0-9a-f]{64}$/);
     const pbody = JSON.parse(provisionCall.body);
+    expect(pbody.version).toBe('1');
     expect(pbody.link_token).toBe(VALID_LINK_TOKEN);
-    expect(pbody.sf_tenant.sf_tenant_id).toBe(2);
-    expect(pbody.sf_tenant.sf_base_url).toBe('https://sf-test.example.com');
-    expect(pbody.sf_tenant.sf_source_instance).toBe('sf-test');
-    expect(pbody.sf_credential.token).toMatch(/^sfo_v1\./);
-    expect(pbody.sf_credential.kid).toBe('sf_orch_test_kid');
-    expect(pbody.sf_credential.scope).toBe('lb_orchestration');
-    expect(pbody.sf_endpoints.availability).toBe('/api/integrations/leadbridge/orchestration/availability');
-    expect(pbody.sf_endpoints.credentials_refresh).toBe('/api/integrations/leadbridge/orchestration/credentials/refresh');
-    expect(pbody.sf_signature_metadata.algorithm).toBe('hmac-sha256-hex');
-    expect(pbody.sf_signature_metadata.timestamp_format).toBe('unix_seconds');
-    expect(pbody.sf_event_types).toContain('connection.connected');
-    expect(pbody.sf_event_types).toContain('credential.rotated');
-    expect(pbody.sf_event_types).toContain('connection.revoked');
+    expect(pbody.tenant.sf_tenant_id).toBe(2);
+    expect(pbody.tenant.sf_base_url).toBe('https://sf-test.example.com');
+    expect(pbody.tenant.source_instance).toBe('sf-test');
+    expect(pbody.credential.token).toMatch(/^sfo_v1\./);
+    expect(pbody.credential.kid).toBe('sf_orch_test_kid');
+    expect(pbody.credential.scope).toBe('lb_orchestration');
+    expect(pbody.endpoints.availability).toBe('/api/integrations/leadbridge/orchestration/availability');
+    expect(pbody.endpoints.credentials_refresh).toBe('/api/integrations/leadbridge/orchestration/credentials/refresh');
+    expect(pbody.signature_metadata.algorithm).toBe('hmac-sha256-hex');
+    expect(pbody.signature_metadata.timestamp_format).toBe('unix_seconds');
+    expect(pbody.event_types).toContain('connection.connected');
+    expect(pbody.event_types).toContain('credential.rotated');
+    expect(pbody.event_types).toContain('connection.revoked');
   });
 });
 
@@ -270,7 +271,7 @@ describe('secret hygiene', () => {
     const sniffingClient = async (req) => {
       const r = await client(req);
       if (req.url.endsWith('/v1/integrations/sf/provision')) {
-        mintedToken = JSON.parse(req.data).sf_credential.token;
+        mintedToken = JSON.parse(req.data).credential.token;
       }
       return r;
     };
