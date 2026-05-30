@@ -65,6 +65,10 @@ const { performRefresh: orchPerformRefresh } = lbOrchHandshake
 // OAuth browser-redirect path for tenant-driven Connect. See
 // lib/lb-orchestration-direct-provision.js for the contract.
 const lbOrchDirectProvision = require('./lib/lb-orchestration-direct-provision')
+// Migration-060 — LB-initiated historical lead link.
+const lbLeadLinkMatcher = require('./lib/lb-lead-link-matcher')
+const lbLeadLinkAttacher = require('./lib/lb-lead-link-attacher')
+const lbLeadLinkBulk = require('./lib/lb-lead-link-bulk')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -1614,6 +1618,178 @@ module.exports = (supabase, logger) => {
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchBookingCancelHandler)
   router.post('/orchestration/handoff',
     orchAuthDispatcher, layeredRequireOrchestrationEnabled, orchHandoffHandler)
+
+  // ══════════════════════════════════════
+  // POST /orchestration/match-candidates
+  // GET  /orchestration/job-status
+  // POST /orchestration/attach-lb-link
+  //
+  // LB-initiated historical lead link (migration 060). Lets LB find an
+  // existing SF customer/job that matches a historical LB lead and
+  // attach LB identifiers to it without overwriting in flight.
+  //
+  // All three use the orchestration bearer dispatcher + layered
+  // enablement, same as the other LB-callable routes.
+  // ══════════════════════════════════════
+  router.post('/orchestration/match-candidates',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      if (!req.user || req.user.userId == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+      const body = req.body || {}
+      try {
+        const out = await lbLeadLinkMatcher.findMatchCandidates(supabase, {
+          userId: req.user.userId,
+          input: {
+            lb_lead_id:             body.lb_lead_id             || null,
+            lb_external_request_id: body.lb_external_request_id || null,
+            lb_channel:             body.lb_channel             || null,
+            lb_business_id:         body.lb_business_id         || null,
+            customer_phone:         body.customer_phone         || null,
+            customer_email:         body.customer_email         || null,
+            customer_name:          body.customer_name          || null,
+            lead_created_at:        body.lead_created_at        || null,
+          },
+        })
+        // Single-line audit log, no PII (only counts + the LB identifiers
+        // we received, which are LB-internal not customer PII).
+        logger.log(`[lb-link/match] tenant=${req.user.userId} lb_lead=${body.lb_lead_id || '-'} candidates=${out.match_count}`)
+        return res.json({ ok: true, ...out })
+      } catch (e) {
+        logger.error(`[lb-link/match] tenant=${req.user.userId} error: ${e && e.message}`)
+        return res.status(500).json({ ok: false, error: 'internal_error' })
+      }
+    })
+
+  router.get('/orchestration/job-status',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      if (!req.user || req.user.userId == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+      const sfJobIdRaw = req.query.sf_job_id
+      const extReqId   = req.query.external_request_id
+      if (!sfJobIdRaw && !extReqId) {
+        return res.status(400).json({ error: 'invalid_arguments', detail: 'sf_job_id or external_request_id required' })
+      }
+
+      try {
+        let q = supabase.from('jobs')
+          .select('id, user_id, status, payment_status, payment_date, scheduled_date, total_amount, invoice_amount, lb_external_request_id, lb_channel, lb_business_id, lb_lead_id, last_status_changed_at, created_at')
+          .eq('user_id', req.user.userId)
+          .limit(1)
+        if (sfJobIdRaw) q = q.eq('id', sfJobIdRaw)
+        else            q = q.eq('lb_external_request_id', extReqId)
+
+        const { data: job, error } = await q.maybeSingle()
+        if (error)  return res.status(503).json({ error: 'db_error' })
+        if (!job)   return res.status(404).json({ error: 'job_not_found' })
+
+        return res.json({
+          ok: true,
+          sf_job_id:               job.id,
+          lb_external_request_id:  job.lb_external_request_id || null,
+          lb_channel:              job.lb_channel             || null,
+          lb_business_id:          job.lb_business_id         || null,
+          lb_lead_id:              job.lb_lead_id             || null,
+          status:                  job.status,
+          payment_status:          job.payment_status         || null,
+          payment_date:            job.payment_date           || null,
+          scheduled_date:          job.scheduled_date         || null,
+          amount:                  job.invoice_amount != null ? Number(job.invoice_amount)
+                                   : job.total_amount   != null ? Number(job.total_amount)
+                                   : null,
+          last_status_changed_at:  job.last_status_changed_at || null,
+        })
+      } catch (e) {
+        logger.error(`[lb-link/status] tenant=${req.user.userId} error: ${e && e.message}`)
+        return res.status(500).json({ error: 'internal_error' })
+      }
+    })
+
+  router.post('/orchestration/attach-lb-link',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      if (!req.user || req.user.userId == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+      const body = req.body || {}
+      try {
+        const out = await lbLeadLinkAttacher.attachLbLink(supabase, {
+          userId: req.user.userId,
+          input: {
+            sf_job_id:              body.sf_job_id,
+            lb_external_request_id: body.lb_external_request_id,
+            lb_channel:             body.lb_channel,
+            lb_business_id:         body.lb_business_id || null,
+            lb_lead_id:             body.lb_lead_id || null,
+            match_confidence:       body.match_confidence || null,
+            match_signals:          Array.isArray(body.match_signals) ? body.match_signals : [],
+            force_overwrite:        body.force_overwrite === true,
+          },
+        })
+        if (!out.ok) {
+          logger.warn(`[lb-link/attach] tenant=${req.user.userId} sf_job=${body.sf_job_id || '-'} error=${out.error} status=${out.status}`)
+          return res.status(out.status || 400).json(out)
+        }
+        logger.log(`[lb-link/attach] tenant=${req.user.userId} sf_job=${out.sf_job_id} action=${out.action} synthetic_event=${out.synthetic_status_event_id} enqueued=${out.synthetic_status_event_enqueued}`)
+        return res.json(out)
+      } catch (e) {
+        logger.error(`[lb-link/attach] tenant=${req.user.userId} error: ${e && e.message}`)
+        return res.status(500).json({ ok: false, error: 'internal_error' })
+      }
+    })
+
+  // ══════════════════════════════════════
+  // POST /orchestration/bulk-reconcile
+  //
+  // Automatic historical reconciliation. LB sends a batch of leads (up
+  // to 50 per call). SF runs the matcher per-lead; for any lead with
+  // exactly one unambiguous high-confidence candidate, SF auto-attaches
+  // (writes audit row, updates the SF job, enqueues synthetic
+  // job.status_changed). Ambiguous / low-confidence / multi-candidate /
+  // already-linked-to-different-id leads come back as `needs_review`
+  // with the candidate list so LB can drive a manual attach.
+  //
+  // Body:
+  //   { leads: [{ lb_lead_id, lb_external_request_id, lb_channel,
+  //               lb_business_id, customer_phone, customer_email,
+  //               customer_name, lead_created_at }, …],
+  //     dry_run: false }
+  //
+  // Response: per-lead { outcome: 'auto_attached' | 'needs_review' |
+  //                                 'no_match' | 'auto_attach_preview' |
+  //                                 'error' } plus a roll-up summary.
+  // ══════════════════════════════════════
+  router.post('/orchestration/bulk-reconcile',
+    orchAuthDispatcher, layeredRequireOrchestrationEnabled,
+    async (req, res) => {
+      if (!req.user || req.user.userId == null) {
+        return res.status(401).json({ error: 'invalid_orchestration_token' })
+      }
+      const body = req.body || {}
+      const leads = Array.isArray(body.leads) ? body.leads : null
+      if (!leads) {
+        return res.status(400).json({ ok: false, error: 'invalid_arguments', detail: 'leads array required' })
+      }
+      try {
+        const out = await lbLeadLinkBulk.reconcileBatch(supabase, {
+          userId: req.user.userId,
+          leads,
+          dryRun: body.dry_run === true,
+          logger,
+        })
+        if (!out.ok) {
+          return res.status(out.status || 400).json(out)
+        }
+        logger.log(`[lb-bulk-reconcile] tenant=${req.user.userId} dry_run=${out.dry_run} total=${out.summary.total} auto_attached=${out.summary.auto_attached} preview=${out.summary.auto_attach_preview} needs_review=${out.summary.needs_review} no_match=${out.summary.no_match} error=${out.summary.error}`)
+        return res.json(out)
+      } catch (e) {
+        logger.error(`[lb-bulk-reconcile] tenant=${req.user.userId} error: ${e && e.message}`)
+        return res.status(500).json({ ok: false, error: 'internal_error' })
+      }
+    })
 
   // ══════════════════════════════════════
   // POST /orchestration/provision-retry — Tenant-initiated retry for the
