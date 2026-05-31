@@ -210,6 +210,24 @@ describe('payload + signer (§7)', () => {
     expect(p.actor).toMatchObject({ type: 'account_owner', id: '42' })
   })
 
+  test('sf_managed=true when job has lb_external_request_id + lb_channel', () => {
+    const p = buildPayload({ job, oldStatus: 'pending', newStatus: 'Completed', actor })
+    expect(p.sf_managed).toBe(true)
+  })
+
+  test('sf_managed=false when job lacks LB linkage', () => {
+    const unlinkedJob = { ...job, lb_external_request_id: null, lb_channel: null }
+    const p = buildPayload({ job: unlinkedJob, oldStatus: 'pending', newStatus: 'Completed', actor })
+    expect(p.sf_managed).toBe(false)
+  })
+
+  test('sf_managed=false when only one half of the linkage pair is set', () => {
+    const halfLinked1 = { ...job, lb_external_request_id: 'req', lb_channel: null }
+    const halfLinked2 = { ...job, lb_external_request_id: null, lb_channel: 'thumbtack' }
+    expect(buildPayload({ job: halfLinked1, oldStatus: 'pending', newStatus: 'completed', actor }).sf_managed).toBe(false)
+    expect(buildPayload({ job: halfLinked2, oldStatus: 'pending', newStatus: 'completed', actor }).sf_managed).toBe(false)
+  })
+
   test('signature is deterministic for (secret, ts, body)', () => {
     const body = JSON.stringify({ x: 1 })
     const s1 = signRequest('secret', body, '1700')

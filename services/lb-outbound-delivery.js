@@ -63,6 +63,18 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
     : null
   const customerEmailPresent = !!(typeof job.customer_email === 'string' && job.customer_email.length > 0)
 
+  // Phase-3: sf_managed flag.
+  //
+  // True iff the job carries an LB linkage (lb_external_request_id +
+  // lb_channel). Per the historical-sync product spec: once a lead is
+  // linked, LB UI must block manual status edits and SF is the source
+  // of truth. This boolean lets LB sanity-check incoming events against
+  // its sf_managed flag on the lb_lead row.
+  //
+  // Always present on the payload (true | false), never omitted — that
+  // way LB can assert on shape, not on field presence.
+  const isLbLinked = !!(job.lb_external_request_id && job.lb_channel)
+
   return {
     event_id: eventIdOverride || `evt_${uuidv7()}`,
     event_type: 'job.status_changed',
@@ -74,6 +86,7 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
     external_request_id: job.lb_external_request_id,
     channel: job.lb_channel,
     lb_lead_id: job.lb_lead_id ?? null,
+    sf_managed: isLbLinked,
     status: {
       new: normalizeStatus(newStatus),
       previous: oldStatus == null ? null : normalizeStatus(oldStatus),
