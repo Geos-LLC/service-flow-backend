@@ -113,6 +113,24 @@ describe('fetchCandidates — request shape', () => {
     expect(out.ok).toBe(false);
     expect(out.reason).toBe('invalid_arguments');
   });
+
+  test('omits LB `status` filter from body when not provided', async () => {
+    const client = makeHttpClient();
+    await fetchCandidates({ lbUserId: LB_USER, httpClient: client, now: NOW });
+    expect(JSON.parse(client.calls[0].body)).not.toHaveProperty('status');
+  });
+
+  test('forwards LB `status` filter when provided', async () => {
+    const client = makeHttpClient();
+    await fetchCandidates({ lbUserId: LB_USER, status: 'scheduled', httpClient: client, now: NOW });
+    expect(JSON.parse(client.calls[0].body).status).toBe('scheduled');
+  });
+
+  test('ignores empty-string `status`', async () => {
+    const client = makeHttpClient();
+    await fetchCandidates({ lbUserId: LB_USER, status: '', httpClient: client, now: NOW });
+    expect(JSON.parse(client.calls[0].body)).not.toHaveProperty('status');
+  });
 });
 
 // ──────────────────────────────────────────────────────────────

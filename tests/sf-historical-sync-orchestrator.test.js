@@ -323,6 +323,22 @@ describe('runHistoricalSync — Phase 1 invariants', () => {
     await runHistoricalSync(store, { tenantId: SF_TENANT_ID, maxLeads: 500 });
     expect(mockFetchCandidates).toHaveBeenCalledTimes(1);
   });
+
+  test('forwards optional LB `status` filter when provided', async () => {
+    const store = makeStore();
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 0, candidates: [], more_may_exist: false });
+    const out = await runHistoricalSync(store, { tenantId: SF_TENANT_ID, status: 'scheduled' });
+    expect(mockFetchCandidates.mock.calls[0][0].status).toBe('scheduled');
+    expect(out.summary.status_filter).toBe('scheduled');
+  });
+
+  test('omits LB `status` filter when not provided (status_filter=null)', async () => {
+    const store = makeStore();
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 0, candidates: [], more_may_exist: false });
+    const out = await runHistoricalSync(store, { tenantId: SF_TENANT_ID });
+    expect(mockFetchCandidates.mock.calls[0][0].status).toBeUndefined();
+    expect(out.summary.status_filter).toBeNull();
+  });
 });
 
 // ──────────────────────────────────────────────────────────────

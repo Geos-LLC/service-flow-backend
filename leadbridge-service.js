@@ -2264,6 +2264,7 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
         tenantId:      userId,
         maxLeads:      Number.isFinite(body.max_leads) ? body.max_leads : undefined,
         syncStatuses:  Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
+        status:        (typeof body.status === 'string' && body.status.length > 0) ? body.status : undefined,
         logger,
       })
 
