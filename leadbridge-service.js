@@ -2262,9 +2262,8 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
 
       const out = await sfHistoricalSyncOrchestrator.runHistoricalSync(supabase, {
         tenantId:      userId,
-        maxLeads:      Number.isFinite(body.max_leads)  ? body.max_leads  : undefined,
-        pageSize:      Number.isFinite(body.page_size)  ? body.page_size  : undefined,
-        lbBusinessId:  body.lb_business_id || null,
+        maxLeads:      Number.isFinite(body.max_leads) ? body.max_leads : undefined,
+        syncStatuses:  Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
         logger,
       })
 
