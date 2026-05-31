@@ -69,6 +69,8 @@ const lbOrchDirectProvision = require('./lib/lb-orchestration-direct-provision')
 const lbLeadLinkMatcher = require('./lib/lb-lead-link-matcher')
 const lbLeadLinkAttacher = require('./lib/lb-lead-link-attacher')
 const lbLeadLinkBulk = require('./lib/lb-lead-link-bulk')
+// SF-driven historical sync (Phase 1: dry-run-only).
+const sfHistoricalSyncOrchestrator = require('./lib/sf-historical-sync-orchestrator')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -2228,6 +2230,51 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
       connected: true,
       provisioning: payload,
     })
+  })
+
+  // ══════════════════════════════════════
+  // POST /historical-sync — SF-driven historical lead sync (Phase 1: DRY-RUN ONLY)
+  //
+  // Operator-triggered (tenant JWT). Calls LB /historical-sync/candidates
+  // for the tenant's unlinked leads, matches each against SF data via
+  // the existing lib/lb-lead-link-matcher, buckets results into
+  // would_link / would_review / would_skip, and returns the preview.
+  //
+  // PHASE 1 HARD CONSTRAINTS (enforced here AND in the orchestrator):
+  //   - dry_run is forced TRUE regardless of request body
+  //   - never calls LB /link-leads-bulk
+  //   - never writes to SF jobs / customers / lb_link_audit
+  //   - never enqueues outbox events
+  //   - response payload includes phase:'phase_1_dry_run_only' so the
+  //     caller can confirm no mutation is possible
+  // ══════════════════════════════════════
+  router.post('/historical-sync', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const body = req.body || {}
+
+      // Defense-in-depth: even if a caller posts { dry_run: false },
+      // the endpoint coerces to true. The orchestrator also forces it.
+      // Either layer is sufficient; both is intentional.
+      if (body.dry_run === false) {
+        logger.warn(`[sf-historical-sync] tenant=${userId} requested dry_run=false; ignored — Phase-1 endpoint forces dry_run=true`)
+      }
+
+      const out = await sfHistoricalSyncOrchestrator.runHistoricalSync(supabase, {
+        tenantId:      userId,
+        maxLeads:      Number.isFinite(body.max_leads) ? body.max_leads : undefined,
+        syncStatuses:  Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
+        logger,
+      })
+
+      if (!out.ok) {
+        return res.status(out.status || 502).json(out)
+      }
+      return res.json(out)
+    } catch (e) {
+      logger.error(`[sf-historical-sync] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
+      return res.status(500).json({ ok: false, error: 'internal_error' })
+    }
   })
 
   // ══════════════════════════════════════
