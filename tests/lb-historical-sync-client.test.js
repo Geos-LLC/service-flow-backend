@@ -228,7 +228,7 @@ describe('linkLeadsBulk — LB production contract (rows:)', () => {
     expect(body).toEqual({
       user_id: LB_USER,
       rows: [{
-        lb_lead_id: 'a', sf_job_id: 1, sf_customer_id: 10,
+        lb_lead_id: 'a', sf_job_id: '1', sf_customer_id: '10',
         confidence: 'high', match_basis: 'externalRequestId',
         sf_status: 'completed', sf_payment_status: 'paid',
         occurred_at: '2026-05-05T22:44:31Z', reason: 'historical_sync_apply',
@@ -258,6 +258,32 @@ describe('linkLeadsBulk — LB production contract (rows:)', () => {
       httpClient: client, now: NOW,
     });
     expect(JSON.parse(client.calls[0].body).rows[0].match_basis).toBe('externalRequestId');
+  });
+
+  test('stringifies sf_job_id + sf_customer_id on the wire (LB Prisma string columns)', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: 141929, sf_customer_id: 23427, match_basis: 'externalRequestId' }],
+      httpClient: client, now: NOW,
+    });
+    const body = JSON.parse(client.calls[0].body);
+    expect(body.rows[0].sf_job_id).toBe('141929');
+    expect(body.rows[0].sf_customer_id).toBe('23427');
+    expect(typeof body.rows[0].sf_job_id).toBe('string');
+    expect(typeof body.rows[0].sf_customer_id).toBe('string');
+  });
+
+  test('null sf_job_id stays null (does not become "null" string)', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: null, sf_customer_id: 23427 }],
+      httpClient: client, now: NOW,
+    });
+    const body = JSON.parse(client.calls[0].body);
+    expect(body.rows[0].sf_job_id).toBeNull();
+    expect(body.rows[0].sf_customer_id).toBe('23427');
   });
 
   test('null/missing match_basis → empty string', async () => {
