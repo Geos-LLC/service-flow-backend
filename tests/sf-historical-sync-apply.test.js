@@ -407,6 +407,39 @@ describe('runHistoricalSyncApply — Erin Davis happy path', () => {
     expect(custUpdates[0].payload.lb_lead_id).toBe(ERIN_LB_CANDIDATE.leadId);
   });
 
+  test('reattach_same fix: jobs.lb_lead_id is populated even when lb_external_request_id was pre-set (Batch-1 Issue #2)', async () => {
+    // Pre-seed: job has lb_external_request_id set (e.g. from earlier
+    // LB webhook), but lb_lead_id is still NULL. With the OLD code the
+    // action='reattach_same' branch skipped the UPDATE entirely, leaving
+    // lb_lead_id null. The fix runs the UPDATE when any incoming
+    // linkage field is missing on the SF side.
+    const seededJob = { ...ERIN_JOB, lb_external_request_id: '574011065576308746', lb_channel: 'thumbtack', lb_lead_id: null };
+    const store = makeStore({ customers: [ERIN_CUST], jobs: [seededJob] });
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false });
+    mockFindMatchCandidates.mockResolvedValueOnce({ candidates: [ERIN_MATCH] });
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: true, applied: [lbApplied(ERIN_LB_CANDIDATE.leadId)], rejected: [], summary: {} });
+
+    await runHistoricalSyncApply(store, {
+      tenantId: SF_TENANT,
+      expectedMatches: [{ lb_lead_id: ERIN_LB_CANDIDATE.leadId, sf_job_id: 141929 }],
+    });
+
+    // Audit row was written with action='reattach_same' (because
+    // lb_external_request_id matched), AND the jobs UPDATE still ran
+    // to populate lb_lead_id.
+    const auditInserts = store._log.inserts.filter(i => i.table === 'lb_link_audit');
+    expect(auditInserts).toHaveLength(1);
+    expect(auditInserts[0].payload.action).toBe('reattach_same');
+
+    const jobUpdates = store._log.updates.filter(u => u.table === 'jobs');
+    expect(jobUpdates).toHaveLength(1);
+    expect(jobUpdates[0].payload.lb_lead_id).toBe(ERIN_LB_CANDIDATE.leadId);
+
+    // Final state: the in-memory store reflects lb_lead_id populated.
+    const erinJobNow = store._rows.jobs.find(j => Number(j.id) === 141929);
+    expect(erinJobNow.lb_lead_id).toBe(ERIN_LB_CANDIDATE.leadId);
+  });
+
   test('LB payload uses match_basis + sf_status field names (LB production contract)', async () => {
     const store = makeStore({ customers: [ERIN_CUST], jobs: [ERIN_JOB] });
     mockFetchCandidates.mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false });
@@ -664,6 +697,120 @@ describe('runHistoricalSyncApply — LB infra failure', () => {
     expect(out.ok).toBe(false);
     expect(out.error).toBe('lb_unreachable');
     expect(store._log.inserts.filter(i => i.table === 'leadbridge_outbound_events')).toHaveLength(0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Post-timeout reconcile (Task 1 stabilization)
+// Regression for prod Batch #1: LB committed the rows server-side after
+// SF's HTTP client timed out at 30s. The orchestrator must NOT write SF
+// state until it confirms LB's actual state by re-fetching
+// sync_statuses=['linked'] and cross-referencing.
+// ──────────────────────────────────────────────────────────────────────
+describe('runHistoricalSyncApply — post-timeout reconcile', () => {
+  test('linkLeadsBulk request_timeout + LB linked-fetch confirms row → attach runs (NO data loss)', async () => {
+    const store = makeStore({ customers: [ERIN_CUST], jobs: [ERIN_JOB] });
+    mockFetchCandidates
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false })  // initial pending fetch
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false }); // post-timeout linked fetch
+    mockFindMatchCandidates.mockResolvedValueOnce({ candidates: [ERIN_MATCH] });
+    // LB call times out (client returns request_timeout)
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', timeout: true, request_id: 'sf-test123', error_description: 'request_timeout' });
+
+    const out = await runHistoricalSyncApply(store, {
+      tenantId: SF_TENANT,
+      expectedMatches: [{ lb_lead_id: ERIN_LB_CANDIDATE.leadId, sf_job_id: 141929 }],
+    });
+
+    expect(out.ok).toBe(true);
+    expect(out.post_timeout_reconciled).toBe(true);
+    expect(out.summary.applied).toBe(1);
+    expect(out.summary.uncertain).toBe(0);
+    expect(out.applied).toHaveLength(1);
+    expect(out.applied[0].lb_lead_id).toBe(ERIN_LB_CANDIDATE.leadId);
+    expect(out.request_id).toBe('sf-test123');
+    // attachLbLink ran → audit + outbox written exactly once
+    expect(store._log.inserts.filter(i => i.table === 'lb_link_audit')).toHaveLength(1);
+    expect(store._log.inserts.filter(i => i.table === 'leadbridge_outbound_events')).toHaveLength(1);
+  });
+
+  test('linkLeadsBulk request_timeout + LB linked-fetch shows row NOT linked → uncertain, NO SF writes', async () => {
+    const store = makeStore({ customers: [ERIN_CUST], jobs: [ERIN_JOB] });
+    mockFetchCandidates
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false })
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 0, candidates: [], more_may_exist: false });  // LB didn't actually link
+    mockFindMatchCandidates.mockResolvedValueOnce({ candidates: [ERIN_MATCH] });
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', timeout: true, request_id: 'sf-uncertain1' });
+
+    const out = await runHistoricalSyncApply(store, {
+      tenantId: SF_TENANT,
+      expectedMatches: [{ lb_lead_id: ERIN_LB_CANDIDATE.leadId, sf_job_id: 141929 }],
+    });
+
+    expect(out.ok).toBe(true);
+    expect(out.post_timeout_reconciled).toBe(true);
+    expect(out.summary.applied).toBe(0);
+    expect(out.summary.uncertain).toBe(1);
+    expect(out.uncertain).toHaveLength(1);
+    expect(out.uncertain[0].reason).toBe('lb_state_uncertain');
+    // NO writes for uncertain rows — operator must use /remediate
+    expect(store._log.inserts.filter(i => i.table === 'lb_link_audit')).toHaveLength(0);
+    expect(store._log.inserts.filter(i => i.table === 'leadbridge_outbound_events')).toHaveLength(0);
+  });
+
+  test('partial reconcile: 2 confirmed linked, 1 uncertain', async () => {
+    const c1 = { ...ERIN_LB_CANDIDATE, leadId: 'l-A', externalRequestId: 'r-A' };
+    const c2 = { ...ERIN_LB_CANDIDATE, leadId: 'l-B', externalRequestId: 'r-B' };
+    const c3 = { ...ERIN_LB_CANDIDATE, leadId: 'l-C', externalRequestId: 'r-C' };
+    const cust = (id) => ({ ...ERIN_CUST, id });
+    const job  = (id, cid) => ({ ...ERIN_JOB, id, customer_id: cid, lb_external_request_id: null });
+    const store = makeStore({
+      customers: [cust(101), cust(102), cust(103)],
+      jobs:      [job(11,101), job(12,102), job(13,103)],
+    });
+    mockFetchCandidates
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 3, candidates: [c1, c2, c3], more_may_exist: false })
+      // post-timeout: LB linked l-A + l-C; l-B is uncertain
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 2, candidates: [c1, c3], more_may_exist: false });
+    mockFindMatchCandidates
+      .mockResolvedValueOnce({ candidates: [{ ...ERIN_MATCH, sf_customer_id: 101, sf_job_id: 11 }] })
+      .mockResolvedValueOnce({ candidates: [{ ...ERIN_MATCH, sf_customer_id: 102, sf_job_id: 12 }] })
+      .mockResolvedValueOnce({ candidates: [{ ...ERIN_MATCH, sf_customer_id: 103, sf_job_id: 13 }] });
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', timeout: true });
+
+    const out = await runHistoricalSyncApply(store, {
+      tenantId: SF_TENANT,
+      expectedMatches: [
+        { lb_lead_id: 'l-A', sf_job_id: 11 },
+        { lb_lead_id: 'l-B', sf_job_id: 12 },
+        { lb_lead_id: 'l-C', sf_job_id: 13 },
+      ],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.summary.applied).toBe(2);
+    expect(out.summary.uncertain).toBe(1);
+    expect(out.uncertain[0].lb_lead_id).toBe('l-B');
+    // exactly 2 audit + 2 outbox writes (NOT 3)
+    expect(store._log.inserts.filter(i => i.table === 'lb_link_audit')).toHaveLength(2);
+    expect(store._log.inserts.filter(i => i.table === 'leadbridge_outbound_events')).toHaveLength(2);
+  });
+
+  test('linkLeadsBulk request_timeout + post-timeout fetch ALSO fails → 502 lb_state_uncertain, NO writes', async () => {
+    const store = makeStore({ customers: [ERIN_CUST], jobs: [ERIN_JOB] });
+    mockFetchCandidates
+      .mockResolvedValueOnce({ ok: true, user_id: LB_USER_UUID, count: 1, candidates: [ERIN_LB_CANDIDATE], more_may_exist: false })
+      .mockResolvedValueOnce({ ok: false, reason: 'lb_unreachable' });  // post-timeout fetch also fails
+    mockFindMatchCandidates.mockResolvedValueOnce({ candidates: [ERIN_MATCH] });
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', timeout: true });
+
+    const out = await runHistoricalSyncApply(store, {
+      tenantId: SF_TENANT,
+      expectedMatches: [{ lb_lead_id: ERIN_LB_CANDIDATE.leadId, sf_job_id: 141929 }],
+    });
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe(502);
+    expect(out.error).toBe('lb_state_uncertain');
+    expect(store._log.inserts).toHaveLength(0);
   });
 });
 
