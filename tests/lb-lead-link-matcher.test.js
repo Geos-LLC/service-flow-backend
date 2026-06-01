@@ -24,6 +24,7 @@ const {
   splitName,
   phoneLast4,
   scoreCandidate,
+  pickOriginatorOrEarliestPerCustomer,
 } = require('../lib/lb-lead-link-matcher');
 
 // ──────────────────────────────────────────────────────────────
@@ -140,7 +141,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_phone: '8133752443', customer_email: 'erin@x.com', customer_name: 'Erin Davis' },
       customer: { phone: '+1-813-375-2443', email: 'ERIN@X.com', first_name: 'Erin', last_name: 'Davis' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBe('exact');
     expect(r.signals).toEqual(expect.arrayContaining(['phone_exact:…2443', 'email_exact', 'name_exact']));
@@ -149,7 +150,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_phone: '8133752443', customer_name: 'Erin Davis' },
       customer: { phone: '(813) 375-2443', email: 'other@y.com', first_name: 'Erin', last_name: 'Davis' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBe('high');
     expect(r.signals).toContain('phone_exact:…2443');
@@ -158,7 +159,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_email: 'erin@x.com', customer_name: 'Erin Davis' },
       customer: { phone: null, email: 'erin@x.com', first_name: 'Other', last_name: 'Name' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBe('high');
     expect(r.signals).toContain('email_exact');
@@ -167,7 +168,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_name: 'Erin Davis', lead_created_at: '2026-03-10T00:00:00Z' },
       customer: { phone: null, email: null, first_name: 'Erin', last_name: 'Davis' },
-      mostRecentJob: { scheduled_date: '2026-03-18T00:00:00Z' },
+      pickedJob: { scheduled_date: '2026-03-18T00:00:00Z' },
     });
     expect(r.confidence).toBe('medium');
     expect(r.signals).toEqual(expect.arrayContaining(['name_exact', 'date_within_14d']));
@@ -176,7 +177,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_name: 'Erin Davis' },
       customer: { phone: null, email: null, first_name: 'Erin', last_name: 'Davis' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBe('low');
   });
@@ -184,7 +185,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { customer_name: 'Erin Davis' },
       customer: { phone: null, email: null, first_name: 'Other', last_name: 'Name' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBeNull();
   });
@@ -192,7 +193,7 @@ describe('scoreCandidate', () => {
     const r = scoreCandidate({
       input: { lb_lead_id: 'lb-uuid-1', customer_name: 'Other Name' },
       customer: { phone: null, email: null, first_name: 'Other', last_name: 'Name', lb_lead_id: 'lb-uuid-1' },
-      mostRecentJob: null,
+      pickedJob: null,
     });
     expect(r.confidence).toBe('exact');
     expect(r.signals).toContain('lb_lead_id_already_linked');
@@ -312,5 +313,137 @@ describe('findMatchCandidates', () => {
     });
     expect(out.match_count).toBe(1);
     expect(out.candidates[0].confidence).toBe('high');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Originator/earliest job picker (post-Batch-5 audit fix)
+// ──────────────────────────────────────────────────────────────────────
+describe('pickOriginatorOrEarliestPerCustomer', () => {
+  test('prefers the originator job (matching lb_external_request_id) over later jobs', () => {
+    const jobs = [
+      { id: 5, customer_id: 10, lb_external_request_id: null,    created_at: '2026-04-01T00:00:00Z' },
+      { id: 2, customer_id: 10, lb_external_request_id: 'EXT-A', created_at: '2025-01-01T00:00:00Z' },
+      { id: 7, customer_id: 10, lb_external_request_id: null,    created_at: '2026-06-01T00:00:00Z' },
+    ];
+    const picked = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A').get(10);
+    expect(picked.id).toBe(2);
+    expect(picked.lb_external_request_id).toBe('EXT-A');
+  });
+
+  test('falls back to earliest job when no originator match', () => {
+    const jobs = [
+      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2026-04-01T00:00:00Z' },
+      { id: 2, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
+      { id: 7, customer_id: 10, lb_external_request_id: null, created_at: '2026-06-01T00:00:00Z' },
+    ];
+    const picked = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A').get(10);
+    expect(picked.id).toBe(2);     // earliest by created_at
+  });
+
+  test('null input externalRequestId → earliest fallback even if jobs have ext_reqs', () => {
+    const jobs = [
+      { id: 5, customer_id: 10, lb_external_request_id: 'EXT-X', created_at: '2026-04-01T00:00:00Z' },
+      { id: 2, customer_id: 10, lb_external_request_id: 'EXT-Y', created_at: '2025-01-01T00:00:00Z' },
+    ];
+    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
+    expect(picked.id).toBe(2);
+  });
+
+  test('ties on created_at broken by lower id', () => {
+    const jobs = [
+      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
+      { id: 2, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
+    ];
+    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
+    expect(picked.id).toBe(2);
+  });
+
+  test('per-customer isolation: originator vs earliest applied independently', () => {
+    const jobs = [
+      { id: 1, customer_id: 10, lb_external_request_id: 'EXT-A', created_at: '2025-01-01T00:00:00Z' },
+      { id: 9, customer_id: 10, lb_external_request_id: null,    created_at: '2026-06-01T00:00:00Z' },
+      { id: 2, customer_id: 20, lb_external_request_id: null,    created_at: '2024-12-01T00:00:00Z' },
+      { id: 8, customer_id: 20, lb_external_request_id: null,    created_at: '2026-03-01T00:00:00Z' },
+    ];
+    const out = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A');
+    expect(out.get(10).id).toBe(1);  // originator match
+    expect(out.get(20).id).toBe(2);  // no ext_req match → earliest
+  });
+
+  test('jobs without created_at sort to the end (defensive)', () => {
+    const jobs = [
+      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
+      { id: 9, customer_id: 10, lb_external_request_id: null, created_at: null },
+    ];
+    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
+    expect(picked.id).toBe(5);
+  });
+
+  test('empty jobsRows → empty map', () => {
+    expect(pickOriginatorOrEarliestPerCustomer([], 'EXT-A').size).toBe(0);
+    expect(pickOriginatorOrEarliestPerCustomer(null, null).size).toBe(0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Regression: recurring-customer scenario from the Batch-5 audit
+//
+// Scenario: customer has 3 SF jobs:
+//   - 100 (originator, ext_req=EXT-A, created 2025-01-01)
+//   - 200 (recurring, created 2025-06-01)
+//   - 300 (recurring, created 2025-12-01, sched 2026-04-15)
+// LB sends a lead with externalRequestId=EXT-A. The OLD matcher
+// returned sf_job=300 (most-recent), which then conflicted on LB's
+// /link-leads-bulk because LB had pinned to job 100. The NEW matcher
+// must return sf_job=100 — the originator.
+// ──────────────────────────────────────────────────────────────────────
+describe('findMatchCandidates — recurring customer originator fix', () => {
+  test('recurring customer with matching ext_req → returns originator (earliest) sf_job', async () => {
+    const cust = { id: 50, user_id: 2, first_name: 'Recurring', last_name: 'Service',
+      phone: '5550000000', email: 'r@example.com', lb_lead_id: null, created_at: '2025-01-01T00:00:00Z' };
+    const jobs = [
+      { id: 300, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
+        lb_external_request_id: null, scheduled_date: '2026-04-15T00:00:00Z', created_at: '2025-12-01T00:00:00Z' },
+      { id: 200, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
+        lb_external_request_id: null, scheduled_date: '2025-08-01T00:00:00Z', created_at: '2025-06-01T00:00:00Z' },
+      { id: 100, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
+        lb_external_request_id: 'EXT-A', scheduled_date: '2025-02-01T00:00:00Z', created_at: '2025-01-01T00:00:00Z' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: {
+        lb_external_request_id: 'EXT-A',
+        customer_phone: '5550000000',
+        customer_name:  'Recurring Service',
+        lead_created_at: '2025-01-05T00:00:00Z',
+      },
+    });
+    expect(out.match_count).toBe(1);
+    expect(out.candidates[0].sf_job_id).toBe(100);   // originator, NOT 300 (the most-recent)
+    expect(out.candidates[0].sf_job.lb_external_request_id).toBe('EXT-A');
+  });
+
+  test('recurring customer with NO matching ext_req → returns EARLIEST sf_job (not most-recent)', async () => {
+    const cust = { id: 60, user_id: 2, first_name: 'Walk', last_name: 'In',
+      phone: '5550001111', email: null, lb_lead_id: null, created_at: '2025-01-01T00:00:00Z' };
+    const jobs = [
+      { id: 600, user_id: 2, customer_id: 60, status: 'completed', payment_status: 'paid',
+        lb_external_request_id: null, scheduled_date: '2026-04-15T00:00:00Z', created_at: '2025-12-01T00:00:00Z' },
+      { id: 500, user_id: 2, customer_id: 60, status: 'completed', payment_status: 'paid',
+        lb_external_request_id: null, scheduled_date: '2025-02-01T00:00:00Z', created_at: '2025-01-01T00:00:00Z' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: {
+        lb_external_request_id: null,            // LB lead has no ext_req on file (or doesn't match)
+        customer_phone: '5550001111',
+        lead_created_at: '2025-01-05T00:00:00Z',
+      },
+    });
+    expect(out.match_count).toBe(1);
+    expect(out.candidates[0].sf_job_id).toBe(500);   // earliest (NOT 600 most-recent)
   });
 });
