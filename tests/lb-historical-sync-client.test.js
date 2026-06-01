@@ -30,10 +30,12 @@ const {
   fetchCandidates,
   linkLeadsBulk,
   normalizeMatchBasis,
+  mintRequestId,
   APPLIED_RESULTS,
   REJECTED_RESULTS,
   CANDIDATES_PATH,
   LINK_BULK_PATH,
+  DEFAULT_TIMEOUT_MS,
   DEFAULT_BATCH_SIZE,
   MAX_BATCH_SIZE,
   DEFAULT_SYNC_STATUSES,
@@ -396,11 +398,61 @@ describe('linkLeadsBulk — response bucketing by per-row `result`', () => {
     expect(out.reason).toBe('upstream_down');
   });
 
-  test('network error → ok:false reason=lb_unreachable', async () => {
-    const client = makeHttpClient({ throwErr: 'connect ETIMEDOUT' });
+  test('non-timeout network error → ok:false reason=lb_unreachable', async () => {
+    const client = makeHttpClient({ throwErr: 'connection refused' });
     const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
     expect(out.ok).toBe(false);
     expect(out.reason).toBe('lb_unreachable');
+    expect(out.timeout).toBe(false);
+  });
+
+  test('axios timeout (ETIMEDOUT message) → ok:false reason=request_timeout + timeout:true', async () => {
+    const client = makeHttpClient({ throwErr: 'connect ETIMEDOUT 1.2.3.4:443' });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe('request_timeout');
+    expect(out.timeout).toBe(true);
+    expect(out.request_id).toMatch(/^sf-[0-9a-f]{16}$/);
+  });
+
+  test('axios timeout ("timeout of 120000ms exceeded") → request_timeout', async () => {
+    const client = makeHttpClient({ throwErr: 'timeout of 120000ms exceeded' });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.reason).toBe('request_timeout');
+    expect(out.timeout).toBe(true);
+  });
+});
+
+describe('linkLeadsBulk — correlation id (X-SF-Request-Id)', () => {
+  test('mints a request id and includes it on the wire as X-SF-Request-Id', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 0 }, rows: [{ lb_lead_id:'a', result:'linked' }] } } });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.request_id).toMatch(/^sf-[0-9a-f]{16}$/);
+    expect(client.calls[0].headers['X-SF-Request-Id']).toBe(out.request_id);
+  });
+
+  test('respects caller-supplied requestId', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 0 }, rows: [{ lb_lead_id:'a', result:'linked' }] } } });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW, requestId: 'sf-caller-supplied-123' });
+    expect(out.request_id).toBe('sf-caller-supplied-123');
+    expect(client.calls[0].headers['X-SF-Request-Id']).toBe('sf-caller-supplied-123');
+  });
+});
+
+describe('DEFAULT_TIMEOUT_MS', () => {
+  test('is 120s (bumped from 30s after Batch #1 timeout incident)', () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(120_000);
+  });
+});
+
+describe('mintRequestId', () => {
+  test('returns sf-prefixed 16 hex chars', () => {
+    const id = mintRequestId();
+    expect(id).toMatch(/^sf-[0-9a-f]{16}$/);
+  });
+  test('produces distinct ids on repeated calls', () => {
+    const set = new Set(Array.from({ length: 50 }, () => mintRequestId()));
+    expect(set.size).toBe(50);
   });
 });
 
