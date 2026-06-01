@@ -456,6 +456,72 @@ describe('drainer processRow — response handling (§5)', () => {
     expect(s._db.outbox[0].terminal_at).toBeTruthy()
   })
 
+  test('200 + result=noop → state=sent, result=lifecycle_drift:noop (without LB enrichment)', async () => {
+    const s = seedDrainerFixture()
+    const logs = []
+    axios.mockResolvedValueOnce({ status: 200, data: { result: 'noop' } })
+    const row = s._db.outbox[0]
+    await processRow({ supabase: s, logger: { log: (m) => logs.push(m), error: () => {}, warn: () => {} }, row })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('lifecycle_drift:noop')
+    expect(s._db.outbox[0].last_error).toContain('desired=completed')
+    expect(s._db.outbox[0].last_error).toContain('actual=unknown')
+    expect(s._db.outbox[0].last_error).toContain('reason=unknown')
+    const driftLine = logs.find((l) => l.includes('lifecycle_drift'))
+    expect(driftLine).toBeTruthy()
+    expect(driftLine).toMatch(/\[SF → LB\] lifecycle_drift event=evt_drainer_1/)
+    expect(driftLine).toMatch(/desired=completed/)
+    expect(driftLine).toMatch(/lb_result=noop/)
+  })
+
+  test('200 + result=noop with LB enrichment → drift surfaces reason + actual', async () => {
+    const s = seedDrainerFixture()
+    const logs = []
+    axios.mockResolvedValueOnce({
+      status: 200,
+      data: { result: 'noop', skipReason: 'hard_terminal', currentStatus: 'archived' },
+    })
+    await processRow({ supabase: s, logger: { log: (m) => logs.push(m), error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('lifecycle_drift:noop')
+    expect(s._db.outbox[0].last_error).toBe(
+      'lifecycle_drift desired=completed actual=archived reason=hard_terminal'
+    )
+    const driftLine = logs.find((l) => l.includes('lifecycle_drift'))
+    expect(driftLine).toMatch(/desired=completed/)
+    expect(driftLine).toMatch(/actual=archived/)
+    expect(driftLine).toMatch(/reason=hard_terminal/)
+    expect(driftLine).toMatch(/lb_result=noop/)
+  })
+
+  test('200 + result=stale → state=sent, result=lifecycle_drift:stale', async () => {
+    const s = seedDrainerFixture()
+    const logs = []
+    axios.mockResolvedValueOnce({
+      status: 200,
+      data: { result: 'stale', skipReason: 'stale_event' },
+    })
+    await processRow({ supabase: s, logger: { log: (m) => logs.push(m), error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('lifecycle_drift:stale')
+    expect(s._db.outbox[0].last_error).toMatch(/reason=stale_event/)
+    const driftLine = logs.find((l) => l.includes('lifecycle_drift'))
+    expect(driftLine).toMatch(/lb_result=stale/)
+    expect(driftLine).toMatch(/reason=stale_event/)
+  })
+
+  test('200 + result=applied is NOT drift (regression: existing happy path preserved)', async () => {
+    const s = seedDrainerFixture()
+    const logs = []
+    axios.mockResolvedValueOnce({ status: 200, data: { result: 'applied' } })
+    await processRow({ supabase: s, logger: { log: (m) => logs.push(m), error: () => {}, warn: () => {} }, row: s._db.outbox[0] })
+    expect(s._db.outbox[0].state).toBe('sent')
+    expect(s._db.outbox[0].result).toBe('applied')
+    expect(s._db.outbox[0].last_error).toBeNull()
+    const driftLine = logs.find((l) => l.includes('lifecycle_drift'))
+    expect(driftLine).toBeUndefined()
+  })
+
   test('409 → state=sent, result=duplicate (LB idempotency hit)', async () => {
     const s = seedDrainerFixture()
     axios.mockResolvedValueOnce({ status: 409, data: { error: 'duplicate event_id' } })
