@@ -2233,44 +2233,91 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
   })
 
   // ══════════════════════════════════════
-  // POST /historical-sync — SF-driven historical lead sync (Phase 1: DRY-RUN ONLY)
+  // POST /historical-sync — SF-driven historical lead sync
   //
-  // Operator-triggered (tenant JWT). Calls LB /historical-sync/candidates
-  // for the tenant's unlinked leads, matches each against SF data via
-  // the existing lib/lb-lead-link-matcher, buckets results into
-  // would_link / would_review / would_skip, and returns the preview.
+  // Operator-triggered (tenant JWT).
   //
-  // PHASE 1 HARD CONSTRAINTS (enforced here AND in the orchestrator):
-  //   - dry_run is forced TRUE regardless of request body
-  //   - never calls LB /link-leads-bulk
-  //   - never writes to SF jobs / customers / lb_link_audit
-  //   - never enqueues outbox events
-  //   - response payload includes phase:'phase_1_dry_run_only' so the
-  //     caller can confirm no mutation is possible
+  // Two modes, switched by request body:
+  //
+  //   PREVIEW (dry_run:true, default if omitted)
+  //     Returns matcher preview only. Never calls LB /link-leads-bulk,
+  //     never writes to SF state. Same as Phase 1.
+  //
+  //   APPLY (dry_run:false + apply.expected_matches[])
+  //     Re-validates operator-approved (lb_lead_id, sf_job_id) pairs
+  //     against a fresh LB fetch + matcher, calls LB /link-leads-bulk,
+  //     and attaches SF state only for LB-confirmed rows. Gated by:
+  //       - SF_HISTORICAL_SYNC_APPLY_ENABLED env flag (default OFF)
+  //       - JWT must carry workspace owner/admin role
+  //       - active LB connection (orchestrator checks comm_settings)
+  //       - per-tenant lock (migration 064 — row-based, TTL 5m)
+  //
+  // Mutation-impossibility for the preview path is structural: the
+  // apply branch is unreachable without explicit dry_run:false AND
+  // apply.expected_matches AND the feature flag.
   // ══════════════════════════════════════
+
+  const APPLY_ENABLED_FLAG = 'SF_HISTORICAL_SYNC_APPLY_ENABLED'
+
+  function isApplyEnabled() {
+    const v = process.env[APPLY_ENABLED_FLAG]
+    return v === 'true' || v === '1' || v === 'on'
+  }
+
+  function isWorkspaceOwnerOrAdmin(user) {
+    const role = String((user && user.role) || '').toLowerCase()
+    return role === 'account owner' || role === 'owner' || role === 'admin'
+  }
+
   router.post('/historical-sync', authenticateToken, async (req, res) => {
     try {
       const userId = req.user.userId
       const body = req.body || {}
 
-      // Defense-in-depth: even if a caller posts { dry_run: false },
-      // the endpoint coerces to true. The orchestrator also forces it.
-      // Either layer is sufficient; both is intentional.
-      if (body.dry_run === false) {
-        logger.warn(`[sf-historical-sync] tenant=${userId} requested dry_run=false; ignored — Phase-1 endpoint forces dry_run=true`)
+      // ── PREVIEW path (dry_run !== false) ──
+      if (body.dry_run !== false) {
+        const out = await sfHistoricalSyncOrchestrator.runHistoricalSync(supabase, {
+          tenantId:      userId,
+          maxLeads:      Number.isFinite(body.max_leads) ? body.max_leads : undefined,
+          syncStatuses:  Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
+          status:        (typeof body.status === 'string' && body.status.length > 0) ? body.status : undefined,
+          logger,
+        })
+        if (!out.ok) return res.status(out.status || 502).json(out)
+        return res.json(out)
       }
 
-      const out = await sfHistoricalSyncOrchestrator.runHistoricalSync(supabase, {
-        tenantId:      userId,
-        maxLeads:      Number.isFinite(body.max_leads) ? body.max_leads : undefined,
-        syncStatuses:  Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
-        status:        (typeof body.status === 'string' && body.status.length > 0) ? body.status : undefined,
+      // ── APPLY path (dry_run === false) ──
+
+      // Feature flag.
+      if (!isApplyEnabled()) {
+        logger.warn(`[sf-historical-apply] tenant=${userId} apply requested but feature flag disabled`)
+        return res.status(503).json({ ok: false, error: 'apply_disabled', detail: 'Phase-2 apply is not enabled on this deployment' })
+      }
+
+      // Role check — workspace owner/admin only.
+      if (!isWorkspaceOwnerOrAdmin(req.user)) {
+        logger.warn(`[sf-historical-apply] tenant=${userId} apply denied: role=${req.user && req.user.role}`)
+        return res.status(403).json({ ok: false, error: 'forbidden', detail: 'workspace owner or admin role required' })
+      }
+
+      // Validation — apply.expected_matches required.
+      const apply = body.apply
+      if (!apply || !Array.isArray(apply.expected_matches) || apply.expected_matches.length === 0) {
+        return res.status(400).json({ ok: false, error: 'apply_matches_required', detail: 'apply.expected_matches[] required and non-empty when dry_run=false' })
+      }
+
+      const out = await sfHistoricalSyncOrchestrator.runHistoricalSyncApply(supabase, {
+        tenantId:         userId,
+        expectedMatches:  apply.expected_matches,
+        requireNoDrift:   apply.require_no_drift !== false,    // default TRUE
+        maxLeads:         Number.isFinite(body.max_leads) ? body.max_leads : undefined,
+        syncStatuses:     Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
+        status:           (typeof body.status === 'string' && body.status.length > 0) ? body.status : undefined,
         logger,
       })
 
-      if (!out.ok) {
-        return res.status(out.status || 502).json(out)
-      }
+      if (!out.ok) return res.status(out.status || 502).json(out)
       return res.json(out)
     } catch (e) {
       logger.error(`[sf-historical-sync] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
