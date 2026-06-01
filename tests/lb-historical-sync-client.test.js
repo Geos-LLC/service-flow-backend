@@ -29,6 +29,9 @@ process.env.LB_PROVISIONING_BASE_URL          = 'https://lb-test.example.com/api
 const {
   fetchCandidates,
   linkLeadsBulk,
+  normalizeMatchBasis,
+  APPLIED_RESULTS,
+  REJECTED_RESULTS,
   CANDIDATES_PATH,
   LINK_BULK_PATH,
   DEFAULT_BATCH_SIZE,
@@ -208,22 +211,93 @@ describe('fetchCandidates — response shape', () => {
 // ──────────────────────────────────────────────────────────────
 // linkLeadsBulk — Phase-2 stub (apply-only, no dry_run flag)
 // ──────────────────────────────────────────────────────────────
-describe('linkLeadsBulk — apply-only contract', () => {
-  test('posts { user_id, matches } only — no dry_run flag', async () => {
-    const client = makeHttpClient({ response: { status: 200, data: { ok: true, applied: [], rejected: [], summary: { total: 0 } } } });
-    await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a', sf_job_id: 1 }], httpClient: client, now: NOW });
+describe('linkLeadsBulk — LB production contract (rows:)', () => {
+  test('posts { user_id, rows } — NOT matches', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1, linked: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked', sync_status: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{
+        lb_lead_id: 'a', sf_job_id: 1, sf_customer_id: 10,
+        confidence: 'high', match_basis: 'externalRequestId',
+        sf_status: 'completed', sf_payment_status: 'paid',
+        occurred_at: '2026-05-05T22:44:31Z', reason: 'historical_sync_apply',
+      }],
+      httpClient: client, now: NOW,
+    });
     const body = JSON.parse(client.calls[0].body);
     expect(body).toEqual({
       user_id: LB_USER,
-      matches: [{ lb_lead_id: 'a', sf_job_id: 1 }],
+      rows: [{
+        lb_lead_id: 'a', sf_job_id: '1', sf_customer_id: '10',
+        confidence: 'high', match_basis: 'externalRequestId',
+        sf_status: 'completed', sf_payment_status: 'paid',
+        occurred_at: '2026-05-05T22:44:31Z', reason: 'historical_sync_apply',
+      }],
     });
+    expect(body).not.toHaveProperty('matches');
     expect(body).not.toHaveProperty('dry_run');
-    expect(body).not.toHaveProperty('sf_tenant_id');
-    expect(body).not.toHaveProperty('sf_source_instance');
   });
 
-  test('attaches HMAC signature', async () => {
-    const client = makeHttpClient();
+  test('collapses array match_basis → string before sending', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: 1, match_basis: ['phone_exact:…2443','name_exact'] }],
+      httpClient: client, now: NOW,
+    });
+    const body = JSON.parse(client.calls[0].body);
+    expect(body.rows[0].match_basis).toBe('phone_exact:…2443+name_exact');
+    expect(typeof body.rows[0].match_basis).toBe('string');
+  });
+
+  test('preserves string match_basis verbatim', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: 1, match_basis: 'externalRequestId' }],
+      httpClient: client, now: NOW,
+    });
+    expect(JSON.parse(client.calls[0].body).rows[0].match_basis).toBe('externalRequestId');
+  });
+
+  test('stringifies sf_job_id + sf_customer_id on the wire (LB Prisma string columns)', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: 141929, sf_customer_id: 23427, match_basis: 'externalRequestId' }],
+      httpClient: client, now: NOW,
+    });
+    const body = JSON.parse(client.calls[0].body);
+    expect(body.rows[0].sf_job_id).toBe('141929');
+    expect(body.rows[0].sf_customer_id).toBe('23427');
+    expect(typeof body.rows[0].sf_job_id).toBe('string');
+    expect(typeof body.rows[0].sf_customer_id).toBe('string');
+  });
+
+  test('null sf_job_id stays null (does not become "null" string)', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: null, sf_customer_id: 23427 }],
+      httpClient: client, now: NOW,
+    });
+    const body = JSON.parse(client.calls[0].body);
+    expect(body.rows[0].sf_job_id).toBeNull();
+    expect(body.rows[0].sf_customer_id).toBe('23427');
+  });
+
+  test('null/missing match_basis → empty string', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: { total: 1 }, rows: [{ lb_lead_id: 'a', result: 'linked' }] } } });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'a', sf_job_id: 1 }],
+      httpClient: client, now: NOW,
+    });
+    expect(JSON.parse(client.calls[0].body).rows[0].match_basis).toBe('');
+  });
+
+  test('attaches HMAC signature + correct path', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: { ok: true, summary: {total:0}, rows: [] } } });
     await linkLeadsBulk({ lbUserId: LB_USER, matches: [], httpClient: client, now: NOW });
     expect(client.calls[0].headers['X-SF-LB-Signature']).toMatch(/^[0-9a-f]{64}$/);
     expect(client.calls[0].url).toBe(`https://lb-test.example.com/api${LINK_BULK_PATH}`);
@@ -240,19 +314,122 @@ describe('linkLeadsBulk — apply-only contract', () => {
     expect(out.ok).toBe(false);
     expect(out.reason).toBe('invalid_arguments');
   });
+});
 
-  test('passes through applied/rejected/summary from LB response', async () => {
-    const client = makeHttpClient({ response: { status: 200, data: {
-      ok: true,
-      applied: [{ lb_lead_id: 'a', sf_managed: true }],
-      rejected: [{ lb_lead_id: 'b', reason: 'already_linked' }],
-      summary: { total: 2, applied: 1, rejected: 1 },
-    } } });
-    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }, { lb_lead_id: 'b' }], httpClient: client, now: NOW });
+describe('linkLeadsBulk — response bucketing by per-row `result`', () => {
+  function lbResponse(rowsOut) {
+    const summary = { total: rowsOut.length, linked: 0, needs_review: 0, no_match: 0, conflict: 0, not_found: 0, failed: 0, status_updates_applied: 0 };
+    for (const r of rowsOut) if (summary[r.result] != null) summary[r.result]++;
+    return { status: 200, data: { ok: rowsOut.every(r => r.result === 'linked'), summary, rows: rowsOut } };
+  }
+
+  test('result=linked → applied bucket with sf_managed=true', async () => {
+    const client = makeHttpClient({ response: lbResponse([{ lb_lead_id: 'a', result: 'linked', sync_status: 'linked' }]) });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a', sf_job_id: 1 }], httpClient: client, now: NOW });
     expect(out.ok).toBe(true);
     expect(out.applied).toHaveLength(1);
+    expect(out.applied[0]).toEqual(expect.objectContaining({ lb_lead_id: 'a', lb_result: 'linked', sf_managed: true }));
+    expect(out.rejected).toHaveLength(0);
+  });
+
+  test('result ∈ {linked, needs_review, no_match} → all APPLIED', async () => {
+    const client = makeHttpClient({ response: lbResponse([
+      { lb_lead_id: 'a', result: 'linked' },
+      { lb_lead_id: 'b', result: 'needs_review' },
+      { lb_lead_id: 'c', result: 'no_match' },
+    ]) });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{lb_lead_id:'a'},{lb_lead_id:'b'},{lb_lead_id:'c'}], httpClient: client, now: NOW });
+    expect(out.applied.map(r => r.lb_lead_id).sort()).toEqual(['a','b','c']);
+    expect(out.applied.every(r => r.sf_managed === true)).toBe(true);
+    expect(out.rejected).toHaveLength(0);
+  });
+
+  test('result ∈ {conflict, not_found, failed} → all REJECTED', async () => {
+    const client = makeHttpClient({ response: lbResponse([
+      { lb_lead_id: 'a', result: 'conflict',  detail: 'sf_job already linked' },
+      { lb_lead_id: 'b', result: 'not_found', detail: 'lb_lead absent' },
+      { lb_lead_id: 'c', result: 'failed',    detail: 'db error' },
+    ]) });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{lb_lead_id:'a'},{lb_lead_id:'b'},{lb_lead_id:'c'}], httpClient: client, now: NOW });
+    expect(out.applied).toHaveLength(0);
+    expect(out.rejected.map(r => r.reason).sort()).toEqual(['conflict','failed','not_found']);
+    expect(out.rejected.every(r => r.lb_detail != null)).toBe(true);
+  });
+
+  test('mixed batch → bucketed by result correctly', async () => {
+    const client = makeHttpClient({ response: lbResponse([
+      { lb_lead_id: 'a', result: 'linked' },
+      { lb_lead_id: 'b', result: 'conflict', detail: 'already linked' },
+      { lb_lead_id: 'c', result: 'needs_review' },
+      { lb_lead_id: 'd', result: 'failed', detail: 'prisma error' },
+    ]) });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{lb_lead_id:'a'},{lb_lead_id:'b'},{lb_lead_id:'c'},{lb_lead_id:'d'}], httpClient: client, now: NOW });
+    expect(out.applied.map(r => r.lb_lead_id).sort()).toEqual(['a','c']);
+    expect(out.rejected.map(r => r.lb_lead_id).sort()).toEqual(['b','d']);
+    expect(out.summary).toEqual(expect.objectContaining({ total: 4, linked: 1, needs_review: 1, conflict: 1, failed: 1 }));
+  });
+
+  test('unknown result value → REJECTED (fail-closed)', async () => {
+    const client = makeHttpClient({ response: lbResponse([{ lb_lead_id: 'a', result: 'mystery_status' }]) });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.applied).toHaveLength(0);
     expect(out.rejected).toHaveLength(1);
-    expect(out.summary.total).toBe(2);
+    expect(out.rejected[0].reason).toBe('mystery_status');
+  });
+
+  test('HTTP 200 with rows:[] + error:"invalid_body" → batch error surfaced', async () => {
+    const client = makeHttpClient({ response: { status: 200, data: {
+      ok: false, error: 'invalid_body',
+      summary: { total: 0, linked: 0, needs_review: 0, no_match: 0, conflict: 0, not_found: 0, failed: 0, status_updates_applied: 0 },
+      rows: [],
+    } } });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe('invalid_body');
+  });
+
+  test('HTTP 5xx → ok:false reason carries status', async () => {
+    const client = makeHttpClient({ response: { status: 503, data: { error: 'upstream_down' } } });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe(503);
+    expect(out.reason).toBe('upstream_down');
+  });
+
+  test('network error → ok:false reason=lb_unreachable', async () => {
+    const client = makeHttpClient({ throwErr: 'connect ETIMEDOUT' });
+    const out = await linkLeadsBulk({ lbUserId: LB_USER, matches: [{ lb_lead_id: 'a' }], httpClient: client, now: NOW });
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe('lb_unreachable');
+  });
+});
+
+describe('normalizeMatchBasis', () => {
+  test('string → passthrough', () => {
+    expect(normalizeMatchBasis('externalRequestId')).toBe('externalRequestId');
+    expect(normalizeMatchBasis('phone+name')).toBe('phone+name');
+  });
+  test('array → joined with +', () => {
+    expect(normalizeMatchBasis(['phone_exact:…2443','name_exact'])).toBe('phone_exact:…2443+name_exact');
+    expect(normalizeMatchBasis(['a'])).toBe('a');
+  });
+  test('falsy → empty string', () => {
+    expect(normalizeMatchBasis(null)).toBe('');
+    expect(normalizeMatchBasis(undefined)).toBe('');
+    expect(normalizeMatchBasis([])).toBe('');
+  });
+});
+
+describe('APPLIED_RESULTS / REJECTED_RESULTS sets', () => {
+  test('APPLIED contains exactly {linked, needs_review, no_match}', () => {
+    expect([...APPLIED_RESULTS].sort()).toEqual(['linked','needs_review','no_match'].sort());
+  });
+  test('REJECTED contains exactly {conflict, not_found, failed}', () => {
+    expect([...REJECTED_RESULTS].sort()).toEqual(['conflict','failed','not_found'].sort());
+  });
+  test('APPLIED and REJECTED are disjoint', () => {
+    for (const r of APPLIED_RESULTS) expect(REJECTED_RESULTS.has(r)).toBe(false);
+    for (const r of REJECTED_RESULTS) expect(APPLIED_RESULTS.has(r)).toBe(false);
   });
 });
 
