@@ -71,6 +71,8 @@ const lbLeadLinkAttacher = require('./lib/lb-lead-link-attacher')
 const lbLeadLinkBulk = require('./lib/lb-lead-link-bulk')
 // SF-driven historical sync (Phase 1: dry-run-only).
 const sfHistoricalSyncOrchestrator = require('./lib/sf-historical-sync-orchestrator')
+// Phase-2 remediation tool (Type A / Type B drift detector + repair).
+const sfHistoricalRemediation      = require('./lib/sf-historical-remediation')
 
 const LB_BASE = process.env.LEADBRIDGE_URL || 'https://thumbtack-bridge-production.up.railway.app/api'
 
@@ -2321,6 +2323,44 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
       return res.json(out)
     } catch (e) {
       logger.error(`[sf-historical-sync] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
+      return res.status(500).json({ ok: false, error: 'internal_error' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // POST /historical-sync/remediate — Post-incident LB↔SF drift repair
+  //
+  // Detects (and optionally repairs) two classes of state drift
+  // surfaced by Phase 2 Batch #1:
+  //   Type A — LB linked, SF entirely unlinked (timeout race)
+  //   Type B — SF audit + customer + outbox exist but jobs.lb_lead_id
+  //            still NULL (the now-fixed reattach_same shortcut)
+  //
+  // Auth: tenant JWT, owner/admin role only. The endpoint is ALWAYS
+  // reachable (no feature flag) because it's the safety-net path and
+  // must work regardless of SF_HISTORICAL_SYNC_APPLY_ENABLED. The
+  // repair primitive (attachLbLink) is idempotent.
+  //
+  // Body: { dry_run: bool }  (default true — operator must explicitly
+  //                            opt in to mutations)
+  // ══════════════════════════════════════
+  router.post('/historical-sync/remediate', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      if (!isWorkspaceOwnerOrAdmin(req.user)) {
+        logger.warn(`[sf-historical-remediate] tenant=${userId} denied: role=${req.user && req.user.role}`)
+        return res.status(403).json({ ok: false, error: 'forbidden', detail: 'workspace owner or admin role required' })
+      }
+      const body = req.body || {}
+      const dryRun = body.dry_run !== false   // default TRUE
+      const out = await sfHistoricalRemediation.remediate(supabase, {
+        tenantId: userId, dryRun, logger,
+      })
+      if (!out.ok) return res.status(out.status || 502).json(out)
+      logger.log(`[sf-historical-remediate] tenant=${userId} dry_run=${dryRun} type_a=${out.counts.type_a} type_b=${out.counts.type_b} repaired=${out.counts.repaired || 0} failed=${out.counts.failed || 0}`)
+      return res.json(out)
+    } catch (e) {
+      logger.error(`[sf-historical-remediate] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
       return res.status(500).json({ ok: false, error: 'internal_error' })
     }
   })
