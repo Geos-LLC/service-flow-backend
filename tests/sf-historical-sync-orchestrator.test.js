@@ -333,6 +333,103 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
     expect(cat.bucket).toBe('would_link');
     expect(cat.reason).toBeNull();
   });
+  // ────────────────────────────────────────────────────────────────
+  // lb_already_pinned_to_different_job guard.
+  //
+  // LB candidates endpoint returns `sfJobId` per row. When LB already
+  // has the lead pinned to a different sf_job_id than the matcher
+  // selects, LB's bulk-link safeguard refuses to overwrite. Surface
+  // as would_review BEFORE the apply manifest is built so the row
+  // is never submitted.
+  // ────────────────────────────────────────────────────────────────
+  test('lbCandidate.sfJobId set & differs from matcher pick → would_review reason=lb_already_pinned_to_different_job', () => {
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139558 },     // LB has cancelled-originator pinned
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139806,                 // matcher picks later completed+paid
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_review');
+    expect(cat.reason).toBe('lb_already_pinned_to_different_job');
+  });
+  test('lbCandidate.sfJobId set & matches matcher pick → still would_link (negative case)', () => {
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139806 },     // LB pin matches matcher
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139806,
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBeNull();
+  });
+  test('lbCandidate.sfJobId null → unchanged behavior (negative case)', () => {
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: null },
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139806,
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_link');
+  });
+  test('lb_already_pinned_to_different_job takes precedence over already_reconciled_customer', () => {
+    // Customer is already-reconciled AND LB has a different pin. The
+    // observable LB-side veto wins — operator should see this as a
+    // conflict for review, not as a silent skip.
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139558 },
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139806,
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: 'lb-uuid-prior', any_job_linked: true },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_review');
+    expect(cat.reason).toBe('lb_already_pinned_to_different_job');
+  });
+  test('lb_already_pinned_to_different_job takes precedence over sf_job_linked_to_different_lb_lead', () => {
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139558, externalRequestId: 'NEW_REQ' },
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139806,
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: 'OLD_REQ' },           // also drifts on ext_req
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_review');
+    expect(cat.reason).toBe('lb_already_pinned_to_different_job');
+  });
+  test('lbCandidate.sfJobId arrives as string; equality is numeric', () => {
+    // LB stores sfJobId as text in Prisma; SF stores as integer. The
+    // guard must coerce so '139558' === 139558 doesn't slip through.
+    const cat = categorize({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: '139558' },   // string
+      matched: [{
+        sf_customer_id: 23362, sf_job_id: 139558,                 // number — same!
+        confidence: 'high', match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_link');                        // numeric match
+  });
+
   test('already_reconciled_customer takes precedence over sf_job_linked_to_different_lb_lead conflict', () => {
     // Customer is already reconciled AND the picked sf_job is also
     // linked to a different lb_external_request_id. The guard wins:
