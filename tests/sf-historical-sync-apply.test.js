@@ -312,6 +312,29 @@ describe('isApplicable — Phase-2 apply gate', () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('sf_job_id_missing');
   });
+
+  // ────────────────────────────────────────────────────────────────
+  // already_reconciled_customer guard — defense-in-depth at apply time.
+  // Catches stale would_link approvals queued before the matcher
+  // patch deployed, so the operator can't slip a remap through.
+  // ────────────────────────────────────────────────────────────────
+  test('matched customer has lb_lead_id set on customer row → rejected as already_reconciled_customer', () => {
+    const m = { ...ERIN_MATCH, sf_customer: { lb_lead_id: 'lb-uuid-prior', any_job_linked: true } };
+    const r = isApplicable({ lbCandidate: ERIN_LB_CANDIDATE, matched: [m] });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('already_reconciled_customer');
+  });
+  test('matched customer has any_job_linked=true (no customer.lb_lead_id) → rejected as already_reconciled_customer', () => {
+    const m = { ...ERIN_MATCH, sf_customer: { lb_lead_id: null, any_job_linked: true } };
+    const r = isApplicable({ lbCandidate: ERIN_LB_CANDIDATE, matched: [m] });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('already_reconciled_customer');
+  });
+  test('matched customer has no prior link → still ok (negative case)', () => {
+    const m = { ...ERIN_MATCH, sf_customer: { lb_lead_id: null, any_job_linked: false } };
+    const r = isApplicable({ lbCandidate: ERIN_LB_CANDIDATE, matched: [m] });
+    expect(r.ok).toBe(true);
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────

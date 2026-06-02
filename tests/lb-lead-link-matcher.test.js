@@ -566,6 +566,96 @@ describe('findMatchCandidates — recurring customer historical-representative f
 });
 
 // ──────────────────────────────────────────────────────────────────────
+// any_job_linked flag — surfaces "this customer has at least one job
+// already linked to some LB lead" so the orchestrator can suppress
+// would_link suggestions on already-reconciled customers (prevents
+// 2nd-link remaps after the tiered picker moves to an earlier
+// unlinked job).
+// ──────────────────────────────────────────────────────────────────────
+describe('any_job_linked flag — already-reconciled-customer signal', () => {
+  test('customer with at least one job carrying lb_lead_id → any_job_linked=true', async () => {
+    const cust = {
+      id: 50, user_id: 2, first_name: 'Reconciled', last_name: 'Customer',
+      phone: '5555551111', email: null,
+      lb_lead_id: null,                       // NOT set on customer row
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const jobs = [
+      // Earliest completed+paid — UNLINKED. After the tiered picker
+      // this is what gets surfaced. Without the new flag the
+      // orchestrator would happily suggest re-linking it.
+      { id: 1001, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
+        lb_lead_id: null,
+        scheduled_date: '2026-02-01', created_at: '2026-01-15T00:00:00Z' },
+      // Later completed+paid — already linked from an earlier batch.
+      { id: 1099, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
+        lb_lead_id: 'lb-uuid-prior-batch',
+        scheduled_date: '2026-04-01', created_at: '2026-03-15T00:00:00Z' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: { customer_phone: '5555551111', customer_name: 'Reconciled Customer', lead_created_at: '2026-01-01T00:00:00Z' },
+    });
+    expect(out.match_count).toBe(1);
+    const c = out.candidates[0];
+    expect(c.sf_job_id).toBe(1001);           // picker still picks earliest completed+paid
+    expect(c.sf_customer.any_job_linked).toBe(true);
+    expect(c.sf_customer.lb_lead_id).toBeNull();
+  });
+
+  test('customer with lb_lead_id set on customer row → any_job_linked=true (linked job present too)', async () => {
+    const cust = {
+      id: 51, user_id: 2, first_name: 'Customer', last_name: 'Linked',
+      phone: '5555552222', email: null,
+      lb_lead_id: 'lb-uuid-on-customer',
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const jobs = [
+      { id: 2001, user_id: 2, customer_id: 51, status: 'completed', payment_status: 'paid',
+        lb_lead_id: null,
+        scheduled_date: '2026-02-01', created_at: '2026-01-15T00:00:00Z' },
+      { id: 2099, user_id: 2, customer_id: 51, status: 'completed', payment_status: 'paid',
+        lb_lead_id: 'lb-uuid-on-customer',
+        scheduled_date: '2026-04-01', created_at: '2026-03-15T00:00:00Z' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: { customer_phone: '5555552222', customer_name: 'Customer Linked', lead_created_at: '2026-01-01T00:00:00Z' },
+    });
+    expect(out.match_count).toBe(1);
+    const c = out.candidates[0];
+    expect(c.sf_customer.lb_lead_id).toBe('lb-uuid-on-customer');
+    expect(c.sf_customer.any_job_linked).toBe(true);
+  });
+
+  test('customer with NO linked jobs → any_job_linked=false', async () => {
+    const cust = {
+      id: 52, user_id: 2, first_name: 'Clean', last_name: 'Backlog',
+      phone: '5555553333', email: null, lb_lead_id: null,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const jobs = [
+      { id: 3001, user_id: 2, customer_id: 52, status: 'completed', payment_status: 'paid',
+        lb_lead_id: null,
+        scheduled_date: '2026-02-01', created_at: '2026-01-15T00:00:00Z' },
+      { id: 3002, user_id: 2, customer_id: 52, status: 'completed', payment_status: 'paid',
+        lb_lead_id: null,
+        scheduled_date: '2026-03-01', created_at: '2026-02-15T00:00:00Z' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: { customer_phone: '5555553333', customer_name: 'Clean Backlog', lead_created_at: '2026-01-01T00:00:00Z' },
+    });
+    expect(out.match_count).toBe(1);
+    expect(out.candidates[0].sf_customer.any_job_linked).toBe(false);
+    expect(out.candidates[0].sf_customer.lb_lead_id).toBeNull();
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
 // Live/new-conversion flow remains unaffected
 //
 // findMatchCandidates is invoked only by historical/reconcile paths:
