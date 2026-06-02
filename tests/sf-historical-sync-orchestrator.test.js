@@ -276,6 +276,81 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
     expect(cat.bucket).toBe('would_skip');
     expect(cat.reason).toBe('no_match');
   });
+
+  // ────────────────────────────────────────────────────────────────
+  // already_reconciled_customer guard. Prevents resurfacing rows for
+  // customers already linked in earlier batches (the 44-row scenario
+  // exposed when PR #39's tiered picker moved to an earlier unlinked
+  // job for recurring customers whose later jobs hold the LB lead
+  // from Batches #1–#5).
+  //
+  // Position rule: this check runs BEFORE the conflict check
+  // (sf_job_linked_to_different_lb_lead), because already-reconciled
+  // is a stronger signal — operator action is "leave it alone".
+  // ────────────────────────────────────────────────────────────────
+  test('single high match + sf_customer.lb_lead_id set → would_skip reason=already_reconciled_customer', () => {
+    const cat = categorize({
+      lbCandidate: ERIN_LB_CANDIDATE,
+      matched: [{
+        sf_customer_id: 23427, sf_job_id: 141929,
+        confidence: 'high',
+        match_signals: ['phone_exact:…2443', 'name_exact'],
+        sf_customer: { lb_lead_id: 'lb-uuid-prior-batch', any_job_linked: true },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('already_reconciled_customer');
+  });
+  test('single high match + sf_customer.any_job_linked=true (customer.lb_lead_id null) → would_skip already_reconciled_customer', () => {
+    const cat = categorize({
+      lbCandidate: ERIN_LB_CANDIDATE,
+      matched: [{
+        sf_customer_id: 23427, sf_job_id: 141929,
+        confidence: 'high',
+        match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: true },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('already_reconciled_customer');
+  });
+  test('single high match + no prior link on customer → still would_link (negative case)', () => {
+    const cat = categorize({
+      lbCandidate: ERIN_LB_CANDIDATE,
+      matched: [{
+        sf_customer_id: 23427, sf_job_id: 141929,
+        confidence: 'high',
+        match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: null, any_job_linked: false },
+        sf_job: { lb_external_request_id: null },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBeNull();
+  });
+  test('already_reconciled_customer takes precedence over sf_job_linked_to_different_lb_lead conflict', () => {
+    // Customer is already reconciled AND the picked sf_job is also
+    // linked to a different lb_external_request_id. The guard wins:
+    // surface as already_reconciled_customer, not as a conflict.
+    const cat = categorize({
+      lbCandidate: ERIN_LB_CANDIDATE,
+      matched: [{
+        sf_customer_id: 23427, sf_job_id: 141929,
+        confidence: 'high',
+        match_signals: ['phone_exact:…2443'],
+        sf_customer: { lb_lead_id: 'lb-uuid-prior-batch', any_job_linked: true },
+        sf_job: { lb_external_request_id: 'OTHER_REQ' },
+        ambiguity_warnings: [],
+      }],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('already_reconciled_customer');
+  });
 });
 
 // ──────────────────────────────────────────────────────────────
