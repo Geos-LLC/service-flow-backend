@@ -38836,27 +38836,47 @@ async function rebuildJobLedger(jobId, userId, { types = LEDGER_COMPLETION_DERIV
 
   // 5. Late tip/incentive bump (Constitution-aligned with §3.4 — corrections
   //    happen in the current pay period, not retroactively into a closed one).
-  //    If a tip or incentive arrives AFTER the job's earning was already paid
-  //    out, bump effective_date to today so it lands in the current pay period.
+  //    Only bump when the entry's current effective_date actually falls inside
+  //    a PAID batch's period for that member. If it sits in a pending batch's
+  //    period or an entirely unbatched period, leave it alone — those periods
+  //    are still open and the entry belongs there (a pending batch can be
+  //    edited; an unbatched period gets swept by the next batch creation).
+  //    The earlier heuristic ("any batched entry exists for this job") was too
+  //    aggressive: it jumped tips past a pending batch whose period the tip
+  //    rightfully belonged to.
   const todayStr = new Date().toISOString().split('T')[0];
   const { data: postRebuildEntries } = await supabase
     .from('cleaner_ledger')
     .select('id, team_member_id, type, payout_batch_id, effective_date')
     .eq('job_id', jobId);
-  const memberHasBatched = new Set(
-    (postRebuildEntries || []).filter(e => e.payout_batch_id).map(e => e.team_member_id)
+
+  const bumpCandidates = (postRebuildEntries || []).filter(e =>
+    !e.payout_batch_id &&
+    (e.type === 'tip' || e.type === 'incentive') &&
+    e.effective_date !== todayStr
   );
-  for (const e of (postRebuildEntries || [])) {
-    if (
-      !e.payout_batch_id &&
-      (e.type === 'tip' || e.type === 'incentive') &&
-      memberHasBatched.has(e.team_member_id) &&
-      e.effective_date !== todayStr
-    ) {
+
+  if (bumpCandidates.length > 0) {
+    const candidateMembers = [...new Set(bumpCandidates.map(e => e.team_member_id))];
+    const { data: paidBatches } = await supabase
+      .from('cleaner_payout_batch')
+      .select('team_member_id, period_start, period_end')
+      .eq('user_id', userId)
+      .in('team_member_id', candidateMembers)
+      .eq('status', 'paid');
+    const paidPeriodsByMember = new Map();
+    for (const b of (paidBatches || [])) {
+      if (!paidPeriodsByMember.has(b.team_member_id)) paidPeriodsByMember.set(b.team_member_id, []);
+      paidPeriodsByMember.get(b.team_member_id).push(b);
+    }
+    for (const e of bumpCandidates) {
+      const periods = paidPeriodsByMember.get(e.team_member_id) || [];
+      const covering = periods.find(b => b.period_start <= e.effective_date && b.period_end >= e.effective_date);
+      if (!covering) continue;
       await supabase.from('cleaner_ledger')
         .update({ effective_date: todayStr })
         .eq('id', e.id);
-      console.log(`Ledger: Bumped late ${e.type} #${e.id} (job ${jobId}) to ${todayStr} — earning was already in a paid batch`);
+      console.log(`Ledger: Bumped late ${e.type} #${e.id} (job ${jobId}) to ${todayStr} — current date ${e.effective_date} falls in paid period ${covering.period_start}..${covering.period_end}`);
     }
   }
 }
