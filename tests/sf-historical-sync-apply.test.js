@@ -318,6 +318,50 @@ describe('isApplicable — Phase-2 apply gate', () => {
   // Catches stale would_link approvals queued before the matcher
   // patch deployed, so the operator can't slip a remap through.
   // ────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────────
+  // lb_already_pinned_to_different_job guard — defense-in-depth at
+  // apply time. LB's no_overwrite_different_sfJobId safeguard would
+  // refuse the row anyway, but rejecting before the LB round-trip
+  // keeps SF audit/outbox clean.
+  // ────────────────────────────────────────────────────────────────
+  test('lbCandidate.sfJobId set & differs from matcher pick → rejected as lb_already_pinned_to_different_job', () => {
+    const r = isApplicable({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139558 },
+      matched: [{ ...ERIN_MATCH, sf_job_id: 139806 }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('lb_already_pinned_to_different_job');
+  });
+  test('lbCandidate.sfJobId set & matches matcher pick → ok (negative case)', () => {
+    const r = isApplicable({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 141929 },     // matches ERIN_MATCH.sf_job_id
+      matched: [ERIN_MATCH],
+    });
+    expect(r.ok).toBe(true);
+  });
+  test('lbCandidate.sfJobId null → ok (negative case)', () => {
+    const r = isApplicable({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: null },
+      matched: [ERIN_MATCH],
+    });
+    expect(r.ok).toBe(true);
+  });
+  test('lbCandidate.sfJobId string equality is numeric', () => {
+    const r = isApplicable({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: '141929' },   // string
+      matched: [ERIN_MATCH],                                      // sf_job_id: 141929 number
+    });
+    expect(r.ok).toBe(true);
+  });
+  test('lb_already_pinned_to_different_job takes precedence over already_reconciled_customer', () => {
+    const r = isApplicable({
+      lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139558 },
+      matched: [{ ...ERIN_MATCH, sf_job_id: 139806, sf_customer: { lb_lead_id: 'lb-uuid-prior', any_job_linked: true } }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('lb_already_pinned_to_different_job');  // not already_reconciled_customer
+  });
+
   test('matched customer has lb_lead_id set on customer row → rejected as already_reconciled_customer', () => {
     const m = { ...ERIN_MATCH, sf_customer: { lb_lead_id: 'lb-uuid-prior', any_job_linked: true } };
     const r = isApplicable({ lbCandidate: ERIN_LB_CANDIDATE, matched: [m] });
