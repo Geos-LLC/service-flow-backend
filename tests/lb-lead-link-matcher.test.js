@@ -24,7 +24,8 @@ const {
   splitName,
   phoneLast4,
   scoreCandidate,
-  pickOriginatorOrEarliestPerCustomer,
+  pickHistoricalRepresentativeJob,
+  pickHistoricalRepresentativeJobPerCustomer,
 } = require('../lib/lb-lead-link-matcher');
 
 // ──────────────────────────────────────────────────────────────
@@ -317,133 +318,271 @@ describe('findMatchCandidates', () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────
-// Originator/earliest job picker (post-Batch-5 audit fix)
+// pickHistoricalRepresentativeJob — tiered status ordering
+//
+// Tier 1: earliest completed + paid
+// Tier 2: earliest completed (any payment status)
+// Tier 3: earliest scheduled / booked (only when no completed exists)
+// Else  : null (customer has only cancelled/no_show → drop)
 // ──────────────────────────────────────────────────────────────────────
-describe('pickOriginatorOrEarliestPerCustomer', () => {
-  test('prefers the originator job (matching lb_external_request_id) over later jobs', () => {
+describe('pickHistoricalRepresentativeJob — tiered status picker', () => {
+  test('deep cleaning (completed+paid, early) then recurring (completed+paid, later) → picks deep cleaning', () => {
+    // Realistic Spotless shape: customer's first SF job was a deep clean,
+    // followed by months of recurring regular cleanings. The lead
+    // converted on the deep clean, so that's the representative.
     const jobs = [
-      { id: 5, customer_id: 10, lb_external_request_id: null,    created_at: '2026-04-01T00:00:00Z' },
-      { id: 2, customer_id: 10, lb_external_request_id: 'EXT-A', created_at: '2025-01-01T00:00:00Z' },
-      { id: 7, customer_id: 10, lb_external_request_id: null,    created_at: '2026-06-01T00:00:00Z' },
+      { id: 100, status: 'completed', payment_status: 'paid', created_at: '2025-01-15', total_amount: 349 },  // deep
+      { id: 200, status: 'completed', payment_status: 'paid', created_at: '2025-02-15', total_amount: 159 },  // recurring
+      { id: 300, status: 'completed', payment_status: 'paid', created_at: '2025-03-15', total_amount: 159 },
+      { id: 400, status: 'completed', payment_status: 'paid', created_at: '2025-04-15', total_amount: 159 },
     ];
-    const picked = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A').get(10);
-    expect(picked.id).toBe(2);
-    expect(picked.lb_external_request_id).toBe('EXT-A');
+    const picked = pickHistoricalRepresentativeJob(jobs);
+    expect(picked.id).toBe(100);
+    expect(picked.total_amount).toBe(349);
   });
 
-  test('falls back to earliest job when no originator match', () => {
+  test('first regular completed, recurring later → picks the first regular', () => {
     const jobs = [
-      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2026-04-01T00:00:00Z' },
-      { id: 2, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
-      { id: 7, customer_id: 10, lb_external_request_id: null, created_at: '2026-06-01T00:00:00Z' },
+      { id: 10, status: 'completed', payment_status: 'paid', created_at: '2025-01-15', total_amount: 159 },
+      { id: 20, status: 'completed', payment_status: 'paid', created_at: '2025-04-15', total_amount: 159 },
+      { id: 30, status: 'completed', payment_status: 'paid', created_at: '2025-07-15', total_amount: 159 },
     ];
-    const picked = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A').get(10);
-    expect(picked.id).toBe(2);     // earliest by created_at
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(10);
   });
 
-  test('null input externalRequestId → earliest fallback even if jobs have ext_reqs', () => {
+  test('cancelled first job, completed second → picks the completed second (skips the cancelled)', () => {
     const jobs = [
-      { id: 5, customer_id: 10, lb_external_request_id: 'EXT-X', created_at: '2026-04-01T00:00:00Z' },
-      { id: 2, customer_id: 10, lb_external_request_id: 'EXT-Y', created_at: '2025-01-01T00:00:00Z' },
+      { id: 50, status: 'cancelled', payment_status: null,   created_at: '2025-01-01' },
+      { id: 60, status: 'completed', payment_status: 'paid', created_at: '2025-02-01' },
     ];
-    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
-    expect(picked.id).toBe(2);
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(60);
   });
 
-  test('ties on created_at broken by lower id', () => {
+  test('only scheduled future job exists → picks earliest scheduled', () => {
     const jobs = [
-      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
-      { id: 2, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
+      { id: 70, status: 'scheduled', payment_status: null, created_at: '2025-05-01', scheduled_date: '2026-06-01' },
+      { id: 80, status: 'scheduled', payment_status: null, created_at: '2025-03-01', scheduled_date: '2026-04-01' },
     ];
-    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
-    expect(picked.id).toBe(2);
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(80);
   });
 
-  test('per-customer isolation: originator vs earliest applied independently', () => {
-    const jobs = [
-      { id: 1, customer_id: 10, lb_external_request_id: 'EXT-A', created_at: '2025-01-01T00:00:00Z' },
-      { id: 9, customer_id: 10, lb_external_request_id: null,    created_at: '2026-06-01T00:00:00Z' },
-      { id: 2, customer_id: 20, lb_external_request_id: null,    created_at: '2024-12-01T00:00:00Z' },
-      { id: 8, customer_id: 20, lb_external_request_id: null,    created_at: '2026-03-01T00:00:00Z' },
-    ];
-    const out = pickOriginatorOrEarliestPerCustomer(jobs, 'EXT-A');
-    expect(out.get(10).id).toBe(1);  // originator match
-    expect(out.get(20).id).toBe(2);  // no ext_req match → earliest
+  test('many recurring jobs → never picks the latest by default', () => {
+    // 48 recurring jobs — the same shape as Sigrid Shelton in prod.
+    const jobs = Array.from({ length: 48 }, (_, i) => ({
+      id: 1000 + i, status: 'completed', payment_status: 'paid',
+      created_at: `2024-${String((i % 12) + 1).padStart(2,'0')}-01`,
+    }));
+    // Sort plausible so the earliest by created_at is id=1000
+    const picked = pickHistoricalRepresentativeJob(jobs);
+    expect(picked.id).toBe(1000);   // never 1047 (the latest)
   });
 
-  test('jobs without created_at sort to the end (defensive)', () => {
+  test('tier 1 fires even when later completed-paid would be the same status — earliest still wins', () => {
     const jobs = [
-      { id: 5, customer_id: 10, lb_external_request_id: null, created_at: '2025-01-01T00:00:00Z' },
-      { id: 9, customer_id: 10, lb_external_request_id: null, created_at: null },
+      { id: 9, status: 'completed', payment_status: 'paid', created_at: '2025-12-01' },
+      { id: 3, status: 'completed', payment_status: 'paid', created_at: '2025-01-01' },
     ];
-    const picked = pickOriginatorOrEarliestPerCustomer(jobs, null).get(10);
-    expect(picked.id).toBe(5);
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(3);
   });
 
-  test('empty jobsRows → empty map', () => {
-    expect(pickOriginatorOrEarliestPerCustomer([], 'EXT-A').size).toBe(0);
-    expect(pickOriginatorOrEarliestPerCustomer(null, null).size).toBe(0);
+  test('tier 2 fires when there are completed jobs but none paid', () => {
+    const jobs = [
+      { id: 11, status: 'completed', payment_status: null,    created_at: '2025-03-01' },
+      { id: 12, status: 'completed', payment_status: 'unpaid',created_at: '2025-01-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(12);
+  });
+
+  test('tier 3 fires only when there are no completed jobs', () => {
+    const jobs = [
+      { id: 21, status: 'scheduled', payment_status: null, created_at: '2025-04-01' },
+      { id: 22, status: 'completed', payment_status: 'paid', created_at: '2025-08-01' },
+    ];
+    // Tier 1 wins even though the scheduled is earlier in time.
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(22);
+  });
+
+  test('booked is treated as scheduled (tier 3)', () => {
+    const jobs = [
+      { id: 31, status: 'booked',    payment_status: null, created_at: '2025-05-01' },
+      { id: 32, status: 'scheduled', payment_status: null, created_at: '2025-03-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(32);
+  });
+
+  test('all cancelled → null (drop the candidate; no conversion to represent)', () => {
+    const jobs = [
+      { id: 41, status: 'cancelled', payment_status: null, created_at: '2025-01-01' },
+      { id: 42, status: 'cancelled', payment_status: null, created_at: '2025-02-01' },
+      { id: 43, status: 'cancelled', payment_status: null, created_at: '2025-03-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs)).toBeNull();
+  });
+
+  test('no jobs → null', () => {
+    expect(pickHistoricalRepresentativeJob([])).toBeNull();
+    expect(pickHistoricalRepresentativeJob(null)).toBeNull();
+  });
+
+  test('ties on created_at broken by lower id (deterministic)', () => {
+    const jobs = [
+      { id: 9, status: 'completed', payment_status: 'paid', created_at: '2025-01-01' },
+      { id: 2, status: 'completed', payment_status: 'paid', created_at: '2025-01-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(2);
+  });
+
+  test('case-insensitive on status + payment_status', () => {
+    const jobs = [
+      { id: 1, status: 'Completed', payment_status: 'PAID', created_at: '2025-01-01' },
+      { id: 2, status: 'CANCELLED', payment_status: null,    created_at: '2024-12-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(1);
+  });
+});
+
+describe('pickHistoricalRepresentativeJobPerCustomer', () => {
+  test('per-customer isolation; cancelled-only customer dropped from map', () => {
+    const jobs = [
+      // customer 10: mixed
+      { id: 1, customer_id: 10, status: 'cancelled', payment_status: null,   created_at: '2025-01-01' },
+      { id: 2, customer_id: 10, status: 'completed', payment_status: 'paid', created_at: '2025-02-01' },
+      // customer 20: only cancelled
+      { id: 3, customer_id: 20, status: 'cancelled', payment_status: null,   created_at: '2025-01-01' },
+      // customer 30: only scheduled
+      { id: 4, customer_id: 30, status: 'scheduled', payment_status: null,   created_at: '2025-05-01' },
+    ];
+    const out = pickHistoricalRepresentativeJobPerCustomer(jobs);
+    expect(out.get(10).id).toBe(2);
+    expect(out.has(20)).toBe(false);   // cancelled-only → dropped
+    expect(out.get(30).id).toBe(4);
+  });
+
+  test('empty input → empty map', () => {
+    expect(pickHistoricalRepresentativeJobPerCustomer([]).size).toBe(0);
+    expect(pickHistoricalRepresentativeJobPerCustomer(null).size).toBe(0);
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────
-// Regression: recurring-customer scenario from the Batch-5 audit
-//
-// Scenario: customer has 3 SF jobs:
-//   - 100 (originator, ext_req=EXT-A, created 2025-01-01)
-//   - 200 (recurring, created 2025-06-01)
-//   - 300 (recurring, created 2025-12-01, sched 2026-04-15)
-// LB sends a lead with externalRequestId=EXT-A. The OLD matcher
-// returned sf_job=300 (most-recent), which then conflicted on LB's
-// /link-leads-bulk because LB had pinned to job 100. The NEW matcher
-// must return sf_job=100 — the originator.
+// Regression: recurring-customer scenarios from production
 // ──────────────────────────────────────────────────────────────────────
-describe('findMatchCandidates — recurring customer originator fix', () => {
-  test('recurring customer with matching ext_req → returns originator (earliest) sf_job', async () => {
-    const cust = { id: 50, user_id: 2, first_name: 'Recurring', last_name: 'Service',
-      phone: '5550000000', email: 'r@example.com', lb_lead_id: null, created_at: '2025-01-01T00:00:00Z' };
+describe('findMatchCandidates — recurring customer historical-representative fix', () => {
+  test('Alicia Daub shape: 14 completed+paid jobs → picks the EARLIEST (sf_job 139784), not the manifest 141937', async () => {
+    const cust = { id: 22855, user_id: 2, first_name: 'Alicia', last_name: 'Daub',
+      phone: '5555550001', email: null, lb_lead_id: null, created_at: '2026-03-26T00:00:00Z' };
+    // Mirrors the actual prod data: all 14 are completed+paid; primary
+    // is id=139784, also has matching ext_req.
     const jobs = [
-      { id: 300, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
-        lb_external_request_id: null, scheduled_date: '2026-04-15T00:00:00Z', created_at: '2025-12-01T00:00:00Z' },
-      { id: 200, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
-        lb_external_request_id: null, scheduled_date: '2025-08-01T00:00:00Z', created_at: '2025-06-01T00:00:00Z' },
-      { id: 100, user_id: 2, customer_id: 50, status: 'completed', payment_status: 'paid',
-        lb_external_request_id: 'EXT-A', scheduled_date: '2025-02-01T00:00:00Z', created_at: '2025-01-01T00:00:00Z' },
+      { id: 139784, user_id: 2, customer_id: 22855, status: 'completed', payment_status: 'paid', lb_external_request_id: 'EXT-ALICIA', scheduled_date: '2026-04-08', created_at: '2026-03-26T00:00:00Z' },
+      { id: 140217, user_id: 2, customer_id: 22855, status: 'completed', payment_status: 'paid', lb_external_request_id: null,        scheduled_date: '2026-01-31', created_at: '2026-03-26T00:00:00Z' },
+      { id: 141889, user_id: 2, customer_id: 22855, status: 'completed', payment_status: 'paid', lb_external_request_id: null,        scheduled_date: '2026-04-08', created_at: '2026-04-05T00:00:00Z' },
+      { id: 141937, user_id: 2, customer_id: 22855, status: 'completed', payment_status: 'paid', lb_external_request_id: null,        scheduled_date: '2026-04-28', created_at: '2026-04-20T00:00:00Z' },
     ];
     const store = makeStore({ customers: [cust], jobs });
     const out = await findMatchCandidates(store, {
       userId: 2,
       input: {
-        lb_external_request_id: 'EXT-A',
-        customer_phone: '5550000000',
-        customer_name:  'Recurring Service',
-        lead_created_at: '2025-01-05T00:00:00Z',
+        lb_external_request_id: 'EXT-ALICIA',
+        customer_phone: '5555550001',
+        lead_created_at: '2026-03-26T00:00:00Z',
       },
     });
     expect(out.match_count).toBe(1);
-    expect(out.candidates[0].sf_job_id).toBe(100);   // originator, NOT 300 (the most-recent)
-    expect(out.candidates[0].sf_job.lb_external_request_id).toBe('EXT-A');
+    expect(out.candidates[0].sf_job_id).toBe(139784);   // earliest completed+paid, NOT 141937
   });
 
-  test('recurring customer with NO matching ext_req → returns EARLIEST sf_job (not most-recent)', async () => {
-    const cust = { id: 60, user_id: 2, first_name: 'Walk', last_name: 'In',
-      phone: '5550001111', email: null, lb_lead_id: null, created_at: '2025-01-01T00:00:00Z' };
+  test('Renee Teeter shape: 2 completed+paid jobs → picks the lower-id 141731, not the manifest 141732', async () => {
+    const cust = { id: 22847, user_id: 2, first_name: 'Renee', last_name: 'Teeter',
+      phone: '5555550002', email: null, lb_lead_id: null, created_at: '2026-03-26T00:00:00Z' };
     const jobs = [
-      { id: 600, user_id: 2, customer_id: 60, status: 'completed', payment_status: 'paid',
-        lb_external_request_id: null, scheduled_date: '2026-04-15T00:00:00Z', created_at: '2025-12-01T00:00:00Z' },
-      { id: 500, user_id: 2, customer_id: 60, status: 'completed', payment_status: 'paid',
-        lb_external_request_id: null, scheduled_date: '2025-02-01T00:00:00Z', created_at: '2025-01-01T00:00:00Z' },
+      { id: 141731, user_id: 2, customer_id: 22847, status: 'completed', payment_status: 'paid', lb_external_request_id: 'EXT-RENEE', scheduled_date: '2025-03-06', created_at: '2026-03-26T00:00:00Z' },
+      { id: 141732, user_id: 2, customer_id: 22847, status: 'completed', payment_status: 'paid', lb_external_request_id: null,        scheduled_date: '2025-03-06', created_at: '2026-03-26T00:00:00Z' },
     ];
     const store = makeStore({ customers: [cust], jobs });
     const out = await findMatchCandidates(store, {
       userId: 2,
       input: {
-        lb_external_request_id: null,            // LB lead has no ext_req on file (or doesn't match)
-        customer_phone: '5550001111',
-        lead_created_at: '2025-01-05T00:00:00Z',
+        lb_external_request_id: 'EXT-RENEE',
+        customer_phone: '5555550002',
+        lead_created_at: '2026-03-26T00:00:00Z',
       },
     });
     expect(out.match_count).toBe(1);
-    expect(out.candidates[0].sf_job_id).toBe(500);   // earliest (NOT 600 most-recent)
+    expect(out.candidates[0].sf_job_id).toBe(141731);   // tied created_at; lower id wins
+  });
+
+  test('Cancelled-only customer (Julia-Planck shape) → candidate is dropped from match results', async () => {
+    // 7 jobs, all cancelled (the actual Julia Planck case has 5 cancelled
+    // + 2 completed+paid; this is a stricter all-cancelled shape to test
+    // the explicit drop behavior).
+    const cust = { id: 23362, user_id: 2, first_name: 'Cancel', last_name: 'Only',
+      phone: '5555550003', email: null, lb_lead_id: null, created_at: '2026-03-26T00:00:00Z' };
+    const jobs = Array.from({ length: 7 }, (_, i) => ({
+      id: 100 + i, user_id: 2, customer_id: 23362,
+      status: 'cancelled', payment_status: null,
+      lb_external_request_id: i === 0 ? 'EXT-CANCEL' : null,
+      scheduled_date: `2026-0${i + 1}-01`,
+      created_at: `2026-0${i + 1}-01T00:00:00Z`,
+    }));
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: {
+        lb_external_request_id: 'EXT-CANCEL',
+        customer_phone: '5555550003',
+        lead_created_at: '2026-03-01T00:00:00Z',
+      },
+    });
+    // The customer still matches by phone, but sf_job_id is null because
+    // the picker dropped — `isApplicable` (in the orchestrator) then
+    // rejects with reason=sf_job_id_missing. That's intentional: a lead
+    // who never converted shouldn't drag SF state along.
+    expect(out.candidates[0].sf_job_id).toBeNull();
+  });
+
+  test('Mix of cancelled + completed (real Julia Planck shape) → picks earliest completed+paid', async () => {
+    const cust = { id: 90, user_id: 2, first_name: 'Mix', last_name: 'Customer',
+      phone: '5555550009', email: null, lb_lead_id: null, created_at: '2026-03-26T00:00:00Z' };
+    const jobs = [
+      { id: 139558, user_id: 2, customer_id: 90, status: 'cancelled', payment_status: null,   lb_external_request_id: 'EXT-MIX', created_at: '2026-03-01' },
+      { id: 139587, user_id: 2, customer_id: 90, status: 'cancelled', payment_status: null,   created_at: '2026-03-02' },
+      { id: 139806, user_id: 2, customer_id: 90, status: 'completed', payment_status: 'paid', created_at: '2026-03-03' },
+      { id: 139999, user_id: 2, customer_id: 90, status: 'completed', payment_status: 'paid', created_at: '2026-03-04' },
+      { id: 142086, user_id: 2, customer_id: 90, status: 'cancelled', payment_status: null,   created_at: '2026-03-05' },
+    ];
+    const store = makeStore({ customers: [cust], jobs });
+    const out = await findMatchCandidates(store, {
+      userId: 2,
+      input: {
+        lb_external_request_id: 'EXT-MIX',
+        customer_phone: '5555550009',
+        lead_created_at: '2026-03-01T00:00:00Z',
+      },
+    });
+    expect(out.match_count).toBe(1);
+    expect(out.candidates[0].sf_job_id).toBe(139806);   // earliest completed+paid, NOT the cancelled originator
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Live/new-conversion flow remains unaffected
+//
+// findMatchCandidates is invoked only by historical/reconcile paths:
+//   - lib/lb-lead-link-bulk.js     (bulk-reconcile, PR #32)
+//   - lib/sf-historical-sync-orchestrator.js (Phase 2 apply)
+// The live conversion flow attaches an LB lead to a freshly created SF
+// job inline via /orchestration/attach-lb-link with explicit ids and
+// does NOT call findMatchCandidates — so the picker change cannot
+// affect new-booking attachment.
+// ──────────────────────────────────────────────────────────────────────
+describe('live/new-conversion flow unaffected', () => {
+  test('attachLbLink (live path) does not import or invoke findMatchCandidates or the picker', () => {
+    const attacherSrc = require('fs').readFileSync(
+      require('path').resolve(__dirname, '..', 'lib', 'lb-lead-link-attacher.js'),
+      'utf8',
+    );
+    expect(attacherSrc).not.toMatch(/findMatchCandidates/);
+    expect(attacherSrc).not.toMatch(/pickHistoricalRepresentativeJob/);
   });
 });
