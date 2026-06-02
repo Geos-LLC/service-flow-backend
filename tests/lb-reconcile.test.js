@@ -21,6 +21,8 @@ const {
   classifyJob,
   indexLbLeadsByExternalRequestId,
   reconcileEventId,
+  isShadowRecurringCancellation,
+  ACTIVE_LIFECYCLE_STATUSES,
 } = require('../lib/lb-reconcile');
 
 const SILENT = { log() {}, warn() {}, error() {} };
@@ -151,7 +153,7 @@ function makeJobsClassifyStub({ outbox = [] } = {}) {
 describe('classifyJob', () => {
   test('lb_lead_not_in_pull when LB index lacks the externalRequestId', async () => {
     const job = { id: 1, status: 'completed', lb_external_request_id: 'MISSING', lb_channel: 'thumbtack' };
-    const out = await classifyJob(makeJobsClassifyStub(), job, new Map(), SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, new Map(), new Map(), SILENT);
     expect(out.action).toBe('skipped');
     expect(out.reason).toBe('lb_lead_not_in_pull');
   });
@@ -159,7 +161,7 @@ describe('classifyJob', () => {
   test('sf_status_not_mappable when SF status is unknown', async () => {
     const job = { id: 1, status: 'frobnicated', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'scheduled' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('skipped');
     expect(out.reason).toBe('sf_status_not_mappable');
   });
@@ -168,7 +170,7 @@ describe('classifyJob', () => {
     // SF 'pending' canonicalizes to LB 'scheduled' — same as LB current → no-op.
     const job = { id: 1, status: 'pending', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'scheduled' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('noop');
     expect(out.reason).toBe('already_in_sync');
   });
@@ -176,7 +178,7 @@ describe('classifyJob', () => {
   test('lb_hard_terminal blocks push when LB is archived', async () => {
     const job = { id: 1, status: 'cancelled', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'archived' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('skipped');
     expect(out.reason).toBe('lb_hard_terminal');
   });
@@ -185,7 +187,7 @@ describe('classifyJob', () => {
     // LB at completed, SF says in-progress → regression.
     const job = { id: 1, status: 'in-progress', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'completed' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('skipped');
     expect(out.reason).toBe('pipeline_regression');
   });
@@ -193,7 +195,7 @@ describe('classifyJob', () => {
   test('cancelled SF → cancelled LB push allowed even from completed (not a regression)', async () => {
     const job = { id: 1, status: 'cancelled', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'completed' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('queue');
     expect(out.reason).toBe('lifecycle_drift');
     expect(out.sf_canonical).toBe('cancelled');
@@ -202,7 +204,7 @@ describe('classifyJob', () => {
   test('queue when SF advances LB forward (scheduled → in_progress)', async () => {
     const job = { id: 1, status: 'started', lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
     const map = new Map([['EXT', { status: 'scheduled' }]]);
-    const out = await classifyJob(makeJobsClassifyStub(), job, map, SILENT);
+    const out = await classifyJob(makeJobsClassifyStub(), job, map, new Map(), SILENT);
     expect(out.action).toBe('queue');
     expect(out.sf_canonical).toBe('in_progress');
     expect(out.event_id).toBe('evt_reconcile_1_in_progress');
@@ -214,7 +216,7 @@ describe('classifyJob', () => {
     const supabase = makeJobsClassifyStub({
       outbox: [{ event_id: 'evt_reconcile_1_cancelled', state: 'sent', result: 'applied', terminal_at: '2026-05-25' }],
     });
-    const out = await classifyJob(supabase, job, map, SILENT);
+    const out = await classifyJob(supabase, job, map, new Map(), SILENT);
     expect(out.action).toBe('noop');
     expect(out.reason).toBe('outbound_already_queued_or_sent');
     expect(out.existing_event_id).toBe('evt_reconcile_1_cancelled');
@@ -226,7 +228,7 @@ describe('classifyJob', () => {
     const supabase = makeJobsClassifyStub({
       outbox: [{ event_id: 'evt_reconcile_1_cancelled', state: 'dlq', result: null, terminal_at: '2026-05-25' }],
     });
-    const out = await classifyJob(supabase, job, map, SILENT);
+    const out = await classifyJob(supabase, job, map, new Map(), SILENT);
     expect(out.action).toBe('skipped');
     expect(out.reason).toBe('previous_attempt_in_dlq');
   });
@@ -241,11 +243,17 @@ function makeFullStub({ jobs = [], outbox = [] } = {}) {
     recorded,
     from(table) {
       let filter = {};
+      let inFilters = []; // [{col, vals}] — for .in() support
       let rangeFrom = 0;
       let rangeTo = 9999;
       const chain = {
         select() { return chain; },
         eq(k, v) { filter[k] = v; return chain; },
+        in(k, vals) {
+          // Used by fetchPeerJobsByCustomer's .in('customer_id', [...])
+          inFilters.push({ col: k, vals: vals.map((v) => String(v)) });
+          return chain;
+        },
         not(k, op, v) {
           // Used for `.not('lb_external_request_id', 'is', null)`
           filter[`__not_${k}`] = { op, v };
@@ -271,6 +279,9 @@ function makeFullStub({ jobs = [], outbox = [] } = {}) {
                   continue;
                 }
                 if (String(r[k]) !== String(v)) return false;
+              }
+              for (const f of inFilters) {
+                if (!f.vals.includes(String(r[f.col]))) return false;
               }
               return true;
             }).slice(rangeFrom, rangeTo + 1);
@@ -477,5 +488,322 @@ describe('reconcileTenantWithLb — cross-domain semantics', () => {
     expect(out.summary.not_applicable_to_lb).toBe(1);
     expect(out.summary.skipped_unsupported).toBe(1);
     expect(out.summary.failures).toBe(0);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────
+// Shadow-recurring-cancellation guard.
+//
+// Root cause being fixed: lib/lb-reconcile.js previously classified each
+// LB-stamped job independently. A cancelled recurring/future-appointment
+// could push `cancelled` to LB even when the same customer already had a
+// completed job, downgrading a converted lead from `completed` to
+// `cancelled` on the LB side.
+//
+// The guard suppresses such pushes via two tiers:
+//   Tier 1 (strong): any completed peer on the same customer
+//   Tier 2 (medium): an active peer scheduled AFTER this cancellation
+//
+// Cancelled-only customers continue to push as before.
+// ──────────────────────────────────────────────────────────────────
+
+describe('isShadowRecurringCancellation — predicate (pure)', () => {
+  test('non-cancelled job → never suppressed', () => {
+    const job = { id: 1, status: 'completed', customer_id: 10 };
+    const peers = [{ id: 2, status: 'cancelled' }];
+    expect(isShadowRecurringCancellation(job, peers).suppress).toBe(false);
+  });
+
+  test('empty peers → never suppressed', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10 };
+    expect(isShadowRecurringCancellation(job, []).suppress).toBe(false);
+    expect(isShadowRecurringCancellation(job, null).suppress).toBe(false);
+  });
+
+  test('Tier 1 fires when any completed peer exists', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10 };
+    const peers = [
+      { id: 2, status: 'cancelled' },
+      { id: 3, status: 'completed' },
+    ];
+    const r = isShadowRecurringCancellation(job, peers);
+    expect(r.suppress).toBe(true);
+    expect(r.tier).toBe('strong_has_completed_peer');
+    expect(r.peer_job_ids).toEqual([3]);
+  });
+
+  test('Tier 1 fires regardless of date ordering', () => {
+    // Completed peer scheduled BEFORE the cancellation — still suppresses.
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = [{ id: 2, status: 'completed', scheduled_date: '2026-02-01' }];
+    expect(isShadowRecurringCancellation(job, peers).tier).toBe('strong_has_completed_peer');
+  });
+
+  test('Tier 2 fires when active peer is scheduled AFTER cancellation', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = [
+      { id: 2, status: 'cancelled' },
+      { id: 3, status: 'scheduled', scheduled_date: '2026-08-01T10:00:00Z' },
+    ];
+    const r = isShadowRecurringCancellation(job, peers);
+    expect(r.suppress).toBe(true);
+    expect(r.tier).toBe('medium_has_newer_active_peer');
+    expect(r.peer_job_ids).toEqual([3]);
+  });
+
+  test('Tier 2 does NOT fire when active peer is scheduled BEFORE cancellation', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = [
+      { id: 2, status: 'cancelled' },
+      { id: 3, status: 'scheduled', scheduled_date: '2026-03-01' },  // before
+    ];
+    expect(isShadowRecurringCancellation(job, peers).suppress).toBe(false);
+  });
+
+  test('Tier 2 honors all active statuses (booked / in_progress / confirmed)', () => {
+    const base = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-01-01T00:00:00Z' };
+    for (const peerStatus of [...ACTIVE_LIFECYCLE_STATUSES]) {
+      const peers = [{ id: 2, status: peerStatus, scheduled_date: '2026-06-01' }];
+      const r = isShadowRecurringCancellation(base, peers);
+      expect(r.suppress).toBe(true);
+      expect(r.tier).toBe('medium_has_newer_active_peer');
+    }
+  });
+
+  test('cancelled-only customer (no completed/active peers) → NOT suppressed', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = [{ id: 2, status: 'cancelled' }];
+    expect(isShadowRecurringCancellation(job, peers).suppress).toBe(false);
+  });
+
+  test('Tier 1 takes precedence over Tier 2 (completed is stronger)', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = [
+      { id: 2, status: 'completed' },
+      { id: 3, status: 'scheduled', scheduled_date: '2026-08-01' },
+    ];
+    const r = isShadowRecurringCancellation(job, peers);
+    expect(r.tier).toBe('strong_has_completed_peer');
+    expect(r.peer_job_ids).toEqual([2]);
+  });
+
+  test('falls back to created_at when last_status_changed_at is missing', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: null, created_at: '2026-05-01' };
+    const peers = [{ id: 2, status: 'scheduled', scheduled_date: '2026-08-01' }];
+    expect(isShadowRecurringCancellation(job, peers).tier).toBe('medium_has_newer_active_peer');
+  });
+
+  test('no comparable reference timestamp → returns false (defensive)', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: null, created_at: null };
+    const peers = [{ id: 2, status: 'scheduled', scheduled_date: '2026-08-01' }];
+    expect(isShadowRecurringCancellation(job, peers).suppress).toBe(false);
+  });
+
+  test('peer with null scheduled_date is ignored in Tier 2', () => {
+    const job = { id: 1, status: 'cancelled', customer_id: 10,
+      last_status_changed_at: '2026-05-26' };
+    const peers = [{ id: 2, status: 'scheduled', scheduled_date: null }];
+    expect(isShadowRecurringCancellation(job, peers).suppress).toBe(false);
+  });
+});
+
+describe('classifyJob — shadow_recurring_cancellation integration', () => {
+  // Required: the 6 specified scenarios + a coverage case for telemetry shape.
+  // Each test builds its own peerJobsByCust map directly and passes it in.
+
+  const lbScheduledMap = new Map([['EXT', { lb_id: 'lb1', status: 'scheduled' }]]);
+  const lbCompletedMap = new Map([['EXT', { lb_id: 'lb1', status: 'completed' }]]);
+
+  test('(1) cancelled job + completed peer → skipped, tier=strong_has_completed_peer', async () => {
+    const job = { id: 100, status: 'cancelled', customer_id: 50,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = new Map([[50, [
+      { id: 100, status: 'cancelled' },
+      { id: 101, status: 'completed', payment_status: 'paid' },
+    ]]]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, peers, SILENT);
+    expect(out.action).toBe('skipped');
+    expect(out.reason).toBe('shadow_recurring_cancellation');
+    expect(out.suppression_tier).toBe('strong_has_completed_peer');
+    expect(out.peer_job_ids).toEqual([101]);
+    // Telemetry fields all present
+    expect(out.customer_id).toBe(50);
+    expect(out.lb_lead_id).toBe('lb1');
+    expect(out.lb_external_request_id).toBe('EXT');
+  });
+
+  test('(2) cancelled job + active peer scheduled AFTER cancellation → skipped, tier=medium_has_newer_active_peer', async () => {
+    const job = { id: 200, status: 'cancelled', customer_id: 60,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = new Map([[60, [
+      { id: 200, status: 'cancelled' },
+      { id: 201, status: 'scheduled', scheduled_date: '2026-08-01' },
+    ]]]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, peers, SILENT);
+    expect(out.action).toBe('skipped');
+    expect(out.reason).toBe('shadow_recurring_cancellation');
+    expect(out.suppression_tier).toBe('medium_has_newer_active_peer');
+    expect(out.peer_job_ids).toEqual([201]);
+  });
+
+  test('(3) cancelled job + active peer scheduled BEFORE cancellation → NOT skipped by new guard', async () => {
+    const job = { id: 300, status: 'cancelled', customer_id: 70,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = new Map([[70, [
+      { id: 300, status: 'cancelled' },
+      { id: 301, status: 'scheduled', scheduled_date: '2026-03-01' },  // before
+    ]]]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, peers, SILENT);
+    // Existing path: SF cancelled vs LB scheduled → queue/lifecycle_drift
+    expect(out.reason).not.toBe('shadow_recurring_cancellation');
+    expect(out.action).toBe('queue');
+  });
+
+  test('(4) cancelled job + only cancelled peers → NOT skipped by new guard', async () => {
+    const job = { id: 400, status: 'cancelled', customer_id: 80,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    const peers = new Map([[80, [
+      { id: 400, status: 'cancelled' },
+      { id: 401, status: 'cancelled' },
+    ]]]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, peers, SILENT);
+    expect(out.reason).not.toBe('shadow_recurring_cancellation');
+    expect(out.action).toBe('queue');
+  });
+
+  test('(5) completed job path is unchanged — guard never inspects non-cancelled jobs', async () => {
+    const job = { id: 500, status: 'completed', customer_id: 90,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+      last_status_changed_at: '2026-05-26T20:00:00Z' };
+    // Even with a "shadowing" peer, completed jobs always push
+    const peers = new Map([[90, [
+      { id: 500, status: 'completed' },
+      { id: 501, status: 'completed' },
+    ]]]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, peers, SILENT);
+    expect(out.action).toBe('queue');
+    expect(out.sf_canonical).toBe('completed');
+    expect(out.reason).toBe('lifecycle_drift');
+  });
+
+  test('(6) historical 8-conflict shape (Julia Planck) → skipped, tier=strong_has_completed_peer', async () => {
+    // Reproduces the exact shape of the 8 production conflicts:
+    //   sf_job 139558: cancelled, future-scheduled, lb_external_request_id set,
+    //                  last status change on 2026-05-11
+    //   sf_job 139806: completed+paid, lb_external_request_id NULL (pre-Strategy-4)
+    // Without the fix, the 2026-05-26 LB Reconcile pushed cancelled and
+    // downgraded LB.status from completed → cancelled.
+    const job = {
+      id: 139558, status: 'cancelled', customer_id: 23362,
+      lb_external_request_id: '573157186885943325', lb_channel: 'thumbtack',
+      scheduled_date: '2026-07-03',
+      last_status_changed_at: '2026-05-11T19:58:56Z',
+    };
+    const peers = new Map([[23362, [
+      { id: 139558, status: 'cancelled', scheduled_date: '2026-07-03' },
+      { id: 139806, status: 'completed', payment_status: 'paid',
+        scheduled_date: '2026-04-03' },
+      // The other recurring jobs that exist for this customer; doesn't matter
+      { id: 139999, status: 'completed', payment_status: 'paid' },
+    ]]]);
+    const lbCompletedThenCancelled = new Map([
+      ['573157186885943325', { lb_id: '06acf8c8-a6f8-4beb-aa2d-5bb25c0c5edf', status: 'completed' }],
+    ]);
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbCompletedThenCancelled, peers, SILENT);
+    expect(out.action).toBe('skipped');
+    expect(out.reason).toBe('shadow_recurring_cancellation');
+    expect(out.suppression_tier).toBe('strong_has_completed_peer');
+    expect(out.peer_job_ids).toEqual(expect.arrayContaining([139806, 139999]));
+    expect(out.lb_lead_id).toBe('06acf8c8-a6f8-4beb-aa2d-5bb25c0c5edf');
+    expect(out.lb_external_request_id).toBe('573157186885943325');
+    expect(out.customer_id).toBe(23362);
+  });
+
+  test('coverage: missing peerJobsByCust map → guard is inert, no false suppression', async () => {
+    // Defensive: if peer-load failed and the map is empty, the guard
+    // must not fire and the existing classification path takes over.
+    const job = { id: 600, status: 'cancelled', customer_id: 95,
+      lb_external_request_id: 'EXT', lb_channel: 'thumbtack' };
+    const out = await classifyJob(makeJobsClassifyStub(), job, lbScheduledMap, new Map(), SILENT);
+    expect(out.reason).not.toBe('shadow_recurring_cancellation');
+    expect(out.action).toBe('queue');
+  });
+});
+
+describe('reconcileTenantWithLb — shadow_recurring_cancellation orchestration', () => {
+  test('end-to-end: cancelled + completed peer → skipped, summary counter increments', async () => {
+    const supabase = makeFullStub({
+      jobs: [
+        // The cancelled stamped job (would have been pushed pre-fix)
+        { id: 100, user_id: 2, customer_id: 50, status: 'cancelled',
+          lb_external_request_id: 'EXT', lb_channel: 'thumbtack',
+          last_status_changed_at: '2026-05-26T20:00:00Z' },
+        // The completed peer (not stamped — that's the bug pattern)
+        { id: 101, user_id: 2, customer_id: 50, status: 'completed',
+          payment_status: 'paid', lb_external_request_id: null,
+          scheduled_date: '2026-04-01' },
+      ],
+    });
+    const lbLeads = [{ id: 'lb1', externalRequestId: 'EXT', status: 'completed' }];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+
+    expect(out.summary.jobs_evaluated).toBe(1);                     // only stamped jobs land in linkedJobs
+    expect(out.summary.skipped_shadow_recurring_cancellation).toBe(1);
+    expect(out.summary.statuses_pushed).toBe(0);
+    expect(out.summary.lifecycle_drift).toBe(0);
+    expect(out.plan[0].action).toBe('skipped');
+    expect(out.plan[0].reason).toBe('shadow_recurring_cancellation');
+    expect(out.plan[0].suppression_tier).toBe('strong_has_completed_peer');
+    expect(out.plan[0].peer_job_ids).toEqual([101]);
+  });
+
+  test('end-to-end: only cancelled stamped, no completed peer → still pushes (cancelled-only customer)', async () => {
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 700, user_id: 2, customer_id: 55, status: 'cancelled',
+          lb_external_request_id: 'EXT', lb_channel: 'thumbtack' },
+      ],
+    });
+    const lbLeads = [{ id: 'lb1', externalRequestId: 'EXT', status: 'scheduled' }];
+    const out = await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: SILENT });
+    expect(out.summary.skipped_shadow_recurring_cancellation).toBe(0);
+    expect(out.summary.lifecycle_drift).toBe(1);
+    expect(out.plan[0].action).toBe('queue');
+  });
+
+  test('end-to-end: log telemetry for suppressions includes customer + peer + lb identifiers', async () => {
+    const messages = [];
+    const captureLogger = { log: (m) => messages.push(m), warn() {}, error() {} };
+    const supabase = makeFullStub({
+      jobs: [
+        { id: 800, user_id: 2, customer_id: 60, status: 'cancelled',
+          lb_external_request_id: 'EXT-T', lb_channel: 'thumbtack',
+          last_status_changed_at: '2026-05-26T20:00:00Z' },
+        { id: 801, user_id: 2, customer_id: 60, status: 'completed',
+          payment_status: 'paid', scheduled_date: '2026-04-01' },
+      ],
+    });
+    const lbLeads = [{ id: 'lb-t', externalRequestId: 'EXT-T', status: 'completed' }];
+    await reconcileTenantWithLb(supabase, 2, lbLeads, { dryRun: true, logger: captureLogger });
+    const tel = messages.find((m) => m.includes('reason=shadow_recurring_cancellation'));
+    expect(tel).toBeDefined();
+    expect(tel).toContain('tier=strong_has_completed_peer');
+    expect(tel).toContain('job=800');
+    expect(tel).toContain('customer=60');
+    expect(tel).toContain('lb_lead=lb-t');
+    expect(tel).toContain('ext_req=EXT-T');
+    expect(tel).toContain('peer_jobs=[801]');
   });
 });
