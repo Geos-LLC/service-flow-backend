@@ -302,6 +302,48 @@ describe('updateJobStatus control flow (§4)', () => {
     expect(s._db.outbox[0].terminal_at).toBeTruthy()
   })
 
+  // ── Issue #47: SF-connected lifecycle statuses enqueue normally ──
+  //
+  // Before PR-for-#47, SF literal `scheduled` / `booked` were missing
+  // from the allowlist and landed in `skipped_unmapped_status`. Tenant 2's
+  // Wave 1B/1C exposed this in prod (Luma/Kathy/Sandra outbox rows).
+  // These tests guard the regression: any of the four SF-connected
+  // lifecycle states must enqueue a pending outbox row, not skip.
+
+  test('scheduled status enqueues pending outbox row (Issue #47)', async () => {
+    const s = seed({ status: 'pending' })
+    const res = await updateJobStatus(s, {
+      jobId: 1, userId: 'u1', newStatus: 'scheduled',
+      source: 'account_owner', actor: { type: 'account_owner', id: 1 },
+    })
+    expect(res.outboundAction).toBe('enqueued')
+    expect(s._db.outbox.length).toBe(1)
+    expect(s._db.outbox[0].state).toBe('pending')
+    expect(s._db.outbox[0].terminal_at).toBeFalsy()
+  })
+
+  test('booked status enqueues pending outbox row (Issue #47)', async () => {
+    const s = seed({ status: 'pending' })
+    const res = await updateJobStatus(s, {
+      jobId: 1, userId: 'u1', newStatus: 'booked',
+      source: 'account_owner', actor: { type: 'account_owner', id: 1 },
+    })
+    expect(res.outboundAction).toBe('enqueued')
+    expect(s._db.outbox.length).toBe(1)
+    expect(s._db.outbox[0].state).toBe('pending')
+  })
+
+  test('in_progress status enqueues pending outbox row', async () => {
+    const s = seed({ status: 'scheduled' })
+    const res = await updateJobStatus(s, {
+      jobId: 1, userId: 'u1', newStatus: 'in_progress',
+      source: 'account_owner', actor: { type: 'account_owner', id: 1 },
+    })
+    expect(res.outboundAction).toBe('enqueued')
+    expect(s._db.outbox.length).toBe(1)
+    expect(s._db.outbox[0].state).toBe('pending')
+  })
+
   test('happy path — pending row enqueued with frozen payload', async () => {
     const s = seed({ status: 'pending' })
     const res = await updateJobStatus(s, {
