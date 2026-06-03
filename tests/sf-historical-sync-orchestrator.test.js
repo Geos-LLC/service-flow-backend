@@ -356,7 +356,12 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
     expect(cat.bucket).toBe('would_review');
     expect(cat.reason).toBe('lb_already_pinned_to_different_job');
   });
-  test('lbCandidate.sfJobId set & matches matcher pick → still would_link (negative case)', () => {
+  test('lbCandidate.sfJobId set & matches matcher pick → already_linked (no re-apply on rerun)', () => {
+    // BEHAVIOR CHANGE: previously this case bucketed as would_link with
+    // reason=null because the LB pin agreed with the matcher pick — but
+    // attempting to "apply" it under full_reconcile would re-link an
+    // already-linked row. The new `already_linked` bucket short-circuits
+    // here so reruns of full_reconcile never re-apply existing links.
     const cat = categorize({
       lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: 139806 },     // LB pin matches matcher
       matched: [{
@@ -367,8 +372,8 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
         ambiguity_warnings: [],
       }],
     });
-    expect(cat.bucket).toBe('would_link');
-    expect(cat.reason).toBeNull();
+    expect(cat.bucket).toBe('already_linked');
+    expect(cat.reason).toBe('already_linked');
   });
   test('lbCandidate.sfJobId null → unchanged behavior (negative case)', () => {
     const cat = categorize({
@@ -414,9 +419,11 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
     expect(cat.bucket).toBe('would_review');
     expect(cat.reason).toBe('lb_already_pinned_to_different_job');
   });
-  test('lbCandidate.sfJobId arrives as string; equality is numeric', () => {
-    // LB stores sfJobId as text in Prisma; SF stores as integer. The
-    // guard must coerce so '139558' === 139558 doesn't slip through.
+  test('lbCandidate.sfJobId arrives as string; numeric equality routes to already_linked', () => {
+    // LB stores sfJobId as text in Prisma; SF stores as integer. Both
+    // guards (already_linked AND lb_already_pinned_to_different_job)
+    // must coerce, so '139558' === 139558 (numeric) routes to
+    // already_linked, not would_link or would_review.
     const cat = categorize({
       lbCandidate: { ...ERIN_LB_CANDIDATE, sfJobId: '139558' },   // string
       matched: [{
@@ -427,7 +434,8 @@ describe('categorize — reads externalRequestId from LB candidate', () => {
         ambiguity_warnings: [],
       }],
     });
-    expect(cat.bucket).toBe('would_link');                        // numeric match
+    expect(cat.bucket).toBe('already_linked');                    // numeric match → already linked
+    expect(cat.reason).toBe('already_linked');
   });
 
   test('already_reconciled_customer takes precedence over sf_job_linked_to_different_lb_lead conflict', () => {
