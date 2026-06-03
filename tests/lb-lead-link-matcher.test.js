@@ -439,6 +439,69 @@ describe('pickHistoricalRepresentativeJob — tiered status picker', () => {
     ];
     expect(pickHistoricalRepresentativeJob(jobs).id).toBe(1);
   });
+
+  // ── in_progress (tier 3) — SF-connected lifecycle rule additions ──
+  //
+  // in_progress represents a customer mid-service (cleaner currently
+  // delivering). Stronger conversion signal than scheduled/booked,
+  // weaker than completed. Tier ordering: completed+paid > completed >
+  // in_progress > scheduled/booked.
+
+  test('tier 3 (in_progress) — fires when no completed exists', () => {
+    const jobs = [
+      { id: 51, status: 'in_progress', payment_status: null, created_at: '2025-06-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(51);
+  });
+
+  test('completed (tier 1/2) wins over in_progress (tier 3)', () => {
+    const jobs = [
+      { id: 52, status: 'in_progress', payment_status: null,   created_at: '2025-01-01' },
+      { id: 53, status: 'completed',   payment_status: 'paid', created_at: '2025-08-01' },
+    ];
+    // Tier 1 wins even when in_progress is older.
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(53);
+  });
+
+  test('completed unpaid (tier 2) wins over in_progress (tier 3)', () => {
+    const jobs = [
+      { id: 54, status: 'in_progress', payment_status: null,    created_at: '2025-01-01' },
+      { id: 55, status: 'completed',   payment_status: 'unpaid', created_at: '2025-08-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(55);
+  });
+
+  test('in_progress (tier 3) wins over scheduled/booked (tier 4)', () => {
+    const jobs = [
+      { id: 56, status: 'in_progress', payment_status: null, created_at: '2025-05-01' },
+      { id: 57, status: 'scheduled',   payment_status: null, created_at: '2025-03-01' },
+      { id: 58, status: 'booked',      payment_status: null, created_at: '2025-04-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(56);
+  });
+
+  test('earliest in_progress wins among multiple in_progress (tier 3 ordering)', () => {
+    const jobs = [
+      { id: 59, status: 'in_progress', payment_status: null, created_at: '2025-04-01' },
+      { id: 60, status: 'in_progress', payment_status: null, created_at: '2025-01-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(60);
+  });
+
+  test('case-insensitive on in_progress', () => {
+    const jobs = [
+      { id: 61, status: 'In_Progress', payment_status: null, created_at: '2025-01-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs).id).toBe(61);
+  });
+
+  test('cancelled-only customer still drops to null (no lifecycle representative)', () => {
+    const jobs = [
+      { id: 70, status: 'cancelled', payment_status: null, created_at: '2025-01-01' },
+      { id: 71, status: 'no_show',   payment_status: null, created_at: '2025-02-01' },
+    ];
+    expect(pickHistoricalRepresentativeJob(jobs)).toBeNull();
+  });
 });
 
 describe('pickHistoricalRepresentativeJobPerCustomer', () => {

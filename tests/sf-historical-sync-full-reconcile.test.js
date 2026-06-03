@@ -148,76 +148,90 @@ describe('resolveSyncStatuses', () => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// categorize — sf_truth_overrides_lb_automation_lost
+// categorize — sf_truth_overrides_lost (SF-connected lifecycle rule)
 // ──────────────────────────────────────────────────────────────
-describe('categorize — sf_truth_overrides_lb_automation_lost (the Barbara/Elda rule)', () => {
-  test('lost + lb_automation + sf completed+paid + phone exact → would_link with new reason', () => {
+describe('categorize — sf_truth_overrides_lost (SF lifecycle rule)', () => {
+  test('lost + lb_automation + completed+paid → would_link with reason=sf_truth_overrides_lost', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch()],
     });
     expect(cat.bucket).toBe('would_link');
-    expect(cat.reason).toBe('sf_truth_overrides_lb_automation_lost');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
   });
 
-  test('lost but human-set (statusSource=user_admin) → does NOT trigger new rule, falls through to would_skip', () => {
-    // Strict gate fails on the statusSource check. With no auto-link rule
-    // catching it, the row should fall through to low_confidence (single
-    // medium-conf path) or no_match. Confidence stays high here so it
-    // falls to the shouldAutoLink branch — but that would auto-link it,
-    // which is wrong for human-set lost. Confirm the new rule does NOT
-    // produce sf_truth_overrides_lb_automation_lost as the reason.
-    const cat = categorize({
-      lbCandidate: lbCandidate({ statusSource: 'user_admin' }),
-      matched:     [sfMatch()],
-    });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
-    // The existing rule still auto-links — which is acceptable, because
-    // a human-set lost on a customer with a completed+paid job is most
-    // likely a data-quality issue and the standard would_link path is
-    // the right escalation. The defense is in isApplicable() (covered
-    // below).
-    expect(cat.bucket).toBe('would_link');
-    expect(cat.reason).toBeNull();
-  });
-
-  test('lost + lb_automation + sf job NOT completed → does NOT auto-link via new rule', () => {
-    const cat = categorize({
-      lbCandidate: lbCandidate(),
-      matched:     [sfMatch({ sf_job: { status: 'scheduled', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
-    });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
-  });
-
-  test('lost + lb_automation + sf completed but unpaid → does NOT auto-link via new rule', () => {
+  test('lost + lb_automation + completed/unpaid → would_link (payment is informational)', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
     });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
   });
 
-  test('lost + lb_automation + medium confidence → does NOT auto-link via new rule', () => {
+  test('lost + platform_sync + completed/paid → would_link (Shalie shape)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch()],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('lost + platform_sync + completed/unpaid → would_link (Megan shape)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('lost + statusSource undefined → would_link (LB #196 no longer required)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: undefined }),
+      matched:     [sfMatch()],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('lost + in_progress SF job → would_link (mid-service lifecycle entry)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch({ sf_job: { status: 'in_progress', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('lost + scheduled SF job → would_link (booked lifecycle entry)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ sf_job: { status: 'scheduled', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('lost + medium confidence → would_skip:low_confidence (does NOT fire new rule)', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({ confidence: 'medium' })],
     });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
-    // medium-conf single match with no other guard hit falls to
-    // low_confidence skip.
     expect(cat.bucket).toBe('would_skip');
     expect(cat.reason).toBe('low_confidence');
   });
 
-  test('lost + lb_automation + ambiguity_warnings present → does NOT auto-link via new rule', () => {
+  test('lost + ambiguity_warnings present → does NOT fire new rule, falls to standard path', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({ ambiguity_warnings: ['multiple_high_conf'] })],
     });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
+    expect(cat.reason).not.toBe('sf_truth_overrides_lost');
   });
 
-  test('lost + lb_automation but matched customer already reconciled → would_skip (not new rule)', () => {
+  test('lost + customer already reconciled → would_skip:already_reconciled_customer (no remap)', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({
@@ -229,7 +243,7 @@ describe('categorize — sf_truth_overrides_lb_automation_lost (the Barbara/Elda
     expect(cat.bucket).toBe('would_skip');
   });
 
-  test('lost + lb_automation but sf_job pinned to DIFFERENT lb_lead → does NOT trigger new rule', () => {
+  test('lost + sf_job pinned to DIFFERENT lb_lead → does NOT fire new rule', () => {
     const cat = categorize({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({
@@ -241,29 +255,16 @@ describe('categorize — sf_truth_overrides_lb_automation_lost (the Barbara/Elda
         },
       })],
     });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
+    expect(cat.reason).not.toBe('sf_truth_overrides_lost');
   });
 
-  test('lost + lb_automation + statusSource undefined (LB hasn\'t shipped field yet) → fails closed, NOT new rule', () => {
-    const cat = categorize({
-      lbCandidate: lbCandidate({ statusSource: undefined }),
-      matched:     [sfMatch()],
-    });
-    expect(cat.reason).not.toBe('sf_truth_overrides_lb_automation_lost');
-    // Without statusSource the row still has a high-conf match + completed+paid
-    // job, so the existing rule kicks in and would_link with reason=null.
-    expect(cat.bucket).toBe('would_link');
-    expect(cat.reason).toBeNull();
-  });
-
-  test('REGRESSION (Elda) — engaged status set by admin → existing rule handles, NOT new rule', () => {
-    // Elda is no longer 'lost' — admin moved her to 'engaged' before
-    // tenant 2's full_reconcile shadow run. Confirm she rides the
-    // standard auto-link path, not the new rule.
+  test('REGRESSION (Elda) — non-lost (engaged) → standard rule, not new rule', () => {
+    // Non-lost rows do NOT route through sf_truth_overrides_lost — they
+    // ride the standard shouldAutoLink path with reason=null.
     const cat = categorize({
       lbCandidate: lbCandidate({
         leadId: ELDA_LB_ID, status: 'engaged', statusSource: 'lb_admin', lostReason: null,
-        customerName: 'Elda Pittman', customerPhone: '8132226789',
+        customerName: 'Elda', customerPhone: '8132226789',
       }),
       matched: [sfMatch({ sf_customer_id: 23477, sf_job_id: 142222 })],
     });
@@ -297,7 +298,7 @@ describe('categorize — already_linked bucket', () => {
     expect(cat.bucket).toBe('already_linked');
   });
 
-  test('already_linked wins over sf_truth_overrides_lb_automation_lost (no re-apply under rerun)', () => {
+  test('already_linked wins over sf_truth_overrides_lost (no re-apply under rerun)', () => {
     // The Barbara fix has shipped — her LB sfJobId is now 141941.
     // Re-running full_reconcile must NOT classify her as would_link a
     // second time; she belongs in already_linked.
@@ -368,9 +369,9 @@ describe('categorize — non-regression for existing rules', () => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// isApplicable — lost-row defense-in-depth
+// isApplicable — uniform SF-connected lifecycle rule
 // ──────────────────────────────────────────────────────────────
-describe('isApplicable — lost-row defense', () => {
+describe('isApplicable — uniform across lost and non-lost rows', () => {
   test('lost + lb_automation + completed+paid → ok', () => {
     const r = isApplicable({
       lbCandidate: lbCandidate(),
@@ -379,34 +380,47 @@ describe('isApplicable — lost-row defense', () => {
     expect(r.ok).toBe(true);
   });
 
-  test('lost + statusSource !== lb_automation → reject lost_not_lb_automation_origin', () => {
+  test('lost + platform_sync + completed+paid → ok (Shalie shape — no longer blocked)', () => {
     const r = isApplicable({
-      lbCandidate: lbCandidate({ statusSource: 'user_admin' }),
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
       matched:     [sfMatch()],
     });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe('lost_not_lb_automation_origin');
+    expect(r.ok).toBe(true);
   });
 
-  test('lost + lb_automation + sf job NOT completed → reject lost_requires_completed_paid_sf_job', () => {
+  test('lost + platform_sync + completed/unpaid → ok (Megan shape — no longer blocked)', () => {
     const r = isApplicable({
-      lbCandidate: lbCandidate(),
-      matched:     [sfMatch({ sf_job: { status: 'scheduled', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
     });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe('lost_requires_completed_paid_sf_job');
+    expect(r.ok).toBe(true);
   });
 
-  test('lost + lb_automation + completed but unpaid → reject lost_requires_completed_paid_sf_job', () => {
+  test('lost + lb_automation + completed/unpaid → ok (no longer blocked)', () => {
     const r = isApplicable({
       lbCandidate: lbCandidate(),
       matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
     });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe('lost_requires_completed_paid_sf_job');
+    expect(r.ok).toBe(true);
   });
 
-  test('non-lost row (engaged + lb_admin) — lost gates don\'t apply, existing high-conf gate passes', () => {
+  test('lost + in_progress SF job → ok', () => {
+    const r = isApplicable({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch({ sf_job: { status: 'in_progress', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test('lost + scheduled SF job → ok', () => {
+    const r = isApplicable({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ sf_job: { status: 'scheduled', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test('non-lost row (engaged + lb_admin) → ok', () => {
     const r = isApplicable({
       lbCandidate: lbCandidate({ status: 'engaged', statusSource: 'lb_admin' }),
       matched:     [sfMatch()],
@@ -414,7 +428,25 @@ describe('isApplicable — lost-row defense', () => {
     expect(r.ok).toBe(true);
   });
 
-  test('regression — lb_already_pinned_to_different_job still rejects FIRST', () => {
+  test('low-conf single → reject confidence_below_threshold', () => {
+    const r = isApplicable({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ confidence: 'low' })],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('confidence_below_threshold');
+  });
+
+  test('multiple candidates → reject multiple_candidates', () => {
+    const r = isApplicable({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch(), sfMatch({ sf_customer_id: 99999, sf_job_id: 99998 })],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('multiple_candidates');
+  });
+
+  test('regression — lb_already_pinned_to_different_job still rejects', () => {
     const r = isApplicable({
       lbCandidate: lbCandidate({ sfJobId: 99999 }),
       matched:     [sfMatch({ sf_job_id: 141941 })],
@@ -433,6 +465,147 @@ describe('isApplicable — lost-row defense', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('already_reconciled_customer');
+  });
+
+  test('ambiguity_warnings present → reject', () => {
+    const r = isApplicable({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ ambiguity_warnings: ['multiple_high_conf'] })],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('ambiguity_warnings_present');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────
+// 14 user-listed cases — explicit map to the approved spec
+// ──────────────────────────────────────────────────────────────
+describe('SF-connected lifecycle rule — 14 spec cases', () => {
+  test('1. Non-lost (new) + scheduled SF → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ status: 'new', statusSource: undefined }),
+      matched:     [sfMatch({ sf_job: { status: 'scheduled', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+  });
+
+  test('2. Non-lost (new) + booked SF → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ status: 'new', statusSource: undefined }),
+      matched:     [sfMatch({ sf_job: { status: 'booked', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+  });
+
+  test('3. Non-lost (engaged) + in_progress SF → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ status: 'engaged', statusSource: 'lb_admin' }),
+      matched:     [sfMatch({ sf_job: { status: 'in_progress', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+  });
+
+  test('4. Lost + platform_sync + completed/unpaid → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('5. Lost + platform_sync + completed/paid → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ statusSource: 'platform_sync' }),
+      matched:     [sfMatch()],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('6. Lost + lb_automation + completed/unpaid → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ sf_job: { status: 'completed', payment_status: 'unpaid', lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('7. Lost + in_progress SF job (high conf, single, no ambiguity) → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ sf_job: { status: 'in_progress', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('8. Lost + scheduled/booked SF (high conf, single, no ambiguity) → would_link', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ sf_job: { status: 'booked', payment_status: null, lb_external_request_id: null, lb_lead_id: null } })],
+    });
+    expect(cat.bucket).toBe('would_link');
+    expect(cat.reason).toBe('sf_truth_overrides_lost');
+  });
+
+  test('9. Lost + no SF job at all → would_skip:no_match', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('no_match');
+  });
+
+  test('10. Lost + cancelled-only SF (matcher returns no candidate) → would_skip:no_match', () => {
+    // Matcher's pickHistoricalRepresentativeJob excludes cancelled jobs.
+    // A customer with only cancelled jobs produces no representative,
+    // and findMatchCandidates would drop the candidate entirely.
+    // categorize() sees an empty `matched` array.
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('no_match');
+  });
+
+  test('11. Lost + low confidence → would_skip:low_confidence', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch({ confidence: 'low' })],
+    });
+    expect(cat.bucket).toBe('would_skip');
+    expect(cat.reason).toBe('low_confidence');
+  });
+
+  test('12. Lost + multiple candidates → would_review:multiple_candidates', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate(),
+      matched:     [sfMatch(), sfMatch({ sf_customer_id: 99999, sf_job_id: 99998 })],
+    });
+    expect(cat.bucket).toBe('would_review');
+    expect(cat.reason).toBe('multiple_candidates');
+  });
+
+  test('13. lb_already_pinned_to_different_job → would_review (existing rule wins)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ sfJobId: 99999 }),
+      matched:     [sfMatch({ sf_job_id: 141941 })],
+    });
+    expect(cat.bucket).toBe('would_review');
+    expect(cat.reason).toBe('lb_already_pinned_to_different_job');
+  });
+
+  test('14. already_linked → still protected (no re-apply)', () => {
+    const cat = categorize({
+      lbCandidate: lbCandidate({ sfJobId: 141941 }),
+      matched:     [sfMatch({ sf_job_id: 141941 })],
+    });
+    expect(cat.bucket).toBe('already_linked');
+    expect(cat.reason).toBe('already_linked');
   });
 });
 
@@ -523,15 +696,15 @@ describe('runHistoricalSync — sync_scope wiring', () => {
     }));
   });
 
-  test('summary surfaces new bucket counts + automation_false_lost_candidates', async () => {
+  test('summary surfaces new bucket counts + lost_truth_override_candidates', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [], count: 0, more_may_exist: false });
     const out = await runHistoricalSync(makeStubSupa(), { tenantId: SF_TENANT_ID, syncScope: 'full_reconcile' });
     expect(out.summary).toEqual(expect.objectContaining({
-      already_linked:                   0,
-      automation_false_lost_candidates: 0,
-      would_link:                       0,
-      would_review:                     0,
-      would_skip:                       0,
+      already_linked:                  0,
+      lost_truth_override_candidates:  0,
+      would_link:                      0,
+      would_review:                    0,
+      would_skip:                      0,
     }));
     expect(out.already_linked).toEqual([]);
   });
@@ -597,7 +770,7 @@ describe('runHistoricalSync — bucketing under full_reconcile', () => {
     expect(out.summary.would_skip).toBe(2);
     expect(out.summary.would_link).toBe(0);
     expect(out.summary.already_linked).toBe(0);
-    expect(out.summary.automation_false_lost_candidates).toBe(0);
+    expect(out.summary.lost_truth_override_candidates).toBe(0);
   });
 
   test('LB fetch failure surfaces with structured error (no SF writes)', async () => {
