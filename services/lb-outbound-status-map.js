@@ -16,8 +16,12 @@
  */
 
 const ALLOWED_SF_STATUSES = new Set([
-  // Pre-service
+  // Pre-service (legacy)
   'pending', 'confirmed', 'rescheduled',
+  // SF-connected lifecycle (Issue #47 + PR #46) — SF emits these literal
+  // statuses for jobs in lifecycle. LB's mapSfStatus maps them via the
+  // mirrored switch in sf-status-map.ts (LB commit 7ffdac0).
+  'scheduled', 'booked',
   // In-service (two spellings supported since both appear in the
   // codebase's enum column)
   'in-progress', 'in_progress', 'en-route', 'en_route', 'started',
