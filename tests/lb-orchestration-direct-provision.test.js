@@ -317,6 +317,28 @@ describe('preflight failures', () => {
     expect(store._rows[CREDS_TABLE]).toHaveLength(0);
   });
 
+  test('preflight skip emits logger.warn telemetry — surfaces silent fails in Loki', async () => {
+    // Added 2026-06-03: the 2026-05-26 reconnect issue was invisible in
+    // Loki because the preflight early-return had no log call. This test
+    // pins the new logger.warn so any future regression is caught.
+    const store  = makeStore({ settings: [{ user_id: 2,
+      leadbridge_connected: true,
+      lb_orchestration_enabled_at: '2026-05-28T00:00:00Z' }] });
+    const client = makeHttpClient();
+    const warnings = [];
+    const captureLogger = { log() {}, warn: (m) => warnings.push(m), error() {} };
+    const r = await directProvision.performDirectProvision(store, {
+      tenantId: 2, lbEmail: 'a@b', lbPassword: 'p',
+      httpClient: client, now: NOW, logger: captureLogger,
+    });
+    expect(r.reason).toBe('already_provisioned');
+    const skipLog = warnings.find(m => m.includes('preflight skip') && m.includes('reason=already_provisioned'));
+    expect(skipLog).toBeDefined();
+    expect(skipLog).toContain('tenant=2');
+    expect(skipLog).toContain('lb_orchestration_enabled_at=2026-05-28T00:00:00Z');
+    expect(skipLog).toContain('leadbridge_connected=true');
+  });
+
   test('shared secret missing → preflight failure, no LB calls, no cred mint', async () => {
     const saved = process.env.SF_LB_PROVISIONING_SHARED_SECRET;
     delete process.env.SF_LB_PROVISIONING_SHARED_SECRET;

@@ -159,6 +159,49 @@ function sfPublicBaseUrl() {
 // HMAC tolerance window (seconds) for X-LB-Timestamp replay protection.
 const LEAD_STATUS_TS_TOLERANCE_S = 5 * 60
 
+/**
+ * Build the communication_settings upsert payload for /connect step 3.
+ *
+ * Pure helper, exported for testing. Detects stale orchestration state
+ * (lb_orchestration_enabled_at set while leadbridge_connected=false)
+ * and includes a clear-out of the six orchestration columns so step 8
+ * (performDirectProvision) sees a clean slate.
+ *
+ * The canonical /disconnect path clears these via performDisconnect;
+ * this helper handles the case where disconnect was incomplete (direct
+ * SQL, crashed teardown, or pre-performDisconnect legacy state).
+ *
+ * @param {object} args
+ * @param {number} args.userId
+ * @param {string} args.lbToken
+ * @param {string} args.lbUserId
+ * @param {object|null} args.priorSettings   - the row read before upsert
+ * @param {Date} args.now
+ * @returns {{ payload: object, orchStale: boolean }}
+ */
+function buildConnectUpsertPayload({ userId, lbToken, lbUserId, priorSettings, now }) {
+  const orchStale = !!priorSettings
+    && priorSettings.leadbridge_connected === false
+    && priorSettings.lb_orchestration_enabled_at != null
+  const payload = {
+    user_id: userId,
+    leadbridge_connected: true,
+    leadbridge_integration_token: lbToken,
+    leadbridge_user_id: lbUserId,
+    leadbridge_connected_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  }
+  if (orchStale) {
+    payload.lb_orchestration_enabled_at = null
+    payload.lb_orchestration_webhook_url = null
+    payload.lb_orchestration_webhook_secret_enc = null
+    payload.lb_orchestration_webhook_set_at = null
+    payload.lb_orchestration_subscription_id = null
+    payload.lb_orchestration_state_ref = null
+  }
+  return { payload, orchStale }
+}
+
 module.exports = (supabase, logger) => {
   const router = express.Router()
 
@@ -877,15 +920,36 @@ module.exports = (supabase, logger) => {
         logger.warn('[LB] Failed to fetch accounts:', e.message)
       }
 
-      // 3. Store connection in communication_settings
-      await supabase.from('communication_settings').upsert({
-        user_id: userId,
-        leadbridge_connected: true,
-        leadbridge_integration_token: lbToken,
-        leadbridge_user_id: lbUserId,
-        leadbridge_connected_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id' })
+      // 3. Store connection in communication_settings.
+      //
+      // Defense-in-depth: read prior state FIRST so we can detect stale
+      // orchestration state (lb_orchestration_enabled_at non-null while
+      // leadbridge_connected=false). The canonical /disconnect path
+      // clears these via lbOrchHandshake.performDisconnect; this guard
+      // handles the case where disconnect was incomplete (direct SQL,
+      // crashed teardown, or legacy state predating performDisconnect).
+      // Without this clear, step 8 (performDirectProvision) short-
+      // circuits at preflight with reason=already_provisioned and the
+      // LB /v1/integrations/sf/provision call is silently skipped —
+      // leaving the LB sf_connections row missing after reconnect.
+      const { data: priorSettings } = await supabase
+        .from('communication_settings')
+        .select('leadbridge_connected, lb_orchestration_enabled_at')
+        .eq('user_id', userId)
+        .maybeSingle()
+
+      const { payload: upsertPayload, orchStale } = buildConnectUpsertPayload({
+        userId, lbToken, lbUserId, priorSettings, now: new Date(),
+      })
+      if (orchStale) {
+        logger.log(
+          `[LB] /connect cleared stale orchestration state user=${userId} ` +
+          `prior_lb_orchestration_enabled_at=${priorSettings.lb_orchestration_enabled_at} ` +
+          `prior_leadbridge_connected=${priorSettings.leadbridge_connected}`
+        )
+      }
+
+      await supabase.from('communication_settings').upsert(upsertPayload, { onConflict: 'user_id' })
 
       // 4. Create provider accounts for each LB account
       for (const acct of accounts) {
@@ -3409,3 +3473,6 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
 
   return router
 }
+
+// Exported for tests + adjacent modules. Not used directly by Express.
+module.exports.buildConnectUpsertPayload = buildConnectUpsertPayload
