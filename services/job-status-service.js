@@ -62,7 +62,9 @@ function getMetrics() {
 // NOTE: jobs has customer_id (FK) — there is no customer_name column.
 // The LB outbound payload wants a display name, so we embed first_name/last_name
 // via the customers relation and flatten it into job.customer_name for consumers.
-const JOB_SELECT_COLUMNS = 'id, user_id, status, lb_external_request_id, lb_channel, scheduled_date, invoice_amount, total_amount, customer_id, customer:customers(first_name, last_name)'
+// lb_lead_id is loaded so the outbound payload carries LB's UUID when present
+// (the column is populated by historical sync + connect-time linkage).
+const JOB_SELECT_COLUMNS = 'id, user_id, status, lb_external_request_id, lb_channel, lb_lead_id, scheduled_date, invoice_amount, total_amount, customer_id, customer:customers(first_name, last_name)'
 
 async function readJob(supabase, jobId, userId) {
   let query = supabase.from('jobs').select(JOB_SELECT_COLUMNS).eq('id', jobId)
