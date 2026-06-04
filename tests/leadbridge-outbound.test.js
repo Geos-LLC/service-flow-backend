@@ -189,6 +189,7 @@ describe('payload + signer (§7)', () => {
   const job = {
     id: 100,
     user_id: 'u1',
+    customer_id: 555,
     lb_external_request_id: 'req_tt_1',
     lb_channel: 'thumbtack',
     scheduled_date: '2026-04-20',
@@ -202,12 +203,25 @@ describe('payload + signer (§7)', () => {
     expect(p.event_type).toBe('job.status_changed')
     expect(p.source).toBe('service_flow')
     expect(p.sf_job_id).toBe('100')
+    expect(p.sf_user_id).toBe('u1')
+    expect(p.sf_customer_id).toBe('555')
     expect(p.external_request_id).toBe('req_tt_1')
     expect(p.channel).toBe('thumbtack')
     expect(p.status.previous).toBe('pending')
     expect(p.status.new).toBe('completed')
     // actor.id is coerced to string for LB compatibility (Prisma actorId is String)
     expect(p.actor).toMatchObject({ type: 'account_owner', id: '42' })
+  })
+
+  test('sf_customer_id is null when job has no customer_id', () => {
+    const p = buildPayload({ job: { ...job, customer_id: null }, oldStatus: 'pending', newStatus: 'completed', actor })
+    expect(p.sf_customer_id).toBeNull()
+  })
+
+  test('sf_customer_id is stringified at the wire boundary', () => {
+    const p = buildPayload({ job: { ...job, customer_id: 7321 }, oldStatus: 'pending', newStatus: 'completed', actor })
+    expect(p.sf_customer_id).toBe('7321')
+    expect(typeof p.sf_customer_id).toBe('string')
   })
 
   test('sf_managed=true when job has lb_external_request_id + lb_channel', () => {
