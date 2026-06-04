@@ -83,6 +83,11 @@ function buildPayload({ job, oldStatus, newStatus, actor, eventIdOverride }) {
     source_instance: SF_INSTANCE,
     sf_job_id: String(job.id),
     sf_user_id: job.user_id,
+    // LB's mirror schema stores sf_customer_id as String — stringify at the
+    // wire boundary so it matches the historical-sync /link-leads-bulk path.
+    // Null when the job row has no customer_id (degenerate; should never
+    // happen for LB-linked jobs but we don't enforce that here).
+    sf_customer_id: job.customer_id != null ? String(job.customer_id) : null,
     external_request_id: job.lb_external_request_id,
     channel: job.lb_channel,
     lb_lead_id: job.lb_lead_id ?? null,
