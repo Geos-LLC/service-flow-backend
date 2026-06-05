@@ -36,10 +36,34 @@ jest.mock('../lib/lb-historical-sync-client', () => ({
 
 // Matcher mock — fully replaces the real matcher so tests can dictate
 // per-candidate outcomes without standing up customers/jobs fixtures.
-const mockFindMatchCandidates = jest.fn();
+//
+// PR C wired runHistoricalFeedbackApply onto findHistoricalMatchType
+// (PR A's leads-aware decision tree). Tests that previously injected
+// findMatchCandidates fixtures now inject findHistoricalMatchType
+// fixtures. Both are mocked so backwards-compat surfaces are still
+// covered when this file later imports findMatchCandidates directly.
+const mockFindMatchCandidates    = jest.fn();
+const mockFindHistoricalMatchType = jest.fn();
 jest.mock('../lib/lb-lead-link-matcher', () => ({
-  findMatchCandidates: (...args) => mockFindMatchCandidates(...args),
+  findMatchCandidates:       (...args) => mockFindMatchCandidates(...args),
+  findHistoricalMatchType:   (...args) => mockFindHistoricalMatchType(...args),
+  MATCH_TYPE: Object.freeze({ LEAD_ONLY:'lead_only', CUSTOMER_JOB:'customer_job', NEEDS_REVIEW:'needs_review', NO_MATCH:'no_match', TEST_NOISE:'test_noise' }),
+  MATCH_BASIS: Object.freeze({ EXTERNAL_REQUEST_ID:'externalRequestId', LB_LEAD_ID:'lbLeadId', PHONE:'phone', EMAIL:'email', MANUAL:'manual', NONE:'none' }),
 }));
+
+// Convenience builders for findHistoricalMatchType fixtures
+const mt = {
+  noMatch:  () => ({ match_type: 'no_match',  confidence: 'none',  match_basis: 'none', step: 5, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id: null, sf_job_id: null, ambiguity_warnings: [], candidates: [], matched_sf_lead_ids: [], reason: 'no_sf_record_anywhere' }),
+  leadOnly: ({ sf_lead_id, sf_lead_stage_name = null } = {}) => ({ match_type: 'lead_only', confidence: 'exact', match_basis: 'externalRequestId', step: 1, sf_lead_id, sf_lead_stage_name, sf_customer_id: null, sf_job_id: null, ambiguity_warnings: [], candidates: [], matched_sf_lead_ids: [], reason: null }),
+  testNoise: () => ({ match_type: 'test_noise', confidence: 'none', match_basis: 'none', step: 0, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id: null, sf_job_id: null, ambiguity_warnings: [], candidates: [], matched_sf_lead_ids: [], reason: 'lb_test_channel' }),
+  customerJobHigh: ({ sf_customer_id, sf_job_id }) => ({ match_type: 'customer_job', confidence: 'high', match_basis: 'phone', step: 2, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id, sf_job_id, ambiguity_warnings: [], candidates: [{ confidence: 'high', sf_job_id, sf_customer_id, match_signals: ['phone_exact:…3841'], sf_job: { lb_external_request_id: null }, ambiguity_warnings: [] }], matched_sf_lead_ids: [], reason: null }),
+  multiCandidates: () => ({ match_type: 'needs_review', confidence: 'high', match_basis: 'phone', step: 2, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id: null, sf_job_id: null, ambiguity_warnings: ['multiple_customer_candidates'], candidates: [
+    { confidence: 'high', sf_job_id: null, sf_customer_id: 23115, sf_job: null, ambiguity_warnings: ['multiple_high_confidence_candidates'], match_signals: ['phone_exact:…2681'] },
+    { confidence: 'high', sf_job_id: null, sf_customer_id: 23116, sf_job: null, ambiguity_warnings: [], match_signals: ['phone_exact:…2681'] },
+  ], matched_sf_lead_ids: [], reason: 'multiple_customer_candidates' }),
+  lowConfidence: ({ sf_customer_id, sf_job_id, matcherConf = 'medium', signals = ['name_exact','date_within_14d'] } = {}) => ({ match_type: 'needs_review', confidence: matcherConf, match_basis: 'manual', step: 2, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id, sf_job_id, ambiguity_warnings: [], candidates: [{ confidence: matcherConf, sf_job_id, sf_customer_id, match_signals: signals, sf_job: { status: 'completed', payment_status: 'paid' }, ambiguity_warnings: [] }], matched_sf_lead_ids: [], reason: 'low_confidence_customer_match' }),
+  alreadyReconciled: ({ sf_customer_id, sf_job_id } = {}) => ({ match_type: 'needs_review', confidence: 'low', match_basis: 'manual', step: 2, sf_lead_id: null, sf_lead_stage_name: null, sf_customer_id, sf_job_id, ambiguity_warnings: [], candidates: [{ confidence: 'low', sf_job_id, sf_customer_id, sf_job: null, sf_customer: { lb_lead_id: 'OTHER_LEAD', any_job_linked: true }, ambiguity_warnings: [], match_signals: ['name_exact'] }], matched_sf_lead_ids: [], reason: null }),
+};
 
 // Apply lock mock — feedback uses the same per-tenant lock as the apply
 // path. Default to "always acquires"; individual tests override.
@@ -125,6 +149,7 @@ beforeEach(() => {
   mockFetchCandidates.mockReset();
   mockLinkLeadsBulk.mockReset();
   mockFindMatchCandidates.mockReset();
+  mockFindHistoricalMatchType.mockReset();
   mockTryAcquire.mockReset();
   mockRelease.mockReset();
   mockTryAcquire.mockResolvedValue({ ok: true });
@@ -135,13 +160,14 @@ beforeEach(() => {
 // buildFeedbackRow — encodes LB wire contract precisely
 // ──────────────────────────────────────────────────────────────────────
 describe('buildFeedbackRow', () => {
-  test('no_match → confidence=none, no sf_job_id', () => {
+  test('no_match → confidence=none, no sf_job_id, match_type=customer_job', () => {
     const row = buildFeedbackRow({
       lbCandidate: JILL,
       categorized: { bucket: 'would_skip', reason: 'no_match', matched: [] },
     });
     expect(row).toEqual({
       lb_lead_id:        JILL.leadId,
+      match_type:        'customer_job',
       sf_job_id:         null,
       sf_customer_id:    null,
       confidence:        'none',
@@ -151,6 +177,40 @@ describe('buildFeedbackRow', () => {
       occurred_at:       null,
       reason:            FEEDBACK_APPLY_REASON + ':no_match',
     });
+  });
+
+  test('lead_only_match → match_type=lead_only with sf_lead_id + stage; sf_customer_id/sf_job_id null', () => {
+    const row = buildFeedbackRow({
+      lbCandidate: JILL,
+      categorized: {
+        bucket: 'lead_only_match',
+        reason: null,
+        matched: [],
+        extra: { sf_lead_id: 107, sf_lead_stage_name: 'Contacted', wire_match_basis: 'externalRequestId', matcher_step: 1 },
+      },
+    });
+    expect(row).toEqual({
+      lb_lead_id:         JILL.leadId,
+      match_type:         'lead_only',
+      sf_lead_id:         107,
+      sf_lead_stage_name: 'Contacted',
+      sf_customer_id:     null,
+      sf_job_id:          null,
+      confidence:         'exact',
+      match_basis:        'externalRequestId',
+      sf_status:          null,
+      sf_payment_status:  null,
+      occurred_at:        null,
+      reason:             FEEDBACK_APPLY_REASON + ':sf_lead_only:externalRequestId',
+    });
+  });
+
+  test('lead_only_match without sf_lead_id in extra → null (defensive)', () => {
+    const row = buildFeedbackRow({
+      lbCandidate: JILL,
+      categorized: { bucket: 'lead_only_match', reason: null, matched: [], extra: { sf_lead_id: null } },
+    });
+    expect(row).toBeNull();
   });
 
   test('low_confidence (matcher returned medium) → confidence=medium with sf_job_id surfaced', () => {
@@ -247,7 +307,7 @@ describe('buildFeedbackRow', () => {
 describe('runHistoricalFeedbackApply — dryRun defaults TRUE', () => {
   test('dryRun is true when omitted; LB linkLeadsBulk NEVER called', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [] });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.noMatch());
 
     const store = makeStore();
     const out = await runHistoricalFeedbackApply(store, { tenantId: SF_TENANT_ID });
@@ -267,7 +327,7 @@ describe('runHistoricalFeedbackApply — dryRun defaults TRUE', () => {
 
   test('explicit dryRun:true behaves the same as default', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [] });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.noMatch());
 
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: true });
     expect(out.summary.dry_run).toBe(true);
@@ -279,30 +339,16 @@ describe('runHistoricalFeedbackApply — dryRun defaults TRUE', () => {
       ok: true, count: 4, more_may_exist: false,
       candidates: [LINKABLE, AMBIG, LOWCONF, JILL],
     });
-    // LINKABLE → high-conf single match, would_link
-    // AMBIG    → 2 high-conf candidates, would_review:multiple_candidates
-    // LOWCONF  → 1 medium-conf single match, would_skip:low_confidence
-    // JILL     → no candidates, would_skip:no_match
-    mockFindMatchCandidates.mockImplementation((_db, args) => {
+    // LINKABLE → customer_job high → would_link (skip)
+    // AMBIG    → needs_review multi-candidate
+    // LOWCONF  → needs_review low_confidence
+    // JILL     → no_match
+    mockFindHistoricalMatchType.mockImplementation((_db, args) => {
       const id = args.input.lb_lead_id;
-      if (id === LINKABLE.leadId) return Promise.resolve({ candidates: [{
-        confidence: 'high', sf_job_id: 142307, sf_customer_id: 23487,
-        sf_job: { lb_external_request_id: null }, ambiguity_warnings: [],
-        match_signals: ['phone_exact:…3841'],
-      }] });
-      if (id === AMBIG.leadId) return Promise.resolve({ candidates: [
-        { confidence: 'high', sf_job_id: null, sf_customer_id: 23115,
-          sf_job: null, ambiguity_warnings: ['multiple_high_confidence_candidates'], match_signals: ['phone_exact:…2681'] },
-        { confidence: 'high', sf_job_id: null, sf_customer_id: 23116,
-          sf_job: null, ambiguity_warnings: [], match_signals: ['phone_exact:…2681'] },
-      ] });
-      if (id === LOWCONF.leadId) return Promise.resolve({ candidates: [{
-        confidence: 'medium', sf_job_id: 139832, sf_customer_id: 23393,
-        sf_job: { status: 'completed', payment_status: 'paid' },
-        ambiguity_warnings: [],
-        match_signals: ['name_exact','date_within_14d'],
-      }] });
-      return Promise.resolve({ candidates: [] });
+      if (id === LINKABLE.leadId) return Promise.resolve(mt.customerJobHigh({ sf_customer_id: 23487, sf_job_id: 142307 }));
+      if (id === AMBIG.leadId)    return Promise.resolve(mt.multiCandidates());
+      if (id === LOWCONF.leadId)  return Promise.resolve(mt.lowConfidence({ sf_customer_id: 23393, sf_job_id: 139832, matcherConf: 'medium' }));
+      return Promise.resolve(mt.noMatch());
     });
 
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID });
@@ -316,11 +362,31 @@ describe('runHistoricalFeedbackApply — dryRun defaults TRUE', () => {
     // confirm Jill is in the proposed batch as no_match
     const jillRow = out.proposed_rows.find(r => r.lb_lead_id === JILL.leadId);
     expect(jillRow.confidence).toBe('none');
+    expect(jillRow.match_type).toBe('customer_job');
+  });
+
+  test('lead_only candidate → match_type=lead_only emitted to wire shape', async () => {
+    mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' }));
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID });
+    expect(out.summary.would_lead_link).toBe(1);
+    expect(out.summary.would_no_match).toBe(0);
+    expect(out.proposed_rows).toHaveLength(1);
+    expect(out.proposed_rows[0]).toEqual(expect.objectContaining({
+      lb_lead_id:         JILL.leadId,
+      match_type:         'lead_only',
+      sf_lead_id:         107,
+      sf_lead_stage_name: 'Contacted',
+      sf_customer_id:     null,
+      sf_job_id:          null,
+      confidence:         'exact',
+      match_basis:        'externalRequestId',
+    }));
   });
 
   test('matcher throw → would_failed++ and row NOT in proposed_rows', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockRejectedValue(new Error('db is on fire'));
+    mockFindHistoricalMatchType.mockRejectedValue(new Error('db is on fire'));
 
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID });
     expect(out.summary.would_failed).toBe(1);
@@ -336,13 +402,10 @@ describe('runHistoricalFeedbackApply — dryRun defaults TRUE', () => {
 describe('runHistoricalFeedbackApply — dryRun:false posts to LB once', () => {
   test('posts ONE batch with all eligible rows; lock acquired and released', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL, AMBIG], count: 2, more_may_exist: false });
-    mockFindMatchCandidates.mockImplementation((_db, args) => {
-      if (args.input.lb_lead_id === JILL.leadId)  return Promise.resolve({ candidates: [] });
-      if (args.input.lb_lead_id === AMBIG.leadId) return Promise.resolve({ candidates: [
-        { confidence: 'high', sf_job_id: null, sf_customer_id: 23115, sf_job: null, ambiguity_warnings: ['multiple_high_confidence_candidates'], match_signals: ['phone_exact:…2681'] },
-        { confidence: 'high', sf_job_id: null, sf_customer_id: 23116, sf_job: null, ambiguity_warnings: [], match_signals: ['phone_exact:…2681'] },
-      ] });
-      return Promise.resolve({ candidates: [] });
+    mockFindHistoricalMatchType.mockImplementation((_db, args) => {
+      if (args.input.lb_lead_id === JILL.leadId)  return Promise.resolve(mt.noMatch());
+      if (args.input.lb_lead_id === AMBIG.leadId) return Promise.resolve(mt.multiCandidates());
+      return Promise.resolve(mt.noMatch());
     });
     mockLinkLeadsBulk.mockResolvedValue({
       ok: true, status: 200,
@@ -388,11 +451,7 @@ describe('runHistoricalFeedbackApply — dryRun:false posts to LB once', () => {
   test('zero eligible rows → no LB call, ok response', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [LINKABLE], count: 1, more_may_exist: false });
     // LINKABLE → would_link → feedback skips, nothing to post.
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [{
-      confidence: 'high', sf_job_id: 142307, sf_customer_id: 23487,
-      sf_job: { lb_external_request_id: null }, ambiguity_warnings: [],
-      match_signals: ['phone_exact:…3841'],
-    }] });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.customerJobHigh({ sf_customer_id: 23487, sf_job_id: 142307 }));
 
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
     expect(out.ok).toBe(true);
@@ -403,7 +462,7 @@ describe('runHistoricalFeedbackApply — dryRun:false posts to LB once', () => {
 
   test('LB call fails → status passed through, lock released', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [] });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.noMatch());
     mockLinkLeadsBulk.mockResolvedValue({ ok: false, status: 503, reason: 'lb_unreachable', error_description: 'connection refused', request_id: 'sf-zzz' });
 
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
@@ -427,15 +486,10 @@ describe('runHistoricalFeedbackApply — class filter', () => {
 
   test('classes:[no_match] only sends no_match rows', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL, LOWCONF], count: 2, more_may_exist: false });
-    mockFindMatchCandidates.mockImplementation((_db, args) => {
-      if (args.input.lb_lead_id === JILL.leadId) return Promise.resolve({ candidates: [] });
-      return Promise.resolve({ candidates: [{
-        confidence: 'medium', sf_job_id: 139832, sf_customer_id: 23393,
-        sf_job: { status: 'completed' }, ambiguity_warnings: [],
-        match_signals: ['name_exact','date_within_14d'],
-      }] });
+    mockFindHistoricalMatchType.mockImplementation((_db, args) => {
+      if (args.input.lb_lead_id === JILL.leadId) return Promise.resolve(mt.noMatch());
+      return Promise.resolve(mt.lowConfidence({ sf_customer_id: 23393, sf_job_id: 139832, matcherConf: 'medium' }));
     });
-
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, classes: ['no_match'] });
     expect(out.summary.would_no_match).toBe(1);
     expect(out.summary.would_review).toBe(0);                      // LOWCONF excluded by class filter
@@ -453,13 +507,7 @@ describe('runHistoricalFeedbackApply — class filter', () => {
 
   test('already_reconciled_customer omitted by default — not in proposed_rows, not in LB POST', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [{
-      confidence: 'low', sf_job_id: 140075, sf_customer_id: 23274,
-      sf_job: null, ambiguity_warnings: [],
-      sf_customer: { lb_lead_id: 'OTHER_LEAD', any_job_linked: true },
-      match_signals: ['name_exact'],
-    }] });
-
+    mockFindHistoricalMatchType.mockResolvedValue(mt.alreadyReconciled({ sf_customer_id: 23274, sf_job_id: 140075 }));
     // Default classes: feedback should classify this row as
     // already_reconciled_customer and NOT include it in the proposed batch.
     const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID });
@@ -475,18 +523,27 @@ describe('runHistoricalFeedbackApply — class filter', () => {
 
   test('classes including already_reconciled_customer opts in', async () => {
     mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
-    mockFindMatchCandidates.mockResolvedValue({ candidates: [{
-      confidence: 'low', sf_job_id: 140075, sf_customer_id: 23274,
-      sf_job: null, ambiguity_warnings: [],
-      sf_customer: { lb_lead_id: 'OTHER_LEAD', any_job_linked: true },
-      match_signals: ['name_exact'],
-    }] });
-
+    mockFindHistoricalMatchType.mockResolvedValue(mt.alreadyReconciled({ sf_customer_id: 23274, sf_job_id: 140075 }));
     const out = await runHistoricalFeedbackApply(makeStore(), {
       tenantId: SF_TENANT_ID,
       classes: ['no_match','already_reconciled_customer'],
     });
     expect(out.summary.would_no_match).toBe(1);
     expect(out.proposed_rows[0].confidence).toBe('none');
+  });
+
+  test('lead_only included in default classes; classes:[no_match] excludes it', async () => {
+    expect(FEEDBACK_DEFAULT_CLASSES).toContain('lead_only');
+
+    // Run with classes:[no_match] → lead_only row is filtered out
+    mockFetchCandidates.mockResolvedValue({ ok: true, candidates: [JILL], count: 1, more_may_exist: false });
+    mockFindHistoricalMatchType.mockResolvedValue(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' }));
+    const out = await runHistoricalFeedbackApply(makeStore(), {
+      tenantId: SF_TENANT_ID,
+      classes: ['no_match'],
+    });
+    expect(out.summary.would_lead_link).toBe(0);
+    expect(out.summary.would_skipped_not_processed).toBe(1);
+    expect(out.proposed_rows).toEqual([]);
   });
 });
