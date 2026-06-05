@@ -25005,7 +25005,16 @@ app.post('/api/team-members/:id/pay-rates', authenticateToken, async (req, res) 
         .eq('id', id);
     }
 
-    res.json({ payRate: data });
+    // Rebuild any unbatched ledger rows whose snapshot rate now disagrees with
+    // the new rate table. Settled rows stay frozen (Constitution §3.1).
+    let recalculated = { jobsRebuilt: 0, totalDelta: 0, jobs: [] };
+    try {
+      recalculated = await reconcileMemberPayRateChange(parseInt(id), userId, 'pay-rate-create');
+    } catch (e) {
+      console.error('[PayRate POST] reconcile failed:', e);
+    }
+
+    res.json({ payRate: data, recalculated });
   } catch (error) {
     console.error('Create pay rate error:', error);
     res.status(500).json({ error: 'Failed to create pay rate' });
@@ -25091,7 +25100,17 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
       }
     } catch (e) { console.error('Manager salary rebuild after pay rate change:', e); }
 
-    res.json({ payRate: data });
+    // Rebuild any unbatched ledger rows whose snapshot rate now disagrees with
+    // the updated rate table. Helper is a no-op for managers (their salary is
+    // re-derived in the block above) and for already-consistent snapshots.
+    let recalculated = { jobsRebuilt: 0, totalDelta: 0, jobs: [] };
+    try {
+      recalculated = await reconcileMemberPayRateChange(parseInt(memberId), userId, 'pay-rate-update');
+    } catch (e) {
+      console.error('[PayRate PUT] reconcile failed:', e);
+    }
+
+    res.json({ payRate: data, recalculated });
   } catch (error) {
     console.error('Update pay rate error:', error);
     res.status(500).json({ error: 'Failed to update pay rate' });
@@ -25142,16 +25161,27 @@ app.delete('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, a
         .eq('id', memberId);
     }
 
-    res.json({ success: true });
+    // Rebuild any unbatched ledger rows whose snapshot rate no longer matches
+    // what the (now-shorter) rate table would produce.
+    let recalculated = { jobsRebuilt: 0, totalDelta: 0, jobs: [] };
+    try {
+      recalculated = await reconcileMemberPayRateChange(parseInt(memberId), userId, 'pay-rate-delete');
+    } catch (e) {
+      console.error('[PayRate DELETE] reconcile failed:', e);
+    }
+
+    res.json({ success: true, recalculated });
   } catch (error) {
     console.error('Delete pay rate error:', error);
     res.status(500).json({ error: 'Failed to delete pay rate' });
   }
 });
 
-// Helper: get effective pay rate for a team member on a specific date
+// Helper: get effective pay rate for a team member on a specific date.
+// payRates should be sorted by effective_from DESC. Returns null when no row
+// covers the date so the caller can fall back to team_members.hourly_rate
+// instead of silently zeroing out earnings for pre-history jobs.
 function getEffectivePayRate(payRates, date) {
-  // payRates should be sorted by effective_from DESC
   const dateStr = typeof date === 'string' ? date.split('T')[0].split(' ')[0] : date;
   for (const rate of payRates) {
     const rateFrom = String(rate.effective_from).split('T')[0].split(' ')[0];
@@ -25162,7 +25192,7 @@ function getEffectivePayRate(payRates, date) {
       };
     }
   }
-  return { hourlyRate: 0, commissionPercentage: 0 };
+  return null;
 }
 
 // Helper: calculate scheduled working hours from team member availability for a date range
@@ -38346,11 +38376,17 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
   });
 
   for (const member of teamMembers) {
-    // Use pay rate history if available, otherwise fall back to member record
+    // Use pay rate history if it covers the date; otherwise fall back to the
+    // member record. The fallback fires for both "no rates at all" AND "rates
+    // exist but none predate this job" — the latter was previously bugged into
+    // a silent $0.
     const memberRates = jobPayRatesByMember[member.id] || [];
-    const effectiveRate = memberRates.length > 0
-      ? getEffectivePayRate(memberRates, effectiveDate)
-      : { hourlyRate: parseFloat(member.hourly_rate) || 0, commissionPercentage: parseFloat(member.commission_percentage) || 0 };
+    const memberFallback = {
+      hourlyRate: parseFloat(member.hourly_rate) || 0,
+      commissionPercentage: parseFloat(member.commission_percentage) || 0,
+    };
+    const effectiveRate = (memberRates.length > 0 && getEffectivePayRate(memberRates, effectiveDate))
+      || memberFallback;
     const hourlyRate = effectiveRate.hourlyRate;
     const commissionPct = effectiveRate.commissionPercentage;
     const memberRole = (member.role || '').toLowerCase();
@@ -38879,6 +38915,136 @@ async function rebuildJobLedger(jobId, userId, { types = LEDGER_COMPLETION_DERIV
       console.log(`Ledger: Bumped late ${e.type} #${e.id} (job ${jobId}) to ${todayStr} — current date ${e.effective_date} falls in paid period ${covering.period_start}..${covering.period_end}`);
     }
   }
+}
+
+// Reconcile a worker's UNBATCHED ledger rows against the current pay-rate
+// table after a rate row was added/edited/deleted. Walks each unbatched earning
+// row, compares its embedded snapshot to what getEffectivePayRate would now
+// produce at the job's scheduled_date, and rebuilds any job whose snapshot
+// disagrees. Settled rows are protected by rebuildJobLedger (Constitution §3.1)
+// and surface as drift events instead of mutations. Managers are skipped — the
+// PUT endpoint has its own availability-based salary re-derive for them.
+async function reconcileMemberPayRateChange(teamMemberId, userId, source = 'pay-rate-change') {
+  const { data: member } = await supabase
+    .from('team_members')
+    .select('id, role, hourly_rate, commission_percentage')
+    .eq('id', teamMemberId)
+    .eq('user_id', userId)
+    .single();
+  if (!member) return { jobsRebuilt: 0, totalDelta: 0, jobs: [], skipped: 'member_not_found' };
+
+  const role = (member.role || '').toLowerCase();
+  if (['account owner', 'owner', 'manager', 'admin', 'scheduler'].includes(role)) {
+    return { jobsRebuilt: 0, totalDelta: 0, jobs: [], skipped: 'manager_uses_separate_rederive' };
+  }
+
+  const { data: payRates = [] } = await supabase
+    .from('team_member_pay_rates')
+    .select('hourly_rate, commission_percentage, effective_from')
+    .eq('team_member_id', teamMemberId)
+    .eq('user_id', userId)
+    .order('effective_from', { ascending: false });
+
+  const memberFallback = {
+    hourlyRate: parseFloat(member.hourly_rate) || 0,
+    commissionPercentage: parseFloat(member.commission_percentage) || 0,
+  };
+
+  // Walk unbatched earning rows with pagination (1000-row Supabase default).
+  const PAGE = 1000;
+  let offset = 0;
+  const oldAmountByJob = new Map();
+  const staleJobIds = new Set();
+
+  while (true) {
+    const { data: earnings, error } = await supabase
+      .from('cleaner_ledger')
+      .select('id, job_id, amount, metadata')
+      .eq('user_id', userId)
+      .eq('team_member_id', teamMemberId)
+      .eq('type', 'earning')
+      .is('payout_batch_id', null)
+      .not('job_id', 'is', null)
+      .range(offset, offset + PAGE - 1);
+    if (error) {
+      console.error(`[${source}] earnings fetch error:`, error);
+      break;
+    }
+    const batch = earnings || [];
+    if (batch.length === 0) break;
+
+    const jobIds = [...new Set(batch.map(e => e.job_id))];
+    const { data: jobs = [] } = await supabase
+      .from('jobs')
+      .select('id, scheduled_date')
+      .in('id', jobIds);
+    const jobsById = new Map((jobs || []).map(j => [j.id, j]));
+
+    for (const e of batch) {
+      const job = jobsById.get(e.job_id);
+      if (!job || !job.scheduled_date) continue;
+      const sd = String(job.scheduled_date).split('T')[0].split(' ')[0];
+      const fromRates = payRates.length > 0 ? getEffectivePayRate(payRates, sd) : null;
+      const expectedHr = fromRates ? fromRates.hourlyRate : memberFallback.hourlyRate;
+      const expectedCp = fromRates ? fromRates.commissionPercentage : memberFallback.commissionPercentage;
+
+      const md = e.metadata || {};
+      const rawHr = md.hourly_rate_snapshot != null ? md.hourly_rate_snapshot : md.hourly_rate;
+      const rawCp = md.commission_pct_snapshot != null ? md.commission_pct_snapshot : md.commission_pct;
+      const snapHr = parseFloat(rawHr) || 0;
+      const snapCp = parseFloat(rawCp) || 0;
+
+      if (Math.abs(snapHr - expectedHr) > 0.01 || Math.abs(snapCp - expectedCp) > 0.01) {
+        staleJobIds.add(e.job_id);
+        oldAmountByJob.set(e.job_id, (oldAmountByJob.get(e.job_id) || 0) + (parseFloat(e.amount) || 0));
+      }
+    }
+
+    if (batch.length < PAGE) break;
+    offset += PAGE;
+  }
+
+  if (staleJobIds.size === 0) {
+    return { jobsRebuilt: 0, totalDelta: 0, jobs: [] };
+  }
+
+  let totalDelta = 0;
+  const rebuilt = [];
+  for (const jobId of staleJobIds) {
+    try {
+      await rebuildJobLedger(jobId, userId, {
+        types: ['earning', 'tip', 'incentive'],
+        source,
+      });
+      const { data: newRows = [] } = await supabase
+        .from('cleaner_ledger')
+        .select('amount')
+        .eq('user_id', userId)
+        .eq('job_id', jobId)
+        .eq('team_member_id', teamMemberId)
+        .eq('type', 'earning')
+        .is('payout_batch_id', null);
+      const newSum = (newRows || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+      const oldSum = oldAmountByJob.get(jobId) || 0;
+      const delta = parseFloat((newSum - oldSum).toFixed(2));
+      totalDelta += delta;
+      rebuilt.push({
+        jobId,
+        oldAmount: parseFloat(oldSum.toFixed(2)),
+        newAmount: parseFloat(newSum.toFixed(2)),
+        delta,
+      });
+    } catch (err) {
+      console.error(`[${source}] rebuild failed for job ${jobId}: ${err.message}`);
+    }
+  }
+
+  console.log(`[${source}] member=${teamMemberId} rebuilt ${rebuilt.length} jobs, delta=$${totalDelta.toFixed(2)}`);
+  return {
+    jobsRebuilt: rebuilt.length,
+    totalDelta: parseFloat(totalDelta.toFixed(2)),
+    jobs: rebuilt,
+  };
 }
 
 // === LEDGER API ENDPOINTS ===
