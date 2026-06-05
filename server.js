@@ -24967,6 +24967,51 @@ app.post('/api/team-members/:id/pay-rates', authenticateToken, async (req, res) 
       return res.status(400).json({ error: 'effectiveFrom date is required' });
     }
 
+    // Auto-baseline: if this is the FIRST rate row for the member and they
+    // already have prior values on team_members, capture the prior state as a
+    // backdated baseline first. Without this, jobs predating effectiveFrom
+    // would rebuild against the post-sync team_members.hourly_rate (the NEW
+    // rate) — wrong. Baseline date is salary_start_date if it predates the new
+    // effective_from, else 1900-01-01 (covers everything historical).
+    const { data: existingRates } = await supabase
+      .from('team_member_pay_rates')
+      .select('id')
+      .eq('team_member_id', id)
+      .eq('user_id', userId)
+      .limit(1);
+
+    if (!existingRates || existingRates.length === 0) {
+      const { data: priorMember } = await supabase
+        .from('team_members')
+        .select('hourly_rate, commission_percentage, salary_start_date')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .single();
+
+      const priorHr = priorMember && priorMember.hourly_rate != null ? parseFloat(priorMember.hourly_rate) : null;
+      const priorCp = priorMember && priorMember.commission_percentage != null ? parseFloat(priorMember.commission_percentage) : null;
+
+      if ((priorHr != null && priorHr > 0) || (priorCp != null && priorCp > 0)) {
+        const newFromStr = String(effectiveFrom).split('T')[0].split(' ')[0];
+        let baselineFrom = '1900-01-01';
+        if (priorMember.salary_start_date) {
+          const candidate = String(priorMember.salary_start_date).split('T')[0].split(' ')[0];
+          if (candidate < newFromStr) baselineFrom = candidate;
+        }
+
+        await supabase
+          .from('team_member_pay_rates')
+          .insert({
+            user_id: userId,
+            team_member_id: parseInt(id),
+            hourly_rate: priorHr,
+            commission_percentage: priorCp,
+            effective_from: baselineFrom,
+            note: 'Auto-baseline: prior rate captured at first rate-change'
+          });
+      }
+    }
+
     const { data, error } = await supabase
       .from('team_member_pay_rates')
       .insert({
