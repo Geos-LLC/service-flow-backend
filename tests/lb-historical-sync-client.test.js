@@ -472,9 +472,78 @@ describe('normalizeMatchBasis', () => {
   });
 });
 
+// ──────────────────────────────────────────────────────────────
+// PR C — match_type='lead_only' wire round-trip
+// ──────────────────────────────────────────────────────────────
+describe('linkLeadsBulk — match_type=lead_only wire round-trip', () => {
+  test('stringifies sf_lead_id, passes match_type + sf_lead_stage_name through, routes lead_linked result to applied[]', async () => {
+    const client = makeHttpClient({
+      response: { status: 200, data: {
+        ok: true,
+        summary: { total: 1, linked: 0, lead_linked: 1, needs_review: 0, no_match: 0, conflict: 0, not_found: 0, failed: 0, status_updates_applied: 0 },
+        rows: [{ lb_lead_id: 'b5109475-396c-47a6-88de-c9d8270fe20a', result: 'lead_linked', sync_status: 'lead_linked' }],
+      } },
+    });
+    const r = await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{
+        lb_lead_id: 'b5109475-396c-47a6-88de-c9d8270fe20a',
+        match_type: 'lead_only',
+        sf_lead_id: 107,                                   // numeric — must be stringified
+        sf_lead_stage_name: 'Contacted',
+        sf_customer_id: null,
+        sf_job_id: null,
+        confidence: 'exact',
+        match_basis: 'externalRequestId',
+        reason: 'historical_sync_feedback:sf_lead_only:externalRequestId',
+      }],
+      httpClient: client, now: NOW,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.applied).toHaveLength(1);
+    expect(r.applied[0]).toEqual(expect.objectContaining({
+      lb_lead_id: 'b5109475-396c-47a6-88de-c9d8270fe20a',
+      lb_result: 'lead_linked',
+      lb_sync_status: 'lead_linked',
+      sf_managed: true,
+    }));
+    expect(r.rejected).toHaveLength(0);
+    // Wire body inspection: sf_lead_id stringified, match_type + stage_name preserved
+    const sent = JSON.parse(client.calls[0].body);
+    expect(sent.rows[0]).toEqual(expect.objectContaining({
+      lb_lead_id:         'b5109475-396c-47a6-88de-c9d8270fe20a',
+      match_type:         'lead_only',
+      sf_lead_id:         '107',                          // stringified at wire boundary
+      sf_lead_stage_name: 'Contacted',
+      sf_customer_id:     null,                           // hard rule
+      sf_job_id:          null,                           // hard rule
+      confidence:         'exact',
+      match_basis:        'externalRequestId',
+    }));
+    expect(typeof sent.rows[0].sf_lead_id).toBe('string');
+  });
+
+  test('null sf_lead_id passes through as null (defensive against undefined)', async () => {
+    const client = makeHttpClient({
+      response: { status: 200, data: { ok: true, summary: {}, rows: [{ lb_lead_id: 'x', result: 'no_match', sync_status: 'no_match' }] } },
+    });
+    await linkLeadsBulk({
+      lbUserId: LB_USER,
+      matches: [{ lb_lead_id: 'x', match_type: 'customer_job', sf_lead_id: null, confidence: 'none', match_basis: 'none' }],
+      httpClient: client, now: NOW,
+    });
+    const sent = JSON.parse(client.calls[0].body);
+    expect(sent.rows[0].sf_lead_id).toBeNull();
+  });
+});
+
 describe('APPLIED_RESULTS / REJECTED_RESULTS sets', () => {
-  test('APPLIED contains exactly {linked, needs_review, no_match}', () => {
-    expect([...APPLIED_RESULTS].sort()).toEqual(['linked','needs_review','no_match'].sort());
+  test('APPLIED contains exactly {linked, lead_linked, needs_review, no_match}', () => {
+    // PR C added 'lead_linked' alongside LB PR #203 which made the receiver
+    // emit it for match_type='lead_only' rows. The wire client treats it as
+    // APPLIED — LB has accepted the row and recorded syncStatus + sfLeadId
+    // without touching sfJobId/sfCustomerId.
+    expect([...APPLIED_RESULTS].sort()).toEqual(['lead_linked','linked','needs_review','no_match'].sort());
   });
   test('REJECTED contains exactly {conflict, not_found, failed}', () => {
     expect([...REJECTED_RESULTS].sort()).toEqual(['conflict','failed','not_found'].sort());
