@@ -2324,9 +2324,15 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
   // ══════════════════════════════════════
 
   const APPLY_ENABLED_FLAG = 'SF_HISTORICAL_SYNC_APPLY_ENABLED'
+  const FEEDBACK_APPLY_ENABLED_FLAG = 'SF_HISTORICAL_FEEDBACK_APPLY_ENABLED'
 
   function isApplyEnabled() {
     const v = process.env[APPLY_ENABLED_FLAG]
+    return v === 'true' || v === '1' || v === 'on'
+  }
+
+  function isFeedbackApplyEnabled() {
+    const v = process.env[FEEDBACK_APPLY_ENABLED_FLAG]
     return v === 'true' || v === '1' || v === 'on'
   }
 
@@ -2427,6 +2433,72 @@ ${safeHost ? '<div>Webhook destination: <span class="host">' + safeHost + '</spa
       return res.json(out)
     } catch (e) {
       logger.error(`[sf-historical-remediate] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
+      return res.status(500).json({ ok: false, error: 'internal_error' })
+    }
+  })
+
+  // ══════════════════════════════════════
+  // POST /historical-sync/feedback — Per-candidate outcome feedback to LB
+  //
+  // Background: /historical-sync (Phase 1 + 2) only pushes high-confidence
+  // matches to LB. Every other classification (no_match, needs_review,
+  // multiple_candidates, customer_match_no_job, low_confidence,
+  // lb_already_pinned_to_different_job, sf_job_linked_to_different_lb_lead)
+  // was silently dropped on SF's side, leaving hundreds of LB leads in
+  // syncStatus='pending' forever. This endpoint closes that gap.
+  //
+  // Modes:
+  //   PREVIEW (dry_run !== false, default)
+  //     Returns the proposed per-candidate feedback rows without posting.
+  //     Operator reviews counts (would_no_match / would_review /
+  //     would_failed / would_link / skipped_not_processed) before any
+  //     LB-side mutation.
+  //
+  //   APPLY (dry_run === false)
+  //     Posts the batch to LB /link-leads-bulk. LB transitions each row
+  //     to the matching syncStatus (no_match / needs_review / linked).
+  //     SF makes NO state writes — this endpoint is intentionally a
+  //     one-way LB-only update; the existing /historical-sync apply
+  //     path remains the only way to write SF-side link state.
+  //
+  // Gates:
+  //   - SF_HISTORICAL_FEEDBACK_APPLY_ENABLED (env, default OFF)
+  //   - workspace owner / admin role
+  //   - per-tenant lock (shared with the apply path — never both at once)
+  //   - dry_run defaults TRUE
+  // ══════════════════════════════════════
+  router.post('/historical-sync/feedback', authenticateToken, async (req, res) => {
+    try {
+      const userId = req.user.userId
+      const body = req.body || {}
+      const dryRun = body.dry_run !== false   // default TRUE
+
+      // Live apply path requires both the flag AND owner/admin role.
+      if (!dryRun) {
+        if (!isFeedbackApplyEnabled()) {
+          logger.warn(`[sf-historical-feedback] tenant=${userId} apply requested but feature flag disabled`)
+          return res.status(503).json({ ok: false, error: 'feedback_apply_disabled', detail: 'feedback apply is not enabled on this deployment' })
+        }
+        if (!isWorkspaceOwnerOrAdmin(req.user)) {
+          logger.warn(`[sf-historical-feedback] tenant=${userId} apply denied: role=${req.user && req.user.role}`)
+          return res.status(403).json({ ok: false, error: 'forbidden', detail: 'workspace owner or admin role required' })
+        }
+      }
+
+      const out = await sfHistoricalSyncOrchestrator.runHistoricalFeedbackApply(supabase, {
+        tenantId:     userId,
+        dryRun,
+        classes:      Array.isArray(body.classes) ? body.classes : undefined,
+        maxLeads:     Number.isFinite(body.max_leads) ? body.max_leads : undefined,
+        syncStatuses: Array.isArray(body.sync_statuses) ? body.sync_statuses : undefined,
+        syncScope:    (typeof body.sync_scope === 'string' && body.sync_scope.length > 0) ? body.sync_scope : undefined,
+        status:       (typeof body.status === 'string' && body.status.length > 0) ? body.status : undefined,
+        logger,
+      })
+      if (!out.ok) return res.status(out.status || 502).json(out)
+      return res.json(out)
+    } catch (e) {
+      logger.error(`[sf-historical-feedback] tenant=${req.user?.userId || '-'} unexpected: ${e && e.message}`)
       return res.status(500).json({ ok: false, error: 'internal_error' })
     }
   })
