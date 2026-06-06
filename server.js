@@ -43477,21 +43477,29 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
     const settings = await getSigcoreSettings(userId);
     if (!settings?.sigcore_tenant_api_key) return res.status(400).json({ error: 'OpenPhone not connected' });
 
-    // Find sender (first available phone number)
+    // Pick sender phone. Prefer the conversation's endpoint_phone (the line
+    // the customer messaged); fall back to the first SMS-capable number.
+    // phoneNumbers[0] is unsafe — voice-only / toll-free numbers fail with
+    // OpenPhone 400 "can't send SMS from this line".
     const phoneNumbers = settings.cached_phone_numbers || [];
     if (phoneNumbers.length === 0) return res.status(400).json({ error: 'No phone numbers available' });
+    const targetEndpoint = normalizePhone(conv.endpoint_phone);
+    const senderPhone =
+      phoneNumbers.find(pn => normalizePhone(pn.number || pn.phoneNumber) === targetEndpoint && pn.capabilities?.sms !== false)
+      || phoneNumbers.find(pn => pn.capabilities?.sms === true)
+      || phoneNumbers.find(pn => pn.capabilities?.sms !== false);
+    if (!senderPhone) return res.status(400).json({ error: 'No SMS-capable phone number available' });
 
     // Send via Sigcore's phone-string endpoint. /messages (UUID-based) and
     // /internal/messages/send (Twilio-only) don't fit the OpenPhone flow —
     // cached_phone_numbers holds OpenPhone PN IDs, not Sigcore Sender UUIDs,
     // and SF has no Twilio integration on the Sigcore workspace.
-    const fromNumber = phoneNumbers[0].number || phoneNumbers[0].phoneNumber;
     const sendResult = await sigcoreRequest('POST', '/v1/messages', settings.sigcore_tenant_api_key, {
-      fromNumber,
+      fromNumber: senderPhone.number || senderPhone.phoneNumber,
       toNumber: conv.participant_phone,
       body: text.trim(),
       channel: 'sms',
-      phoneNumberId: phoneNumbers[0].id
+      phoneNumberId: senderPhone.id
     });
 
     const sentMsg = sendResult.data?.data || sendResult.data || {};
@@ -43503,7 +43511,7 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
       sigcore_message_id: sentMsg.id || null,
       provider_message_id: sentMsg.providerMessageId || null,
       direction: 'out', channel: 'sms', body: text.trim(),
-      from_number: phoneNumbers[0]?.number || phoneNumbers[0]?.phoneNumber,
+      from_number: senderPhone.number || senderPhone.phoneNumber,
       to_number: conv.participant_phone,
       sender_role: 'agent', status: sentMsg.status || 'sent',
       created_at: new Date().toISOString()
