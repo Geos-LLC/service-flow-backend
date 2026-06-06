@@ -475,6 +475,244 @@ describe('runHistoricalFeedbackApply — dryRun:false posts to LB once', () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────
+// Post-timeout reconcile — fired when LB times out at SF's 120s mark
+// while still committing rows server-side. The reconcile re-fetches LB
+// state and synthesises applied / uncertain from authoritative
+// syncStatus, so the orchestrator can return ok:true with accurate
+// per-row outcomes instead of 502 lb_request_timeout + applied=[].
+// ──────────────────────────────────────────────────────────────────────
+const { expectedLbSyncStatusFor } = require('../lib/sf-historical-sync-orchestrator');
+
+describe('expectedLbSyncStatusFor — match_type → expected LB syncStatus', () => {
+  test('lead_only → lead_linked', () => {
+    expect(expectedLbSyncStatusFor({ match_type: 'lead_only', confidence: 'exact' })).toBe('lead_linked');
+  });
+  test('customer_job exact|high → linked', () => {
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job', confidence: 'exact' })).toBe('linked');
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job', confidence: 'high' })).toBe('linked');
+  });
+  test('customer_job medium|low → needs_review', () => {
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job', confidence: 'medium' })).toBe('needs_review');
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job', confidence: 'low' })).toBe('needs_review');
+  });
+  test('confidence=none → no_match', () => {
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job', confidence: 'none' })).toBe('no_match');
+  });
+  test('unknown/missing shape → null', () => {
+    expect(expectedLbSyncStatusFor(null)).toBeNull();
+    expect(expectedLbSyncStatusFor({})).toBeNull();
+    expect(expectedLbSyncStatusFor({ match_type: 'customer_job' })).toBeNull();
+  });
+});
+
+describe('runHistoricalFeedbackApply — post-timeout reconcile', () => {
+  // Reusable fixture for the live-apply path so each test can swap the
+  // LB linkLeadsBulk response without re-declaring matcher/store setup.
+  //
+  // fetchCandidates is called TWICE in the reconcile path:
+  //   1. initial candidates pull (start of runHistoricalFeedbackApply)
+  //   2. reconcile pull (only when linkLeadsBulk returns request_timeout)
+  // We queue the initial response via mockResolvedValueOnce here so each
+  // test can append its own mockResolvedValueOnce for the reconcile call.
+  function setupBatch(candidates, matcherImpl) {
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: candidates.length, candidates, more_may_exist: false });
+    mockFindHistoricalMatchType.mockImplementation((_db, args) => matcherImpl(args.input.lb_lead_id));
+  }
+
+  test('LB timeout but ALL rows later committed → reconcile applied + ok:true + reconciled_after_timeout=true', async () => {
+    // Two leads sent: Jill (lead_only) + AMBIG (needs_review). LB times out
+    // at SF's 120s mark; reconcile fetch reveals both rows landed under
+    // their expected syncStatuses (lead_linked + needs_review). Expected:
+    // synthetic applied set with both rows; uncertain stays empty.
+    setupBatch([JILL, AMBIG], id => {
+      if (id === JILL.leadId)  return Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' }));
+      if (id === AMBIG.leadId) return Promise.resolve(mt.multiCandidates());
+      return Promise.resolve(mt.noMatch());
+    });
+    // First call (the actual POST) times out.
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-001', timeout: true });
+    // Reconcile fetch — both rows show as fully committed.
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: 2, candidates: [
+      { ...JILL,  syncStatus: 'lead_linked',  sfLeadId: '107', sfLeadStageName: 'Contacted', sfJobId: null, sfCustomerId: null },
+      { ...AMBIG, syncStatus: 'needs_review', sfLeadId: null,  sfJobId: null,                sfCustomerId: null },
+    ], more_may_exist: false });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(true);
+    expect(out.reconciled_after_timeout).toBe(true);
+    expect(out.applied).toHaveLength(2);
+    expect(out.uncertain).toEqual([]);
+    expect(out.rejected).toEqual([]);
+    const jillApplied = out.applied.find(r => r.lb_lead_id === JILL.leadId);
+    expect(jillApplied.lb_sync_status).toBe('lead_linked');
+    expect(jillApplied.lb_detail).toBe('reconciled_from_post_timeout_fetch');
+    const ambigApplied = out.applied.find(r => r.lb_lead_id === AMBIG.leadId);
+    expect(ambigApplied.lb_sync_status).toBe('needs_review');
+  });
+
+  test('LB timeout and NO rows committed → all uncertain[] + applied[] empty', async () => {
+    setupBatch([JILL], id => (id === JILL.leadId ? Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })) : Promise.resolve(mt.noMatch())));
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-002', timeout: true });
+    // Reconcile fetch returns zero candidates in any of the landing statuses —
+    // LB never wrote any of the rows we sent.
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: 0, candidates: [], more_may_exist: false });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(true);
+    expect(out.reconciled_after_timeout).toBe(true);
+    expect(out.applied).toEqual([]);
+    expect(out.uncertain).toHaveLength(1);
+    expect(out.uncertain[0]).toEqual(expect.objectContaining({
+      lb_lead_id: JILL.leadId,
+      match_type: 'lead_only',
+      expected_sync_status: 'lead_linked',
+      actual_sync_status: null,
+      reason: 'lb_state_uncertain',
+    }));
+  });
+
+  test('partial commit → some applied, others uncertain', async () => {
+    // Two rows sent; LB committed Jill (lead_linked) but not Antonya (customer_job).
+    const ANTONYA_HIGH = candidate('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Antonya Cooper', { platform: 'thumbtack', customerPhone: '8005553841' });
+    // setupBatch only returns lead_only by default — we need both candidates.
+    // Sent: Jill → lead_only, Antonya → customer_job. But customer_job rows
+    // currently route to the apply path (not feedback) when confidence=high.
+    // We use a medium-confidence customer_job so the row goes through feedback
+    // and would land as needs_review on the LB side.
+    setupBatch([JILL, ANTONYA_HIGH], id => {
+      if (id === JILL.leadId)         return Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' }));
+      if (id === ANTONYA_HIGH.leadId) return Promise.resolve(mt.lowConfidence({ sf_customer_id: 23487, sf_job_id: 142307, matcherConf: 'medium' }));
+      return Promise.resolve(mt.noMatch());
+    });
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-003', timeout: true });
+    // Reconcile: Jill landed at lead_linked; Antonya nowhere.
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: 1, candidates: [
+      { ...JILL, syncStatus: 'lead_linked', sfLeadId: '107', sfLeadStageName: 'Contacted', sfJobId: null, sfCustomerId: null },
+    ], more_may_exist: false });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(true);
+    expect(out.reconciled_after_timeout).toBe(true);
+    expect(out.applied).toHaveLength(1);
+    expect(out.applied[0].lb_lead_id).toBe(JILL.leadId);
+    expect(out.uncertain).toHaveLength(1);
+    expect(out.uncertain[0].lb_lead_id).toBe(ANTONYA_HIGH.leadId);
+    expect(out.uncertain[0].match_type).toBe('customer_job');
+  });
+
+  test('LB returns wrong syncStatus for our row → uncertain (lb_state_mismatch), not applied', async () => {
+    // We sent lead_only for Jill but LB shows her at syncStatus='pending'
+    // somehow (race / partial rollback / unrelated state). Must NOT be
+    // counted as applied — must land in uncertain with lb_state_mismatch.
+    setupBatch([JILL], id => Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })));
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-004', timeout: true });
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: 1, candidates: [
+      // Wrong state — looks like LB didn't actually apply our feedback row
+      { ...JILL, syncStatus: 'pending', sfLeadId: null, sfLeadStageName: null, sfJobId: null, sfCustomerId: null },
+    ], more_may_exist: false });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(true);
+    expect(out.reconciled_after_timeout).toBe(true);
+    expect(out.applied).toEqual([]);
+    expect(out.uncertain).toHaveLength(1);
+    expect(out.uncertain[0]).toEqual(expect.objectContaining({
+      reason: 'lb_state_mismatch',
+      expected_sync_status: 'lead_linked',
+      actual_sync_status: 'pending',
+    }));
+  });
+
+  test('reconcile fetch itself fails → 502 lb_state_uncertain (operator must inspect)', async () => {
+    setupBatch([JILL], id => Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })));
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-005', timeout: true });
+    // Reconcile fetch returns ok:false — LB is unreachable for the
+    // reconcile pass too. The orchestrator can no longer determine
+    // state authoritatively; it must surface that explicitly.
+    mockFetchCandidates.mockResolvedValueOnce({ ok: false, reason: 'lb_unreachable', error_description: 'still down' });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe(502);
+    expect(out.error).toBe('lb_state_uncertain');
+    expect(out.request_id).toBe('sf-timeout-005');
+  });
+
+  test('attachLbLink is NEVER called from the feedback path — even after reconcile confirms applied rows', async () => {
+    // Hard structural invariant — `runHistoricalFeedbackApply` does not
+    // and must not own SF-side state writes; that's the apply path's job
+    // (runHistoricalSyncApply). Even with a successful reconcile, no
+    // SF customer / job / outbox write happens.
+    //
+    // The store mock would throw on any insert/update/delete, so a
+    // structural regression that adds an attach call from this path
+    // would fail the test loudly. We assert no LB-call-side-effect
+    // beyond the two expected calls (linkLeadsBulk + reconcile fetch),
+    // and trust the mock store to enforce the rest.
+    setupBatch([JILL], id => Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })));
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'request_timeout', request_id: 'sf-timeout-006', timeout: true });
+    mockFetchCandidates.mockResolvedValueOnce({ ok: true, count: 1, candidates: [
+      { ...JILL, syncStatus: 'lead_linked', sfLeadId: '107', sfLeadStageName: 'Contacted', sfJobId: null, sfCustomerId: null },
+    ], more_may_exist: false });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    // Sanity: the row appears in applied (reconciled).
+    expect(out.applied).toHaveLength(1);
+    expect(out.applied[0].lb_lead_id).toBe(JILL.leadId);
+
+    // No additional LB calls. Specifically, no second linkLeadsBulk
+    // (which is how a hypothetical attach-style retry would manifest).
+    expect(mockLinkLeadsBulk).toHaveBeenCalledTimes(1);
+    // The two fetchCandidates calls: 1 initial fetch + 1 reconcile.
+    expect(mockFetchCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  test('non-timeout LB error (e.g. 503 lb_unreachable) does NOT trigger reconcile', async () => {
+    // The reconcile branch is gated on reason === 'request_timeout'.
+    // Other failure modes pass through to the existing error path
+    // unchanged — orchestrator returns ok:false with the LB status.
+    setupBatch([JILL], id => Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })));
+    mockLinkLeadsBulk.mockResolvedValueOnce({ ok: false, reason: 'lb_unreachable', status: 503, error_description: 'down', request_id: 'sf-not-timeout' });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe(503);
+    expect(out.error).toBe('lb_unreachable');
+    // Exactly 1 fetch (the initial candidates pull) — no reconcile fetch.
+    expect(mockFetchCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  test('successful (non-timeout) apply path is unchanged — no reconciled_after_timeout flag', async () => {
+    // Regression guard: a normal happy-path apply must still work and
+    // the new reconciled_after_timeout flag must be false.
+    setupBatch([JILL], id => Promise.resolve(mt.leadOnly({ sf_lead_id: 107, sf_lead_stage_name: 'Contacted' })));
+    mockLinkLeadsBulk.mockResolvedValueOnce({
+      ok: true, status: 200,
+      applied:  [{ lb_lead_id: JILL.leadId, lb_result: 'lead_linked', lb_sync_status: 'lead_linked', sf_managed: true }],
+      rejected: [],
+      summary:  { total: 1, lead_linked: 1, linked: 0, needs_review: 0, no_match: 0, conflict: 0, not_found: 0, failed: 0, status_updates_applied: 0 },
+      request_id: 'sf-happy',
+    });
+
+    const out = await runHistoricalFeedbackApply(makeStore(), { tenantId: SF_TENANT_ID, dryRun: false });
+
+    expect(out.ok).toBe(true);
+    expect(out.applied).toHaveLength(1);
+    expect(out.reconciled_after_timeout).toBe(false);
+    expect(out.uncertain).toEqual([]);
+    // No reconcile fetch.
+    expect(mockFetchCandidates).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
 // Class filter — operator-selectable
 // ──────────────────────────────────────────────────────────────────────
 describe('runHistoricalFeedbackApply — class filter', () => {
