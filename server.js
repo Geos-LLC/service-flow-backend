@@ -5321,7 +5321,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       serviceModifiers,
       serviceIntakeQuestions: serviceIntakeQuestionsInput,
       propertyId,
-      forceBook = false
+      forceBook = false,
+      // Multi-service support. createjob.jsx sends one or both of:
+      //   selectedServices: [{ id, name, price }, …]  (full objects)
+      //   serviceIds:       [id1, id2, …]             (back-compat)
+      // We persist a normalized [{serviceId, name, basePrice}] array
+      // into jobs.service_line_items so the job-detail UI can render
+      // each service as its own block.
+      selectedServices,
+      serviceIds: serviceIdsInput,
     } = req.body;
 
     let serviceIntakeQuestions = serviceIntakeQuestionsInput;
@@ -5660,6 +5668,54 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       }
       const lbLink = lbResolution.link;
 
+      // Build per-service line items + combined service_name string.
+      // Inputs handled, in order of preference:
+      //   1. selectedServices: [{id, name, price}, …]   — preferred
+      //   2. serviceIds: [id, id, …]                    — needs lookup
+      //   3. Falls back to the single serviceId+serviceName pair
+      // basePrice can be missing on lookup-fallback; we leave it null
+      // so the UI knows it has to split service_price evenly across
+      // services rather than trust a stored zero.
+      let computedServiceLineItems = null;
+      let combinedServiceName = serviceName;
+      try {
+        let sourceList = null;
+        if (Array.isArray(selectedServices) && selectedServices.length > 0) {
+          sourceList = selectedServices
+            .map((s) => ({
+              serviceId: s?.id ?? s?.serviceId ?? null,
+              name: s?.name || s?.service_name || null,
+              basePrice: s?.price != null ? parseFloat(s.price) : null,
+            }))
+            .filter((s) => s.serviceId != null || s.name);
+        } else if (Array.isArray(serviceIdsInput) && serviceIdsInput.length > 0) {
+          const { data: svcRows } = await supabase
+            .from('services')
+            .select('id, name, price')
+            .in('id', serviceIdsInput)
+            .eq('user_id', userId);
+          const svcMap = new Map((svcRows || []).map((r) => [String(r.id), r]));
+          sourceList = serviceIdsInput.map((id) => {
+            const r = svcMap.get(String(id));
+            return {
+              serviceId: id,
+              name: r?.name || null,
+              basePrice: r?.price != null ? parseFloat(r.price) : null,
+            };
+          });
+        }
+        if (sourceList && sourceList.length > 0) {
+          computedServiceLineItems = sourceList;
+          const names = sourceList.map((s) => s.name).filter(Boolean);
+          if (names.length > 0) {
+            combinedServiceName = names.join(', ');
+          }
+        }
+      } catch (lineErr) {
+        console.warn('[service_line_items] Failed to build line items:', lineErr?.message);
+        // Non-fatal — fall through with null. Single-service render still works.
+      }
+
       // Create the job
       const jobData = {
         user_id: userId,
@@ -5701,7 +5757,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         service_address_city: serviceAddress?.city,
         service_address_state: serviceAddress?.state,
         service_address_zip: serviceAddress?.zipCode,
-        service_name: serviceName,
+        service_name: combinedServiceName,
+        service_line_items: computedServiceLineItems,
         invoice_status: invoiceStatus,
         payment_status: paymentStatus,
         priority: priority,
@@ -7412,6 +7469,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       qualityCheck: 'quality_check',
       serviceModifiers: 'service_modifiers',
       serviceIntakeQuestions: 'service_intake_questions',
+      serviceLineItems: 'service_line_items',
       tipAmount: 'tip_amount',
       tip_amount: 'tip_amount'
     };
@@ -7427,7 +7485,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
         if (key === 'scheduledDate' && updateData.scheduledTime) {
           // Simply combine date and time as-is, no timezone conversion
           updateDataToSend[fieldMappings[key]] = `${updateData[key]} ${updateData.scheduledTime}:00`;
-        } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
+        } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions', 'serviceLineItems'].includes(key)) {
           updateDataToSend[fieldMappings[key] || key] = updateData[key];
         } else if (key === 'serviceAddress') {
           // Handle nested service address
