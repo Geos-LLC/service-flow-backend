@@ -43481,23 +43481,18 @@ app.post('/api/communications/conversations/:id/send', authenticateToken, async 
     const phoneNumbers = settings.cached_phone_numbers || [];
     if (phoneNumbers.length === 0) return res.status(400).json({ error: 'No phone numbers available' });
 
-    // Send via Sigcore
-    let sendResult;
-    if (conv.sigcore_conversation_id) {
-      // Use conversation-based send
-      sendResult = await sigcoreRequest('POST', '/messages', settings.sigcore_tenant_api_key, {
-        body: text.trim(),
-        senderId: phoneNumbers[0].id || phoneNumbers[0].senderId,
-        conversationId: conv.sigcore_conversation_id
-      });
-    } else {
-      // Use phone-based send
-      sendResult = await sigcoreRequest('POST', '/internal/messages/send', settings.sigcore_tenant_api_key, {
-        businessId: String(userId),
-        toPhone: conv.participant_phone,
-        body: text.trim()
-      });
-    }
+    // Send via Sigcore's phone-string endpoint. /messages (UUID-based) and
+    // /internal/messages/send (Twilio-only) don't fit the OpenPhone flow —
+    // cached_phone_numbers holds OpenPhone PN IDs, not Sigcore Sender UUIDs,
+    // and SF has no Twilio integration on the Sigcore workspace.
+    const fromNumber = phoneNumbers[0].number || phoneNumbers[0].phoneNumber;
+    const sendResult = await sigcoreRequest('POST', '/v1/messages', settings.sigcore_tenant_api_key, {
+      fromNumber,
+      toNumber: conv.participant_phone,
+      body: text.trim(),
+      channel: 'sms',
+      phoneNumberId: phoneNumbers[0].id
+    });
 
     const sentMsg = sendResult.data?.data || sendResult.data || {};
 
