@@ -26250,7 +26250,9 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
           });
         }
 
-        // Mirror onto the per-assignment cache.
+        // Mirror onto the per-assignment cache (no-op if row doesn't exist —
+        // ZZB-synced and historical jobs often store team_member_id on the
+        // job row without a matching job_team_assignments row).
         const { error: assignErr } = await supabase
           .from('job_team_assignments')
           .update({ incentive_amount: newVal })
@@ -26258,12 +26260,16 @@ app.patch('/api/jobs/:id/payroll', authenticateToken, async (req, res) => {
           .eq('team_member_id', teamMemberId);
         if (assignErr) console.error(`[Payroll PATCH] Assignment incentive update error:`, assignErr);
 
-        // Recalculate job total from all assignments
-        const { data: allAssignments } = await supabase
-          .from('job_team_assignments')
-          .select('incentive_amount')
+        // Recalculate job total from job_incentives (source of truth), NOT
+        // from job_team_assignments. The assignments table is a denormalized
+        // cache and can't be the source — jobs without any assignment rows
+        // would silently land at jobTotal=0 and zero out the incentive the
+        // user just typed.
+        const { data: allLines } = await supabase
+          .from('job_incentives')
+          .select('amount')
           .eq('job_id', id);
-        const jobTotal = (allAssignments || []).reduce((sum, a) => sum + (parseFloat(a.incentive_amount) || 0), 0);
+        const jobTotal = (allLines || []).reduce((sum, l) => sum + (parseFloat(l.amount) || 0), 0);
         const oldVal = parseFloat(job.incentive_amount) || 0;
         update.incentive_amount = jobTotal;
         if (jobTotal !== oldVal) edits.push({ field: 'incentive_amount', old_value: String(oldVal), new_value: String(jobTotal) });
