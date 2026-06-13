@@ -25304,19 +25304,35 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     if (!isDayEnabled) continue;
 
     let dayHoursTotal = 0;
-    if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+    // Multi-slot (length > 1) → genuine per-day breakdown, always wins.
+    // Otherwise prefer the simple from-to (dayHrs.start/end) when set — that's
+    // what the most common editor saves, and historic drift can leave a
+    // single-slot timeSlots[0] disagreeing with start/end (e.g. timeSlots set
+    // by an older edit, then start/end updated by a later edit on a different
+    // UI without resyncing timeSlots). Falling back to single-slot timeSlots
+    // covers the worker-availability editor which only writes timeSlots.
+    const hasMultiSlot = Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 1;
+    const hasSimpleFromTo = !!(dayHrs.start && dayHrs.end);
+    if (hasMultiSlot) {
       dayHrs.timeSlots.forEach(ts => {
         const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
         const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
         if (tsEnd > tsStart) dayHoursTotal += (tsEnd - tsStart) / 60;
       });
-    } else if (dayHrs.start && dayHrs.end) {
+    } else if (hasSimpleFromTo) {
       const dStart = toMinutes(dayHrs.start);
       const dEnd = toMinutes(dayHrs.end);
       if (dEnd > dStart) dayHoursTotal = (dEnd - dStart) / 60;
+    } else if (Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+      dayHrs.timeSlots.forEach(ts => {
+        const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
+        const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
+        if (tsEnd > tsStart) dayHoursTotal += (tsEnd - tsStart) / 60;
+      });
     }
-    // Subtract common break (only if using simple from-to, not multiple timeSlots which already account for breaks)
-    if (breakHours > 0 && dayHoursTotal > 0 && !(dayHrs.timeSlots && dayHrs.timeSlots.length > 1)) {
+    // Subtract common break only when the day is a single window
+    // (multi-slot users already encode the break as the gap between slots).
+    if (breakHours > 0 && dayHoursTotal > 0 && !hasMultiSlot) {
       dayHoursTotal = Math.max(0, dayHoursTotal - breakHours);
     }
     totalHours += dayHoursTotal;
