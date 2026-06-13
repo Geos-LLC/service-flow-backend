@@ -25926,6 +25926,59 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       }
     }
 
+    // ===== Surface cancelled jobs in each assigned cleaner's breakdown =====
+    // Cancelled jobs produce no earnings, but managers still want to see them
+    // so they can attach an incentive (e.g. compensation for a late cancellation
+    // the cleaner already prepped for). Inject a zero-amount synthetic earning
+    // entry per (cancelled job, assigned member) pair where no ledger entry
+    // already exists. The jobEntriesMap builder below will then render the
+    // job with $0 revenue/labor; any real tip/incentive ledger rows still flow
+    // through normally.
+    {
+      const cancelStatusesSet = new Set(['cancelled', 'canceled', 'cancel']);
+      const cancelledJobs = (allJobs || []).filter(j => cancelStatusesSet.has((j.status || '').toLowerCase()));
+      const cancelledJobIds = cancelledJobs.map(j => j.id);
+      const ledgeredByJobMember = new Set(
+        (ledgerEntries || [])
+          .filter(e => e.job_id && e.team_member_id)
+          .map(e => `${e.job_id}:${e.team_member_id}`)
+      );
+
+      const cancelledAssignmentsByJob = {};
+      if (cancelledJobIds.length > 0) {
+        for (let i = 0; i < cancelledJobIds.length; i += 100) {
+          const chunk = cancelledJobIds.slice(i, i + 100);
+          const { data: assigns } = await supabase
+            .from('job_team_assignments')
+            .select('job_id, team_member_id')
+            .in('job_id', chunk);
+          (assigns || []).forEach(a => {
+            if (!cancelledAssignmentsByJob[a.job_id]) cancelledAssignmentsByJob[a.job_id] = [];
+            cancelledAssignmentsByJob[a.job_id].push(a.team_member_id);
+          });
+        }
+      }
+
+      for (const job of cancelledJobs) {
+        let memberIds = cancelledAssignmentsByJob[job.id] || [];
+        if (memberIds.length === 0 && job.team_member_id) memberIds = [job.team_member_id];
+        if (memberIds.length === 0) continue;
+        const mc = memberIds.length;
+        for (const memberId of memberIds) {
+          if (ledgeredByJobMember.has(`${job.id}:${memberId}`)) continue;
+          const placeholder = {
+            team_member_id: memberId,
+            job_id: job.id,
+            type: 'earning',
+            amount: 0,
+            metadata: { hours: 0, revenue: 0, hourly_rate: 0, commission_pct: 0, member_count: mc, cancelled: true, placeholder: true },
+          };
+          if (!entriesByMember[memberId]) entriesByMember[memberId] = [];
+          entriesByMember[memberId].push(placeholder);
+        }
+      }
+    }
+
     // Scheduled hours date range
     let scheduledHoursStartDate = startDate;
     let scheduledHoursEndDate = endDate;
@@ -25966,6 +26019,16 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       for (const entry of memberEntries) {
         const amount = parseFloat(entry.amount) || 0;
         const meta = entry.metadata || {};
+
+        // Cancelled-job placeholder: surfaces the job in the per-cleaner table
+        // (so an incentive can be attached) but contributes nothing to totals.
+        if (meta.placeholder && meta.cancelled) {
+          if (entry.job_id) {
+            if (!jobEntriesMap[entry.job_id]) jobEntriesMap[entry.job_id] = {};
+            if (!jobEntriesMap[entry.job_id][entry.type]) jobEntriesMap[entry.job_id][entry.type] = entry;
+          }
+          continue;
+        }
 
         if (entry.type === 'earning') {
           if (meta.is_manager_salary) {
@@ -26156,9 +26219,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     sortedTeamMembers.forEach(item => { (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id)); });
     const grandTotalJobCount = allUniqueJobIds.size;
 
+    // Net business revenue = gross job revenue minus incentives paid to cleaners.
+    // Incentives are a direct cost of the work, so they reduce what the business
+    // keeps from the period's billings.
+    const netBusinessRevenue = totalBusinessRevenue - grandTotalIncentives;
+
     res.json({
       period: { startDate: startDate || null, endDate: endDate || null },
       totalBusinessRevenue: parseFloat(totalBusinessRevenue.toFixed(2)),
+      netBusinessRevenue: parseFloat(netBusinessRevenue.toFixed(2)),
       teamMembers: sortedTeamMembers.map(({ jobIds, ...rest }) => rest),
       summary: {
         totalTeamMembers: sortedTeamMembers.length,
@@ -26367,7 +26436,7 @@ async function recalcJobIncentiveTotals(jobId, userId) {
     .update({ incentive_amount: parseFloat(jobTotal.toFixed(2)) })
     .eq('id', jobId);
 
-  // Reconcile ledger (no-op if job not completed/paid).
+  // Reconcile ledger (writes for completed/paid/cancelled; no-op otherwise).
   try {
     await syncJobIncentiveLedger(parseInt(jobId), userId);
   } catch (e) {
@@ -38736,7 +38805,10 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
  * Settled rows (already linked to a payout_batch_id) are never mutated or deleted —
  * historical payout data is preserved.
  *
- * Only runs for completed/paid jobs; scheduled/pending jobs exit immediately.
+ * Runs for completed/paid AND cancelled jobs (so cleaners can be paid an
+ * incentive for a cancelled cleaning). For cancelled jobs there is no
+ * earned-on date, so the entry lands in the CURRENT pay period (today).
+ * Scheduled/pending jobs still exit early.
  */
 async function syncJobIncentiveLedger(jobId, userId) {
   const { data: job, error: jobErr } = await supabase
@@ -38751,7 +38823,8 @@ async function syncJobIncentiveLedger(jobId, userId) {
   }
 
   const jobStatus = (job.status || '').toLowerCase();
-  if (jobStatus !== 'completed' && jobStatus !== 'paid') {
+  const isCancelledJob = jobStatus === 'cancelled' || jobStatus === 'canceled' || jobStatus === 'cancel';
+  if (jobStatus !== 'completed' && jobStatus !== 'paid' && !isCancelledJob) {
     return;
   }
 
@@ -38836,8 +38909,10 @@ async function syncJobIncentiveLedger(jobId, userId) {
   const jobDate = job.scheduled_date
     ? String(job.scheduled_date).split('T')[0].split(' ')[0]
     : today;
+  // Cancelled jobs have no "earned-on" date — the incentive is paid in the
+  // current period regardless of when the job was scheduled.
   const effectiveDateFor = (memberId) =>
-    settledMembers.has(memberId) ? today : jobDate;
+    (isCancelledJob || settledMembers.has(memberId)) ? today : jobDate;
 
   const memberIdsToProcess = new Set([
     ...teamMemberIds,
@@ -38881,6 +38956,7 @@ async function syncJobIncentiveLedger(jobId, userId) {
           metadata: {
             incentive_lines: memberDescriptions,
             late_addition: settledMembers.has(memberId) ? true : undefined,
+            cancelled_job: isCancelledJob ? true : undefined,
           },
           created_by: userId,
         });
