@@ -55,16 +55,26 @@ function calculateScheduledHoursFromAvailability(availabilityRaw, startDateStr, 
     const isDayEnabled = dayHrs.enabled !== false && dayHrs.available !== false;
     if (!isDayEnabled) continue;
 
-    if (dayHrs.timeSlots && Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+    // Multi-slot wins. Otherwise prefer simple from-to over single-slot
+    // timeSlots (resolves drift between the two editors).
+    const hasMultiSlot = Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 1;
+    const hasSimpleFromTo = !!(dayHrs.start && dayHrs.end);
+    if (hasMultiSlot) {
       dayHrs.timeSlots.forEach(ts => {
         const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
         const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
         if (tsEnd > tsStart) totalHours += (tsEnd - tsStart) / 60;
       });
-    } else {
-      const dayStart = toMinutes(dayHrs.start || dayHrs.startTime || '09:00');
-      const dayEnd = toMinutes(dayHrs.end || dayHrs.endTime || '17:00');
+    } else if (hasSimpleFromTo) {
+      const dayStart = toMinutes(dayHrs.start);
+      const dayEnd = toMinutes(dayHrs.end);
       if (dayEnd > dayStart) totalHours += (dayEnd - dayStart) / 60;
+    } else if (Array.isArray(dayHrs.timeSlots) && dayHrs.timeSlots.length > 0) {
+      dayHrs.timeSlots.forEach(ts => {
+        const tsStart = toMinutes(ts.start || ts.startTime || '09:00');
+        const tsEnd = toMinutes(ts.end || ts.endTime || '17:00');
+        if (tsEnd > tsStart) totalHours += (tsEnd - tsStart) / 60;
+      });
     }
   }
   return totalHours;
@@ -162,6 +172,30 @@ describe('calculateScheduledHoursFromAvailability', () => {
     // 4 full days × 8 = 32, plus Wednesday 4 hours = 36
     const hours = calculateScheduledHoursFromAvailability(availability, '2026-02-15', '2026-02-21');
     expect(hours).toBe(36);
+  });
+
+  test('drift: prefers simple from-to over conflicting single-slot timeSlots', () => {
+    // Real-world drift: simple-form editor saved start/end=09-17,
+    // but a prior edit through a per-day-slots editor left a stale
+    // timeSlots[0]=09-18 behind. UI shows 09-17 so calc must too.
+    const availability = {
+      workingHours: {
+        monday: {
+          enabled: true,
+          start: '09:00',
+          end: '17:00',
+          timeSlots: [{ start: '09:00', end: '18:00' }],
+        },
+        tuesday: { enabled: false },
+        wednesday: { enabled: false },
+        thursday: { enabled: false },
+        friday: { enabled: false },
+        saturday: { enabled: false },
+        sunday: { enabled: false },
+      },
+    };
+    // Feb 16 is Monday → 8h (from start/end), not 9h (from stale timeSlots)
+    expect(calculateScheduledHoursFromAvailability(availability, '2026-02-16', '2026-02-16')).toBe(8);
   });
 
   test('handles timeSlots array', () => {
