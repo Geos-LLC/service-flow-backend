@@ -26897,6 +26897,75 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
     // Store as object — Supabase handles jsonb serialization. Don't stringify.
     const availabilityObj = typeof availability === 'string' ? JSON.parse(availability) : availability;
 
+    // Normalize each day so the flat `start`/`end` and single-element
+    // `timeSlots` can never disagree. Two editors write this shape (per-day
+    // timeSlots editor and a flat from-to editor) and neither touches the
+    // other's field — without normalization we accumulate drift, the calc
+    // reads a stale field, and edits silently "don't save" because the calc
+    // sees the field the editor didn't touch.
+    //
+    // Strategy: diff incoming against currently-stored, then mirror the
+    // CHANGED field onto the unchanged one. Multi-slot days are deliberate
+    // and left alone.
+    if (availabilityObj && typeof availabilityObj === 'object' && availabilityObj.workingHours) {
+      const { data: prior } = await supabase
+        .from('team_members')
+        .select('availability')
+        .eq('id', id)
+        .maybeSingle();
+      const priorWH = (prior?.availability && typeof prior.availability === 'object')
+        ? (prior.availability.workingHours || {})
+        : {};
+      for (const dayName of Object.keys(availabilityObj.workingHours)) {
+        const day = availabilityObj.workingHours[dayName];
+        if (!day || typeof day !== 'object') continue;
+        const slots = Array.isArray(day.timeSlots) ? day.timeSlots : null;
+        if (slots && slots.length > 1) continue; // multi-slot is authoritative
+        const single = slots && slots.length === 1 ? slots[0] : null;
+        const flatStart = day.start || null;
+        const flatEnd = day.end || null;
+        const slotStart = single ? (single.start || single.startTime || null) : null;
+        const slotEnd = single ? (single.end || single.endTime || null) : null;
+
+        const priorDay = priorWH[dayName] || {};
+        const priorFlatStart = priorDay.start || null;
+        const priorFlatEnd = priorDay.end || null;
+        const priorSingle = (Array.isArray(priorDay.timeSlots) && priorDay.timeSlots.length === 1)
+          ? priorDay.timeSlots[0] : null;
+        const priorSlotStart = priorSingle ? (priorSingle.start || priorSingle.startTime || null) : null;
+        const priorSlotEnd = priorSingle ? (priorSingle.end || priorSingle.endTime || null) : null;
+
+        const flatChanged = (flatStart && flatStart !== priorFlatStart) || (flatEnd && flatEnd !== priorFlatEnd);
+        const slotChanged = (slotStart && slotStart !== priorSlotStart) || (slotEnd && slotEnd !== priorSlotEnd);
+
+        // Pick canonical (start, end): the side the editor actively changed
+        // in this save wins. If both look unchanged or both changed, prefer
+        // the timeSlot (its editor is more deliberate about per-day intent).
+        let canonStart = null;
+        let canonEnd = null;
+        if (slotChanged && !flatChanged) {
+          canonStart = slotStart; canonEnd = slotEnd;
+        } else if (flatChanged && !slotChanged) {
+          canonStart = flatStart; canonEnd = flatEnd;
+        } else {
+          canonStart = slotStart || flatStart;
+          canonEnd = slotEnd || flatEnd;
+        }
+        if (!canonStart || !canonEnd) continue;
+
+        day.start = canonStart;
+        day.end = canonEnd;
+        if (single) {
+          single.start = canonStart;
+          single.end = canonEnd;
+        } else if (day.available !== false) {
+          // Day enabled but no timeSlots — synthesize one so future reads
+          // through the timeSlots-only UI see the same value.
+          day.timeSlots = [{ id: Date.now(), start: canonStart, end: canonEnd, enabled: true }];
+        }
+      }
+    }
+
     const { error: updateError } = await supabase
       .from('team_members')
       .update({
