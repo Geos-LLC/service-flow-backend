@@ -1397,22 +1397,31 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
         await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'transaction_payment_method', note: 'resolved via atomic payment write' })
       }
 
-      // Rebuild ledger if any cash transaction now exists for this job. The webhook may
-      // arrive with rawMethod = 'custom'/null while the DB already has a cash tx (e.g. from
-      // an earlier syncTransactions correction), so we check the DB rather than the payload.
+      // Rebuild ledger when either:
+      //   (a) a cash tx exists — cash_collected needs to be (re)created; OR
+      //   (b) tip_amount on the job changed from the pre-event value — common for
+      //       card/Stripe flows where the tip is added in ZB after job.completed
+      //       already ran, so the original completion-time ledger has no tip row.
+      // The cash check reads the DB (webhook rawMethod can be 'custom'/null while
+      // syncTransactions has already corrected an existing row to 'cash').
       if (createLedgerEntriesForCompletedJob) {
         const { data: cashTxCheck } = await supabase.from('transactions')
           .select('id').eq('job_id', job.id).eq('status', 'completed').ilike('payment_method', 'cash').limit(1)
-        if (cashTxCheck && cashTxCheck.length > 0) {
+        const hasCashTx = !!(cashTxCheck && cashTxCheck.length > 0)
+        const prevTip = parseFloat(job.tip_amount) || 0
+        const nextTip = update.tip_amount != null ? (parseFloat(update.tip_amount) || 0) : prevTip
+        const tipChanged = Math.abs(nextTip - prevTip) >= 0.01
+        if (hasCashTx || tipChanged) {
           try {
             await rebuildLedger(job.id, userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] })
-            logger.log(`[Zenbooker] Ledger rebuilt with cash_collected for job ${job.id}`)
-            await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'ledger_rebuild', note: 'resolved after cash-payment rebuild' })
+            const reason = hasCashTx && tipChanged ? 'cash+tip' : hasCashTx ? 'cash' : 'tip'
+            logger.log(`[Zenbooker] Ledger rebuilt (${reason}) for job ${job.id} (prevTip=${prevTip} nextTip=${nextTip})`)
+            await resolveDirty(supabase, { userId, sfJobId: job.id, operation: 'ledger_rebuild', note: `resolved after payment rebuild (${reason})` })
           } catch (rebuildErr) {
             await markDirty(supabase, {
               userId, sfJobId: job.id, zenbookerId: jobZbId,
               operation: 'ledger_rebuild', error: rebuildErr, logger,
-              context: { source: 'handlePaymentEvent:cash_path', event_type: eventType },
+              context: { source: 'handlePaymentEvent:rebuild_path', event_type: eventType, has_cash_tx: hasCashTx, tip_changed: tipChanged },
             })
           }
         }
@@ -1813,7 +1822,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
 
       // Auto-register webhooks
       const webhookUrl = `${req.protocol}://${req.get('host')}/api/zenbooker/webhook`
-      const webhookEvents = ['job.created', 'job.canceled', 'job.rescheduled', 'job.en_route', 'job.started', 'job.completed', 'job.service_providers.assigned', 'job.service_order.edited', 'invoice.payment_succeeded', 'invoice.payment_recorded', 'customer.edited']
+      const webhookEvents = ['job.created', 'job.canceled', 'job.rescheduled', 'job.en_route', 'job.started', 'job.completed', 'job.service_providers.assigned', 'job.service_order.edited', 'invoice.payment_succeeded', 'invoice.payment_recorded', 'invoice.payment_voided', 'customer.edited']
       try {
         // Get existing webhooks
         const existingRes = await zbFetch(apiKey, '/webhooks', { limit: 50 })
