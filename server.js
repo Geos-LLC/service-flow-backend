@@ -26820,13 +26820,17 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
       return res.status(404).json({ error: 'Team member not found' });
     }
     
-    // Permission check: 
-    // - Account owners can edit any team member's availability
-    // - Team members can only edit their own availability
-    const isAccountOwner = !userRole || userRole === 'owner' || userRole === 'account owner' || userRole === 'admin';
+    // Permission check:
+    // - Account owners and managers can edit any team member's availability
+    // - Other team members can only edit their own availability
+    // (Mirrors the role-change check at the PUT /api/team-members/:id handler,
+    //  which already includes 'manager'. Omitting it here was the gap that
+    //  blocked manager Ekaterina from setting time off for scheduler Queeny.)
+    const canEditOthers = !userRole || userRole === 'owner' || userRole === 'account owner' || userRole === 'admin' || userRole === 'manager';
     const isEditingSelf = teamMemberId && parseInt(teamMemberId) === parseInt(id);
-    
-    if (!isAccountOwner && !isEditingSelf) {
+
+    if (!canEditOthers && !isEditingSelf) {
+      logger.log(`[TeamMember] 403 availability edit blocked — actor teamMemberId=${teamMemberId} userRole=${userRole} target=${id}`);
       return res.status(403).json({ error: 'You do not have permission to edit this team member\'s availability' });
     }
     
