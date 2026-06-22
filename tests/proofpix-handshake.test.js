@@ -25,6 +25,11 @@ const jwt = require('jsonwebtoken');
 const JWT_SECRET = 'test-jwt-secret-handshake';
 
 process.env.JWT_SECRET = JWT_SECRET;
+// supabase-storage.js creates a Supabase client at module-load — give it
+// non-empty values so the proofpix-service require chain doesn't crash.
+// The fake supabase replaces all real DB / storage calls.
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'http://test.invalid';
+process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'test-service-role';
 
 const {
   FLAGS,

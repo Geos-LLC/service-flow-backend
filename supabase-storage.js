@@ -22,7 +22,17 @@ const BUCKETS = {
   LOGOS: 'logos',
   HERO_IMAGES: 'hero-images',
   FAVICONS: 'favicons',
-  JOB_ATTACHMENTS: 'job-attachments'
+  JOB_ATTACHMENTS: 'job-attachments',
+  PROOFPIX_PHOTOS: 'proofpix-photos',
+};
+
+// Per-bucket overrides. Buckets without an entry get the default
+// 10MB / jpeg-png-gif-webp config below.
+const BUCKET_CONFIG = {
+  'proofpix-photos': {
+    fileSizeLimit: 20 * 1024 * 1024,                 // 20MB per spec
+    allowedMimeTypes: ['image/jpeg', 'image/png'],   // strict — ProofPix-native pre-encodes
+  },
 };
 
 // Ensure all buckets exist
@@ -30,22 +40,24 @@ const ensureBuckets = async () => {
   try {
     for (const [_bucketName, bucketId] of Object.entries(BUCKETS)) {
       const { data: buckets, error } = await supabase.storage.listBuckets();
-      
+
       if (error) {
         console.error(`❌ Error listing buckets:`, error);
         continue;
       }
-      
+
       const bucketExists = buckets.some(bucket => bucket.name === bucketId);
-      
+
       if (!bucketExists) {
-        console.log(`🔄 Creating bucket: ${bucketId}`);
-        const { error: createError } = await supabase.storage.createBucket(bucketId, {
-          public: true, // Make buckets public for easy access
-          allowedMimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
-          fileSizeLimit: 10 * 1024 * 1024 // 10MB limit
-        });
-        
+        const override = BUCKET_CONFIG[bucketId] || {};
+        const config = {
+          public: true,
+          allowedMimeTypes: override.allowedMimeTypes || ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
+          fileSizeLimit:    override.fileSizeLimit    || 10 * 1024 * 1024,
+        };
+        console.log(`🔄 Creating bucket: ${bucketId} (${config.fileSizeLimit} bytes)`);
+        const { error: createError } = await supabase.storage.createBucket(bucketId, config);
+
         if (createError) {
           console.error(`❌ Error creating bucket ${bucketId}:`, createError);
         } else {
