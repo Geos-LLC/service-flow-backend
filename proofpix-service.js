@@ -1,15 +1,18 @@
 /**
- * ProofPix Integration Module (Loosely Coupled) — PR 1 (Handshake).
+ * ProofPix Integration Module (Loosely Coupled).
  *
  * Mount: app.use('/api/integrations/proofpix', require('./proofpix-service')(supabase, logger))
  * Remove: delete this file + remove the line above = zero breakage.
  *
- * PR 1 scope: handshake only.
+ * PR 1 — handshake:
  *   - POST /connect/code/issue            (SF user JWT)
  *   - POST /connect/code/redeem           (no auth — code is the credential)
  *   - POST /connect/refresh               (no auth — refresh token is the credential)
  *   - GET  /connection/status             (ProofPix access token)
  *   - DELETE /connection                  (ProofPix access token; idempotent)
+ *
+ * PR 2 — jobs list:
+ *   - GET /jobs                           (ProofPix access token)
  *
  * Every route is gated behind FLAGS.PROOFPIX_INTEGRATION_ENABLED. When the
  * flag is OFF the namespace returns 404 — the integration is invisible
@@ -19,7 +22,9 @@
  * resolves to users.business_name, falling back to users.email if the
  * business name is null/empty. SF has no separate company abstraction.
  *
- * Photo storage table = customer_files (lands in PR 3). Not used here.
+ * Photo storage table = customer_files (lands in PR 3). PR 2 already
+ * reads it for the `photo_count` field via the proofpix_job_photo_counts
+ * SQL helper (migration 067).
  */
 
 const express = require('express');
@@ -372,6 +377,215 @@ module.exports = (supabase, logger) => {
     }
     log.log(`[ProofPix] revoked conn ${req.proofpix.connectionId} for user ${req.proofpix.userId}`);
     return res.status(204).end();
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /jobs?status=&search=&limit=&cursor=
+  //   Returns the job picker list for ProofPix-native. Cursor-based
+  //   pagination ordered by (scheduled_date DESC, id DESC).
+  // ═════════════════════════════════════════════════════════════════
+
+  // SF's job_status enum has 12 values; the ProofPix picker only cares
+  // about 4 buckets. Two maps:
+  //   STATUS_BUCKET   — for the response field (per-job).
+  //   ACTIVE_FILTER   — the SF statuses that satisfy ?status=active.
+  // `paid` is bucketed under `completed` because it's a downstream
+  // step of completion (Stripe payment recorded) — visually the job
+  // is done from the cleaner's perspective.
+  const STATUS_BUCKETS = {
+    completed: 'completed',
+    complete:  'completed',
+    paid:      'completed',
+    cancelled: 'cancelled',
+    scheduled: 'scheduled',
+  };
+  function bucketStatus(sfStatus) {
+    return STATUS_BUCKETS[sfStatus] || 'active';
+  }
+  const ACTIVE_SF_STATUSES = [
+    'pending', 'confirmed', 'in-progress', 'en-route',
+    'started', 'late', 'rescheduled',
+  ];
+
+  function joinAddress(j) {
+    const parts = [
+      j.service_address_street,
+      j.service_address_city,
+      [j.service_address_state, j.service_address_zip].filter(Boolean).join(' '),
+    ].map((s) => (s == null ? '' : String(s).trim())).filter(Boolean);
+    return parts.length ? parts.join(', ') : null;
+  }
+
+  function scheduledAtMs(j) {
+    if (!j.scheduled_date) return null;
+    const time = j.scheduled_time || '09:00:00';
+    const ms = Date.parse(`${j.scheduled_date}T${time}`);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  function customerName(c) {
+    if (!c) return null;
+    const name = [c.first_name, c.last_name].filter(Boolean).map((s) => String(s).trim()).filter(Boolean).join(' ');
+    return name || null;
+  }
+
+  function encodeCursor(row) {
+    return Buffer.from(JSON.stringify({ d: row.scheduled_date, i: row.id })).toString('base64url');
+  }
+  function decodeCursor(input) {
+    if (!input) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(String(input), 'base64url').toString('utf8'));
+      if (typeof parsed.d !== 'string' || !Number.isFinite(Number(parsed.i))) return null;
+      return { d: parsed.d, i: Number(parsed.i) };
+    } catch {
+      return null;
+    }
+  }
+
+  router.get('/jobs', requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+
+    // ── Parse + validate query params ───────────────────────────────
+    const statusParam = (typeof req.query.status === 'string' && req.query.status)
+      ? req.query.status
+      : 'active';
+    if (!['active', 'all', 'completed', 'cancelled', 'scheduled'].includes(statusParam)) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Unknown status filter.'));
+    }
+
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 100)
+      : 50;
+    const cursor = decodeCursor(req.query.cursor);
+    if (req.query.cursor && !cursor) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed cursor.'));
+    }
+
+    // ── Resolve search → customer_ids (same two-step the existing
+    //    GET /api/jobs route uses) ─────────────────────────────────
+    let searchCustomerIds = null;
+    if (search) {
+      const escaped = search.replace(/[%_\\]/g, '\\$&');
+      const tokens = search.split(/\s+/).filter(Boolean);
+      let custQ = supabase.from('customers').select('id').eq('user_id', userId);
+      if (tokens.length > 1) {
+        const first = tokens[0].replace(/[%_\\]/g, '\\$&');
+        const rest  = tokens.slice(1).join(' ').replace(/[%_\\]/g, '\\$&');
+        custQ = custQ.or(
+          `and(first_name.ilike.%${first}%,last_name.ilike.%${rest}%),` +
+          `and(first_name.ilike.%${rest}%,last_name.ilike.%${first}%)`
+        );
+      } else {
+        custQ = custQ.or(`first_name.ilike.%${escaped}%,last_name.ilike.%${escaped}%`);
+      }
+      const { data: matched, error: custErr } = await custQ;
+      if (custErr) {
+        log.error('[ProofPix] /jobs customer search failed:', custErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Search failed.'));
+      }
+      searchCustomerIds = (matched || []).map((c) => c.id);
+    }
+
+    // ── Build the jobs query ────────────────────────────────────────
+    let query = supabase
+      .from('jobs')
+      .select(`
+        id, status, service_name,
+        scheduled_date, scheduled_time, created_at,
+        service_address_street, service_address_city,
+        service_address_state, service_address_zip,
+        customers!left ( first_name, last_name )
+      `)
+      .eq('user_id', userId)
+      .order('scheduled_date', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(limit + 1);   // +1 = peek for next page
+
+    // Status filter
+    if (statusParam === 'active') {
+      query = query.in('status', ACTIVE_SF_STATUSES);
+    } else if (statusParam === 'completed') {
+      query = query.in('status', ['completed', 'complete', 'paid']);
+    } else if (statusParam === 'cancelled') {
+      query = query.eq('status', 'cancelled');
+    } else if (statusParam === 'scheduled') {
+      query = query.eq('status', 'scheduled');
+    }
+    // 'all' → no filter.
+
+    // Search filter
+    if (search) {
+      const escaped = search.replace(/[%_\\]/g, '\\$&');
+      const ors = [`service_name.ilike.%${escaped}%`];
+      if (searchCustomerIds && searchCustomerIds.length > 0) {
+        ors.push(`customer_id.in.(${searchCustomerIds.join(',')})`);
+      }
+      // Numeric search → job id
+      const numeric = search.replace(/^#/, '');
+      if (/^\d+$/.test(numeric)) {
+        const n = Number(numeric);
+        if (Number.isSafeInteger(n) && n > 0 && n <= 2147483647) ors.push(`id.eq.${n}`);
+      }
+      query = query.or(ors.join(','));
+    }
+
+    // Cursor: tuple-less-than on (scheduled_date, id)
+    if (cursor) {
+      query = query.or(
+        `scheduled_date.lt.${cursor.d},` +
+        `and(scheduled_date.eq.${cursor.d},id.lt.${cursor.i})`
+      );
+    }
+
+    const { data: rows, error } = await query;
+    if (error) {
+      log.error('[ProofPix] /jobs query failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Job query failed.'));
+    }
+
+    // ── Detect "more pages": we fetched limit+1; if we got back all
+    //    limit+1, drop the extra and emit a cursor pointing at the LAST
+    //    item we're returning. ─────────────────────────────────────
+    const pageRows = (rows || []).slice(0, limit);
+    const hasMore  = (rows || []).length > limit;
+    const nextCursor = hasMore ? encodeCursor(pageRows[pageRows.length - 1]) : null;
+
+    // ── Photo counts via the SQL helper (single round-trip, dodges
+    //    1000-row default limit on customer_files.) ────────────────
+    const jobIds = pageRows.map((r) => r.id);
+    const countsByJobId = {};
+    if (jobIds.length > 0) {
+      const { data: counts, error: countErr } = await supabase
+        .rpc('proofpix_job_photo_counts', { p_user_id: userId, p_job_ids: jobIds });
+      if (countErr) {
+        // Non-fatal: log + fall back to zero counts so the picker still
+        // works. ProofPix renders "0 photos" rather than blowing up the
+        // whole list when the helper is unavailable.
+        log.warn('[ProofPix] proofpix_job_photo_counts rpc failed:', countErr.message);
+      } else {
+        for (const row of counts || []) {
+          countsByJobId[row.job_id] = Number(row.photo_count) || 0;
+        }
+      }
+    }
+
+    // ── Shape response ──────────────────────────────────────────────
+    const jobs = pageRows.map((j) => ({
+      id: String(j.id),
+      title: j.service_name && String(j.service_name).trim()
+        ? String(j.service_name).trim()
+        : `Job #${j.id}`,
+      customer_name: customerName(j.customers),
+      address: joinAddress(j),
+      status: bucketStatus(j.status),
+      scheduled_at: scheduledAtMs(j),
+      photo_count: countsByJobId[j.id] || 0,
+    }));
+
+    return res.status(200).json({ jobs, next_cursor: nextCursor });
   });
 
   return router;
