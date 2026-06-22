@@ -21,6 +21,18 @@
  *     return the existing crm_photo_id with HTTP 409 instead of
  *     creating duplicate rows.
  *
+ * PR 4 — same-device pairing:
+ *   - POST /connect/token/issue           (SF user JWT)
+ *     Mints a base64url single-use token (60s TTL) for deep-link pairing.
+ *   - POST /connect/redeem                (no auth — credential in body)
+ *     Canonical redeem. Accepts both 16-char codes AND base64url tokens
+ *     via shape discrimination.
+ *   - POST /connect/code/redeem           (kept as alias ≥30 days)
+ *     Same handler as /connect/redeem so the live ProofPix-native
+ *     adapter (still hitting the old path) keeps working.
+ *   No dedupe on /redeem — multi-device pairing intentionally preserved
+ *   from PR 1.
+ *
  * Every route is gated behind FLAGS.PROOFPIX_INTEGRATION_ENABLED. When the
  * flag is OFF the namespace returns 404 — the integration is invisible
  * until ProofPix-native is wired up against staging.
@@ -48,6 +60,9 @@ const {
   newConnectCode,
   normalizeConnectCode,
   CODE_TTL_MS,
+  newConnectToken,
+  isConnectToken,
+  CONNECT_TOKEN_TTL_MS,
   newRefreshToken,
   hashRefreshToken,
   signAccessToken,
@@ -211,23 +226,72 @@ module.exports = (supabase, logger) => {
   });
 
   // ═════════════════════════════════════════════════════════════════
-  // POST /connect/code/redeem
-  //   ProofPix mobile app exchanges the pasted code for a refresh
-  //   token + access token. Single-use; subsequent calls with the same
-  //   code return INVALID_CODE.
+  // POST /connect/token/issue
+  //   Mints a base64url single-use token for the same-device deep-link
+  //   flow. SF web/PWA's authorize page calls this on behalf of the
+  //   authenticated SF user, then redirects to proofpix://connect?token=...
+  //   The ProofPix deep-link handler immediately POSTs to /connect/redeem.
+  //
+  //   60-second TTL — much shorter than the 16-char code (which is
+  //   typed by hand) because the deep-link flow consumes it instantly.
   // ═════════════════════════════════════════════════════════════════
-  router.post('/connect/code/redeem', exchangeLimiter, async (req, res) => {
-    const codeInput = req.body && req.body.code;
+  router.post('/connect/token/issue', requireSfUserJwt, async (req, res) => {
+    const userId = req.sfUserId;
+    const token = newConnectToken();
+    const expiresAt = new Date(Date.now() + CONNECT_TOKEN_TTL_MS).toISOString();
+
+    const { error } = await supabase
+      .from('proofpix_connect_codes')
+      .insert({ code: token, user_id: userId, expires_at: expiresAt });
+
+    if (error) {
+      log.error('[ProofPix] token insert failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Failed to issue token.'));
+    }
+
+    log.log(`[ProofPix] issued connect token for user ${userId}`);
+    return res.status(200).json({
+      token,
+      expires_in: Math.floor(CONNECT_TOKEN_TTL_MS / 1000),
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // Shared redeem handler — accepts either a 16-char typed code or a
+  // base64url deep-link token. Discriminates by shape:
+  //   - normalizeConnectCode() returns non-null  → typed code path
+  //   - isConnectToken()                          → deep-link token path
+  //   - neither                                    → 400 INVALID_PAYLOAD
+  //
+  // Mounted on both POST /connect/redeem (canonical) and
+  // POST /connect/code/redeem (kept ≥30 days for the existing
+  // ProofPix-native adapter; same handler, no behavior diff).
+  // ═════════════════════════════════════════════════════════════════
+  async function handleRedeem(req, res) {
+    const input = req.body && req.body.code;
     const deviceLabel = req.body && req.body.device_label;
-    const normalized = normalizeConnectCode(codeInput);
-    if (!normalized) {
+    if (typeof input !== 'string' || !input.trim()) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Missing or malformed code.'));
+    }
+
+    // Shape discrimination. Try the typed-code normalizer first because
+    // it's stricter (alphabet, length, group structure all enforced).
+    // Falling through to the token check means we never confuse a
+    // malformed code with a too-short token.
+    const normalized = normalizeConnectCode(input);
+    let lookupKey;
+    if (normalized) {
+      lookupKey = normalized;
+    } else if (isConnectToken(input)) {
+      lookupKey = input;
+    } else {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Missing or malformed code.'));
     }
 
     const { data: row, error } = await supabase
       .from('proofpix_connect_codes')
       .select('code, user_id, expires_at, redeemed_at')
-      .eq('code', normalized)
+      .eq('code', lookupKey)
       .maybeSingle();
 
     if (error) {
@@ -245,7 +309,7 @@ module.exports = (supabase, logger) => {
     }
 
     // Mark the code redeemed BEFORE issuing the refresh token. The
-    // .eq('redeemed_at', null) guard turns this into a CAS — concurrent
+    // .is('redeemed_at', null) guard turns this into a CAS — concurrent
     // /redeem calls with the same code race here, and the loser gets 0
     // rows back.
     const labelToStore = typeof deviceLabel === 'string' && deviceLabel.trim()
@@ -257,7 +321,7 @@ module.exports = (supabase, logger) => {
         redeemed_at: new Date().toISOString(),
         redeemed_by_label: labelToStore,
       })
-      .eq('code', normalized)
+      .eq('code', lookupKey)
       .is('redeemed_at', null)
       .select('code');
     if (claimErr) {
@@ -271,7 +335,8 @@ module.exports = (supabase, logger) => {
 
     // Mint refresh token + insert connection row. Refresh token raw
     // value is returned ONCE and discarded — only the sha256 hash is
-    // stored.
+    // stored. No dedupe on prior connections (multi-device pairing
+    // remains supported, per PR 1 design — see project memory).
     const refreshToken = newRefreshToken();
     const refreshHash = hashRefreshToken(refreshToken);
     const { data: connRow, error: connErr } = await supabase
@@ -299,7 +364,7 @@ module.exports = (supabase, logger) => {
       connectionId: connRow.id,
     });
 
-    log.log(`[ProofPix] redeemed code → conn ${connRow.id} for user ${row.user_id}`);
+    log.log(`[ProofPix] redeemed → conn ${connRow.id} for user ${row.user_id}`);
     return res.status(200).json({
       refresh_token: refreshToken,
       access_token: accessToken,
@@ -308,7 +373,16 @@ module.exports = (supabase, logger) => {
       workspace_name: workspace.workspace_name,
       admin_user_id: workspace.admin_user_id,
     });
-  });
+  }
+
+  // ═════════════════════════════════════════════════════════════════
+  // POST /connect/redeem            (canonical, since PR 4)
+  // POST /connect/code/redeem       (kept ≥30 days for the in-the-wild
+  //                                  ProofPix-native adapter; same
+  //                                  handler, same accepted formats)
+  // ═════════════════════════════════════════════════════════════════
+  router.post('/connect/redeem',      exchangeLimiter, handleRedeem);
+  router.post('/connect/code/redeem', exchangeLimiter, handleRedeem);
 
   // ═════════════════════════════════════════════════════════════════
   // POST /connect/refresh

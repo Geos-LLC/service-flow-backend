@@ -38,6 +38,8 @@ const {
 const {
   newConnectCode,
   normalizeConnectCode,
+  newConnectToken,
+  isConnectToken,
   newRefreshToken,
   hashRefreshToken,
   signAccessToken,
@@ -556,5 +558,245 @@ describe('proofpix-service — handshake flow', () => {
       .set('Authorization', `Bearer ${expired}`)
       .send();
     expect(res.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// PR 4 — same-device pairing (token + canonical redeem route)
+// ─────────────────────────────────────────────────────────────────────
+
+describe('proofpix-tokens — connect token primitives', () => {
+  test('newConnectToken: 43-char base64url, high entropy', () => {
+    const a = newConnectToken();
+    const b = newConnectToken();
+    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(a).not.toBe(b);
+  });
+
+  test('isConnectToken: accepts good tokens, rejects 16-char codes, rejects garbage', () => {
+    expect(isConnectToken(newConnectToken())).toBe(true);
+    // 16-char hyphenated code is NOT a token
+    expect(isConnectToken(newConnectCode())).toBe(false);
+    // Common rejections
+    expect(isConnectToken('')).toBe(false);
+    expect(isConnectToken('too-short')).toBe(false);
+    expect(isConnectToken('A'.repeat(44))).toBe(false);  // wrong length
+    expect(isConnectToken('A'.repeat(43) + '=')).toBe(false);  // padding not allowed
+    expect(isConnectToken(null)).toBe(false);
+    expect(isConnectToken(undefined)).toBe(false);
+    expect(isConnectToken(123)).toBe(false);
+  });
+});
+
+describe('proofpix-service — /connect/token/issue', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('flag-off namespace returns 404', async () => {
+    delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED];
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    expect(res.status).toBe(404);
+  });
+
+  test('SF JWT → 200 with token shape + 60s expiry', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    expect(res.status).toBe(200);
+    expect(res.body.expires_in).toBe(60);
+    expect(isConnectToken(res.body.token)).toBe(true);
+    // Persisted under the same proofpix_connect_codes table
+    expect(supa._db.proofpix_connect_codes).toHaveLength(1);
+    expect(supa._db.proofpix_connect_codes[0]).toMatchObject({
+      code: res.body.token,
+      user_id: 1,
+    });
+  });
+
+  test('no SF JWT → 401', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .send();
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('INVALID_TOKEN');
+  });
+
+  test('ProofPix access token (wrong audience) cannot mint a connect token', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeem = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code });
+    const reuse = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${redeem.body.access_token}`)
+      .send();
+    expect(reuse.status).toBe(401);
+  });
+});
+
+describe('proofpix-service — /connect/redeem (canonical)', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('redeems a typed code (same shape as /connect/code/redeem)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1, 'Acme')] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeem = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code, device_label: 'iPhone' });
+    expect(redeem.status).toBe(200);
+    expect(redeem.body.workspace_id).toBe('1');
+    expect(redeem.body.refresh_token).toMatch(/^pprt_/);
+  });
+
+  test('redeems a deep-link token end-to-end', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(7, 'Beta Corp')] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(7)}`)
+      .send();
+    expect(isConnectToken(issue.body.token)).toBe(true);
+
+    const redeem = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.token, device_label: 'iPad' });
+    expect(redeem.status).toBe(200);
+    expect(redeem.body).toMatchObject({
+      workspace_id: '7',
+      workspace_name: 'Beta Corp',
+      admin_user_id: '7',
+      expires_in: 3600,
+    });
+    expect(redeem.body.refresh_token).toMatch(/^pprt_/);
+    expect(redeem.body.access_token).toEqual(expect.any(String));
+  });
+
+  test('double-redeem of a token: second call rejected', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const first = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.token });
+    expect(first.status).toBe(200);
+    const second = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.token });
+    expect(second.status).toBe(400);
+    expect(second.body.error.code).toBe('INVALID_CODE');
+  });
+
+  test('expired token (past expires_at) → CODE_EXPIRED', async () => {
+    const expiredToken = newConnectToken();
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connect_codes: [{
+        code: expiredToken,
+        user_id: 1,
+        expires_at: new Date(Date.now() - 1000).toISOString(),
+        redeemed_at: null,
+        redeemed_by_label: null,
+        created_at: new Date().toISOString(),
+      }],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: expiredToken });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('CODE_EXPIRED');
+  });
+
+  test('unknown well-formed token → INVALID_CODE', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: newConnectToken() });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_CODE');
+  });
+
+  test('malformed input (neither code nor token) → INVALID_PAYLOAD', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    for (const bad of ['nope', 'ABCD-EFGH', '!!!', '', null]) {
+      const res = await request(app)
+        .post('/api/integrations/proofpix/connect/redeem')
+        .send({ code: bad });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+    }
+  });
+
+  test('old /connect/code/redeem route still works for both formats', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1, 'Legacy')] });
+    const app = makeApp(supa);
+
+    const issueCode = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeemCode = await request(app)
+      .post('/api/integrations/proofpix/connect/code/redeem')
+      .send({ code: issueCode.body.code });
+    expect(redeemCode.status).toBe(200);
+
+    const issueTok = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeemTok = await request(app)
+      .post('/api/integrations/proofpix/connect/code/redeem')
+      .send({ code: issueTok.body.token });
+    expect(redeemTok.status).toBe(200);
+  });
+
+  test('multi-device pairing preserved (no dedupe on redeem)', async () => {
+    // Same SF user pairs two devices via two redeem calls. Neither
+    // connection is revoked by the other. Mirrors the PR 1 design
+    // intent — see project memory for the rationale on deferring
+    // dedupe to a later admin-UI-driven decision.
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+
+    const t1 = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const r1 = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: t1.body.token, device_label: 'Phone' });
+    const t2 = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const r2 = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: t2.body.token, device_label: 'Tablet' });
+
+    expect(r1.body.refresh_token).not.toBe(r2.body.refresh_token);
+    expect(supa._db.proofpix_connections).toHaveLength(2);
+    // Neither row was revoked by the other's redeem
+    expect(supa._db.proofpix_connections.every((c) => c.revoked_at == null)).toBe(true);
   });
 });
