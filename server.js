@@ -1084,6 +1084,7 @@ try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, cr
 try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
 try { app.use('/api/identity-conflicts', require('./identity-conflicts')(supabase, logger)); } catch (e) { console.log('Identity conflicts module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
+try { app.use('/api/integrations/proofpix', require('./proofpix-service')(supabase, logger)); } catch (e) { console.log('ProofPix module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
 let pushService = null; try { pushService = require('./push.service')(supabase, logger); app.use('/api/push', pushService); } catch (e) { console.log('Push module not loaded:', e.message); }
