@@ -390,6 +390,37 @@ describe('GET /jobs — shape and fields', () => {
     expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-07-15T09:00:00'));
   });
 
+  test('scheduled_at handles "YYYY-MM-DD HH:MM:SS" format in scheduled_date (ZB sync legacy data)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({
+        scheduled_date: '2026-05-16 09:00:00',   // not just YYYY-MM-DD
+        scheduled_time: '14:30:00',
+      })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBe(Date.parse('2026-05-16T14:30:00'));
+  });
+
+  test('scheduled_at is null when scheduled_date is non-parseable', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],
+      jobs: [makeJob({ scheduled_date: 'junk-data' })],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`)
+      .send();
+    expect(res.body.jobs[0].scheduled_at).toBeNull();
+  });
+
   test('photo_count defaults to 0 when RPC fails (logged, not 500)', async () => {
     const supa = makeFakeSupabase({
       users: [{ id: 1, business_name: 'A', email: 'a@b' }],
