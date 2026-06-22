@@ -418,8 +418,15 @@ module.exports = (supabase, logger) => {
 
   function scheduledAtMs(j) {
     if (!j.scheduled_date) return null;
+    // scheduled_date is `text NOT NULL` in the schema, but the live data
+    // is mixed — some rows are 'YYYY-MM-DD' and others 'YYYY-MM-DD HH:MM:SS'
+    // (ZB sync historically wrote the latter). Take the date prefix and
+    // re-attach scheduled_time so we always get an unambiguous local
+    // timestamp string Date.parse can handle.
+    const dateOnly = String(j.scheduled_date).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) return null;
     const time = j.scheduled_time || '09:00:00';
-    const ms = Date.parse(`${j.scheduled_date}T${time}`);
+    const ms = Date.parse(`${dateOnly}T${time}`);
     return Number.isFinite(ms) ? ms : null;
   }
 
