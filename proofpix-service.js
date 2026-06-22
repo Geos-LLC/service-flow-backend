@@ -14,6 +14,13 @@
  * PR 2 — jobs list:
  *   - GET /jobs                           (ProofPix access token)
  *
+ * PR 3 — photo upload:
+ *   - POST /jobs/:jobId/photos            (ProofPix access token; multipart)
+ *     Idempotent on metadata.proofpix_photo_id via the unique partial
+ *     index on customer_files (migration 068). Retried mobile uploads
+ *     return the existing crm_photo_id with HTTP 409 instead of
+ *     creating duplicate rows.
+ *
  * Every route is gated behind FLAGS.PROOFPIX_INTEGRATION_ENABLED. When the
  * flag is OFF the namespace returns 404 — the integration is invisible
  * until ProofPix-native is wired up against staging.
@@ -22,15 +29,20 @@
  * resolves to users.business_name, falling back to users.email if the
  * business name is null/empty. SF has no separate company abstraction.
  *
- * Photo storage table = customer_files (lands in PR 3). PR 2 already
- * reads it for the `photo_count` field via the proofpix_job_photo_counts
- * SQL helper (migration 067).
+ * Photo storage table = customer_files. The Files tab on /customer/:id
+ * already reads it, so ProofPix uploads with a linked customer auto-
+ * appear there. ProofPix-source rows carry source='proofpix' +
+ * proofpix_photo_id + proofpix_metadata for traceability.
  */
 
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const crypto = require('crypto');
+const path = require('path');
 const jwt = require('jsonwebtoken');
 
+const { BUCKETS } = require('./supabase-storage');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
 const {
   newConnectCode,
@@ -594,6 +606,237 @@ module.exports = (supabase, logger) => {
 
     return res.status(200).json({ jobs, next_cursor: nextCursor });
   });
+
+  // ═════════════════════════════════════════════════════════════════
+  // POST /jobs/:jobId/photos
+  //   Multipart upload from ProofPix-native (via the Railway proxy).
+  //   Body: `file` (binary) + `metadata` (JSON string).
+  //
+  //   Idempotent on metadata.proofpix_photo_id — retried mobile
+  //   uploads find the existing row via the unique partial index and
+  //   return 409 with the existing crm_photo_id, NOT a duplicate row.
+  // ═════════════════════════════════════════════════════════════════
+
+  const PHOTO_BUCKET = BUCKETS.PROOFPIX_PHOTOS;
+  const PHOTO_SIZE_LIMIT = 20 * 1024 * 1024;
+  const VALID_MIME_TYPES = new Set(['image/jpeg', 'image/png']);
+  const VALID_MODES = new Set(['before', 'after', 'progress', 'combined']);
+
+  const proofpixUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: PHOTO_SIZE_LIMIT, files: 1 },
+    fileFilter(req, file, cb) {
+      if (!VALID_MIME_TYPES.has(file.mimetype)) {
+        const err = new Error('Only image/jpeg and image/png are accepted.');
+        err.code = 'INVALID_MIME';
+        return cb(err);
+      }
+      cb(null, true);
+    },
+  });
+
+  // Wraps multer's middleware so we can map MulterError → spec error
+  // envelope inline (default Express error path returns generic 500s).
+  function runMulter(req, res, next) {
+    proofpixUpload.single('file')(req, res, (err) => {
+      if (!err) return next();
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json(errBody(
+          'PAYLOAD_TOO_LARGE',
+          `File exceeds the ${PHOTO_SIZE_LIMIT / (1024 * 1024)}MB limit.`
+        ));
+      }
+      if (err.code === 'INVALID_MIME') {
+        return res.status(400).json(errBody('INVALID_PAYLOAD', err.message));
+      }
+      log.error('[ProofPix] multer error:', err.message);
+      return res.status(400).json(errBody('INVALID_PAYLOAD', err.message || 'Upload error.'));
+    });
+  }
+
+  // 120 req/min per admin (per spec). Keyed on the authenticated
+  // userId, so the limit follows the admin's identity across team
+  // members uploading through the same proxy session.
+  const photoUploadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    keyGenerator: (req) => (req.proofpix && String(req.proofpix.userId)) || req.ip,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: errBody(
+      'RATE_LIMITED',
+      'Upload rate limit exceeded for this workspace.',
+      { retryable: true, retryAfterSeconds: 60 }
+    ),
+  });
+
+  function parseMetadata(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) {
+      return { ok: false, reason: 'metadata field is required (JSON string).' };
+    }
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch { return { ok: false, reason: 'metadata is not valid JSON.' }; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, reason: 'metadata must be a JSON object.' };
+    }
+
+    const requiredStr = ['filename', 'room', 'proofpix_photo_id', 'proofpix_project_id'];
+    for (const k of requiredStr) {
+      if (typeof parsed[k] !== 'string' || !parsed[k].trim()) {
+        return { ok: false, reason: `metadata.${k} is required.` };
+      }
+    }
+    if (!VALID_MODES.has(parsed.mode)) {
+      return { ok: false, reason: 'metadata.mode must be one of: before, after, progress, combined.' };
+    }
+    if (!Number.isFinite(Number(parsed.timestamp))) {
+      return { ok: false, reason: 'metadata.timestamp must be a number (ms epoch).' };
+    }
+    // notes, gps, captured_by are all optional/permissive — kept verbatim
+    return { ok: true, metadata: parsed };
+  }
+
+  function pickExtension(mimeType, filename) {
+    if (mimeType === 'image/png') return '.png';
+    if (mimeType === 'image/jpeg') return '.jpg';
+    const fromName = path.extname(filename || '').toLowerCase();
+    if (fromName === '.png' || fromName === '.jpg' || fromName === '.jpeg') return fromName;
+    return '';
+  }
+
+  router.post('/jobs/:jobId/photos',
+    requireProofpixAccessToken,
+    photoUploadLimiter,
+    runMulter,
+    async (req, res) => {
+      const userId = req.proofpix.userId;
+      const jobId  = parseInt(req.params.jobId, 10);
+      if (!Number.isFinite(jobId)) {
+        return res.status(404).json(errBody('JOB_NOT_FOUND', 'Job not found.'));
+      }
+      if (!req.file) {
+        return res.status(400).json(errBody('INVALID_PAYLOAD', 'file field is required.'));
+      }
+
+      const meta = parseMetadata(req.body && req.body.metadata);
+      if (!meta.ok) {
+        return res.status(400).json(errBody('INVALID_PAYLOAD', meta.reason));
+      }
+
+      // ── Verify the job belongs to this tenant ──────────────────
+      const { data: job, error: jobErr } = await supabase
+        .from('jobs')
+        .select('id, user_id, customer_id')
+        .eq('id', jobId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (jobErr) {
+        log.error('[ProofPix] /photos job lookup failed:', jobErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Job lookup failed.'));
+      }
+      if (!job) {
+        return res.status(404).json(errBody('JOB_NOT_FOUND', 'Job not found.'));
+      }
+
+      // ── Pre-check dedup (cheap fast-path; the unique index is the
+      //    actual race guard) ─────────────────────────────────────
+      const existing = await supabase
+        .from('customer_files')
+        .select('id, file_url')
+        .eq('user_id', userId)
+        .eq('proofpix_photo_id', meta.metadata.proofpix_photo_id)
+        .is('deleted_at', null)
+        .maybeSingle();
+      if (existing.error) {
+        log.error('[ProofPix] dedup pre-check failed:', existing.error.message);
+        return res.status(500).json(errBody('INTERNAL', 'Dedup check failed.'));
+      }
+      if (existing.data) {
+        return res.status(409).json({
+          success: true,
+          crm_photo_id: String(existing.data.id),
+          photo_url:    existing.data.file_url,
+        });
+      }
+
+      // ── Upload to Supabase Storage ──────────────────────────────
+      const ext = pickExtension(req.file.mimetype, meta.metadata.filename);
+      const storagePath = `user-${userId}/job-${jobId}/${meta.metadata.proofpix_photo_id}${ext}`;
+      const { error: uploadErr } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .upload(storagePath, req.file.buffer, {
+          contentType: req.file.mimetype,
+          upsert: false,
+        });
+      if (uploadErr) {
+        log.error('[ProofPix] storage upload failed:', uploadErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Storage upload failed.'));
+      }
+      const { data: urlData } = supabase.storage.from(PHOTO_BUCKET).getPublicUrl(storagePath);
+      const fileUrl = urlData.publicUrl;
+
+      // ── Insert customer_files row ───────────────────────────────
+      const insertPayload = {
+        user_id:           userId,
+        customer_id:       job.customer_id || null,   // nullable as of migration 068
+        job_id:            jobId,
+        filename:          meta.metadata.filename,
+        file_url:          fileUrl,
+        mime_type:         req.file.mimetype,
+        size_bytes:        req.file.size,
+        uploaded_by:       userId,
+        source:            'proofpix',
+        proofpix_photo_id: meta.metadata.proofpix_photo_id,
+        proofpix_metadata: meta.metadata,
+      };
+      const insertRes = await supabase
+        .from('customer_files')
+        .insert(insertPayload)
+        .select('id, file_url')
+        .single();
+
+      if (insertRes.error) {
+        // Unique-index race: another request just inserted with the same
+        // (user_id, proofpix_photo_id). Re-fetch + return 409 (matches
+        // the pre-check path). Postgres error code 23505 = unique
+        // violation; postgrest surfaces it via error.code.
+        const isUniqueViolation = insertRes.error.code === '23505'
+          || /duplicate key/i.test(insertRes.error.message || '');
+        if (isUniqueViolation) {
+          const race = await supabase
+            .from('customer_files')
+            .select('id, file_url')
+            .eq('user_id', userId)
+            .eq('proofpix_photo_id', meta.metadata.proofpix_photo_id)
+            .is('deleted_at', null)
+            .maybeSingle();
+          if (race.data) {
+            // Clean up the orphan blob we just uploaded but won't reference.
+            supabase.storage.from(PHOTO_BUCKET).remove([storagePath])
+              .then(() => {}, (e) => log.warn('[ProofPix] orphan blob cleanup failed:', e && e.message));
+            return res.status(409).json({
+              success: true,
+              crm_photo_id: String(race.data.id),
+              photo_url:    race.data.file_url,
+            });
+          }
+        }
+        log.error('[ProofPix] customer_files insert failed:', insertRes.error.message);
+        // Best-effort cleanup of the blob we just uploaded.
+        supabase.storage.from(PHOTO_BUCKET).remove([storagePath])
+          .then(() => {}, (e) => log.warn('[ProofPix] blob cleanup failed:', e && e.message));
+        return res.status(500).json(errBody('INTERNAL', 'Photo record save failed.'));
+      }
+
+      log.log(`[ProofPix] photo attached: user=${userId} job=${jobId} photo_id=${insertRes.data.id}`);
+      return res.status(200).json({
+        success: true,
+        crm_photo_id: String(insertRes.data.id),
+        photo_url:    insertRes.data.file_url,
+      });
+    }
+  );
 
   return router;
 };
