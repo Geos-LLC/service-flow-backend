@@ -8963,15 +8963,16 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
     if (!validateName(firstName)) {
       return res.status(400).json({ error: 'First name must be between 2 and 50 characters' });
     }
-    
-    if (!validateName(lastName)) {
+
+    // Last name is optional — single-name customers are allowed (matches PUT /api/customers/:id)
+    if (lastName && !validateName(lastName)) {
       return res.status(400).json({ error: 'Last name must be between 2 and 50 characters' });
     }
-    
+
     if (email && !validateEmail(email)) {
       return res.status(400).json({ error: 'Please provide a valid email address' });
     }
-    
+
     if (phone && phone.trim().length < 10) {
       return res.status(400).json({ error: 'Please provide a valid phone number (at least 10 digits)' });
     }
