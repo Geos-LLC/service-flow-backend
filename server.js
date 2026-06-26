@@ -1084,6 +1084,7 @@ try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, cr
 try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
 try { app.use('/api/identity-conflicts', require('./identity-conflicts')(supabase, logger)); } catch (e) { console.log('Identity conflicts module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
+try { app.use('/api/integrations/proofpix', require('./proofpix-service')(supabase, logger)); } catch (e) { console.log('ProofPix module not loaded:', e.message); }
 let waRouter = null; try { waRouter = require('./whatsapp-service')(supabase, logger, sigcoreRequest); app.use('/api/integrations/whatsapp', waRouter); } catch (e) { console.log('WhatsApp module not loaded:', e.message); }
 let notificationEmail = null; try { notificationEmail = require('./notification-email.service')(supabase, logger); app.use('/api/notification-email', notificationEmail); } catch (e) { console.log('Notification email module not loaded:', e.message); }
 let pushService = null; try { pushService = require('./push.service')(supabase, logger); app.use('/api/push', pushService); } catch (e) { console.log('Push module not loaded:', e.message); }
@@ -5321,7 +5322,15 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       serviceModifiers,
       serviceIntakeQuestions: serviceIntakeQuestionsInput,
       propertyId,
-      forceBook = false
+      forceBook = false,
+      // Multi-service support. createjob.jsx sends one or both of:
+      //   selectedServices: [{ id, name, price }, …]  (full objects)
+      //   serviceIds:       [id1, id2, …]             (back-compat)
+      // We persist a normalized [{serviceId, name, basePrice}] array
+      // into jobs.service_line_items so the job-detail UI can render
+      // each service as its own block.
+      selectedServices,
+      serviceIds: serviceIdsInput,
     } = req.body;
 
     let serviceIntakeQuestions = serviceIntakeQuestionsInput;
@@ -5660,6 +5669,54 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
       }
       const lbLink = lbResolution.link;
 
+      // Build per-service line items + combined service_name string.
+      // Inputs handled, in order of preference:
+      //   1. selectedServices: [{id, name, price}, …]   — preferred
+      //   2. serviceIds: [id, id, …]                    — needs lookup
+      //   3. Falls back to the single serviceId+serviceName pair
+      // basePrice can be missing on lookup-fallback; we leave it null
+      // so the UI knows it has to split service_price evenly across
+      // services rather than trust a stored zero.
+      let computedServiceLineItems = null;
+      let combinedServiceName = serviceName;
+      try {
+        let sourceList = null;
+        if (Array.isArray(selectedServices) && selectedServices.length > 0) {
+          sourceList = selectedServices
+            .map((s) => ({
+              serviceId: s?.id ?? s?.serviceId ?? null,
+              name: s?.name || s?.service_name || null,
+              basePrice: s?.price != null ? parseFloat(s.price) : null,
+            }))
+            .filter((s) => s.serviceId != null || s.name);
+        } else if (Array.isArray(serviceIdsInput) && serviceIdsInput.length > 0) {
+          const { data: svcRows } = await supabase
+            .from('services')
+            .select('id, name, price')
+            .in('id', serviceIdsInput)
+            .eq('user_id', userId);
+          const svcMap = new Map((svcRows || []).map((r) => [String(r.id), r]));
+          sourceList = serviceIdsInput.map((id) => {
+            const r = svcMap.get(String(id));
+            return {
+              serviceId: id,
+              name: r?.name || null,
+              basePrice: r?.price != null ? parseFloat(r.price) : null,
+            };
+          });
+        }
+        if (sourceList && sourceList.length > 0) {
+          computedServiceLineItems = sourceList;
+          const names = sourceList.map((s) => s.name).filter(Boolean);
+          if (names.length > 0) {
+            combinedServiceName = names.join(', ');
+          }
+        }
+      } catch (lineErr) {
+        console.warn('[service_line_items] Failed to build line items:', lineErr?.message);
+        // Non-fatal — fall through with null. Single-service render still works.
+      }
+
       // Create the job
       const jobData = {
         user_id: userId,
@@ -5701,7 +5758,8 @@ app.post('/api/jobs', authenticateToken, async (req, res) => {
         service_address_city: serviceAddress?.city,
         service_address_state: serviceAddress?.state,
         service_address_zip: serviceAddress?.zipCode,
-        service_name: serviceName,
+        service_name: combinedServiceName,
+        service_line_items: computedServiceLineItems,
         invoice_status: invoiceStatus,
         payment_status: paymentStatus,
         priority: priority,
@@ -7412,6 +7470,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
       qualityCheck: 'quality_check',
       serviceModifiers: 'service_modifiers',
       serviceIntakeQuestions: 'service_intake_questions',
+      serviceLineItems: 'service_line_items',
       tipAmount: 'tip_amount',
       tip_amount: 'tip_amount'
     };
@@ -7427,7 +7486,7 @@ app.put('/api/jobs/:id', authenticateToken, async (req, res) => {
         if (key === 'scheduledDate' && updateData.scheduledTime) {
           // Simply combine date and time as-is, no timezone conversion
           updateDataToSend[fieldMappings[key]] = `${updateData[key]} ${updateData.scheduledTime}:00`;
-        } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions'].includes(key)) {
+        } else if (['skills', 'tags', 'serviceModifiers', 'serviceIntakeQuestions', 'serviceLineItems'].includes(key)) {
           updateDataToSend[fieldMappings[key] || key] = updateData[key];
         } else if (key === 'serviceAddress') {
           // Handle nested service address
@@ -32185,6 +32244,51 @@ app.get('/api/customers/:customerId/files', authenticateToken, async (req, res) 
     res.json({ files: files || [] });
   } catch (error) {
     console.error('Error in GET /customers/:id/files:', error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// List files attached to a specific job. Same customer_files table as
+// the customer Files tab, but scoped to one job_id. Used by the Photos
+// section on the job-detail page. ProofPix metadata columns (source,
+// proofpix_metadata) are included so the UI can badge / annotate
+// proofpix-source rows.
+app.get('/api/jobs/:jobId/files', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const jobId = parseInt(req.params.jobId, 10);
+    if (!Number.isFinite(jobId)) {
+      return res.status(400).json({ error: 'Invalid job id' });
+    }
+
+    // Verify the job belongs to this user before exposing its files.
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .eq('user_id', userId)
+      .single();
+    if (jobErr || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const { data: files, error } = await supabase
+      .from('customer_files')
+      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at, source, proofpix_metadata')
+      .eq('job_id', jobId)
+      .eq('user_id', userId)
+      .is('deleted_at', null)
+      .order('uploaded_at', { ascending: false })
+      .limit(500);
+
+    if (error) {
+      console.error('Error listing job files:', error);
+      return res.status(500).json({ error: 'Failed to list files' });
+    }
+
+    res.json({ files: files || [] });
+  } catch (error) {
+    console.error('Error in GET /jobs/:id/files:', error);
     res.status(500).json({ error: 'Failed to list files' });
   }
 });

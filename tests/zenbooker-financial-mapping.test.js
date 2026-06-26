@@ -198,42 +198,103 @@ describe('mapJobFinancials — non-tip fields', () => {
 });
 
 describe('resolveTip — direct unit', () => {
-  test('explicit ZB tip beats preserve-SF', () => {
+  test('explicit ZB tip beats preserve-SF (signal irrelevant)', () => {
     expect(resolveTip({
       explicitZbTip: 20, existingSfTipAmount: 15,
       amountPaid: 0, subtotal: 0, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: false,
     })).toEqual({ resolvedTip: 20, tipSource: 'explicit_zb' });
   });
 
-  test('preserve-SF beats computed implicit', () => {
+  test('preserve-SF beats computed implicit (signal irrelevant)', () => {
     expect(resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 12,
       amountPaid: 100, subtotal: 80, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: false,
     })).toEqual({ resolvedTip: null, tipSource: 'preserve_sf' });
   });
 
-  test('zero tip everywhere when nothing computed', () => {
+  test('zero tip everywhere when nothing computed (with adjustment signal)', () => {
     expect(resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 0,
       amountPaid: 80, subtotal: 80, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: true,
     })).toEqual({ resolvedTip: 0, tipSource: 'no_tip' });
   });
 
-  test('rounding to cents on computed', () => {
+  test('rounding to cents on computed (with adjustment signal)', () => {
     // overage = 100.005 → cents 100.005 * 100 = 10000.5 → round → 10001 → /100 → 100.01
     const out = resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 0,
       amountPaid: 180.005, subtotal: 80, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: true,
     });
     expect(out.tipSource).toBe('computed_implicit');
     expect(out.resolvedTip).toBe(100.01);
   });
 
-  test('overage under half a cent → no tip', () => {
+  test('overage under half a cent → no tip (with adjustment signal)', () => {
     expect(resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 0,
       amountPaid: 80.001, subtotal: 80, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: true,
     })).toEqual({ resolvedTip: 0, tipSource: 'no_tip' });
+  });
+
+  test('no adjustment signal + apparent overage → refuse to guess (omit tip_amount)', () => {
+    // /jobs/:id payload pattern: amount_paid > subtotal but adjustment_total
+    // wasn't included by the source — could be a tip OR a processing fee.
+    // Mapper must refuse to write tip_amount (preserves whatever SF has).
+    expect(resolveTip({
+      explicitZbTip: 0, existingSfTipAmount: 0,
+      amountPaid: 297.67, subtotal: 289, taxes: 0, adjustmentTotal: 0,
+      hasAdjustmentSignal: false,
+    })).toEqual({ resolvedTip: null, tipSource: 'no_adjustment_signal' });
+  });
+});
+
+describe('mapJobFinancials — no_adjustment_signal regression (job 142150)', () => {
+  test('/jobs/:id payload with overage but no adjustment fields → tip_amount OMITTED', () => {
+    // Reproduction of the Ebony Davis #142150 bug: ZB /jobs/:id returned an
+    // invoice with amount_paid=297.67, subtotal=289, no tip, no adjustment_total.
+    // The overage of 8.67 was the processing fee (visible only on /invoices/:id),
+    // not a customer tip. Before the fix, mapper wrote tip_amount=8.67 which then
+    // got paid out to cleaners through the ledger.
+    const zb = {
+      id: 'x',
+      invoice: {
+        subtotal: '289.00', total: '297.67', amount_paid: '297.67',
+        tax_amount: '0.00', status: 'paid',
+        // no `tip`, no `adjustment_total`, no `adjustments_applied`
+      },
+    };
+    const out = mapJobFinancials(zb);
+    expect('tip_amount' in out).toBe(false);
+    expect(out._tip_source).toBe('no_adjustment_signal');
+  });
+
+  test('explicit ZB tip still wins on /jobs/:id payload (signal not required)', () => {
+    // When ZB does include a tip, we trust it regardless of adjustment visibility.
+    const zb = {
+      id: 'x',
+      invoice: {
+        subtotal: '179.00', total: '204.37', tip: '20.00', amount_paid: '204.37',
+        tax_amount: '0.00', status: 'paid',
+      },
+    };
+    const out = mapJobFinancials(zb);
+    expect(out.tip_amount).toBe(20);
+    expect(out._tip_source).toBe('explicit_zb');
+  });
+
+  test('preserve-SF still wins on /jobs/:id payload', () => {
+    const zb = {
+      id: 'x',
+      invoice: { subtotal: '100', total: '100', amount_paid: '100', tax_amount: '0' },
+    };
+    const out = mapJobFinancials(zb, { existingSfTipAmount: 15 });
+    expect('tip_amount' in out).toBe(false);
+    expect(out._tip_source).toBe('preserve_sf');
   });
 });
 
