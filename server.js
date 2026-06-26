@@ -32247,6 +32247,51 @@ app.get('/api/customers/:customerId/files', authenticateToken, async (req, res) 
   }
 });
 
+// List files attached to a specific job. Same customer_files table as
+// the customer Files tab, but scoped to one job_id. Used by the Photos
+// section on the job-detail page. ProofPix metadata columns (source,
+// proofpix_metadata) are included so the UI can badge / annotate
+// proofpix-source rows.
+app.get('/api/jobs/:jobId/files', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const jobId = parseInt(req.params.jobId, 10);
+    if (!Number.isFinite(jobId)) {
+      return res.status(400).json({ error: 'Invalid job id' });
+    }
+
+    // Verify the job belongs to this user before exposing its files.
+    const { data: job, error: jobErr } = await supabase
+      .from('jobs')
+      .select('id, user_id')
+      .eq('id', jobId)
+      .eq('user_id', userId)
+      .single();
+    if (jobErr || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const { data: files, error } = await supabase
+      .from('customer_files')
+      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at, source, proofpix_metadata')
+      .eq('job_id', jobId)
+      .eq('user_id', userId)
+      .is('deleted_at', null)
+      .order('uploaded_at', { ascending: false })
+      .limit(500);
+
+    if (error) {
+      console.error('Error listing job files:', error);
+      return res.status(500).json({ error: 'Failed to list files' });
+    }
+
+    res.json({ files: files || [] });
+  } catch (error) {
+    console.error('Error in GET /jobs/:id/files:', error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
 // Upload one or more files for a customer
 app.post(
   '/api/customers/:customerId/files',
