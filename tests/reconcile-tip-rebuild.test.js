@@ -88,4 +88,14 @@ describe('ZB reconcile — ledger rebuild also fires on tip change', () => {
     expect(block).toMatch(/markDirty\(/);
     expect(block).toMatch(/operation:\s*['"]ledger_rebuild['"]/);
   });
+
+  test('results.reconcile is initialized up front and merged at the end', () => {
+    // Both rebuild blocks set `results.reconcile.X = Y` BEFORE the final
+    // assignment. Without an early init, the very first reconcile run that
+    // hits a rebuild crashes with "Cannot set properties of undefined".
+    expect(block).toMatch(/results\.reconcile\s*=\s*results\.reconcile\s*\|\|\s*\{\s*\}/);
+    // The final assignment must spread the existing object so the counters
+    // set by the rebuild blocks survive.
+    expect(block).toMatch(/results\.reconcile\s*=\s*\{\s*\.\.\.results\.reconcile/);
+  });
 });
