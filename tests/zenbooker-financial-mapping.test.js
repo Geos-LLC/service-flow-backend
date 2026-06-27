@@ -55,17 +55,22 @@ describe('mapJobFinancials — tip rule', () => {
     expect(out.total).toBe(204.37);
   });
 
-  test('B. computed implicit tip when ZB tip is null and amount_paid > subtotal+fee+tax', () => {
+  test('B. amount_paid overage above subtotal+fee+tax is NOT treated as a tip', () => {
+    // Reversed from earlier behavior. ZB invoices sometimes report a
+    // positive overage that is actually a processing fee the customer
+    // covered for the merchant (not visible in adjustment_total). We
+    // refuse to guess — only an explicit ZB tip counts.
     const zb = fixtureZb142065({
       invoice: {
         ...fixtureZb142065().invoice,
         tip: null,
-        // amount_paid 204.37 - subtotal 179 - tax 0 - adjustment 5.37 = 20.00 implicit
+        // amount_paid 204.37 - subtotal 179 - tax 0 - adjustment 5.37 = 20.00 overage
+        // — could be a tip OR a fee. Resolver writes 0.
       },
     });
     const out = mapJobFinancials(zb);
-    expect(out.tip_amount).toBe(20);
-    expect(out._tip_source).toBe('computed_implicit');
+    expect(out.tip_amount).toBe(0);
+    expect(out._tip_source).toBe('no_tip');
   });
 
   test('C. amount_paid exactly equals subtotal+fee → no tip', () => {
@@ -222,18 +227,17 @@ describe('resolveTip — direct unit', () => {
     })).toEqual({ resolvedTip: 0, tipSource: 'no_tip' });
   });
 
-  test('rounding to cents on computed (with adjustment signal)', () => {
-    // overage = 100.005 → cents 100.005 * 100 = 10000.5 → round → 10001 → /100 → 100.01
-    const out = resolveTip({
+  test('large overage with adjustment signal → still no tip (overage could be a fee)', () => {
+    // Previously tested implicit-tip rounding. Behavior reversed: even with
+    // adjustment data present, the overage is not assumed to be a tip.
+    expect(resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 0,
       amountPaid: 180.005, subtotal: 80, taxes: 0, adjustmentTotal: 0,
       hasAdjustmentSignal: true,
-    });
-    expect(out.tipSource).toBe('computed_implicit');
-    expect(out.resolvedTip).toBe(100.01);
+    })).toEqual({ resolvedTip: 0, tipSource: 'no_tip' });
   });
 
-  test('overage under half a cent → no tip (with adjustment signal)', () => {
+  test('tiny overage with adjustment signal → no tip (unchanged)', () => {
     expect(resolveTip({
       explicitZbTip: 0, existingSfTipAmount: 0,
       amountPaid: 80.001, subtotal: 80, taxes: 0, adjustmentTotal: 0,
