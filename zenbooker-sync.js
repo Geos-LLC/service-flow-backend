@@ -2031,6 +2031,12 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             const { data: team } = await supabase.from('team_members').select('id, zenbooker_id').eq('user_id', userId).not('zenbooker_id', 'is', null)
             const teamMap = {}; (team || []).forEach(t => { teamMap[t.zenbooker_id] = t.id })
 
+            // Initialize the results bucket up front. The rebuild blocks
+            // below set `results.reconcile.ledgerRebuilt` / `.tipLedgerRebuilt`
+            // before the loop's final assignment at the bottom — without this
+            // early init, the rebuild blocks crash with "Cannot set properties
+            // of undefined" the first time they ever fire.
+            results.reconcile = results.reconcile || {}
             let updated = 0, skipped = 0, errors = 0, assignmentsFixed = 0
             // Track jobs that need a ledger rebuild because of tip activity.
             // Two triggers:
@@ -2250,7 +2256,8 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             const txResults = await syncTransactions(userId, apiKey)
             logger.log(`[Zenbooker] Transactions synced: ${JSON.stringify(txResults)}`)
 
-            results.reconcile = { total, updated, skipped, errors, assignmentsFixed, transactions: txResults }
+            // Merge — preserve ledgerRebuilt / tipLedgerRebuilt set above.
+            results.reconcile = { ...results.reconcile, total, updated, skipped, errors, assignmentsFixed, transactions: txResults }
             logger.log(`[Zenbooker] Reconcile done: ${JSON.stringify(results.reconcile)}`)
           }
 
