@@ -26071,18 +26071,6 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
       const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
 
-      // TEMP DEBUG: dump entries for Larionova so we can see why old-dated
-      // jobs are appearing in the current-week view. Remove after diagnosis.
-      const nm = `${member.first_name || ''} ${member.last_name || ''}`.toLowerCase();
-      if (nm.includes('larionova') || nm.includes('larion')) {
-        console.log(`[Debug Larionova] member.id=${member.id} startDate=${startDate} endDate=${endDate} entries=${memberEntries.length}`);
-        memberEntries.forEach(e => {
-          const j = allJobsById[e.job_id];
-          const sched = j ? String(j.scheduled_date || '').split('T')[0].split(' ')[0] : '?';
-          const outOfRange = startDate && endDate && sched && (sched < startDate || sched > endDate) ? ' OUT_OF_RANGE' : '';
-          console.log(`  type=${e.type} amt=${e.amount} eff_date=${e.effective_date} job_id=${e.job_id} job_sched=${sched}${outOfRange} batch=${e.payout_batch_id || '-'}`);
-        });
-      }
 
       // Separate entries by type
       let hourlySalary = 0;
@@ -26252,6 +26240,36 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         };
       }).sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
+      // Split jobs into "in-period" (visible in the per-job table) and
+      // "late from prior period" (their job.scheduled_date is outside the
+      // queried window but a ledger entry's effective_date was bumped into
+      // this period — typically late tips that landed after the original
+      // pay period was already paid). The frontend renders late entries as
+      // a single summary line instead of as misleading rows labeled with
+      // the original job date.
+      const inPeriodJobDetails = [];
+      const latePeriodEntries = [];
+      for (const d of jobDetails) {
+        const sd = d.scheduledDate ? String(d.scheduledDate).split('T')[0].split(' ')[0] : null;
+        const outOfRange = startDate && endDate && sd && (sd < startDate || sd > endDate);
+        if (!outOfRange) { inPeriodJobDetails.push(d); continue; }
+        // Out of range: capture the amounts that actually fall in this period
+        // (tip / incentive / adjustment / reimbursement / deduction).
+        latePeriodEntries.push({
+          jobId: d.id,
+          originalDate: d.scheduledDate,
+          customerName: d.customerName,
+          serviceName: d.serviceName,
+          tip: d.tip || 0,
+          incentive: d.incentive || 0,
+          reimbursement: d.reimbursement || 0,
+          adjustment: d.adjustment || 0,
+          deduction: d.deduction || 0,
+        });
+      }
+      const latePeriodTotal = latePeriodEntries.reduce((s, e) =>
+        s + e.tip + e.incentive + e.reimbursement + e.adjustment + e.deduction, 0);
+
       // Manager revenue jobs
       const memberSalaryStartRaw = member.salary_start_date
         ? String(member.salary_start_date).split('T')[0].split(' ')[0] : null;
@@ -26276,7 +26294,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         },
         jobCount: jobIdSet.size,
         jobIds: [...jobIdSet],
-        totalJobRevenue: parseFloat(jobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
+        totalJobRevenue: parseFloat(inPeriodJobDetails.reduce((sum, j) => sum + (j.fullRevenue || 0), 0).toFixed(2)),
         totalHours: parseFloat(totalHours.toFixed(2)),
         scheduledHours: parseFloat(scheduledHours.toFixed(2)),
         scheduledHourlySalary: parseFloat(scheduledHourlySalary.toFixed(2)),
@@ -26299,7 +26317,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           ? 'hybrid'
           : member.hourly_rate ? 'hourly'
           : member.commission_percentage ? 'commission' : 'none',
-        jobs: jobDetails,
+        jobs: inPeriodJobDetails,
+        latePeriodEntries,
+        latePeriodTotal: parseFloat(latePeriodTotal.toFixed(2)),
         revenueJobs: isManagerOrOwner ? managerRevenueJobsList : undefined
       };
     });
