@@ -2032,6 +2032,11 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             const teamMap = {}; (team || []).forEach(t => { teamMap[t.zenbooker_id] = t.id })
 
             let updated = 0, skipped = 0, errors = 0, assignmentsFixed = 0
+            // Track jobs whose tip_amount changed during reconcile so we can
+            // rebuild their ledger after the loop. Without this, ZB-side tips
+            // added after job.completed land on jobs.tip_amount but never
+            // create a cleaner_ledger 'tip' entry — payroll under-reports tips.
+            const tipChangedJobs = new Set()
             const total = zbJobs.length
             for (let i = 0; i < zbJobs.length; i++) {
               const zb = zbJobs[i]
@@ -2040,7 +2045,7 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
                 syncProgress[userId] = { status: 'running', phase: `Reconciling (${i}/${total})`, progress: pct, detail: `${updated} updated, ${assignmentsFixed} assignments fixed` }
               }
 
-              const { data: sfJob } = await supabase.from('jobs').select('id, status, invoice_status, team_member_id').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
+              const { data: sfJob } = await supabase.from('jobs').select('id, status, invoice_status, team_member_id, tip_amount').eq('user_id', userId).eq('zenbooker_id', zb.id).maybeSingle()
               if (!sfJob) { skipped++; continue }
 
               // ── Update status/invoice ──
@@ -2093,6 +2098,16 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
               update.fees_breakdown = mapAdjustments(inv.adjustments_applied)
               // Only update tip from ZB if ZB has a value > 0 (don't overwrite SF manual tips)
               if (parseFloat(inv.tip || inv.tip_amount) > 0) update.tip_amount = parseFloat(inv.tip || inv.tip_amount)
+              // Flag for ledger rebuild when tip_amount actually changes. Card
+              // tips frequently arrive at ZB after job.completed already ran,
+              // so without this flag the cleaner_ledger 'tip' row never gets
+              // created and payroll under-reports tips. Mirrors the same gate
+              // handlePaymentEvent uses for the webhook path.
+              if (update.tip_amount != null) {
+                const prevTip = parseFloat(sfJob.tip_amount) || 0
+                const nextTip = parseFloat(update.tip_amount) || 0
+                if (Math.abs(nextTip - prevTip) >= 0.01) tipChangedJobs.add(sfJob.id)
+              }
               update.taxes = parseFloat(inv.tax_amount || inv.total_tax_amount) || 0
               // Duration and real start/end times from Zenbooker
               if (zb.estimated_duration_seconds) update.duration = Math.round(zb.estimated_duration_seconds / 60)
@@ -2184,6 +2199,32 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
               }
               results.reconcile.ledgerRebuilt = ledgerRebuilt
               logger.log(`[Zenbooker] Reconcile: rebuilt ledger for ${ledgerRebuilt} jobs`)
+            }
+
+            // ── Rebuild ledger for jobs whose tip_amount changed ──
+            // Card tips added at ZB after job.completed never get a ledger
+            // 'tip' row created by the reconcile UPDATE alone — this block
+            // creates the missing rows. Skips jobs already rebuilt by the
+            // assignment block above (idempotent but wasteful).
+            if (tipChangedJobs.size > 0 && createLedgerEntriesForCompletedJob) {
+              syncProgress[userId] = { status: 'running', phase: 'Rebuilding ledger for tip changes...', progress: 87 }
+              logger.log(`[Zenbooker] Reconcile: ${tipChangedJobs.size} jobs had tip changes, rebuilding ledger`)
+              let tipLedgerRebuilt = 0
+              for (const jobId of tipChangedJobs) {
+                try {
+                  await rebuildLedger(jobId, userId, { types: ['earning', 'tip', 'incentive'] })
+                  tipLedgerRebuilt++
+                  await resolveDirty(supabase, { userId, sfJobId: jobId, operation: 'ledger_rebuild', note: 'resolved on reconcile tip change' })
+                } catch (e) {
+                  await markDirty(supabase, {
+                    userId, sfJobId: jobId, zenbookerId: null,
+                    operation: 'ledger_rebuild', error: e, logger,
+                    context: { source: 'fullSync:reconcile_tip_change' },
+                  })
+                }
+              }
+              results.reconcile.tipLedgerRebuilt = tipLedgerRebuilt
+              logger.log(`[Zenbooker] Reconcile: rebuilt tip ledger for ${tipLedgerRebuilt} jobs`)
             }
 
             // ── Sync transactions (payments) ──
