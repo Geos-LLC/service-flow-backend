@@ -39753,6 +39753,114 @@ app.get('/api/ledger/entries', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/payroll/clear-processing-fee-tips
+// One-shot cleanup for the implicit-overage-as-tip bug. For the authenticated
+// user's account, walks every UNBATCHED 'tip' cleaner_ledger row, re-checks
+// ZB for an EXPLICIT invoice.tip, and if none exists:
+//   - resets jobs.tip_amount to the correct value (0 or the explicit ZB tip)
+//   - deletes the unbatched 'tip' ledger rows
+// Settled (payout_batch_id != null) rows are left alone — use a §3.6
+// compensating adjustment to claw back already-paid amounts if needed.
+//
+// Body: { apply?: boolean, jobIds?: number[] }
+//   apply=false (default) → dry-run, returns what would change
+//   jobIds → restrict to specific job ids; otherwise inspects all
+//            unbatched 'tip' jobs for the user.
+//
+// Auth: must be account owner / manager. Restricted with the same role
+// gate as POST /api/zenbooker/reconcile-job/:jobId.
+app.post('/api/payroll/clear-processing-fee-tips', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const role = (req.user?.role || '').toLowerCase();
+    if (!['admin', 'owner', 'account owner', 'manager'].includes(role)) {
+      return res.status(403).json({ error: 'admin_only' });
+    }
+    const apply = !!req.body?.apply;
+    const onlyJobIds = Array.isArray(req.body?.jobIds) ? req.body.jobIds.map(n => parseInt(n, 10)).filter(Boolean) : null;
+
+    const { data: user } = await supabase.from('users').select('zenbooker_api_key, zenbooker_status').eq('id', userId).single();
+    if (!user?.zenbooker_api_key || user.zenbooker_status !== 'connected') {
+      return res.status(400).json({ error: 'zenbooker_not_connected' });
+    }
+
+    // Find unique job_ids with unbatched 'tip' rows (scoped to user via job lookup).
+    let jobIds;
+    if (onlyJobIds && onlyJobIds.length > 0) {
+      jobIds = onlyJobIds;
+    } else {
+      const { data: tipRows } = await supabase
+        .from('cleaner_ledger')
+        .select('job_id')
+        .eq('user_id', userId)
+        .eq('type', 'tip')
+        .is('payout_batch_id', null)
+        .not('job_id', 'is', null);
+      jobIds = [...new Set((tipRows || []).map(r => r.job_id))];
+    }
+
+    if (jobIds.length === 0) {
+      return res.json({ apply, inspected: 0, changed: [], unchanged: [], errored: [], note: 'no unbatched tip rows for user' });
+    }
+
+    // Hard cap to avoid request-bound long runs. If more, caller can re-invoke.
+    const MAX = 200;
+    const overflow = Math.max(0, jobIds.length - MAX);
+    jobIds = jobIds.slice(0, MAX);
+
+    const zbBase = process.env.ZENBOOKER_API_URL || 'https://api.zenbooker.com/v1';
+    const zbFetch = async (apiKey, p) => {
+      const r = await fetch(`${zbBase}${p}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+      if (!r.ok) throw new Error(`ZB ${p} → ${r.status}`);
+      return r.json();
+    };
+
+    const changed = [], unchanged = [], errored = [];
+    for (const jobId of jobIds) {
+      try {
+        const { data: job } = await supabase
+          .from('jobs').select('id, zenbooker_id, tip_amount, scheduled_date')
+          .eq('id', jobId).eq('user_id', userId).maybeSingle();
+        if (!job) { errored.push({ jobId, reason: 'not_found' }); continue; }
+        if (!job.zenbooker_id) { errored.push({ jobId, reason: 'no_zenbooker_id' }); continue; }
+
+        const zbJob = await zbFetch(user.zenbooker_api_key, `/jobs/${job.zenbooker_id}`);
+        let inv = zbJob?.invoice || {};
+        if (inv.id) {
+          try { const fullInv = await zbFetch(user.zenbooker_api_key, `/invoices/${inv.id}`); inv = { ...inv, ...fullInv }; } catch (_) { /* fall back */ }
+        }
+        const explicitTip = parseFloat(inv.tip != null ? inv.tip : inv.tip_amount);
+        const correctedTip = (!isNaN(explicitTip) && explicitTip > 0) ? explicitTip : 0;
+        const currentTip = parseFloat(job.tip_amount) || 0;
+
+        if (Math.abs(correctedTip - currentTip) < 0.01) {
+          unchanged.push({ jobId, tip: currentTip });
+          continue;
+        }
+
+        if (!apply) {
+          changed.push({ jobId, scheduledDate: job.scheduled_date, currentTip, correctedTip, willDelete: 'unbatched_tip_rows' });
+          continue;
+        }
+
+        await supabase.from('jobs').update({ tip_amount: correctedTip }).eq('id', jobId);
+        const { data: deleted } = await supabase
+          .from('cleaner_ledger').delete()
+          .eq('job_id', jobId).eq('type', 'tip').is('payout_batch_id', null)
+          .select('id');
+        changed.push({ jobId, scheduledDate: job.scheduled_date, currentTip, correctedTip, deletedRows: (deleted || []).length });
+      } catch (e) {
+        errored.push({ jobId, reason: e.message });
+      }
+    }
+
+    res.json({ apply, inspected: jobIds.length, overflow, changed, unchanged, errored });
+  } catch (error) {
+    console.error('clear-processing-fee-tips error:', error);
+    res.status(500).json({ error: 'cleanup_failed', detail: error.message });
+  }
+});
+
 // POST /api/ledger/adjustment - Create manual adjustment
 app.post('/api/ledger/adjustment', authenticateToken, async (req, res) => {
   try {
