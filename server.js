@@ -25604,6 +25604,14 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
   }
 }
 
+// Per-process dedup cache for payroll's auto-rebuild path. Maps jobId →
+// timestamp of last rebuild attempt. Prevents the staleness detector from
+// looping on jobs whose rebuild produces no change (e.g. completed jobs
+// without a team assignment). 5-minute TTL is short enough that a real
+// edit to the job will be reflected within a coffee break, long enough to
+// break tight loops. Cleared on process restart.
+const recentRebuildAttempts = new Map();
+
 // Get payroll summary for all team members — reads from cleaner_ledger (single source of truth)
 app.get('/api/payroll', authenticateToken, async (req, res) => {
   try {
@@ -25867,20 +25875,40 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     });
 
     if (staleJobIds.size > 0) {
+      // Dedupe attempts across requests. Some "stale" jobs cannot actually
+      // be rebuilt (e.g. completed but no team assigned → rebuild produces
+      // no entries → staleness check flags again next load → infinite loop).
+      // A short in-process TTL stops the loop without needing to predict
+      // every unfixable case up front. Restart of the process clears it.
+      const now = Date.now();
+      const REBUILD_DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+      const skipped = [];
+      const eligible = [];
+      for (const jobId of staleJobIds) {
+        const last = recentRebuildAttempts.get(jobId);
+        if (last && now - last < REBUILD_DEDUP_TTL_MS) { skipped.push(jobId); continue; }
+        eligible.push(jobId);
+      }
       // Bound how many rebuilds we'll do in a single payroll request — each
       // rebuild is a write-heavy round trip and on a request-bound endpoint
       // an unbounded loop translates directly into user-visible latency. The
       // overflow gets picked up on the next payroll load (also bounded), so
       // the backlog drains across a few page loads rather than freezing one.
       const MAX_REBUILDS_PER_REQUEST = 10;
-      const toRebuild = [...staleJobIds].slice(0, MAX_REBUILDS_PER_REQUEST);
-      const deferred = staleJobIds.size - toRebuild.length;
-      console.log(`[Payroll] Auto-rebuilding ${toRebuild.length}/${staleJobIds.size} stale job ledger entries${deferred > 0 ? ` (${deferred} deferred to next request)` : ''}: ${toRebuild.join(', ')}`);
+      const toRebuild = eligible.slice(0, MAX_REBUILDS_PER_REQUEST);
+      const deferred = eligible.length - toRebuild.length;
+      if (toRebuild.length > 0 || skipped.length > 0) {
+        const parts = [`${toRebuild.length}/${staleJobIds.size} stale job ledger entries`];
+        if (deferred > 0) parts.push(`${deferred} deferred to next request`);
+        if (skipped.length > 0) parts.push(`${skipped.length} skipped (recently attempted)`);
+        console.log(`[Payroll] Auto-rebuilding ${parts.join(' — ')}: ${toRebuild.join(', ')}`);
+      }
       for (const jobId of toRebuild) {
+        recentRebuildAttempts.set(jobId, now);
         try { await rebuildJobLedger(jobId, req.user.userId, { types: ['earning', 'tip', 'incentive'] }); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
       }
-      // Re-fetch ledger entries after rebuild
-      ledgerEntries = await fetchLedgerEntries();
+      // Re-fetch ledger entries after rebuild (only if we actually rebuilt anything)
+      if (toRebuild.length > 0) ledgerEntries = await fetchLedgerEntries();
     }
 
     // ===== Group ledger entries by team member =====
