@@ -26029,10 +26029,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       let totalTips = 0;
       let totalIncentives = 0;
       let totalCashCollected = 0;
-      let totalReimbursements = 0;
+      let totalReimbursements = 0;       // pure reimbursement (positive)
+      let totalExpenseDeductions = 0;    // expense_deduction (negative)
+      let totalAdjustments = 0;          // manual ledger adjustments (+/-)
       let totalHours = 0;
       const jobIdSet = new Set();
-      const jobEntriesMap = {}; // job_id -> { earning, tip, incentive, reimbursement }
+      const jobEntriesMap = {}; // job_id -> { earning, tip, incentive, reimbursement, expense_deduction, adjustment }
+      // Flat list of non-earning items with notes, so the paystub drawer can
+      // itemize "what each bonus/deduction was for" without a second query.
+      const extras = [];
 
       for (const entry of memberEntries) {
         const amount = parseFloat(entry.amount) || 0;
@@ -26085,12 +26090,32 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
           totalTips += amount;
         } else if (entry.type === 'incentive') {
           totalIncentives += amount;
+          const lines = Array.isArray(meta.incentive_lines) ? meta.incentive_lines : null;
+          extras.push({
+            type: 'incentive', amount, note: entry.note || null,
+            jobId: entry.job_id || null, date: entry.effective_date || null,
+            incentiveLines: lines,
+          });
         } else if (entry.type === 'cash_collected') {
           totalCashCollected += amount; // negative value — offsets balance
         } else if (entry.type === 'reimbursement') {
-          totalReimbursements += amount; // positive value — company owes cleaner
+          totalReimbursements += amount; // positive — company owes cleaner
+          extras.push({
+            type: 'reimbursement', amount, note: entry.note || null,
+            jobId: entry.job_id || null, date: entry.effective_date || null,
+          });
         } else if (entry.type === 'expense_deduction') {
-          totalReimbursements += amount; // negative value — deducted from cleaner payroll
+          totalExpenseDeductions += amount; // negative — charged to cleaner
+          extras.push({
+            type: 'expense_deduction', amount, note: entry.note || null,
+            jobId: entry.job_id || null, date: entry.effective_date || null,
+          });
+        } else if (entry.type === 'adjustment') {
+          totalAdjustments += amount; // +/-
+          extras.push({
+            type: 'adjustment', amount, note: entry.note || null,
+            jobId: entry.job_id || null, date: entry.effective_date || null,
+          });
         }
 
         // Track jobs
@@ -26118,7 +26143,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       // Managers/schedulers: payroll reads from ledger entries (is_manager_salary, is_manager_commission)
       // No override — ledger is the single source of truth for all members including managers
 
-      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives + totalCashCollected + totalReimbursements;
+      const totalSalary = hourlySalary + commissionSalary + totalTips + totalIncentives + totalCashCollected + totalReimbursements + totalExpenseDeductions + totalAdjustments;
 
       // Build job details for expandable rows
       const jobDetails = Object.entries(jobEntriesMap).map(([jobId, entries]) => {
@@ -26156,7 +26181,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
             ? entries.incentive.metadata.incentive_lines
             : [],
           cashCollected: parseFloat((parseFloat(entries.cash_collected?.amount) || 0).toFixed(2)),
-          reimbursement: parseFloat((parseFloat(entries.reimbursement?.amount) || 0).toFixed(2))
+          reimbursement: parseFloat((parseFloat(entries.reimbursement?.amount) || 0).toFixed(2)),
+          reimbursementNote: entries.reimbursement?.note || null,
+          deduction: parseFloat((parseFloat(entries.expense_deduction?.amount) || 0).toFixed(2)),
+          deductionNote: entries.expense_deduction?.note || null,
+          adjustment: parseFloat((parseFloat(entries.adjustment?.amount) || 0).toFixed(2)),
+          adjustmentNote: entries.adjustment?.note || null,
         };
       }).sort((a, b) => new Date(a.scheduledDate) - new Date(b.scheduledDate));
 
@@ -26196,6 +26226,9 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalCashCollected: parseFloat(totalCashCollected.toFixed(2)),
         priorCashCollected: parseFloat((priorCashByMember[member.id] || 0).toFixed(2)),
         totalReimbursements: parseFloat(totalReimbursements.toFixed(2)),
+        totalExpenseDeductions: parseFloat(totalExpenseDeductions.toFixed(2)),
+        totalAdjustments: parseFloat(totalAdjustments.toFixed(2)),
+        extras,
         totalSalary: parseFloat(totalSalary.toFixed(2)),
         hasHourlyRate: !!member.hourly_rate,
         hasCommission: !!member.commission_percentage,
@@ -26232,6 +26265,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     const grandTotalIncentives = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalIncentives || 0), 0);
     const grandTotalCashCollected = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalCashCollected || 0), 0);
     const grandTotalReimbursements = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalReimbursements || 0), 0);
+    const grandTotalExpenseDeductions = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalExpenseDeductions || 0), 0);
+    const grandTotalAdjustments = sortedTeamMembers.reduce((sum, item) => sum + (item?.totalAdjustments || 0), 0);
     const grandTotalJobRevenue = totalBusinessRevenue;
     const allUniqueJobIds = new Set();
     sortedTeamMembers.forEach(item => { (item?.jobIds || []).forEach(id => allUniqueJobIds.add(id)); });
@@ -26258,6 +26293,8 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
         totalIncentives: parseFloat(grandTotalIncentives.toFixed(2)),
         totalCashCollected: parseFloat(grandTotalCashCollected.toFixed(2)),
         totalReimbursements: parseFloat(grandTotalReimbursements.toFixed(2)),
+        totalExpenseDeductions: parseFloat(grandTotalExpenseDeductions.toFixed(2)),
+        totalAdjustments: parseFloat(grandTotalAdjustments.toFixed(2)),
         totalSalary: parseFloat(grandTotal.toFixed(2)),
         totalJobCount: grandTotalJobCount,
         totalJobRevenue: parseFloat(grandTotalJobRevenue.toFixed(2))
