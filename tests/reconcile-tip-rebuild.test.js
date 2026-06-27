@@ -47,25 +47,36 @@ describe('ZB reconcile — ledger rebuild also fires on tip change', () => {
     );
   });
 
-  test('a Set tracks jobs whose tip_amount changed', () => {
-    // Naming can drift — accept any Set whose identifier suggests tip-change
-    // tracking. The fix introduces `tipChangedJobs`.
-    expect(block).toMatch(/tipChangedJobs|tipChanged\w*Jobs/);
+  test('a Set tracks jobs flagged for tip rebuild', () => {
+    // The fix introduces `tipRebuildJobs` (renamed from tipChangedJobs once
+    // the gate broadened to also cover the "missing ledger row" case).
+    expect(block).toMatch(/tipRebuildJobs|tipChangedJobs|tip\w*Jobs/);
     expect(block).toMatch(/new Set\(\)/);
   });
 
-  test('in-loop tip diff guards the Set.add() call', () => {
-    // Look for the comparison pattern: prev vs next tip + a numeric threshold,
-    // followed by an .add() onto the Set. Whitespace-tolerant.
+  test('pre-loop bulk-queries existing tip ledger rows for this user', () => {
+    // The "missing entry" gate requires knowing up front which jobs already
+    // have a 'tip' ledger row, so we can skip them in the loop. This must
+    // be a single bulk query, NOT a per-job query inside the loop.
+    expect(block).toMatch(/from\(['"]cleaner_ledger['"]\)/);
+    expect(block).toMatch(/\.eq\(['"]type['"]\s*,\s*['"]tip['"]\)/);
+    expect(block).toMatch(/existingTipJobIds|hasTipLedger|tipJobsExisting/);
+  });
+
+  test('in-loop gate fires on EITHER tip change OR missing ledger row', () => {
+    // The "changed" branch needs prev/next tip + a numeric threshold.
     expect(block).toMatch(/prevTip|previousTip|oldTip/);
     expect(block).toMatch(/nextTip|newTip|updatedTip/);
     expect(block).toMatch(/Math\.abs\([^)]*tip[^)]*\)\s*>=?\s*0\.0?1/i);
-    expect(block).toMatch(/tipChangedJobs\.add\(/);
+    // The "missing" branch checks the Set populated by the pre-loop query.
+    expect(block).toMatch(/!existingTipJobIds\.has\(|!hasTipLedger\.has\(/);
+    // Both branches must feed into the same Set.add() call.
+    expect(block).toMatch(/tipRebuildJobs\.add\(|tipChangedJobs\.add\(/);
   });
 
   test('post-loop rebuild iterates the Set and calls rebuildLedger', () => {
     // The fix block must contain both the iteration and a rebuildLedger call.
-    expect(block).toMatch(/for\s*\(\s*const\s+\w+\s+of\s+tipChangedJobs\s*\)/);
+    expect(block).toMatch(/for\s*\(\s*const\s+\w+\s+of\s+(tipRebuildJobs|tipChangedJobs)\s*\)/);
     expect(block).toMatch(
       /rebuildLedger\(\s*\w+\s*,\s*userId\s*,\s*\{\s*types:\s*\[\s*['"]earning['"]\s*,\s*['"]tip['"]\s*,\s*['"]incentive['"]\s*\]/
     );
