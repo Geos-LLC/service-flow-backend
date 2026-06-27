@@ -26071,6 +26071,19 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const hourlyRate = member.hourly_rate ? parseFloat(member.hourly_rate) : 0;
       const commissionPercentage = member.commission_percentage ? parseFloat(member.commission_percentage) : 0;
 
+      // TEMP DEBUG: dump entries for Larionova so we can see why old-dated
+      // jobs are appearing in the current-week view. Remove after diagnosis.
+      const nm = `${member.first_name || ''} ${member.last_name || ''}`.toLowerCase();
+      if (nm.includes('larionova') || nm.includes('larion')) {
+        console.log(`[Debug Larionova] member.id=${member.id} startDate=${startDate} endDate=${endDate} entries=${memberEntries.length}`);
+        memberEntries.forEach(e => {
+          const j = allJobsById[e.job_id];
+          const sched = j ? String(j.scheduled_date || '').split('T')[0].split(' ')[0] : '?';
+          const outOfRange = startDate && endDate && sched && (sched < startDate || sched > endDate) ? ' OUT_OF_RANGE' : '';
+          console.log(`  type=${e.type} amt=${e.amount} eff_date=${e.effective_date} job_id=${e.job_id} job_sched=${sched}${outOfRange} batch=${e.payout_batch_id || '-'}`);
+        });
+      }
+
       // Separate entries by type
       let hourlySalary = 0;
       let commissionSalary = 0;
