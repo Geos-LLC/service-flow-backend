@@ -25827,7 +25827,12 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       })();
       for (const e of entries) {
         const meta = e.metadata || {};
-        const ledgerHours = meta.hours || 0;
+        // meta.hours is per-cleaner (job total / member_count — see
+        // createLedgerEntriesForCompletedJob). Multiply back up to get the
+        // job total for an apples-to-apples comparison with currentHours.
+        // meta.revenue is already the FULL job revenue, no scaling needed.
+        const mc = meta.member_count || 1;
+        const ledgerHours = (meta.hours || 0) * mc;
         const ledgerRevenue = meta.revenue || 0;
         if (Math.abs(ledgerHours - currentHours) > 0.01 || Math.abs(ledgerRevenue - currentRevenue) > 0.01) {
           staleJobIds.add(parseInt(jobId));
