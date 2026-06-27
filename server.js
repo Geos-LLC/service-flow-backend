@@ -25631,7 +25631,7 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       const pageSize = 1000;
       while (true) {
         let q = supabase.from('cleaner_ledger')
-          .select('team_member_id, job_id, type, amount, metadata')
+          .select('team_member_id, job_id, type, amount, metadata, payout_batch_id, effective_date, note')
           .eq('user_id', userId)
           .range(from, from + pageSize - 1);
         if (startDate) q = q.gte('effective_date', startDate);
@@ -25801,10 +25801,18 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     // ===== Detect stale ledger entries and auto-rebuild =====
     // When job data changes (duration, price) outside the payroll edit flow (e.g. ZZB sync),
     // ledger entries become stale. Detect and rebuild them here.
+    //
+    // IMPORTANT: settled entries (payout_batch_id != null) are NEVER rebuilt
+    // — they're locked history. Including them in the staleness check causes
+    // the rebuild to fire on every payroll load (since rebuild can't fix
+    // settled drift), making each request slow. Filter them out here so the
+    // detection only flags jobs whose rebuild can actually do something.
+    // Settled drift surfaces separately via [ledger-drift] warnings + the
+    // §3.6 compensating-adjustment flow.
     const staleJobIds = new Set();
     const earningsByJob = {};
     (ledgerEntries || []).forEach(e => {
-      if (e.type === 'earning' && e.job_id && e.metadata && !e.metadata.is_manager_salary && !e.metadata.is_manager_commission) {
+      if (e.type === 'earning' && e.job_id && e.metadata && !e.metadata.is_manager_salary && !e.metadata.is_manager_commission && !e.payout_batch_id) {
         if (!earningsByJob[e.job_id]) earningsByJob[e.job_id] = [];
         earningsByJob[e.job_id].push(e);
       }
@@ -25854,8 +25862,16 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
     });
 
     if (staleJobIds.size > 0) {
-      console.log(`[Payroll] Auto-rebuilding ${staleJobIds.size} stale/missing job ledger entries: ${[...staleJobIds].join(', ')}`);
-      for (const jobId of staleJobIds) {
+      // Bound how many rebuilds we'll do in a single payroll request — each
+      // rebuild is a write-heavy round trip and on a request-bound endpoint
+      // an unbounded loop translates directly into user-visible latency. The
+      // overflow gets picked up on the next payroll load (also bounded), so
+      // the backlog drains across a few page loads rather than freezing one.
+      const MAX_REBUILDS_PER_REQUEST = 10;
+      const toRebuild = [...staleJobIds].slice(0, MAX_REBUILDS_PER_REQUEST);
+      const deferred = staleJobIds.size - toRebuild.length;
+      console.log(`[Payroll] Auto-rebuilding ${toRebuild.length}/${staleJobIds.size} stale job ledger entries${deferred > 0 ? ` (${deferred} deferred to next request)` : ''}: ${toRebuild.join(', ')}`);
+      for (const jobId of toRebuild) {
         try { await rebuildJobLedger(jobId, req.user.userId, { types: ['earning', 'tip', 'incentive'] }); } catch (e) { console.error(`[Payroll] Rebuild error for job ${jobId}:`, e); }
       }
       // Re-fetch ledger entries after rebuild

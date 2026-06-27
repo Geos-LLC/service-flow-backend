@@ -2049,18 +2049,14 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
             const tipRebuildJobs = new Set()
 
             // Pre-fetch the set of job_ids that already have a 'tip' ledger
-            // row for this user. One query up front beats N queries inside the
-            // loop. We compare against this set per-job to decide gate (b).
-            const { data: userJobIds } = await supabase.from('jobs')
-              .select('id').eq('user_id', userId)
-            const allUserJobIds = (userJobIds || []).map(j => j.id)
-            const existingTipJobIds = new Set()
-            if (allUserJobIds.length > 0) {
-              const { data: tipRows } = await supabase.from('cleaner_ledger')
-                .select('job_id').eq('user_id', userId).eq('type', 'tip')
-                .in('job_id', allUserJobIds).not('job_id', 'is', null)
-              for (const r of (tipRows || [])) existingTipJobIds.add(r.job_id)
-            }
+            // row for this user. user_id on cleaner_ledger is the same scope
+            // as on jobs, so a direct filter beats the previous two-step
+            // (jobs.id → IN(...) → cleaner_ledger) which built a giant IN
+            // clause for users with thousands of jobs.
+            const { data: tipRows } = await supabase.from('cleaner_ledger')
+              .select('job_id').eq('user_id', userId).eq('type', 'tip')
+              .not('job_id', 'is', null)
+            const existingTipJobIds = new Set((tipRows || []).map(r => r.job_id))
 
             const total = zbJobs.length
             for (let i = 0; i < zbJobs.length; i++) {
