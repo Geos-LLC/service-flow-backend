@@ -81,6 +81,7 @@ module.exports = (supabase, logger, notificationEmail) => {
       incentives: 0,
       adjustments: 0,
       reimbursements: 0,
+      deductions: 0,        // expense_deduction (negative — charged to cleaner)
       cashCollected: 0,
       netPayout: 0,
     }
@@ -125,6 +126,7 @@ module.exports = (supabase, logger, notificationEmail) => {
       else if (type === 'incentive') totals.incentives += amt
       else if (type === 'adjustment') totals.adjustments += amt
       else if (type === 'reimbursement') totals.reimbursements += amt
+      else if (type === 'expense_deduction') totals.deductions += amt
       else if (type === 'cash_collected') totals.cashCollected += amt
       else if (type === 'cash_to_company') totals.cashCollected += amt
 
@@ -143,6 +145,10 @@ module.exports = (supabase, logger, notificationEmail) => {
             tip: 0,
             incentive: 0,
             reimbursement: 0,
+            deduction: 0,
+            adjustment: 0,
+            adjustmentNote: '',
+            deductionNote: '',
             cashCollected: 0,
           })
         }
@@ -151,6 +157,8 @@ module.exports = (supabase, logger, notificationEmail) => {
         else if (type === 'tip') item.tip += amt
         else if (type === 'incentive') item.incentive += amt
         else if (type === 'reimbursement') item.reimbursement += amt
+        else if (type === 'expense_deduction') { item.deduction += amt; if (entry.note) item.deductionNote = entry.note }
+        else if (type === 'adjustment') { item.adjustment += amt; if (entry.note) item.adjustmentNote = entry.note }
         else if (type === 'cash_collected' || type === 'cash_to_company') item.cashCollected += amt
       }
     }
@@ -158,7 +166,7 @@ module.exports = (supabase, logger, notificationEmail) => {
     totals.netPayout =
       totals.earnings + totals.managerSalary + totals.managerCommission +
       totals.tips + totals.incentives + totals.adjustments +
-      totals.reimbursements + totals.cashCollected
+      totals.reimbursements + totals.deductions + totals.cashCollected
 
     // Round all totals to 2 decimal places for clean display
     for (const k of Object.keys(totals)) {
@@ -326,6 +334,7 @@ module.exports = (supabase, logger, notificationEmail) => {
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Incentives</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.incentives)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Reimbursements</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmt(totals.reimbursements)}</td></tr>
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Adjustments</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.adjustments)}</td></tr>
+        ${totals.deductions ? `<tr><td style="padding:10px 14px;font-size:13px;color:#b91c1c;border-top:1px solid #e5e7eb;">Deductions</td><td style="padding:10px 14px;font-size:13px;text-align:right;color:#b91c1c;border-top:1px solid #e5e7eb;">${fmtNeg(totals.deductions)}</td></tr>` : ''}
         <tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Cash collected</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.cashCollected)}</td></tr>
         ${totals.priorDebt ? `<tr><td style="padding:10px 14px;font-size:13px;color:#374151;border-top:1px solid #e5e7eb;">Prior period debt</td><td style="padding:10px 14px;font-size:13px;text-align:right;border-top:1px solid #e5e7eb;">${fmtNeg(totals.priorDebt)}</td></tr>` : ''}
         <tr><td style="padding:14px;font-size:15px;font-weight:700;color:#111;border-top:2px solid #111;">Net Earned</td><td style="padding:14px;font-size:15px;font-weight:700;text-align:right;border-top:2px solid #111;">${fmt(totals.netPayout)}</td></tr>
@@ -360,6 +369,7 @@ module.exports = (supabase, logger, notificationEmail) => {
       `Incentives:     ${fmt(totals.incentives)}`,
       `Reimbursements: ${fmt(totals.reimbursements)}`,
       `Adjustments:    ${fmt(totals.adjustments)}`,
+      ...(totals.deductions ? [`Deductions:     ${fmt(totals.deductions)}`] : []),
       `Cash collected: ${fmt(totals.cashCollected)}`,
       `Net Paid:       ${fmt(totals.netPayout)}`,
       '',
@@ -409,6 +419,7 @@ module.exports = (supabase, logger, notificationEmail) => {
     if (totals.incentives) rows.push(row('Incentives', fmt(totals.incentives)))
     if (totals.reimbursements) rows.push(row('Reimbursements', fmt(totals.reimbursements)))
     if (totals.adjustments) rows.push(row('Adjustments', fmtNeg(totals.adjustments)))
+    if (totals.deductions) rows.push(row('Deductions', fmtNeg(totals.deductions)))
     if (totals.cashCollected) rows.push(row('Cash collected', fmtNeg(totals.cashCollected)))
     if (totals.priorDebt) rows.push(row('Prior period debt', fmtNeg(totals.priorDebt)))
     rows.push(row('Net Earned', fmt(totals.netPayout), { bold: true, top: true }))
@@ -530,6 +541,7 @@ module.exports = (supabase, logger, notificationEmail) => {
         summaryRows.push(['Incentives', fmt(totals.incentives)])
         summaryRows.push(['Reimbursements', fmt(totals.reimbursements)])
         summaryRows.push(['Adjustments', fmtNeg(totals.adjustments)])
+        if (totals.deductions) summaryRows.push(['Deductions', fmtNeg(totals.deductions)])
         summaryRows.push(['Cash collected', fmtNeg(totals.cashCollected)])
         if (totals.priorDebt) summaryRows.push(['Prior period debt', fmtNeg(totals.priorDebt)])
 
