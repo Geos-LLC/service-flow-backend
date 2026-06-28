@@ -39753,6 +39753,94 @@ app.get('/api/ledger/entries', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/payroll/clear-phantom-prior-entries
+// Cleanup for ledger entries today's reconcile created for jobs that were
+// settled/consolidated outside SF's ledger long ago. These entries land in
+// the user's "prior" balance because their effective_date is before the
+// current pay period and they're unbatched (the reconcile has no way to
+// know the cleaner was already paid through another channel).
+//
+// Body: { apply?: boolean, startDate: 'YYYY-MM-DD', createdSince?: ISO }
+//   startDate REQUIRED — defines the current pay period boundary. Any
+//   unbatched entry with effective_date < startDate AND created_at >=
+//   createdSince (defaults to today 00:00 in server tz) is a candidate.
+//   apply=false (default) returns the candidate list without writing.
+//
+// Types considered (limited to what reconcile creates):
+//   earning, tip, incentive, cash_collected, reimbursement
+// (adjustment / expense_deduction are user-created, never touched.)
+//
+// Settled rows (payout_batch_id != null) are protected — they're history.
+app.post('/api/payroll/clear-phantom-prior-entries', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const role = (req.user?.role || '').toLowerCase();
+    if (!['admin', 'owner', 'account owner', 'manager'].includes(role)) {
+      return res.status(403).json({ error: 'admin_only' });
+    }
+    const apply = !!req.body?.apply;
+    const startDate = String(req.body?.startDate || '').slice(0, 10);
+    if (!startDate) return res.status(400).json({ error: 'startDate required (YYYY-MM-DD)' });
+    const createdSince = req.body?.createdSince || new Date(new Date().setHours(0,0,0,0)).toISOString();
+
+    const CANDIDATE_TYPES = ['earning', 'tip', 'incentive', 'cash_collected', 'reimbursement'];
+
+    const { data: candidates, error } = await supabase.from('cleaner_ledger')
+      .select('id, team_member_id, type, amount, effective_date, note, job_id, created_at, metadata')
+      .eq('user_id', userId)
+      .is('payout_batch_id', null)
+      .in('type', CANDIDATE_TYPES)
+      .lt('effective_date', startDate)
+      .gte('created_at', createdSince)
+      .order('team_member_id', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+
+    const summary = { apply, startDate, createdSince, total: (candidates || []).length };
+    const byMember = {};
+    let netImpact = 0;
+    for (const c of (candidates || [])) {
+      netImpact += parseFloat(c.amount) || 0;
+      const mid = c.team_member_id;
+      if (!byMember[mid]) byMember[mid] = { entries: 0, sum: 0 };
+      byMember[mid].entries++;
+      byMember[mid].sum += parseFloat(c.amount) || 0;
+    }
+    for (const k of Object.keys(byMember)) byMember[k].sum = parseFloat(byMember[k].sum.toFixed(2));
+    summary.byMember = byMember;
+    summary.netImpact = parseFloat(netImpact.toFixed(2));
+
+    if (!apply) {
+      // Return preview only — list each candidate so the operator can audit
+      // before applying.
+      summary.candidates = (candidates || []).map(c => ({
+        id: c.id, team_member_id: c.team_member_id, type: c.type,
+        amount: parseFloat(c.amount) || 0, effective_date: c.effective_date,
+        job_id: c.job_id, note: c.note, created_at: c.created_at,
+      }));
+      return res.json(summary);
+    }
+
+    // Apply — delete in chunks to stay polite to the DB. The
+    // `.is('payout_batch_id', null)` guard is redundant (the SELECT
+    // already filtered to unbatched rows) but required for defense-in-
+    // depth — see ledger-immutability.test.js, no DELETE on
+    // cleaner_ledger may run without it.
+    const ids = (candidates || []).map(c => c.id);
+    let deleted = 0;
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const { data: del, error: delErr } = await supabase.from('cleaner_ledger')
+        .delete().in('id', chunk).is('payout_batch_id', null).select('id');
+      if (delErr) return res.status(500).json({ error: delErr.message, deletedSoFar: deleted });
+      deleted += (del || []).length;
+    }
+    summary.deleted = deleted;
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/payroll/debug-prior-cash?memberId=N&startDate=YYYY-MM-DD
 // Diagnostic: dumps the entries that fetchPriorCash() rolls up into the
 // "prior" balance shown on the payroll Cash column for a given member.
