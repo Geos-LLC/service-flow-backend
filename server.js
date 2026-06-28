@@ -39753,6 +39753,59 @@ app.get('/api/ledger/entries', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/payroll/debug-prior-cash?memberId=N&startDate=YYYY-MM-DD
+// Diagnostic: dumps the entries that fetchPriorCash() rolls up into the
+// "prior" balance shown on the payroll Cash column for a given member.
+// Two sources, both reported:
+//   A) Unpaid cleaner_ledger entries (any type except 'payout') with
+//      effective_date < startDate.
+//   B) Negative paid batches (cleaner owes) before startDate that haven't
+//      been recovered by a subsequent batch.
+app.get('/api/payroll/debug-prior-cash', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const role = (req.user?.role || '').toLowerCase();
+    if (!['admin', 'owner', 'account owner', 'manager'].includes(role)) {
+      return res.status(403).json({ error: 'admin_only' });
+    }
+    const memberId = parseInt(req.query.memberId, 10);
+    const startDate = String(req.query.startDate || '').slice(0, 10);
+    if (!memberId || !startDate) return res.status(400).json({ error: 'memberId and startDate required' });
+
+    const { data: entries } = await supabase.from('cleaner_ledger')
+      .select('id, type, amount, effective_date, note, job_id, created_at, payout_batch_id, metadata')
+      .eq('user_id', userId)
+      .eq('team_member_id', memberId)
+      .is('payout_batch_id', null)
+      .neq('type', 'payout')
+      .lt('effective_date', startDate)
+      .order('effective_date', { ascending: false });
+
+    const { data: negBatches } = await supabase.from('cleaner_payout_batch')
+      .select('id, total_amount, period_start, period_end, paid_at, recovered_by_batch_id')
+      .eq('user_id', userId)
+      .eq('team_member_id', memberId)
+      .eq('status', 'paid')
+      .lt('total_amount', 0)
+      .is('recovered_by_batch_id', null)
+      .lt('period_end', startDate);
+
+    const unpaidSum = (entries || []).reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+    const negBatchSum = (negBatches || []).reduce((s, b) => s + (parseFloat(b.total_amount) || 0), 0);
+
+    res.json({
+      memberId, startDate,
+      unpaidPriorEntries: entries || [],
+      unpaidPriorSum: parseFloat(unpaidSum.toFixed(2)),
+      unrecoveredNegativeBatches: negBatches || [],
+      negativeBatchSum: parseFloat(negBatchSum.toFixed(2)),
+      totalPrior: parseFloat((unpaidSum + negBatchSum).toFixed(2)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/payroll/clear-processing-fee-tips
 // One-shot cleanup for the implicit-overage-as-tip bug. For the authenticated
 // user's account, walks every UNBATCHED 'tip' cleaner_ledger row, re-checks
