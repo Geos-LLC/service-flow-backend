@@ -209,12 +209,22 @@ module.exports = (supabase, logger, notificationEmail) => {
       return v < 0 ? `-$${Math.abs(v).toFixed(2)}` : `$${v.toFixed(2)}`
     }
 
+    const showTipCol = lineItems.some(it => (parseFloat(it.tip) || 0) !== 0)
+    const showIncentiveCol = lineItems.some(it => (parseFloat(it.incentive) || 0) !== 0)
+    const showReimbCol = lineItems.some(it => (parseFloat(it.reimbursement) || 0) !== 0)
+    const cellVal = (n) => ((parseFloat(n) || 0) === 0 ? '—' : fmt(n))
+    const cellTd = (v) => `<td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;text-align:right;color:#4b5563;">${v}</td>`
+    const cellTh = (label) => `<th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280;font-weight:600;">${label}</th>`
+
     const rowsHtml = lineItems.map(item => `
       <tr>
         <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${escapeHtml(formatDate(item.date))}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${escapeHtml(item.service)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;">${escapeHtml(item.customerName)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:13px;text-align:right;">${fmt(item.earning)}</td>
+        ${showTipCol ? cellTd(cellVal(item.tip)) : ''}
+        ${showIncentiveCol ? cellTd(cellVal(item.incentive)) : ''}
+        ${showReimbCol ? cellTd(cellVal(item.reimbursement)) : ''}
       </tr>
     `).join('')
 
@@ -227,6 +237,9 @@ module.exports = (supabase, logger, notificationEmail) => {
             <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Service</th>
             <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Customer</th>
             <th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280;font-weight:600;">Earning</th>
+            ${showTipCol ? cellTh('Tip') : ''}
+            ${showIncentiveCol ? cellTh('Incentive') : ''}
+            ${showReimbCol ? cellTh('Reimb.') : ''}
           </tr>
         </thead>
         <tbody>${rowsHtml}</tbody>
@@ -678,14 +691,36 @@ module.exports = (supabase, logger, notificationEmail) => {
 
         // Jobs
         if (lineItems.length > 0) {
-          const cols = [pageWidth * 0.20, pageWidth * 0.30, pageWidth * 0.30, pageWidth * 0.20]
-          const rows = lineItems.map(it => [
-            formatDate(it.date),
-            it.service || '',
-            it.customerName || '',
-            fmt(it.earning),
-          ])
-          drawTable('Jobs', ['Date', 'Service', 'Customer', 'Earning'], rows, cols)
+          const showTipPdf = lineItems.some(it => (parseFloat(it.tip) || 0) !== 0)
+          const showIncPdf = lineItems.some(it => (parseFloat(it.incentive) || 0) !== 0)
+          const showReimbPdf = lineItems.some(it => (parseFloat(it.reimbursement) || 0) !== 0)
+          const extraCols = [showTipPdf, showIncPdf, showReimbPdf].filter(Boolean).length
+          const cellFmt = (n) => ((parseFloat(n) || 0) === 0 ? '—' : fmt(n))
+          const headers = ['Date', 'Service', 'Customer', 'Earning']
+          if (showTipPdf) headers.push('Tip')
+          if (showIncPdf) headers.push('Incentive')
+          if (showReimbPdf) headers.push('Reimb.')
+          const baseCols = extraCols === 0
+            ? [0.20, 0.30, 0.30, 0.20]
+            : extraCols === 1
+            ? [0.18, 0.25, 0.27, 0.15, 0.15]
+            : extraCols === 2
+            ? [0.16, 0.22, 0.24, 0.14, 0.12, 0.12]
+            : [0.14, 0.20, 0.22, 0.12, 0.11, 0.11, 0.10]
+          const cols = baseCols.map(f => pageWidth * f)
+          const rows = lineItems.map(it => {
+            const row = [
+              formatDate(it.date),
+              it.service || '',
+              it.customerName || '',
+              fmt(it.earning),
+            ]
+            if (showTipPdf) row.push(cellFmt(it.tip))
+            if (showIncPdf) row.push(cellFmt(it.incentive))
+            if (showReimbPdf) row.push(cellFmt(it.reimbursement))
+            return row
+          })
+          drawTable('Jobs', headers, rows, cols)
         }
 
         // Footer
