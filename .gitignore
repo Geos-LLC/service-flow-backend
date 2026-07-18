@@ -13,3 +13,21 @@ npm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# FixLoop
+.env.local
+
+# Ad-hoc investigation / data-fix scripts — never commit (contain hardcoded
+# prod IDs and direct DB write patterns; access could hinder the app)
+scripts/check-vasilchenko-tips.js
+scripts/check-vasilchenko-batches.js
+scripts/check-job-139822.js
+scripts/check-customer-23070.js
+scripts/check-batch-188.js
+scripts/check-alina-harbuz.js
+scripts/check-alina-incentives.js
+scripts/check-alina-current.js
+scripts/check-alina-current-jobs.js
+scripts/find-pre-cutoff-ledger.js
+scripts/apply-pre-cutoff-reconciliation.js
+scripts/fix-job-142456-ledger.js

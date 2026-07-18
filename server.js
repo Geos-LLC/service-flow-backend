@@ -30560,6 +30560,13 @@ app.post('/api/jobs/:jobId/assign', authenticateToken, async (req, res) => {
       if (jobNotifications && teamMemberId) {
         jobNotifications.notifyAssigned(userId, parseInt(jobId), [parseInt(teamMemberId)]).catch(() => {});
       }
+
+      try {
+        await rebuildJobLedger(parseInt(jobId), userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] });
+      } catch (rebuildErr) {
+        console.error(`[Ledger] Rebuild after single-assign failed for job ${jobId}:`, rebuildErr);
+      }
+
       res.json({ message: 'Job assigned successfully' });
   } catch (error) {
     console.error('Job assignment error:', error);
@@ -30678,6 +30685,13 @@ app.delete('/api/jobs/:jobId/assign/:teamMemberId', authenticateToken, async (re
         }
         }
       }
+
+      try {
+        await rebuildJobLedger(parseInt(jobId), userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] });
+      } catch (rebuildErr) {
+        console.error(`[Ledger] Rebuild after assignment removal failed for job ${jobId}:`, rebuildErr);
+      }
+
      res.json({ message: 'Team member assignment removed successfully' });
   } catch (error) {
     console.error('Remove team assignment error:', error);
@@ -30918,6 +30932,12 @@ app.post('/api/jobs/:jobId/assign-multiple', authenticateToken, async (req, res)
         jobNotifications.notifyAssigned(userId, parseInt(jobId), newlyAssigned).catch(() => {});
       }
     }
+
+      try {
+        await rebuildJobLedger(parseInt(jobId), userId, { types: ['earning', 'tip', 'incentive', 'cash_collected'] });
+      } catch (rebuildErr) {
+        console.error(`[Ledger] Rebuild after assign-multiple failed for job ${jobId}:`, rebuildErr);
+      }
 
      res.json({
        message: 'Team members assigned successfully',
