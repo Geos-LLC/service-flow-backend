@@ -27,6 +27,12 @@
 
 const { recordOutboundIfApplicable, buildPayload, insertOutboxRow, OUTBOUND_ENABLED } = require('./lb-outbound-delivery')
 const { isOutboundAllowed, normalizeStatus } = require('./lb-outbound-status-map')
+const { safeDeleteCompletionDerivedLedger, COMPLETION_DERIVED_TYPES } = require('../lib/ledger-immutability')
+
+// Job statuses that materialize completion-derived ledger entries
+// (earning/tip/incentive/cash_collected). Kept in sync with the
+// same list used inline throughout server.js.
+const LEDGER_EARNINGS_STATUSES = ['completed', 'complete', 'paid']
 
 const VALID_SOURCES = new Set([
   'account_owner',
@@ -157,6 +163,49 @@ async function updateJobStatus(supabase, {
   if (userId != null) upd = upd.eq('user_id', userId)
   const { error: updErr } = await upd
   if (updErr) throw updErr
+
+  // ── Ledger cleanup on status transitions ─────────────────────────
+  // Delete UNBATCHED completion-derived entries (earning/tip/incentive/
+  // cash_collected) when a job leaves an earnings-eligible status, or is
+  // directly set to cancelled/rescheduled from any status. Preserves
+  // reimbursement / adjustment / payout / expense_deduction rows.
+  // Settled rows (payout_batch_id IS NOT NULL) are immutable by
+  // Constitution §3.1 — safeDeleteCompletionDerivedLedger skips them
+  // and reports for operator review.
+  //
+  // Why this lives here and not in the PATCH endpoint: every status
+  // write goes through updateJobStatus (CI-guarded), so this covers
+  // system-source reverts (e.g. accidental Start+End tap auto-revert),
+  // LB orchestration transitions, zenbooker sync, etc. — not just
+  // human-driven PATCH calls.
+  try {
+    const prev = (previousStatus || '').toLowerCase()
+    const next = (newStatus || '').toLowerCase()
+    const leavingEarnings = LEDGER_EARNINGS_STATUSES.includes(prev) && !LEDGER_EARNINGS_STATUSES.includes(next)
+    const directCancelOrReschedule = (next === 'cancelled' || next === 'rescheduled') && !LEDGER_EARNINGS_STATUSES.includes(prev)
+    if (leavingEarnings || directCancelOrReschedule) {
+      const src = leavingEarnings
+        ? `status_change:${prev}->${next}:${source}`
+        : `status_change_direct:${prev}->${next}:${source}`
+      const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
+        jobId: Number(jobId),
+        types: COMPLETION_DERIVED_TYPES,
+        source: src,
+      })
+      if (deleted > 0) {
+        console.log(`[Ledger] Removed ${deleted} unbatched completion entries for job ${jobId} (${prev} → ${next}, source=${source})`)
+      }
+      if (skippedBatched.length > 0) {
+        console.warn(`[Ledger] Job ${jobId} status change to ${next} preserved ${skippedBatched.length} settled rows (Constitution §3.1) — compensating adjustment may be required.`)
+      }
+    }
+  } catch (ledgerErr) {
+    // Never fail the status write on ledger cleanup issues — surface loudly
+    // in logs so operators notice, matching the "fail loudly, never silently"
+    // rule (Constitution §0 P2) but preserving the atomicity of the status
+    // update from the caller's perspective.
+    console.error(`[Ledger] Status-change cleanup failed for job ${jobId}:`, ledgerErr.message)
+  }
 
   // Status-history row (best-effort, never blocks the status write).
   // The frontend tooltip on the chevron progress bar (StatusHistoryTooltip)

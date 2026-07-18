@@ -6787,43 +6787,10 @@ app.patch('/api/jobs/:id/status', authenticateToken, async (req, res) => {
       }
     }
 
-    // === LEDGER CLEANUP: Remove UNBATCHED completion-derived entries when job leaves earnings status ===
-    // Covers: cancel, reschedule, reset to pending
-    // Only deletes entries derived from completion (earning/tip/incentive/cash_collected).
-    // reimbursement / expense_deduction / adjustment / payout entries are preserved —
-    // those survive a status change (e.g. cancellation reimbursement must not be wiped).
-    // Settled (payout_batch_id IS NOT NULL) rows are immutable by Constitution §3.1 —
-    // a status reset cannot retroactively erase paid earnings. Drift is audited via
-    // rebuildJobLedger; cleanup here uses safeDeleteCompletionDerivedLedger which
-    // skips settled rows and reports them for operator review.
-    const COMPLETION_DERIVED_TYPES = LEDGER_COMPLETION_DERIVED_TYPES;
-    if (earningsStatuses.includes(previousStatus) && !earningsStatuses.includes(status)) {
-      try {
-        const { deleted, skippedBatched } = await safeDeleteCompletionDerivedLedger(supabase, {
-          jobId: parseInt(id),
-          types: COMPLETION_DERIVED_TYPES,
-          source: `status_change:${previousStatus}->${status}`,
-        });
-        console.log(`[Ledger] Removed ${deleted} unbatched completion entries for job ${id} (${previousStatus} → ${status})`);
-        if (skippedBatched.length > 0) {
-          console.warn(`[Ledger] Job ${id} status change to ${status} preserved ${skippedBatched.length} settled rows (Constitution §3.1) — compensating adjustment may be required.`);
-        }
-      } catch (ledgerError) {
-        console.error(`⚠️ Error removing ledger entries for ${status} job:`, ledgerError);
-      }
-    }
-    // Also clean up if directly set to cancelled/rescheduled from non-earnings status (e.g. pending→cancelled)
-    if ((status === 'cancelled' || status === 'rescheduled') && !earningsStatuses.includes(previousStatus)) {
-      try {
-        await safeDeleteCompletionDerivedLedger(supabase, {
-          jobId: parseInt(id),
-          types: COMPLETION_DERIVED_TYPES,
-          source: `status_change_direct:${previousStatus}->${status}`,
-        });
-      } catch (ledgerError) {
-        console.error('⚠️ Error removing ledger entries (non-blocking):', ledgerError);
-      }
-    }
+    // Ledger cleanup for leaving-earnings and direct-cancel transitions is
+    // handled inside updateJobStatus (services/job-status-service.js) so
+    // every status writer — including system-source auto-reverts and LB
+    // orchestration — gets the same guarantee, not just this PATCH path.
 
     res.json({
       message: 'Job status updated successfully',
