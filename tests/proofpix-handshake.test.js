@@ -647,6 +647,105 @@ describe('proofpix-service — /connect/token/issue', () => {
   });
 });
 
+describe('proofpix-service — /connect/token/status', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  async function mintToken(app, userId) {
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(userId)}`)
+      .send();
+    return res.body.token;
+  }
+
+  test('freshly minted, not redeemed → pending', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const token = await mintToken(app, 1);
+    const res = await request(app)
+      .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'pending' });
+  });
+
+  test('after redeem → redeemed', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const token = await mintToken(app, 1);
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: token });
+    const res = await request(app)
+      .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'redeemed' });
+  });
+
+  test('past expires_at → expired (backend authoritative even if not yet redeemed)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const token = await mintToken(app, 1);
+    // Backdate expiry in the fake DB
+    supa._db.proofpix_connect_codes[0].expires_at = new Date(Date.now() - 1000).toISOString();
+    const res = await request(app)
+      .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'expired' });
+  });
+
+  test('unknown for well-formed but non-existent token (no enumeration signal)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    // Generate a real-shape token that was never inserted
+    const ghost = newConnectToken();
+    const res = await request(app)
+      .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(ghost)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'unknown' });
+  });
+
+  test('unknown for malformed token (short-circuits before DB)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connect/token/status?token=not-a-real-token');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'unknown' });
+  });
+
+  test('unknown for missing token param', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connect/token/status');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'unknown' });
+  });
+
+  test('flag-off namespace still 404s the status route', async () => {
+    delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED];
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connect/token/status?token=whatever');
+    expect(res.status).toBe(404);
+  });
+
+  test('typed 16-char code is not a valid token here (unknown)', async () => {
+    // The status endpoint is scoped to deep-link tokens (43-char
+    // base64url). A hyphenated Crockford code has a different shape
+    // and shouldn't be treated as a poll target — return unknown.
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const code = newConnectCode();
+    const res = await request(app)
+      .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(code)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'unknown' });
+  });
+});
+
 describe('proofpix-service — /connect/redeem (canonical)', () => {
   beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
   afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });

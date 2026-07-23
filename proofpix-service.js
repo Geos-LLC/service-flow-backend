@@ -24,6 +24,10 @@
  * PR 4 — same-device pairing:
  *   - POST /connect/token/issue           (SF user JWT)
  *     Mints a base64url single-use token (60s TTL) for deep-link pairing.
+ *   - GET  /connect/token/status?token=…  (token-as-capability, no auth)
+ *     Pollable status probe for the SF web authorize page. Returns one
+ *     of pending | redeemed | expired | unknown. 'unknown' collapses
+ *     malformed-shape AND not-in-DB to prevent enumeration.
  *   - POST /connect/redeem                (no auth — credential in body)
  *     Canonical redeem. Accepts both 16-char codes AND base64url tokens
  *     via shape discrimination.
@@ -254,6 +258,61 @@ module.exports = (supabase, logger) => {
       token,
       expires_in: Math.floor(CONNECT_TOKEN_TTL_MS / 1000),
     });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /connect/token/status?token=<token>
+  //   Token-scoped polling endpoint for the SF web authorize page.
+  //   The token itself is the capability — knowing it already unlocks
+  //   redemption via /connect/redeem, so exposing status is strictly
+  //   less powerful than what the caller already has.
+  //
+  //   Response: { status: 'pending' | 'redeemed' | 'expired' | 'unknown' }
+  //
+  //   'unknown' collapses both "malformed shape" and "not in DB" so a
+  //   token-enumerator can't distinguish "never existed" from "expired
+  //   long ago" (matches the OAuth device-flow convention).
+  //
+  //   Rate limit is looser than the credential-exchange limiter (30/min
+  //   vs 5/min) because the desktop polls this every ~4s. Still tight
+  //   enough that a wide sweep is expensive.
+  // ═════════════════════════════════════════════════════════════════
+  const statusPollLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: errBody(
+      'RATE_LIMITED',
+      'Too many status polls.',
+      { retryable: true, retryAfterSeconds: 60 }
+    ),
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  router.get('/connect/token/status', statusPollLimiter, async (req, res) => {
+    const token = req.query.token;
+    if (!isConnectToken(token)) {
+      return res.status(200).json({ status: 'unknown' });
+    }
+    const { data: row, error } = await supabase
+      .from('proofpix_connect_codes')
+      .select('code, redeemed_at, expires_at')
+      .eq('code', token)
+      .maybeSingle();
+    if (error) {
+      log.error('[ProofPix] token status lookup failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Status lookup failed.'));
+    }
+    if (!row) {
+      return res.status(200).json({ status: 'unknown' });
+    }
+    if (row.redeemed_at) {
+      return res.status(200).json({ status: 'redeemed' });
+    }
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      return res.status(200).json({ status: 'expired' });
+    }
+    return res.status(200).json({ status: 'pending' });
   });
 
   // ═════════════════════════════════════════════════════════════════
