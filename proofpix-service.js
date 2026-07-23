@@ -9,6 +9,7 @@
  *   - POST /connect/code/redeem           (no auth — code is the credential)
  *   - POST /connect/refresh               (no auth — refresh token is the credential)
  *   - GET  /connections                   (SF user JWT — lists caller's active devices)
+ *   - DELETE /connections/:id             (SF user JWT — admin revoke of a specific device)
  *   - GET  /connection/status             (ProofPix access token)
  *   - DELETE /connection                  (ProofPix access token; idempotent)
  *
@@ -327,9 +328,31 @@ module.exports = (supabase, logger) => {
   // POST /connect/code/redeem (kept ≥30 days for the existing
   // ProofPix-native adapter; same handler, no behavior diff).
   // ═════════════════════════════════════════════════════════════════
+  // Trim + hard-cap a display-only string. Length cap matches the
+  // existing device_label sanitizer so all display fields land in the
+  // DB with the same guarantees.
+  function sanitizeDisplayField(value, maxLen = 200) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    return trimmed.slice(0, maxLen);
+  }
+
   async function handleRedeem(req, res) {
     const input = req.body && req.body.code;
     const deviceLabel = req.body && req.body.device_label;
+    // Optional device metadata — ProofPix mobile client may include
+    // these to populate the SF /settings/proofpix devices card. All
+    // NULL-safe: if the mobile client hasn't been updated yet, the row
+    // is still valid, just less descriptive.
+    const deviceModel = sanitizeDisplayField(req.body && req.body.device_model);
+    const osName     = sanitizeDisplayField(req.body && req.body.os_name, 40);
+    const osVersion  = sanitizeDisplayField(req.body && req.body.os_version, 40);
+    const role       = sanitizeDisplayField(req.body && req.body.role, 40);
+    // req.ip is trust-proxy-safe (server.js:691 sets 'trust proxy', 1).
+    // Truncate to 64 chars to match the pattern in lib/admin-auth.js.
+    const clientIp = ((req.ip || req.headers['x-forwarded-for'] || '') + '').slice(0, 64) || null;
+
     if (typeof input !== 'string' || !input.trim()) {
       return res.status(400).json(errBody('INVALID_PAYLOAD', 'Missing or malformed code.'));
     }
@@ -405,6 +428,12 @@ module.exports = (supabase, logger) => {
         user_id: row.user_id,
         refresh_token_hash: refreshHash,
         device_label: labelToStore,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        role: role,
+        paired_from_ip: clientIp,
+        last_seen_ip: clientIp,
       })
       .select('id')
       .single();
@@ -473,11 +502,19 @@ module.exports = (supabase, logger) => {
       connectionId: conn.id,
     });
 
-    // Best-effort timestamp bump — failure to bump shouldn't fail the
-    // refresh, since the token itself is still valid.
+    // Best-effort timestamp + IP bump — failure to bump shouldn't fail
+    // the refresh, since the token itself is still valid. IP is
+    // captured server-side (trust-proxy honored via server.js:691), so
+    // even devices whose mobile client never sent metadata at
+    // /connect/redeem will accumulate a last_seen_ip after their first
+    // refresh call.
+    const refreshIp = ((req.ip || req.headers['x-forwarded-for'] || '') + '').slice(0, 64) || null;
     supabase
       .from('proofpix_connections')
-      .update({ last_used_at: new Date().toISOString() })
+      .update({
+        last_used_at: new Date().toISOString(),
+        last_seen_ip: refreshIp,
+      })
       .eq('id', conn.id)
       .then(({ error: e }) => { if (e) log.warn('[ProofPix] last_used_at bump failed:', e.message); });
 
@@ -506,7 +543,7 @@ module.exports = (supabase, logger) => {
   router.get('/connections', requireSfUserJwt, async (req, res) => {
     const { data, error } = await supabase
       .from('proofpix_connections')
-      .select('id, device_label, created_at, last_used_at')
+      .select('id, device_label, device_model, os_name, os_version, role, paired_from_ip, last_seen_ip, created_at, last_used_at')
       .eq('user_id', req.sfUserId)
       .is('revoked_at', null)
       .order('created_at', { ascending: false });
@@ -518,10 +555,78 @@ module.exports = (supabase, logger) => {
       connections: (data || []).map((r) => ({
         id: r.id,
         device_label: r.device_label,
+        device_model: r.device_model,
+        os_name: r.os_name,
+        os_version: r.os_version,
+        role: r.role,
+        paired_from_ip: r.paired_from_ip,
+        last_seen_ip: r.last_seen_ip,
         created_at: r.created_at,
         last_used_at: r.last_used_at,
       })),
     });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // DELETE /connections/:id
+  //   SF-side admin revoke — lets the SF /settings/proofpix page
+  //   disconnect a specific device. Distinct from DELETE /connection
+  //   (below) which is scoped to the calling device via its OWN
+  //   access token; this one is authed by the SF user JWT and takes
+  //   the connection id in the path so the admin can revoke any of
+  //   their own devices from the web UI.
+  //
+  //   Ownership: the WHERE clause pins user_id to the calling JWT so
+  //   even if an admin crafts a request with someone else's id, we
+  //   won't touch it. Response distinguishes:
+  //     - 204: revoked (or already revoked — idempotent)
+  //     - 400: :id isn't a valid number
+  //     - 404: no such connection under the calling user (either
+  //            wrong id, or belongs to someone else — collapsed to
+  //            not-found so we don't leak existence of foreign rows)
+  // ═════════════════════════════════════════════════════════════════
+  router.delete('/connections/:id', requireSfUserJwt, async (req, res) => {
+    const rawId = req.params.id;
+    const connectionId = Number.parseInt(rawId, 10);
+    if (!Number.isFinite(connectionId) || connectionId <= 0 || String(connectionId) !== rawId) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed connection id.'));
+    }
+
+    // Existence + ownership check BEFORE the update so we can return
+    // 404 for rows that don't belong to the caller. Idempotent
+    // revoke-of-already-revoked returns 204 (matches the existing
+    // DELETE /connection semantics), so we intentionally don't filter
+    // on revoked_at here.
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_connections')
+      .select('id, revoked_at')
+      .eq('id', connectionId)
+      .eq('user_id', req.sfUserId)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] connections revoke lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke lookup failed.'));
+    }
+    if (!existing) {
+      return res.status(404).json(errBody('NOT_FOUND', 'Connection not found.'));
+    }
+    if (existing.revoked_at) {
+      // Already revoked — idempotent success.
+      return res.status(204).end();
+    }
+
+    const { error: updateErr } = await supabase
+      .from('proofpix_connections')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', connectionId)
+      .eq('user_id', req.sfUserId)
+      .is('revoked_at', null);
+    if (updateErr) {
+      log.error('[ProofPix] connections revoke failed:', updateErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke failed.'));
+    }
+    log.log(`[ProofPix] admin revoked conn ${connectionId} for user ${req.sfUserId}`);
+    return res.status(204).end();
   });
 
   // ═════════════════════════════════════════════════════════════════

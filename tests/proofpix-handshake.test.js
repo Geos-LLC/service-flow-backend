@@ -909,6 +909,174 @@ describe('proofpix-service — GET /connections', () => {
       .set('Authorization', `Bearer ${redeem.body.access_token}`);
     expect(list.status).toBe(401);
   });
+
+  test('returns device metadata that ProofPix mobile sent at redeem', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({
+        code: issue.body.code,
+        device_label: 'iPhone 15 - Sarah',
+        device_model: 'iPhone 15 Pro',
+        os_name: 'iOS',
+        os_version: '18.2',
+        role: 'admin',
+      });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.status).toBe(200);
+    expect(list.body.connections).toHaveLength(1);
+    expect(list.body.connections[0]).toMatchObject({
+      device_label: 'iPhone 15 - Sarah',
+      device_model: 'iPhone 15 Pro',
+      os_name: 'iOS',
+      os_version: '18.2',
+      role: 'admin',
+    });
+  });
+
+  test('metadata fields default to null when mobile client omits them', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code, device_label: 'iPhone' });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections[0]).toMatchObject({
+      device_label: 'iPhone',
+      device_model: null,
+      os_name: null,
+      os_version: null,
+      role: null,
+    });
+  });
+});
+
+describe('proofpix-service — DELETE /connections/:id (admin revoke)', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('unauth → 401', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app).delete('/api/integrations/proofpix/connections/42');
+    expect(res.status).toBe(401);
+  });
+
+  test('malformed id → 400', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app)
+      .delete('/api/integrations/proofpix/connections/not-a-number')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+  });
+
+  test('id belonging to another user → 404 (no leak)', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1), seedUser(2)],
+      proofpix_connections: [
+        {
+          id: 50,
+          user_id: 2,                       // owned by user 2
+          refresh_token_hash: 'x',
+          device_label: 'Other admin device',
+          created_at: '2026-07-23T00:00:00.000Z',
+          revoked_at: null,
+        },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .delete('/api/integrations/proofpix/connections/50')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);   // authed as user 1
+    expect(res.status).toBe(404);
+    // Row still active — user 1's request must not affect user 2's device
+    expect(supa._db.proofpix_connections[0].revoked_at).toBeNull();
+  });
+
+  test('revoke succeeds and marks revoked_at, so future /connections omits it', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [
+        {
+          id: 60,
+          user_id: 1,
+          refresh_token_hash: 'x',
+          device_label: 'iPad',
+          created_at: '2026-07-23T00:00:00.000Z',
+          revoked_at: null,
+        },
+      ],
+    });
+    const app = makeApp(supa);
+    const revoke = await request(app)
+      .delete('/api/integrations/proofpix/connections/60')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(revoke.status).toBe(204);
+    expect(supa._db.proofpix_connections[0].revoked_at).toBeTruthy();
+
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections).toEqual([]);
+  });
+
+  test('re-revoking an already-revoked device is idempotent (204)', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [
+        {
+          id: 70,
+          user_id: 1,
+          refresh_token_hash: 'x',
+          device_label: 'Old phone',
+          created_at: '2026-07-01T00:00:00.000Z',
+          revoked_at: '2026-07-10T00:00:00.000Z',
+        },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .delete('/api/integrations/proofpix/connections/70')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(204);
+    // revoked_at not clobbered with a new timestamp
+    expect(supa._db.proofpix_connections[0].revoked_at).toBe('2026-07-10T00:00:00.000Z');
+  });
+
+  test('subsequent /connect/refresh on revoked device fails 401', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeem = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code });
+    const connectionId = supa._db.proofpix_connections[0].id;
+
+    await request(app)
+      .delete(`/api/integrations/proofpix/connections/${connectionId}`)
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+
+    const refresh = await request(app)
+      .post('/api/integrations/proofpix/connect/refresh')
+      .send({ refresh_token: redeem.body.refresh_token });
+    expect(refresh.status).toBe(401);
+  });
 });
 
 describe('proofpix-service — /connect/redeem (canonical)', () => {
