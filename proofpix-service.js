@@ -8,6 +8,7 @@
  *   - POST /connect/code/issue            (SF user JWT)
  *   - POST /connect/code/redeem           (no auth — code is the credential)
  *   - POST /connect/refresh               (no auth — refresh token is the credential)
+ *   - GET  /connections                   (SF user JWT — lists caller's active devices)
  *   - GET  /connection/status             (ProofPix access token)
  *   - DELETE /connection                  (ProofPix access token; idempotent)
  *
@@ -483,6 +484,43 @@ module.exports = (supabase, logger) => {
     return res.status(200).json({
       access_token: accessToken,
       expires_in: ACCESS_TOKEN_TTL_SEC,
+    });
+  });
+
+  // ═════════════════════════════════════════════════════════════════
+  // GET /connections
+  //   SF-side list of the calling user's active ProofPix devices.
+  //   Used by /settings/proofpix to render "these devices are paired"
+  //   so the admin gets a visible confirmation after the QR flow
+  //   redirects them back. Distinct from /connection/status (below)
+  //   which is scoped to a single device via its access token.
+  //
+  //   Auth: SF user JWT — mirrors the same envelope as
+  //   /connect/token/issue, so the settings page can reuse the
+  //   Authorization: Bearer <sfJwt> header it already carries.
+  //
+  //   Revoked rows are filtered out (the partial index
+  //   idx_proofpix_connections_user_active covers this exact query).
+  //   Refresh token hash is never returned — only the audit fields.
+  // ═════════════════════════════════════════════════════════════════
+  router.get('/connections', requireSfUserJwt, async (req, res) => {
+    const { data, error } = await supabase
+      .from('proofpix_connections')
+      .select('id, device_label, created_at, last_used_at')
+      .eq('user_id', req.sfUserId)
+      .is('revoked_at', null)
+      .order('created_at', { ascending: false });
+    if (error) {
+      log.error('[ProofPix] connections list failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'Connection list failed.'));
+    }
+    return res.status(200).json({
+      connections: (data || []).map((r) => ({
+        id: r.id,
+        device_label: r.device_label,
+        created_at: r.created_at,
+        last_used_at: r.last_used_at,
+      })),
     });
   });
 

@@ -69,9 +69,18 @@ function makeFakeSupabase(seed = {}) {
     if (!db[table]) db[table] = [];
 
     const selectChain = (filters) => {
+      // Order/pagination state — only used by the array-terminal
+      // (.then) path; single-row terminals ignore them.
+      let orderKey = null;
+      let orderAsc = true;
       const api = {
         eq(k, v) { filters.push(['eq', k, v]); return api; },
         is(k, v) { filters.push(['is', k, v]); return api; },
+        order(k, opts) {
+          orderKey = k;
+          orderAsc = opts && opts.ascending !== undefined ? opts.ascending : true;
+          return api;
+        },
         async maybeSingle() {
           const row = db[table].find((r) => matches(r, filters));
           return { data: row || null, error: null };
@@ -80,6 +89,23 @@ function makeFakeSupabase(seed = {}) {
           const row = db[table].find((r) => matches(r, filters));
           if (!row) return { data: null, error: { message: 'not found' } };
           return { data: row, error: null };
+        },
+        // Array terminal — awaiting the chain (or calling .then on it)
+        // returns { data: [...], error }. Enables the list-shaped
+        // routes like GET /connections without changing existing
+        // maybeSingle/single call sites.
+        then(onFulfilled, onRejected) {
+          const rows = db[table].filter((r) => matches(r, filters));
+          if (orderKey) {
+            rows.sort((a, b) => {
+              const av = a[orderKey], bv = b[orderKey];
+              if (av === bv) return 0;
+              if (av == null) return orderAsc ? -1 : 1;
+              if (bv == null) return orderAsc ? 1 : -1;
+              return orderAsc ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+            });
+          }
+          return Promise.resolve({ data: rows, error: null }).then(onFulfilled, onRejected);
         },
       };
       return api;
@@ -743,6 +769,145 @@ describe('proofpix-service — /connect/token/status', () => {
       .get(`/api/integrations/proofpix/connect/token/status?token=${encodeURIComponent(code)}`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: 'unknown' });
+  });
+});
+
+describe('proofpix-service — GET /connections', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('unauth → 401', async () => {
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app).get('/api/integrations/proofpix/connections');
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('INVALID_TOKEN');
+  });
+
+  test('flag-off → 404', async () => {
+    delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED];
+    const app = makeApp(makeFakeSupabase({ users: [seedUser(1)] }));
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(404);
+  });
+
+  test('empty when user has no connections', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ connections: [] });
+  });
+
+  test('returns active devices scoped to the caller (audit fields only, no token hash)', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1), seedUser(2)],
+      proofpix_connections: [
+        {
+          id: 10,
+          user_id: 1,
+          refresh_token_hash: 'MUST_NOT_LEAK',
+          device_label: 'iPhone 15 - Sarah',
+          created_at: '2026-07-23T18:00:00.000Z',
+          last_used_at: '2026-07-23T18:30:00.000Z',
+          revoked_at: null,
+        },
+        {
+          id: 11,
+          user_id: 1,
+          refresh_token_hash: 'ALSO_HIDDEN',
+          device_label: 'iPad',
+          created_at: '2026-07-23T20:00:00.000Z',
+          last_used_at: null,
+          revoked_at: null,
+        },
+        {
+          id: 12,
+          user_id: 2,                       // different owner — must be excluded
+          refresh_token_hash: 'OTHER_USERS',
+          device_label: 'Someone Else',
+          created_at: '2026-07-23T21:00:00.000Z',
+          last_used_at: null,
+          revoked_at: null,
+        },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.connections).toHaveLength(2);
+    // Newest-first (ORDER BY created_at DESC)
+    expect(res.body.connections[0]).toEqual({
+      id: 11,
+      device_label: 'iPad',
+      created_at: '2026-07-23T20:00:00.000Z',
+      last_used_at: null,
+    });
+    expect(res.body.connections[1]).toEqual({
+      id: 10,
+      device_label: 'iPhone 15 - Sarah',
+      created_at: '2026-07-23T18:00:00.000Z',
+      last_used_at: '2026-07-23T18:30:00.000Z',
+    });
+    // Refresh token hash never leaks
+    const asString = JSON.stringify(res.body);
+    expect(asString).not.toContain('MUST_NOT_LEAK');
+    expect(asString).not.toContain('refresh_token_hash');
+  });
+
+  test('excludes revoked devices', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      proofpix_connections: [
+        {
+          id: 20,
+          user_id: 1,
+          refresh_token_hash: 'x',
+          device_label: 'Active',
+          created_at: '2026-07-20T00:00:00.000Z',
+          last_used_at: null,
+          revoked_at: null,
+        },
+        {
+          id: 21,
+          user_id: 1,
+          refresh_token_hash: 'y',
+          device_label: 'Old / revoked',
+          created_at: '2026-07-01T00:00:00.000Z',
+          last_used_at: null,
+          revoked_at: '2026-07-15T00:00:00.000Z',
+        },
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.connections).toHaveLength(1);
+    expect(res.body.connections[0].device_label).toBe('Active');
+  });
+
+  test('ProofPix access token (wrong audience) cannot list connections', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    // Bind a device the standard way, then try to list via its access token
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    const redeem = await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${redeem.body.access_token}`);
+    expect(list.status).toBe(401);
   });
 });
 
