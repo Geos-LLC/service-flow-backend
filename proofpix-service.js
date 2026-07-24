@@ -151,6 +151,15 @@ module.exports = (supabase, logger) => {
       return res.status(401).json(errBody('INVALID_TOKEN', 'Token missing user id.'));
     }
     req.sfUserId = Number(userId);
+    // teamMemberId is present on JWTs issued to team members (the
+    // JWT's userId is still the workspace owner's id; teamMemberId
+    // is the row in team_members that identifies WHICH member is
+    // signed in). Absent on account-owner JWTs. Downstream code uses
+    // this to attribute pair rows and to gate cross-member ops.
+    const rawMemberId = decoded && (decoded.teamMemberId ?? decoded.team_member_id);
+    req.sfTeamMemberId = rawMemberId != null && Number.isFinite(Number(rawMemberId))
+      ? Number(rawMemberId)
+      : null;
     next();
   }
 
@@ -210,12 +219,18 @@ module.exports = (supabase, logger) => {
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/code/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const teamMemberId = req.sfTeamMemberId;
     const code = newConnectCode();
     const expiresAt = new Date(Date.now() + CODE_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code,
+        user_id: userId,
+        team_member_id: teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       // Collision on the PK is astronomically unlikely with 80-bit
@@ -224,7 +239,7 @@ module.exports = (supabase, logger) => {
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue code.'));
     }
 
-    log.log(`[ProofPix] issued connect code for user ${userId}`);
+    log.log(`[ProofPix] issued connect code for user ${userId} tm=${teamMemberId ?? '-'}`);
     return res.status(200).json({
       code,
       expires_in: Math.floor(CODE_TTL_MS / 1000),
@@ -243,19 +258,25 @@ module.exports = (supabase, logger) => {
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/token/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const teamMemberId = req.sfTeamMemberId;
     const token = newConnectToken();
     const expiresAt = new Date(Date.now() + CONNECT_TOKEN_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code: token, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code: token,
+        user_id: userId,
+        team_member_id: teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       log.error('[ProofPix] token insert failed:', error.message);
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue token.'));
     }
 
-    log.log(`[ProofPix] issued connect token for user ${userId}`);
+    log.log(`[ProofPix] issued connect token for user ${userId} tm=${teamMemberId ?? '-'}`);
     return res.status(200).json({
       token,
       expires_in: Math.floor(CONNECT_TOKEN_TTL_MS / 1000),
@@ -373,7 +394,7 @@ module.exports = (supabase, logger) => {
 
     const { data: row, error } = await supabase
       .from('proofpix_connect_codes')
-      .select('code, user_id, expires_at, redeemed_at')
+      .select('code, user_id, team_member_id, expires_at, redeemed_at')
       .eq('code', lookupKey)
       .maybeSingle();
 
@@ -426,6 +447,10 @@ module.exports = (supabase, logger) => {
       .from('proofpix_connections')
       .insert({
         user_id: row.user_id,
+        // Attribution — pulled from the code row (which captured it
+        // from the SF JWT at issue time). NULL for pairings issued
+        // directly by the workspace owner.
+        team_member_id: row.team_member_id,
         refresh_token_hash: refreshHash,
         device_label: labelToStore,
         device_model: deviceModel,
@@ -541,19 +566,64 @@ module.exports = (supabase, logger) => {
   //   Refresh token hash is never returned — only the audit fields.
   // ═════════════════════════════════════════════════════════════════
   router.get('/connections', requireSfUserJwt, async (req, res) => {
-    const { data, error } = await supabase
+    // Scoping rule:
+    //   • Workspace owner (no teamMemberId in JWT) sees EVERY active
+    //     row for their workspace — their own devices plus every
+    //     team member's device.
+    //   • Team member sees ONLY rows attributed to their own
+    //     team_members.id — cross-member visibility isn't part of
+    //     their view.
+    let query = supabase
       .from('proofpix_connections')
-      .select('id, device_label, device_model, os_name, os_version, role, paired_from_ip, last_seen_ip, created_at, last_used_at')
+      .select('id, team_member_id, device_label, device_model, os_name, os_version, role, paired_from_ip, last_seen_ip, created_at, last_used_at')
       .eq('user_id', req.sfUserId)
       .is('revoked_at', null)
       .order('created_at', { ascending: false });
+    if (req.sfTeamMemberId != null) {
+      query = query.eq('team_member_id', req.sfTeamMemberId);
+    }
+    const { data, error } = await query;
     if (error) {
       log.error('[ProofPix] connections list failed:', error.message);
       return res.status(500).json(errBody('INTERNAL', 'Connection list failed.'));
     }
+    const rows = data || [];
+
+    // Batch-fetch team_member display fields for any attributed rows.
+    // Two-step (not a PostgREST embed) so this stays trivially testable
+    // against the fake Supabase and portable if we ever swap drivers.
+    const memberIds = Array.from(new Set(rows.map((r) => r.team_member_id).filter((v) => v != null)));
+    const memberMap = new Map();
+    if (memberIds.length > 0) {
+      const { data: memberRows, error: memberErr } = await supabase
+        .from('team_members')
+        .select('id, first_name, last_name, email, role')
+        .in('id', memberIds);
+      if (memberErr) {
+        log.warn('[ProofPix] team_members lookup failed:', memberErr.message);
+        // Fall through — attribution just becomes null on those rows.
+      } else {
+        (memberRows || []).forEach((m) => {
+          memberMap.set(m.id, {
+            id: m.id,
+            first_name: m.first_name,
+            last_name: m.last_name,
+            email: m.email,
+            role: m.role,
+          });
+        });
+      }
+    }
+
     return res.status(200).json({
-      connections: (data || []).map((r) => ({
+      // viewer_is_owner tells the frontend which scoping applied.
+      // Owner UI shows attribution chips per row; team-member UI
+      // hides them (all rows are theirs by construction).
+      viewer_is_owner: req.sfTeamMemberId == null,
+      connections: rows.map((r) => ({
         id: r.id,
+        team_member_id: r.team_member_id,
+        team_member: r.team_member_id != null ? (memberMap.get(r.team_member_id) || null) : null,
         device_label: r.device_label,
         device_model: r.device_model,
         os_name: r.os_name,
@@ -599,7 +669,7 @@ module.exports = (supabase, logger) => {
     // on revoked_at here.
     const { data: existing, error: lookupErr } = await supabase
       .from('proofpix_connections')
-      .select('id, revoked_at')
+      .select('id, team_member_id, revoked_at')
       .eq('id', connectionId)
       .eq('user_id', req.sfUserId)
       .maybeSingle();
@@ -610,6 +680,17 @@ module.exports = (supabase, logger) => {
     if (!existing) {
       return res.status(404).json(errBody('NOT_FOUND', 'Connection not found.'));
     }
+
+    // Team-member gate: a team member can only revoke their OWN
+    // pairs (same team_member_id). Cross-member and owner-owned
+    // rows return 404 — same shape as "doesn't exist" so we don't
+    // leak the existence of foreign rows via a distinct 403.
+    // Owners (sfTeamMemberId == null) skip this and can revoke any
+    // row in their workspace.
+    if (req.sfTeamMemberId != null && existing.team_member_id !== req.sfTeamMemberId) {
+      return res.status(404).json(errBody('NOT_FOUND', 'Connection not found.'));
+    }
+
     if (existing.revoked_at) {
       // Already revoked — idempotent success.
       return res.status(204).end();
@@ -625,7 +706,7 @@ module.exports = (supabase, logger) => {
       log.error('[ProofPix] connections revoke failed:', updateErr.message);
       return res.status(500).json(errBody('INTERNAL', 'Revoke failed.'));
     }
-    log.log(`[ProofPix] admin revoked conn ${connectionId} for user ${req.sfUserId}`);
+    log.log(`[ProofPix] admin revoked conn ${connectionId} for user ${req.sfUserId} tm=${req.sfTeamMemberId ?? '-'}`);
     return res.status(204).end();
   });
 
