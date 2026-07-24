@@ -941,6 +941,103 @@ describe('proofpix-service — GET /connections', () => {
     });
   });
 
+  test('paired_by identity fields round-trip through redeem → /connections', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({
+        code: issue.body.code,
+        device_label: 'Sarah phone',
+        paired_by_proofpix_user_id: 'usr_9f3a-xyz',
+        paired_by_name: 'Sarah Thompson',
+        paired_by_email: 'sarah@example.com',
+      });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.status).toBe(200);
+    expect(list.body.connections[0]).toMatchObject({
+      paired_by_proofpix_user_id: 'usr_9f3a-xyz',
+      paired_by_name: 'Sarah Thompson',
+      paired_by_email: 'sarah@example.com',
+    });
+  });
+
+  test('team-member payload: name present, email NULL (per ProofPix spec)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({
+        code: issue.body.code,
+        role: 'team_member',
+        paired_by_proofpix_user_id: 'session_abc123',
+        paired_by_name: 'Mike Ross',
+        // paired_by_email intentionally omitted — team members have no local email
+      });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections[0]).toMatchObject({
+      role: 'team_member',
+      paired_by_proofpix_user_id: 'session_abc123',
+      paired_by_name: 'Mike Ross',
+      paired_by_email: null,
+    });
+  });
+
+  test('paired_by fields are truncated to spec lengths (64/200/200)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({
+        code: issue.body.code,
+        paired_by_proofpix_user_id: 'x'.repeat(500),
+        paired_by_name: 'y'.repeat(500),
+        paired_by_email: 'z'.repeat(500),
+      });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections[0].paired_by_proofpix_user_id).toHaveLength(64);
+    expect(list.body.connections[0].paired_by_name).toHaveLength(200);
+    expect(list.body.connections[0].paired_by_email).toHaveLength(200);
+  });
+
+  test('paired_by fields default to null when omitted (legacy client)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code, device_label: 'Legacy phone' });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections[0]).toMatchObject({
+      paired_by_proofpix_user_id: null,
+      paired_by_name: null,
+      paired_by_email: null,
+    });
+  });
+
   test('metadata fields default to null when mobile client omits them', async () => {
     const supa = makeFakeSupabase({ users: [seedUser(1)] });
     const app = makeApp(supa);

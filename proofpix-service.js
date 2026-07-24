@@ -349,6 +349,16 @@ module.exports = (supabase, logger) => {
     const osName     = sanitizeDisplayField(req.body && req.body.os_name, 40);
     const osVersion  = sanitizeDisplayField(req.body && req.body.os_version, 40);
     const role       = sanitizeDisplayField(req.body && req.body.role, 40);
+
+    // Identity of the ProofPix user completing the pair — added in the
+    // OTA after cbb4bd1. Coverage per role:
+    //   admin/individual → all three present
+    //   team_member      → id + name present; email is NULL by design
+    //                      (team members have no email locally)
+    // Legacy clients omit these entirely — nulls all the way, harmless.
+    const pairedByProofpixUserId = sanitizeDisplayField(req.body && req.body.paired_by_proofpix_user_id, 64);
+    const pairedByName           = sanitizeDisplayField(req.body && req.body.paired_by_name, 200);
+    const pairedByEmail          = sanitizeDisplayField(req.body && req.body.paired_by_email, 200);
     // req.ip is trust-proxy-safe (server.js:691 sets 'trust proxy', 1).
     // Truncate to 64 chars to match the pattern in lib/admin-auth.js.
     const clientIp = ((req.ip || req.headers['x-forwarded-for'] || '') + '').slice(0, 64) || null;
@@ -432,6 +442,9 @@ module.exports = (supabase, logger) => {
         os_name: osName,
         os_version: osVersion,
         role: role,
+        paired_by_proofpix_user_id: pairedByProofpixUserId,
+        paired_by_name: pairedByName,
+        paired_by_email: pairedByEmail,
         paired_from_ip: clientIp,
         last_seen_ip: clientIp,
       })
@@ -543,7 +556,7 @@ module.exports = (supabase, logger) => {
   router.get('/connections', requireSfUserJwt, async (req, res) => {
     const { data, error } = await supabase
       .from('proofpix_connections')
-      .select('id, device_label, device_model, os_name, os_version, role, paired_from_ip, last_seen_ip, created_at, last_used_at')
+      .select('id, device_label, device_model, os_name, os_version, role, paired_by_proofpix_user_id, paired_by_name, paired_by_email, paired_from_ip, last_seen_ip, created_at, last_used_at')
       .eq('user_id', req.sfUserId)
       .is('revoked_at', null)
       .order('created_at', { ascending: false });
@@ -559,6 +572,9 @@ module.exports = (supabase, logger) => {
         os_name: r.os_name,
         os_version: r.os_version,
         role: r.role,
+        paired_by_proofpix_user_id: r.paired_by_proofpix_user_id,
+        paired_by_name: r.paired_by_name,
+        paired_by_email: r.paired_by_email,
         paired_from_ip: r.paired_from_ip,
         last_seen_ip: r.last_seen_ip,
         created_at: r.created_at,
