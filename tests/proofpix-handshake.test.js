@@ -53,6 +53,7 @@ const {
 function makeFakeSupabase(seed = {}) {
   const db = {
     users: [...(seed.users || [])],
+    team_members: [...(seed.team_members || [])],
     proofpix_connect_codes: [...(seed.proofpix_connect_codes || [])],
     proofpix_connections: [...(seed.proofpix_connections || [])],
   };
@@ -61,6 +62,7 @@ function makeFakeSupabase(seed = {}) {
     return filters.every(([kind, k, v]) => {
       if (kind === 'eq') return String(row[k]) === String(v);
       if (kind === 'is') return v === null ? row[k] == null : row[k] === v;
+      if (kind === 'in') return Array.isArray(v) && v.some((x) => String(row[k]) === String(x));
       return false;
     });
   }
@@ -76,6 +78,7 @@ function makeFakeSupabase(seed = {}) {
       const api = {
         eq(k, v) { filters.push(['eq', k, v]); return api; },
         is(k, v) { filters.push(['is', k, v]); return api; },
+        in(k, v) { filters.push(['in', k, v]); return api; },
         order(k, opts) {
           orderKey = k;
           orderAsc = opts && opts.ascending !== undefined ? opts.ascending : true;
@@ -841,14 +844,17 @@ describe('proofpix-service — GET /connections', () => {
       .set('Authorization', `Bearer ${sfUserJwt(1)}`);
     expect(res.status).toBe(200);
     expect(res.body.connections).toHaveLength(2);
-    // Newest-first (ORDER BY created_at DESC)
-    expect(res.body.connections[0]).toEqual({
+    // Newest-first (ORDER BY created_at DESC). toMatchObject rather
+    // than toEqual — new nullable fields (linked_sf_team_member_id,
+    // linked_sf_team_member, etc) show up on the response but aren't
+    // material to this test's contract.
+    expect(res.body.connections[0]).toMatchObject({
       id: 11,
       device_label: 'iPad',
       created_at: '2026-07-23T20:00:00.000Z',
       last_used_at: null,
     });
-    expect(res.body.connections[1]).toEqual({
+    expect(res.body.connections[1]).toMatchObject({
       id: 10,
       device_label: 'iPhone 15 - Sarah',
       created_at: '2026-07-23T18:00:00.000Z',
@@ -1173,6 +1179,155 @@ describe('proofpix-service — DELETE /connections/:id (admin revoke)', () => {
       .post('/api/integrations/proofpix/connect/refresh')
       .send({ refresh_token: redeem.body.refresh_token });
     expect(refresh.status).toBe(401);
+  });
+});
+
+describe('proofpix-service — for_team_member_id (linked SF team member)', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  const activeMember = (id, user_id, first_name = 'Sarah', last_name = 'T') => ({
+    id, user_id, first_name, last_name, email: `${first_name.toLowerCase()}@ex.com`,
+    role: 'worker', status: 'active',
+  });
+
+  test('/connect/code/issue captures for_team_member_id on the code row', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      team_members: [activeMember(100, 1)],
+    });
+    const app = makeApp(supa);
+    await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 100 });
+    expect(supa._db.proofpix_connect_codes[0].linked_sf_team_member_id).toBe(100);
+  });
+
+  test('/connect/token/issue captures for_team_member_id on the code row', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      team_members: [activeMember(100, 1)],
+    });
+    const app = makeApp(supa);
+    await request(app)
+      .post('/api/integrations/proofpix/connect/token/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 100 });
+    expect(supa._db.proofpix_connect_codes[0].linked_sf_team_member_id).toBe(100);
+  });
+
+  test('cross-workspace team member id → 400 INVALID_TEAM_MEMBER (no existence leak)', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1), seedUser(2)],
+      team_members: [activeMember(200, 2)],   // owned by user 2
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)         // authed as user 1
+      .send({ for_team_member_id: 200 });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TEAM_MEMBER');
+    expect(supa._db.proofpix_connect_codes).toHaveLength(0);   // nothing written
+  });
+
+  test('inactive team member → 400 INVALID_TEAM_MEMBER', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      team_members: [{ ...activeMember(100, 1), status: 'inactive' }],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 100 });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TEAM_MEMBER');
+  });
+
+  test('malformed for_team_member_id → 400 INVALID_PAYLOAD', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 'not-a-number' });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+  });
+
+  test('omitting for_team_member_id → linked_sf_team_member_id is null (admin scope)', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();   // no body
+    expect(supa._db.proofpix_connect_codes[0].linked_sf_team_member_id).toBeNull();
+  });
+
+  test('handleRedeem propagates linked_sf_team_member_id from code → connection', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      team_members: [activeMember(100, 1)],
+    });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 100 });
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code });
+    expect(supa._db.proofpix_connections[0].linked_sf_team_member_id).toBe(100);
+  });
+
+  test('GET /connections returns linked_sf_team_member joined info', async () => {
+    const supa = makeFakeSupabase({
+      users: [seedUser(1)],
+      team_members: [activeMember(100, 1, 'Sarah', 'Thompson')],
+    });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send({ for_team_member_id: 100 });
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code, device_label: 'Sarah phone' });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.status).toBe(200);
+    expect(list.body.connections[0]).toMatchObject({
+      linked_sf_team_member_id: 100,
+      linked_sf_team_member: {
+        id: 100,
+        first_name: 'Sarah',
+        last_name: 'Thompson',
+        role: 'worker',
+      },
+    });
+  });
+
+  test('admin-scoped connection (no link) has linked_sf_team_member: null in /connections', async () => {
+    const supa = makeFakeSupabase({ users: [seedUser(1)] });
+    const app = makeApp(supa);
+    const issue = await request(app)
+      .post('/api/integrations/proofpix/connect/code/issue')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
+      .send();
+    await request(app)
+      .post('/api/integrations/proofpix/connect/redeem')
+      .send({ code: issue.body.code });
+    const list = await request(app)
+      .get('/api/integrations/proofpix/connections')
+      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
+    expect(list.body.connections[0]).toMatchObject({
+      linked_sf_team_member_id: null,
+      linked_sf_team_member: null,
+    });
   });
 });
 

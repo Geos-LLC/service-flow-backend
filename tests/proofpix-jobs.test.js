@@ -39,6 +39,7 @@ function makeFakeSupabase(seed = {}) {
     customers: [...(seed.customers || [])],
     customer_files: [...(seed.customer_files || [])],
     proofpix_connections: [...(seed.proofpix_connections || [])],
+    job_team_assignments: [...(seed.job_team_assignments || [])],
   };
   const rpcCalls = [];
 
@@ -792,5 +793,113 @@ describe('GET /jobs — auth', () => {
       .set('Authorization', `Bearer ${accessTokenFor(1)}`)
       .send();
     expect(res.status).toBe(401);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Team-member scoping — a device linked to a specific SF team member
+// only sees jobs assigned to them (via jobs.team_member_id OR
+// job_team_assignments join table).
+// ─────────────────────────────────────────────────────────────────────
+
+describe('GET /jobs — linked_sf_team_member scoping', () => {
+  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
+  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
+
+  test('unlinked (admin) connection sees ALL workspace jobs (baseline)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [seedConnection(1)],   // linked_sf_team_member_id absent → null
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),
+        makeJob({ id: 102, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id)).sort()).toEqual([100, 101, 102]);
+  });
+
+  test('linked connection filters via jobs.team_member_id (single-assignee path)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 42 }),   // ← Sarah
+        makeJob({ id: 102, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
+  });
+
+  test('linked connection also picks up jobs via job_team_assignments (multi-assignee path)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        // Only direct-assigned via team_member_id
+        makeJob({ id: 100, status: 'pending', team_member_id: 42 }),
+        // Only assigned via job_team_assignments (jobs.team_member_id = null)
+        makeJob({ id: 101, status: 'pending', team_member_id: null }),
+        // Not assigned to Sarah at all
+        makeJob({ id: 102, status: 'pending', team_member_id: null }),
+      ],
+      job_team_assignments: [
+        { id: 1, job_id: 101, team_member_id: 42, is_primary: true },
+        { id: 2, job_id: 102, team_member_id: 99, is_primary: true },   // different member
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    // Union: 100 (direct) + 101 (via assignments) — but NOT 102.
+    expect(res.body.jobs.map((j) => Number(j.id)).sort()).toEqual([100, 101]);
+  });
+
+  test('linked connection with no assignments at all → empty list', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'pending', team_member_id: null }),
+        makeJob({ id: 101, status: 'pending', team_member_id: 99 }),
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=all')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs).toEqual([]);
+  });
+
+  test('team-member scope composes with status filter (only Sarah\'s active jobs)', async () => {
+    const supa = makeFakeSupabase({
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
+      proofpix_connections: [{ ...seedConnection(1), linked_sf_team_member_id: 42 }],
+      jobs: [
+        makeJob({ id: 100, status: 'completed', team_member_id: 42 }),   // Sarah's but wrong status
+        makeJob({ id: 101, status: 'in-progress', team_member_id: 42 }), // Sarah's active
+        makeJob({ id: 102, status: 'in-progress', team_member_id: 99 }), // active but not Sarah's
+      ],
+    });
+    const app = makeApp(supa);
+    const res = await request(app)
+      .get('/api/integrations/proofpix/jobs?status=active')
+      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.jobs.map((j) => Number(j.id))).toEqual([101]);
   });
 });

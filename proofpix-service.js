@@ -171,9 +171,12 @@ module.exports = (supabase, logger) => {
       return res.status(401).json(errBody('INVALID_TOKEN', msg));
     }
     // Connection must still be active (not revoked, not deleted).
+    // Also pull linked_sf_team_member_id so downstream routes (/jobs
+    // especially) can scope their responses to the linked team member
+    // without an extra roundtrip.
     const { data: conn, error } = await supabase
       .from('proofpix_connections')
-      .select('id, user_id, revoked_at')
+      .select('id, user_id, linked_sf_team_member_id, revoked_at')
       .eq('id', result.connectionId)
       .eq('user_id', result.userId)
       .maybeSingle();
@@ -184,7 +187,13 @@ module.exports = (supabase, logger) => {
     if (!conn || conn.revoked_at) {
       return res.status(401).json(errBody('INVALID_TOKEN', 'Connection revoked.'));
     }
-    req.proofpix = { userId: result.userId, connectionId: result.connectionId };
+    req.proofpix = {
+      userId: result.userId,
+      connectionId: result.connectionId,
+      linkedSfTeamMemberId: conn.linked_sf_team_member_id != null
+        ? Number(conn.linked_sf_team_member_id)
+        : null,
+    };
     next();
   }
 
@@ -203,19 +212,71 @@ module.exports = (supabase, logger) => {
   }
 
   // ═════════════════════════════════════════════════════════════════
+  // Team-member ownership validator — the admin's connect-flow can
+  // scope a pair to a specific team member by passing for_team_member_id
+  // in the body. We verify the member actually belongs to this
+  // workspace AND is active before persisting the link. Returns:
+  //   { ok: true, teamMemberId: <number> }  — validated & active
+  //   { ok: true, teamMemberId: null }      — caller didn't supply one
+  //                                            (admin scope, no filter)
+  //   { ok: false, status, code, message }  — rejected
+  // Cross-workspace and unknown-id both collapse to INVALID_TEAM_MEMBER
+  // (400) — same shape, no existence leak.
+  // ═════════════════════════════════════════════════════════════════
+  async function resolveForTeamMemberId(rawInput, ownerUserId) {
+    if (rawInput == null || rawInput === '') {
+      return { ok: true, teamMemberId: null };
+    }
+    const teamMemberId = Number(rawInput);
+    if (!Number.isFinite(teamMemberId) || teamMemberId <= 0) {
+      return { ok: false, status: 400, code: 'INVALID_PAYLOAD', message: 'Malformed for_team_member_id.' };
+    }
+    const { data: row, error } = await supabase
+      .from('team_members')
+      .select('id, user_id, status')
+      .eq('id', teamMemberId)
+      .maybeSingle();
+    if (error) {
+      log.error('[ProofPix] team_members lookup failed:', error.message);
+      return { ok: false, status: 500, code: 'INTERNAL', message: 'Team member lookup failed.' };
+    }
+    if (!row || Number(row.user_id) !== Number(ownerUserId)) {
+      return { ok: false, status: 400, code: 'INVALID_TEAM_MEMBER', message: 'Team member not found in this workspace.' };
+    }
+    if (row.status && row.status !== 'active') {
+      return { ok: false, status: 400, code: 'INVALID_TEAM_MEMBER', message: 'Team member is not active.' };
+    }
+    return { ok: true, teamMemberId };
+  }
+
+  // ═════════════════════════════════════════════════════════════════
   // POST /connect/code/issue
   //   SF web UI calls this on behalf of an authenticated admin to mint
   //   a fresh code. The admin then pastes the code into the ProofPix
   //   mobile app's connect screen.
+  //
+  //   Optional body { for_team_member_id: <int> } scopes the pair to
+  //   a specific SF team member — that member's jobs will be the only
+  //   ones visible from the resulting device. Omit / null / 0 = admin
+  //   scope (device sees all workspace jobs).
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/code/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const forTM = await resolveForTeamMemberId(req.body && req.body.for_team_member_id, userId);
+    if (!forTM.ok) {
+      return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+    }
     const code = newConnectCode();
     const expiresAt = new Date(Date.now() + CODE_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code,
+        user_id: userId,
+        linked_sf_team_member_id: forTM.teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       // Collision on the PK is astronomically unlikely with 80-bit
@@ -224,7 +285,7 @@ module.exports = (supabase, logger) => {
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue code.'));
     }
 
-    log.log(`[ProofPix] issued connect code for user ${userId}`);
+    log.log(`[ProofPix] issued connect code for user ${userId} tm=${forTM.teamMemberId ?? '-'}`);
     return res.status(200).json({
       code,
       expires_in: Math.floor(CODE_TTL_MS / 1000),
@@ -240,22 +301,34 @@ module.exports = (supabase, logger) => {
   //
   //   60-second TTL — much shorter than the 16-char code (which is
   //   typed by hand) because the deep-link flow consumes it instantly.
+  //
+  //   Optional body { for_team_member_id: <int> } scopes the pair to
+  //   a specific SF team member (same semantics as /connect/code/issue).
   // ═════════════════════════════════════════════════════════════════
   router.post('/connect/token/issue', requireSfUserJwt, async (req, res) => {
     const userId = req.sfUserId;
+    const forTM = await resolveForTeamMemberId(req.body && req.body.for_team_member_id, userId);
+    if (!forTM.ok) {
+      return res.status(forTM.status).json(errBody(forTM.code, forTM.message));
+    }
     const token = newConnectToken();
     const expiresAt = new Date(Date.now() + CONNECT_TOKEN_TTL_MS).toISOString();
 
     const { error } = await supabase
       .from('proofpix_connect_codes')
-      .insert({ code: token, user_id: userId, expires_at: expiresAt });
+      .insert({
+        code: token,
+        user_id: userId,
+        linked_sf_team_member_id: forTM.teamMemberId,
+        expires_at: expiresAt,
+      });
 
     if (error) {
       log.error('[ProofPix] token insert failed:', error.message);
       return res.status(500).json(errBody('INTERNAL', 'Failed to issue token.'));
     }
 
-    log.log(`[ProofPix] issued connect token for user ${userId}`);
+    log.log(`[ProofPix] issued connect token for user ${userId} tm=${forTM.teamMemberId ?? '-'}`);
     return res.status(200).json({
       token,
       expires_in: Math.floor(CONNECT_TOKEN_TTL_MS / 1000),
@@ -383,7 +456,7 @@ module.exports = (supabase, logger) => {
 
     const { data: row, error } = await supabase
       .from('proofpix_connect_codes')
-      .select('code, user_id, expires_at, redeemed_at')
+      .select('code, user_id, linked_sf_team_member_id, expires_at, redeemed_at')
       .eq('code', lookupKey)
       .maybeSingle();
 
@@ -436,6 +509,10 @@ module.exports = (supabase, logger) => {
       .from('proofpix_connections')
       .insert({
         user_id: row.user_id,
+        // Scope the resulting device to a specific SF team member if
+        // the admin selected one at issue time. Copied verbatim from
+        // the code row — /jobs uses this to filter downstream.
+        linked_sf_team_member_id: row.linked_sf_team_member_id,
         refresh_token_hash: refreshHash,
         device_label: labelToStore,
         device_model: deviceModel,
@@ -556,7 +633,7 @@ module.exports = (supabase, logger) => {
   router.get('/connections', requireSfUserJwt, async (req, res) => {
     const { data, error } = await supabase
       .from('proofpix_connections')
-      .select('id, device_label, device_model, os_name, os_version, role, paired_by_proofpix_user_id, paired_by_name, paired_by_email, paired_from_ip, last_seen_ip, created_at, last_used_at')
+      .select('id, device_label, device_model, os_name, os_version, role, paired_by_proofpix_user_id, paired_by_name, paired_by_email, paired_from_ip, last_seen_ip, linked_sf_team_member_id, created_at, last_used_at')
       .eq('user_id', req.sfUserId)
       .is('revoked_at', null)
       .order('created_at', { ascending: false });
@@ -564,8 +641,41 @@ module.exports = (supabase, logger) => {
       log.error('[ProofPix] connections list failed:', error.message);
       return res.status(500).json(errBody('INTERNAL', 'Connection list failed.'));
     }
+    const rows = data || [];
+
+    // Batch-fetch team_member display fields for any linked rows so
+    // the settings UI can render "Linked to Sarah T." without an
+    // extra roundtrip per device. Two-step (not a PostgREST embed)
+    // keeps the fake-supabase in tests trivial to extend.
+    const linkedIds = Array.from(
+      new Set(rows.map((r) => r.linked_sf_team_member_id).filter((v) => v != null))
+    );
+    const linkedMap = new Map();
+    if (linkedIds.length > 0) {
+      const { data: memberRows, error: memberErr } = await supabase
+        .from('team_members')
+        .select('id, first_name, last_name, email, role')
+        .in('id', linkedIds);
+      if (memberErr) {
+        // Non-fatal — linked_sf_team_member returns null instead of
+        // {…}. Client already handles null gracefully (falls back to
+        // no chip). Better to render the list than 500.
+        log.warn('[ProofPix] team_members join failed:', memberErr.message);
+      } else {
+        (memberRows || []).forEach((m) => {
+          linkedMap.set(m.id, {
+            id: m.id,
+            first_name: m.first_name,
+            last_name: m.last_name,
+            email: m.email,
+            role: m.role,
+          });
+        });
+      }
+    }
+
     return res.status(200).json({
-      connections: (data || []).map((r) => ({
+      connections: rows.map((r) => ({
         id: r.id,
         device_label: r.device_label,
         device_model: r.device_model,
@@ -577,6 +687,10 @@ module.exports = (supabase, logger) => {
         paired_by_email: r.paired_by_email,
         paired_from_ip: r.paired_from_ip,
         last_seen_ip: r.last_seen_ip,
+        linked_sf_team_member_id: r.linked_sf_team_member_id,
+        linked_sf_team_member: r.linked_sf_team_member_id != null
+          ? (linkedMap.get(r.linked_sf_team_member_id) || null)
+          : null,
         created_at: r.created_at,
         last_used_at: r.last_used_at,
       })),
@@ -756,6 +870,7 @@ module.exports = (supabase, logger) => {
 
   router.get('/jobs', requireProofpixAccessToken, async (req, res) => {
     const userId = req.proofpix.userId;
+    const linkedTeamMemberId = req.proofpix.linkedSfTeamMemberId;
 
     // ── Parse + validate query params ───────────────────────────────
     const statusParam = (typeof req.query.status === 'string' && req.query.status)
@@ -800,6 +915,28 @@ module.exports = (supabase, logger) => {
       searchCustomerIds = (matched || []).map((c) => c.id);
     }
 
+    // ── Team-member scope: if this device is linked to a specific SF
+    //    team member (via /connect/*/issue's for_team_member_id), only
+    //    return jobs assigned to them. SF stores assignments in TWO
+    //    places (see server.js:3079-3106): jobs.team_member_id (legacy
+    //    single-assignee column) AND job_team_assignments (newer
+    //    multi-assignee join). Union of both = full picture.
+    //
+    //    Pull the assignment-table ids upfront so the final /jobs query
+    //    stays a single filter chain (composes cleanly with search + cursor).
+    let assignedJobIds = null;
+    if (linkedTeamMemberId != null) {
+      const { data: assignments, error: assignErr } = await supabase
+        .from('job_team_assignments')
+        .select('job_id')
+        .eq('team_member_id', linkedTeamMemberId);
+      if (assignErr) {
+        log.error('[ProofPix] /jobs assignments lookup failed:', assignErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Assignment lookup failed.'));
+      }
+      assignedJobIds = Array.from(new Set((assignments || []).map((a) => Number(a.job_id)))).filter(Number.isFinite);
+    }
+
     // ── Build the jobs query ────────────────────────────────────────
     let query = supabase
       .from('jobs')
@@ -814,6 +951,18 @@ module.exports = (supabase, logger) => {
       .order('scheduled_date', { ascending: false })
       .order('id', { ascending: false })
       .limit(limit + 1);   // +1 = peek for next page
+
+    // Team-member scope filter — OR'd from two sources.
+    if (linkedTeamMemberId != null) {
+      const scopeOrs = [`team_member_id.eq.${linkedTeamMemberId}`];
+      if (assignedJobIds && assignedJobIds.length > 0) {
+        scopeOrs.push(`id.in.(${assignedJobIds.join(',')})`);
+      }
+      // Each .or() is its own AND'd group in PostgREST — the search
+      // .or() below stays independent, so both filters compose as
+      // (scope) AND (search).
+      query = query.or(scopeOrs.join(','));
+    }
 
     // Status filter
     if (statusParam === 'active') {
