@@ -59,6 +59,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 
 const { BUCKETS } = require('./supabase-storage');
 const { FLAGS, isEnabled } = require('./lib/feature-flags');
@@ -1271,6 +1272,47 @@ module.exports = (supabase, logger) => {
       }
 
       log.log(`[ProofPix] photo attached: user=${userId} job=${jobId} photo_id=${insertRes.data.id}`);
+
+      // Team-member activity bump — if the upload metadata carries a
+      // captured_by string and it exact-matches a joined team member's
+      // display_name for this workspace, bump their last_upload_at /
+      // last_seen_at / photo_count. Missing match is silent (per doc
+      // §3: "do NOT auto-create a row — that path stays reserved for
+      // POST /team-members"). Best-effort — a failure here doesn't
+      // block the upload success response.
+      const capturedBy = meta.metadata && typeof meta.metadata.captured_by === 'string'
+        ? meta.metadata.captured_by.trim()
+        : '';
+      if (capturedBy) {
+        supabase
+          .from('proofpix_team_members')
+          .select('id, photo_count')
+          .eq('user_id', userId)
+          .eq('display_name', capturedBy)
+          .eq('status', 'joined')
+          .maybeSingle()
+          .then(({ data: member, error: lookupErr }) => {
+            if (lookupErr) {
+              log.warn('[ProofPix] team-member activity lookup failed:', lookupErr.message);
+              return;
+            }
+            if (!member) return;   // no match, silent per spec
+            const nowIso = new Date().toISOString();
+            supabase
+              .from('proofpix_team_members')
+              .update({
+                last_upload_at: nowIso,
+                last_seen_at: nowIso,
+                photo_count: Number(member.photo_count || 0) + 1,
+                updated_at: nowIso,
+              })
+              .eq('id', member.id)
+              .then(({ error: updErr }) => {
+                if (updErr) log.warn('[ProofPix] team-member activity bump failed:', updErr.message);
+              });
+          });
+      }
+
       return res.status(200).json({
         success: true,
         crm_photo_id: String(insertRes.data.id),
@@ -1279,5 +1321,259 @@ module.exports = (supabase, logger) => {
     }
   );
 
+  // ═════════════════════════════════════════════════════════════════
+  // Team-member visibility endpoints — see
+  //   docs SERVICE_FLOW_TEAM_MEMBERS_TASK.md (ProofPix side).
+  //
+  // SF-side shadow of the ProofPix admin's own ProofPix team. Prior
+  // to this, SF only knew the admin (via proofpix_connections) and
+  // had to wait for a photo upload with metadata.captured_by before
+  // it could infer other crew existence. These endpoints let the
+  // ProofPix proxy push a row on join, list them from SF, and revoke.
+  //
+  // All authed by ProofPix access token — the proxy calls with the
+  // admin's token (obtained via /connect/refresh from the admin's
+  // stored refresh token), so req.proofpix.userId = the admin's
+  // users.id = workspace_id. Cross-tenant leak impossible.
+  // ═════════════════════════════════════════════════════════════════
+
+  // 30/min per workspace (keyed on req.proofpix.userId so all admin
+  // access tokens through the same proxy IP still share correctly).
+  // 6× the doc's suggested 100/h cap — comfortable for bursty joins,
+  // still tight enough to make abuse expensive.
+  const teamMembersLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: errBody(
+      'RATE_LIMITED',
+      'Too many team-member calls.',
+      { retryable: true, retryAfterSeconds: 60 }
+    ),
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.proofpix && String(req.proofpix.userId)) || req.ip,
+  });
+
+  function encodeTeamMembersCursor(id) {
+    return Buffer.from(JSON.stringify({ i: id })).toString('base64url');
+  }
+  function decodeTeamMembersCursor(input) {
+    if (!input) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(String(input), 'base64url').toString('utf8'));
+      if (!Number.isFinite(Number(parsed.i))) return null;
+      return Number(parsed.i);
+    } catch {
+      return null;
+    }
+  }
+
+  // POST /team-members
+  //   Upsert on (user_id, proofpix_member_token). Rejoin-after-revoke
+  //   flips status back to 'joined', clears revoked_at, resets
+  //   joined_at (per doc §3).
+  router.post('/team-members', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const token = sanitizeDisplayField(req.body && req.body.proofpix_member_token, 128);
+    if (!token) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'proofpix_member_token is required.'));
+    }
+    const displayName = sanitizeDisplayField(req.body && req.body.display_name, 200);
+    const email       = sanitizeDisplayField(req.body && req.body.email, 200);
+    const deviceModel = sanitizeDisplayField(req.body && req.body.device_model, 200);
+    const osName      = sanitizeDisplayField(req.body && req.body.os_name, 40);
+    const osVersion   = sanitizeDisplayField(req.body && req.body.os_version, 40);
+
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_team_members')
+      .select('id, status, joined_at')
+      .eq('user_id', userId)
+      .eq('proofpix_member_token', token)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] team-members lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team-member lookup failed.'));
+    }
+
+    const now = new Date().toISOString();
+
+    if (existing) {
+      const wasRevoked = existing.status === 'revoked';
+      const patch = {
+        display_name: displayName,
+        email: email,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        last_seen_at: now,
+        updated_at: now,
+      };
+      if (wasRevoked) {
+        patch.status = 'joined';
+        patch.revoked_at = null;
+        patch.joined_at = now;
+      }
+      const { error: updErr } = await supabase
+        .from('proofpix_team_members')
+        .update(patch)
+        .eq('id', existing.id);
+      if (updErr) {
+        log.error('[ProofPix] team-members update failed:', updErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Team-member update failed.'));
+      }
+      return res.status(200).json({
+        id: existing.id,
+        workspace_id: String(userId),
+        proofpix_member_token: token,
+        status: 'joined',
+        joined_at: wasRevoked ? now : existing.joined_at,
+      });
+    }
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('proofpix_team_members')
+      .insert({
+        user_id: userId,
+        proofpix_member_token: token,
+        display_name: displayName,
+        email: email,
+        device_model: deviceModel,
+        os_name: osName,
+        os_version: osVersion,
+        status: 'joined',
+        joined_at: now,
+        last_seen_at: now,
+      })
+      .select('id, joined_at')
+      .single();
+    if (insErr || !inserted) {
+      log.error('[ProofPix] team-members insert failed:', insErr && insErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Team-member create failed.'));
+    }
+    log.log(`[ProofPix] team-member joined workspace=${userId} name=${displayName ?? '-'}`);
+    return res.status(200).json({
+      id: inserted.id,
+      workspace_id: String(userId),
+      proofpix_member_token: token,
+      status: 'joined',
+      joined_at: inserted.joined_at,
+    });
+  });
+
+  // GET /team-members?status=&limit=&cursor=
+  //   Cursor-paginated (opaque base64url id descending). Default
+  //   status='joined'; 'revoked' and 'all' also supported.
+  router.get('/team-members', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const statusParam = typeof req.query.status === 'string' ? req.query.status : 'joined';
+    if (!['joined', 'revoked', 'all'].includes(statusParam)) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Unknown status filter.'));
+    }
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, 500)
+      : 100;
+    const cursor = decodeTeamMembersCursor(req.query.cursor);
+    if (req.query.cursor && !cursor) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed cursor.'));
+    }
+
+    let query = supabase
+      .from('proofpix_team_members')
+      .select('id, proofpix_member_token, display_name, email, device_model, os_name, os_version, status, joined_at, last_seen_at, last_upload_at, photo_count')
+      .eq('user_id', userId)
+      .order('id', { ascending: false })
+      .limit(limit + 1);
+    if (statusParam !== 'all') query = query.eq('status', statusParam);
+    if (cursor != null) query = query.lt('id', cursor);
+
+    const { data, error } = await query;
+    if (error) {
+      log.error('[ProofPix] team-members list failed:', error.message);
+      return res.status(500).json(errBody('INTERNAL', 'List failed.'));
+    }
+    const rows = data || [];
+    const pageRows = rows.slice(0, limit);
+    const hasMore = rows.length > limit;
+    const nextCursor = hasMore ? encodeTeamMembersCursor(pageRows[pageRows.length - 1].id) : null;
+
+    return res.status(200).json({
+      team_members: pageRows,
+      next_cursor: nextCursor,
+    });
+  });
+
+  // POST /team-members/:token/revoke
+  //   Admin-driven revoke. Flips status → 'revoked', sets
+  //   revoked_at=NOW(). Idempotent — re-revoking is a no-op success.
+  //   Fire-and-forget callback to ProofPix proxy so it stops
+  //   accepting uploads with that token; failure is logged but
+  //   doesn't fail the response (admin can retry the revoke later).
+  router.post('/team-members/:token/revoke', teamMembersLimiter, requireProofpixAccessToken, async (req, res) => {
+    const userId = req.proofpix.userId;
+    const token = req.params.token;
+    if (!token || token.length > 128) {
+      return res.status(400).json(errBody('INVALID_PAYLOAD', 'Malformed token.'));
+    }
+
+    const { data: existing, error: lookupErr } = await supabase
+      .from('proofpix_team_members')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('proofpix_member_token', token)
+      .maybeSingle();
+    if (lookupErr) {
+      log.error('[ProofPix] team-member revoke lookup failed:', lookupErr.message);
+      return res.status(500).json(errBody('INTERNAL', 'Revoke lookup failed.'));
+    }
+    if (!existing) {
+      return res.status(404).json(errBody('NOT_FOUND', 'Team member not found.'));
+    }
+
+    if (existing.status !== 'revoked') {
+      const now = new Date().toISOString();
+      const { error: updErr } = await supabase
+        .from('proofpix_team_members')
+        .update({ status: 'revoked', revoked_at: now, updated_at: now })
+        .eq('id', existing.id);
+      if (updErr) {
+        log.error('[ProofPix] team-member revoke update failed:', updErr.message);
+        return res.status(500).json(errBody('INTERNAL', 'Revoke failed.'));
+      }
+      log.log(`[ProofPix] team-member revoked workspace=${userId} token=${token}`);
+    }
+
+    // Best-effort proxy callback. Never blocks the response — a proxy
+    // outage would otherwise strand admins who want to revoke while
+    // the proxy is down. If it fails we log; admin can revoke again
+    // once the proxy is back (idempotent on both sides).
+    notifyProxyOfRevoke(userId, token).catch((err) => {
+      log.warn('[ProofPix] proxy revoke callback failed:', err && err.message);
+    });
+
+    return res.status(200).json({ success: true });
+  });
+
   return router;
 };
+
+// Proxy-callback config lives at module scope so it's evaluated once
+// per process. If PROOFPIX_REVOKE_SHARED_SECRET is unset the callback
+// is skipped entirely — the DB row is still marked revoked, but the
+// proxy won't be notified. Set this env var on Railway before the
+// revoke feature is user-facing.
+const PROOFPIX_REVOKE_SHARED_SECRET = process.env.PROOFPIX_REVOKE_SHARED_SECRET || '';
+const PROOFPIX_PROXY_BASE = process.env.PROOFPIX_PROXY_BASE
+  || 'https://steadfast-blessing-production.up.railway.app';
+async function notifyProxyOfRevoke(workspaceUserId, memberToken) {
+  if (!PROOFPIX_REVOKE_SHARED_SECRET) return;   // callback disabled
+  const url = `${PROOFPIX_PROXY_BASE}/api/admin/${encodeURIComponent(workspaceUserId)}/tokens/${encodeURIComponent(memberToken)}/revoke`;
+  await axios.post(url, { revoked_at: new Date().toISOString() }, {
+    headers: {
+      'X-ProofPix-Signature': PROOFPIX_REVOKE_SHARED_SECRET,
+      'Content-Type': 'application/json',
+    },
+    timeout: 5000,
+    validateStatus: (s) => s >= 200 && s < 300,
+  });
+}
