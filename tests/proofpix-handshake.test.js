@@ -53,7 +53,6 @@ const {
 function makeFakeSupabase(seed = {}) {
   const db = {
     users: [...(seed.users || [])],
-    team_members: [...(seed.team_members || [])],
     proofpix_connect_codes: [...(seed.proofpix_connect_codes || [])],
     proofpix_connections: [...(seed.proofpix_connections || [])],
   };
@@ -62,7 +61,6 @@ function makeFakeSupabase(seed = {}) {
     return filters.every(([kind, k, v]) => {
       if (kind === 'eq') return String(row[k]) === String(v);
       if (kind === 'is') return v === null ? row[k] == null : row[k] === v;
-      if (kind === 'in') return Array.isArray(v) && v.some((x) => String(row[k]) === String(x));
       return false;
     });
   }
@@ -78,7 +76,6 @@ function makeFakeSupabase(seed = {}) {
       const api = {
         eq(k, v) { filters.push(['eq', k, v]); return api; },
         is(k, v) { filters.push(['is', k, v]); return api; },
-        in(k, v) { filters.push(['in', k, v]); return api; },
         order(k, opts) {
           orderKey = k;
           orderAsc = opts && opts.ascending !== undefined ? opts.ascending : true;
@@ -175,13 +172,8 @@ function makeApp(supabase) {
   return app;
 }
 
-function sfUserJwt(userId, teamMemberId = null) {
-  // Match the live token shape — userId is always the workspace owner's
-  // users.id; teamMemberId (if present) identifies which team_members
-  // row is signed in. Owner tokens omit the field.
-  const payload = { userId };
-  if (teamMemberId != null) payload.teamMemberId = teamMemberId;
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+function sfUserJwt(userId) {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '1h' });
 }
 
 const seedUser = (id, business_name = 'Acme Cleaning', email = `user${id}@example.com`) => ({
@@ -807,7 +799,7 @@ describe('proofpix-service — GET /connections', () => {
       .get('/api/integrations/proofpix/connections')
       .set('Authorization', `Bearer ${sfUserJwt(1)}`);
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ viewer_is_owner: true, connections: [] });
+    expect(res.body).toEqual({ connections: [] });
   });
 
   test('returns active devices scoped to the caller (audit fields only, no token hash)', async () => {
@@ -848,20 +840,17 @@ describe('proofpix-service — GET /connections', () => {
       .get('/api/integrations/proofpix/connections')
       .set('Authorization', `Bearer ${sfUserJwt(1)}`);
     expect(res.status).toBe(200);
-    expect(res.body.viewer_is_owner).toBe(true);
     expect(res.body.connections).toHaveLength(2);
     // Newest-first (ORDER BY created_at DESC)
-    expect(res.body.connections[0]).toMatchObject({
+    expect(res.body.connections[0]).toEqual({
       id: 11,
       device_label: 'iPad',
-      team_member: null,
       created_at: '2026-07-23T20:00:00.000Z',
       last_used_at: null,
     });
-    expect(res.body.connections[1]).toMatchObject({
+    expect(res.body.connections[1]).toEqual({
       id: 10,
       device_label: 'iPhone 15 - Sarah',
-      team_member: null,
       created_at: '2026-07-23T18:00:00.000Z',
       last_used_at: '2026-07-23T18:30:00.000Z',
     });
@@ -1087,182 +1076,6 @@ describe('proofpix-service — DELETE /connections/:id (admin revoke)', () => {
       .post('/api/integrations/proofpix/connect/refresh')
       .send({ refresh_token: redeem.body.refresh_token });
     expect(refresh.status).toBe(401);
-  });
-});
-
-describe('proofpix-service — team-member attribution', () => {
-  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
-  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
-
-  // Helper: pair a device by (owner_id, teamMemberId?, device_label)
-  // returns { access_token, refresh_token, connectionId }
-  async function pair(app, ownerId, teamMemberId, deviceLabel) {
-    const issue = await request(app)
-      .post('/api/integrations/proofpix/connect/code/issue')
-      .set('Authorization', `Bearer ${sfUserJwt(ownerId, teamMemberId)}`)
-      .send();
-    const redeem = await request(app)
-      .post('/api/integrations/proofpix/connect/redeem')
-      .send({ code: issue.body.code, device_label: deviceLabel });
-    return redeem.body;
-  }
-
-  test('team_member_id captured on the code row when issued by a team member', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [{ id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' }],
-    });
-    const app = makeApp(supa);
-    await request(app)
-      .post('/api/integrations/proofpix/connect/code/issue')
-      .set('Authorization', `Bearer ${sfUserJwt(1, 100)}`)
-      .send();
-    expect(supa._db.proofpix_connect_codes[0].team_member_id).toBe(100);
-    expect(supa._db.proofpix_connect_codes[0].user_id).toBe(1);
-  });
-
-  test('team_member_id is null on code when issued by the owner directly', async () => {
-    const supa = makeFakeSupabase({ users: [seedUser(1)] });
-    const app = makeApp(supa);
-    await request(app)
-      .post('/api/integrations/proofpix/connect/code/issue')
-      .set('Authorization', `Bearer ${sfUserJwt(1)}`)
-      .send();
-    expect(supa._db.proofpix_connect_codes[0].team_member_id).toBeFalsy();
-  });
-
-  test('team_member_id propagates code → connection at redeem', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [{ id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' }],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, 100, 'Sarah phone');
-    expect(supa._db.proofpix_connections[0].team_member_id).toBe(100);
-  });
-
-  test('owner GET /connections sees ALL rows in the workspace with team_member joined', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [
-        { id: 100, user_id: 1, first_name: 'Sarah',  last_name: 'T', email: 's@ex.com', role: 'worker' },
-        { id: 101, user_id: 1, first_name: 'Mike',   last_name: 'R', email: 'm@ex.com', role: 'worker' },
-      ],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, null, "Owner's iPhone");
-    await pair(app, 1, 100,  "Sarah's iPhone");
-    await pair(app, 1, 101,  "Mike's Android");
-
-    const list = await request(app)
-      .get('/api/integrations/proofpix/connections')
-      .set('Authorization', `Bearer ${sfUserJwt(1)}`);
-    expect(list.status).toBe(200);
-    expect(list.body.viewer_is_owner).toBe(true);
-    expect(list.body.connections).toHaveLength(3);
-
-    const byLabel = new Map(list.body.connections.map((c) => [c.device_label, c]));
-    expect(byLabel.get("Owner's iPhone").team_member).toBeNull();
-    expect(byLabel.get("Sarah's iPhone").team_member).toMatchObject({
-      id: 100, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker',
-    });
-    expect(byLabel.get("Mike's Android").team_member).toMatchObject({
-      id: 101, first_name: 'Mike',
-    });
-  });
-
-  test('team member GET /connections sees ONLY their own devices', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [
-        { id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' },
-        { id: 101, user_id: 1, first_name: 'Mike',  last_name: 'R', email: 'm@ex.com', role: 'worker' },
-      ],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, null, "Owner's iPhone");
-    await pair(app, 1, 100,  "Sarah's iPhone");
-    await pair(app, 1, 100,  "Sarah's iPad");
-    await pair(app, 1, 101,  "Mike's Android");
-
-    const list = await request(app)
-      .get('/api/integrations/proofpix/connections')
-      .set('Authorization', `Bearer ${sfUserJwt(1, 100)}`);   // Sarah's JWT
-    expect(list.status).toBe(200);
-    expect(list.body.viewer_is_owner).toBe(false);
-    expect(list.body.connections).toHaveLength(2);
-    const labels = list.body.connections.map((c) => c.device_label).sort();
-    expect(labels).toEqual(["Sarah's iPad", "Sarah's iPhone"]);
-    // No cross-contamination — no owner or Mike rows
-    expect(labels).not.toContain("Owner's iPhone");
-    expect(labels).not.toContain("Mike's Android");
-  });
-
-  test('team member cannot revoke the OWNER\'s device (404, still active)', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [{ id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' }],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, null, "Owner's iPhone");
-    const ownerConnId = supa._db.proofpix_connections[0].id;
-
-    const revoke = await request(app)
-      .delete(`/api/integrations/proofpix/connections/${ownerConnId}`)
-      .set('Authorization', `Bearer ${sfUserJwt(1, 100)}`);   // Sarah authed
-    expect(revoke.status).toBe(404);
-    expect(supa._db.proofpix_connections[0].revoked_at).toBeFalsy();
-  });
-
-  test('team member cannot revoke ANOTHER team member\'s device (404)', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [
-        { id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' },
-        { id: 101, user_id: 1, first_name: 'Mike',  last_name: 'R', email: 'm@ex.com', role: 'worker' },
-      ],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, 101, "Mike's Android");
-    const mikeConnId = supa._db.proofpix_connections[0].id;
-
-    const revoke = await request(app)
-      .delete(`/api/integrations/proofpix/connections/${mikeConnId}`)
-      .set('Authorization', `Bearer ${sfUserJwt(1, 100)}`);   // Sarah authed
-    expect(revoke.status).toBe(404);
-    expect(supa._db.proofpix_connections[0].revoked_at).toBeFalsy();
-  });
-
-  test('team member CAN revoke their own device (204)', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [{ id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' }],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, 100, "Sarah's iPhone");
-    const connId = supa._db.proofpix_connections[0].id;
-
-    const revoke = await request(app)
-      .delete(`/api/integrations/proofpix/connections/${connId}`)
-      .set('Authorization', `Bearer ${sfUserJwt(1, 100)}`);
-    expect(revoke.status).toBe(204);
-    expect(supa._db.proofpix_connections[0].revoked_at).toBeTruthy();
-  });
-
-  test('owner CAN revoke any team member device (204)', async () => {
-    const supa = makeFakeSupabase({
-      users: [seedUser(1)],
-      team_members: [{ id: 100, user_id: 1, first_name: 'Sarah', last_name: 'T', email: 's@ex.com', role: 'worker' }],
-    });
-    const app = makeApp(supa);
-    await pair(app, 1, 100, "Sarah's iPhone");
-    const connId = supa._db.proofpix_connections[0].id;
-
-    const revoke = await request(app)
-      .delete(`/api/integrations/proofpix/connections/${connId}`)
-      .set('Authorization', `Bearer ${sfUserJwt(1)}`);   // owner (no teamMemberId)
-    expect(revoke.status).toBe(204);
-    expect(supa._db.proofpix_connections[0].revoked_at).toBeTruthy();
   });
 });
 
