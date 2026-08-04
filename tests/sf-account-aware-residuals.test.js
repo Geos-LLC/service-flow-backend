@@ -95,12 +95,13 @@ describe('sf_truth_overrides_lost routes to sync apply, not feedback', () => {
 
 // ─── 3. already_reconciled_customer ────────────────────────────────────────
 describe('already_reconciled_customer', () => {
-  test('stale + not engaged → AUTO_NO_MATCH', () => {
+  test('stale + not engaged → REPEAT_INQUIRY_SAME_ACCOUNT (LB_TERMINAL_SKIPPED, not no_match)', () => {
     const lb = lbCandidate({ createdAt: new Date('2025-03-01T00:00:00Z') });
     const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), ctx({ paidJobsCount: 3 }));
     expect(cls.account_class).toBe(ACCOUNT_CLASSES.EXISTING_CUSTOMER_PINNED);
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
-    expect(cls.delivery_path).toBe(DELIVERY_PATHS.FEEDBACK);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+    expect(cls.lb_terminal_reason).toBe('repeat_inquiry_same_account');
   });
 
   test('paid customer + recent + engaged → needs_review (ACTIVE_ACCOUNT_REENGAGEMENT)', () => {
@@ -111,33 +112,36 @@ describe('already_reconciled_customer', () => {
     expect(cls.delivery_path).toBe(DELIVERY_PATHS.FEEDBACK);
   });
 
-  test('recent but no engagement → AUTO_NO_MATCH', () => {
+  test('recent but no engagement → REPEAT_INQUIRY_SAME_ACCOUNT', () => {
     const lb = lbCandidate({ createdAt: new Date('2026-05-01T00:00:00Z') });
     const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), ctx({ paidJobsCount: 1, customerEngagedOnThread: false }));
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
   });
 
-  test('engaged but stale → AUTO_NO_MATCH', () => {
+  test('engaged but stale → REPEAT_INQUIRY_SAME_ACCOUNT', () => {
     const lb = lbCandidate({ createdAt: new Date('2024-12-01T00:00:00Z') });
     const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), ctx({ paidJobsCount: 1, customerEngagedOnThread: true }));
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
   });
 });
 
 // ─── 4. cross_inquiry_or_non_lb_sf_lead ────────────────────────────────────
 describe('cross_inquiry_or_non_lb_sf_lead', () => {
-  test('marketplace duplicate sibling → AUTO_NO_MATCH', () => {
+  test('marketplace duplicate sibling → MARKETPLACE_DUPLICATE (LB_TERMINAL_SKIPPED, not no_match)', () => {
     const lb = lbCandidate({ createdAt: new Date('2025-09-04T20:02:49Z') });
     const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ marketplaceDuplicateSibling: true, anySiblingLbCount: 1 }));
     expect(cls.account_class).toBe(ACCOUNT_CLASSES.MARKETPLACE_DUPLICATE);
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.MARKETPLACE_DUPLICATE);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+    expect(cls.lb_terminal_reason).toBe('marketplace_duplicate');
   });
 
-  test('linked sibling, no customer → AUTO_NO_MATCH (SAME_ACCOUNT_SIBLING_LINKED)', () => {
+  test('linked sibling, no customer → REPEAT_INQUIRY_SAME_ACCOUNT (LB_TERMINAL_SKIPPED)', () => {
     const lb = lbCandidate({ createdAt: new Date('2025-01-28T00:00:00Z') });   // stale
     const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ linkedSiblingLbCount: 1, paidJobsCount: 0 }));
     expect(cls.account_class).toBe(ACCOUNT_CLASSES.SAME_ACCOUNT_SIBLING_LINKED);
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
   });
 
   test('paid customer + recent + engaged → needs_review', () => {
@@ -154,19 +158,22 @@ describe('cross_inquiry_or_non_lb_sf_lead', () => {
     expect(cls.action).toBe(ACTIONS.NEEDS_REVIEW);
   });
 
-  test('paid customer + stale → AUTO_NO_MATCH (EXISTING_CUSTOMER_PINNED)', () => {
+  test('paid customer + stale → REPEAT_INQUIRY_SAME_ACCOUNT (EXISTING_CUSTOMER_PINNED)', () => {
     const lb = lbCandidate({ createdAt: new Date('2025-01-01T00:00:00Z') });
     const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ paidJobsCount: 13, customerEngagedOnThread: true }));
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
   });
 });
 
-// ─── 5. Stale no-revenue account → auto_no_match ───────────────────────────
-describe('stale no-revenue account → auto_no_match', () => {
+// ─── 5. Stale no-revenue account with linked sibling → REPEAT_INQUIRY ──────
+describe('stale no-revenue account → REPEAT_INQUIRY_SAME_ACCOUNT (not no_match)', () => {
   test('cross_inquiry, no customer, linked sibling, ≥6 months old', () => {
     const lb = lbCandidate({ createdAt: new Date('2024-12-30T00:00:00Z') });
     const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ linkedSiblingLbCount: 1, paidJobsCount: 0 }));
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+    // The known-account-non-primary-inquiry contract: NEVER no_match
+    expect(cls.action).not.toBe(ACTIONS.NO_MATCH);
   });
 
   test('cross_inquiry + zero siblings + zero customer + no SF lead → needs_review (SF_LEAD_ORPHAN)', () => {
@@ -189,8 +196,10 @@ describe('customer with multiple LB leads resolves through same account', () => 
 
     expect(r1.account_class).toBe(ACCOUNT_CLASSES.EXISTING_CUSTOMER_NO_PIN);
     expect(r1.action).toBe(ACTIONS.AUTO_LINK);
-    // lb2 is recent (~67d) but customerEngagedOnThread is false by default → no_match
-    expect(r2.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    // lb2 is recent (~67d) but customerEngagedOnThread is false by default
+    // → repeat_inquiry_same_account (LB-safe terminal, not no_match)
+    expect(r2.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(r2.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
 
     // If lb2 also engaged → becomes reengagement
     const ctx2 = { ...ctx1, customerEngagedOnThread: true };
@@ -215,7 +224,7 @@ describe('duplicate phone conflict accounts are not merged', () => {
 
     // Same phone conflict is invisible to the classifier (which only sees
     // per-Account context). Both rows get their own decision.
-    expect(rA.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(rA.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
     expect(rB.action).toBe(ACTIONS.NEEDS_REVIEW);
     // No merge, no cross-talk.
   });
@@ -242,14 +251,17 @@ describe('out-of-scope categorize results fall through', () => {
   });
 });
 
-// ─── 9. The 59-row fixture: 9 / 47 / 3 / 0 ─────────────────────────────────
+// ─── 9. The 59-row fixture: 9 / 3 / 43 / 4 / 0 (new 5-bucket taxonomy) ─────
 //
 // Synthetic fixture that mirrors the breakdown from the unified second-pass
-// analysis. Each row encodes (categorize-bucket, categorize-reason,
-// account context) — fed through the classifier in bulk. The pinned counts
-// 9 auto_link / 47 auto_no_match / 3 needs_review / 0 unresolved match the
-// PR B shadow report exactly.
-describe('59-row residual fixture classifies to 9 / 47 / 3 / 0', () => {
+// analysis under the LB-safe terminal taxonomy. Pinned counts:
+//   AUTO_LINK                    : 9
+//   NEEDS_REVIEW                 : 3
+//   REPEAT_INQUIRY_SAME_ACCOUNT  : 43
+//   MARKETPLACE_DUPLICATE        : 4
+//   NO_MATCH                     : 0
+//   unresolved                   : 0
+describe('59-row residual fixture classifies to 9 / 3 / 43 / 4 / 0', () => {
   // Builds the 59 rows. Source: unified-pass analysis.
   function build59() {
     const rows = [];
@@ -304,16 +316,26 @@ describe('59-row residual fixture classifies to 9 / 47 / 3 / 0', () => {
     return rows;
   }
 
-  test('counts match exactly 9 / 47 / 3 / 0', () => {
+  test('counts match exactly 9 / 3 / 43 / 4 / 0', () => {
     const rows = build59();
     expect(rows.length).toBe(59);
 
-    const tally = { auto_link: 0, auto_no_match: 0, needs_review: 0, unresolved: 0, fallback: 0 };
+    const tally = {
+      auto_link:                   0,
+      needs_review:                0,
+      repeat_inquiry_same_account: 0,
+      marketplace_duplicate:       0,
+      no_match:                    0,
+      unresolved:                  0,
+      fallback:                    0,
+    };
     for (const r of rows) {
       const cls = classify(r.lb, r.cat, r.ctx);
-      if (cls.action === ACTIONS.AUTO_LINK)             tally.auto_link++;
-      else if (cls.action === ACTIONS.AUTO_NO_MATCH)    tally.auto_no_match++;
-      else if (cls.action === ACTIONS.NEEDS_REVIEW)     tally.needs_review++;
+      if (cls.action === ACTIONS.AUTO_LINK)                          tally.auto_link++;
+      else if (cls.action === ACTIONS.NEEDS_REVIEW)                  tally.needs_review++;
+      else if (cls.action === ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT)   tally.repeat_inquiry_same_account++;
+      else if (cls.action === ACTIONS.MARKETPLACE_DUPLICATE)         tally.marketplace_duplicate++;
+      else if (cls.action === ACTIONS.NO_MATCH)                      tally.no_match++;
       else if (cls.action === ACTIONS.FALLBACK_TO_MATCHER) {
         if (cls.account_class === ACCOUNT_CLASSES.UNRESOLVED_NO_ACCOUNT_ID) tally.unresolved++;
         else tally.fallback++;
@@ -321,8 +343,10 @@ describe('59-row residual fixture classifies to 9 / 47 / 3 / 0', () => {
     }
 
     expect(tally.auto_link).toBe(9);
-    expect(tally.auto_no_match).toBe(47);
     expect(tally.needs_review).toBe(3);
+    expect(tally.repeat_inquiry_same_account).toBe(43);
+    expect(tally.marketplace_duplicate).toBe(4);
+    expect(tally.no_match).toBe(0);
     expect(tally.unresolved).toBe(0);
     expect(tally.fallback).toBe(0);
   });
@@ -338,12 +362,35 @@ describe('59-row residual fixture classifies to 9 / 47 / 3 / 0', () => {
     }
   });
 
-  test('all auto_no_match and needs_review rows route via FEEDBACK', () => {
+  test('all needs_review rows route via FEEDBACK', () => {
     const rows = build59();
     for (const r of rows) {
       const cls = classify(r.lb, r.cat, r.ctx);
-      if (cls.action === ACTIONS.AUTO_NO_MATCH || cls.action === ACTIONS.NEEDS_REVIEW) {
+      if (cls.action === ACTIONS.NEEDS_REVIEW) {
         expect(cls.delivery_path).toBe(DELIVERY_PATHS.FEEDBACK);
+      }
+    }
+  });
+
+  test('all repeat_inquiry_same_account + marketplace_duplicate rows route via LB_TERMINAL_SKIPPED (never FEEDBACK/no_match)', () => {
+    const rows = build59();
+    for (const r of rows) {
+      const cls = classify(r.lb, r.cat, r.ctx);
+      if (cls.action === ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT || cls.action === ACTIONS.MARKETPLACE_DUPLICATE) {
+        expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+        // critical: known-Account non-primary inquiries are NEVER no_match
+        expect(cls.action).not.toBe(ACTIONS.NO_MATCH);
+      }
+    }
+  });
+
+  test('lb_terminal_reason is populated for LB_TERMINAL_SKIPPED rows', () => {
+    const rows = build59();
+    for (const r of rows) {
+      const cls = classify(r.lb, r.cat, r.ctx);
+      if (cls.delivery_path === DELIVERY_PATHS.LB_TERMINAL_SKIPPED) {
+        expect(cls.lb_terminal_reason).toBeTruthy();
+        expect(['repeat_inquiry_same_account', 'marketplace_duplicate']).toContain(cls.lb_terminal_reason);
       }
     }
   });
@@ -357,10 +404,11 @@ describe('recency threshold is configurable', () => {
     expect(cls.action).toBe(ACTIONS.NEEDS_REVIEW);
   });
 
-  test('default 90d: 91d-old + engaged + paid → AUTO_NO_MATCH', () => {
+  test('default 90d: 91d-old + engaged + paid → REPEAT_INQUIRY_SAME_ACCOUNT (not no_match)', () => {
     const lb = lbCandidate({ createdAt: new Date('2026-03-07T00:00:00Z') });   // 91d before NOW
     const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), ctx({ paidJobsCount: 1, customerEngagedOnThread: true }));
-    expect(cls.action).toBe(ACTIONS.AUTO_NO_MATCH);
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(cls.action).not.toBe(ACTIONS.NO_MATCH);
   });
 
   test('threshold=120d: 100d-old + engaged + paid → reengagement', () => {
@@ -386,6 +434,54 @@ describe('safety: already_reconciled_customer NEVER routes to SYNC_APPLY', () =>
       const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), ctx({ paidJobsCount: inp.paidJobsCount, customerEngagedOnThread: inp.customerEngagedOnThread }));
       expect(cls.delivery_path).not.toBe(DELIVERY_PATHS.SYNC_APPLY);
     }
+  });
+});
+
+// ─── 13. Safety surface: known-Account residuals NEVER route to NO_MATCH ───
+describe('safety: known-Account residuals NEVER classify as NO_MATCH', () => {
+  test('already_reconciled_customer never returns NO_MATCH (any signal combo)', () => {
+    const combos = [
+      ctx({ paidJobsCount: 0 }),
+      ctx({ paidJobsCount: 1 }),
+      ctx({ paidJobsCount: 1, customerEngagedOnThread: true }),
+      ctx({ paidJobsCount: 5, customerEngagedOnThread: true }),
+    ];
+    for (const a of combos) {
+      const lb = lbCandidate({ createdAt: new Date('2025-06-01T00:00:00Z') });
+      const cls = classify(lb, cat('would_skip', 'already_reconciled_customer'), a);
+      expect(cls.action).not.toBe(ACTIONS.NO_MATCH);
+    }
+  });
+
+  test('cross_inquiry with any Account anchor never returns NO_MATCH', () => {
+    const combos = [
+      ctx({ linkedSiblingLbCount: 1 }),
+      ctx({ paidJobsCount: 1 }),
+      ctx({ paidJobsCount: 1, customerEngagedOnThread: true }),
+      ctx({ marketplaceDuplicateSibling: true }),
+      ctx({ sfLeadIdsInAccount: ['x'] }),
+    ];
+    for (const a of combos) {
+      const lb = lbCandidate({ createdAt: new Date('2025-06-01T00:00:00Z') });
+      const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), a);
+      expect(cls.action).not.toBe(ACTIONS.NO_MATCH);
+    }
+  });
+
+  test('marketplace_duplicate carries lb_terminal_reason="marketplace_duplicate"', () => {
+    const lb = lbCandidate({ createdAt: new Date('2025-09-04T20:02:49Z') });
+    const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ marketplaceDuplicateSibling: true }));
+    expect(cls.action).toBe(ACTIONS.MARKETPLACE_DUPLICATE);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+    expect(cls.lb_terminal_reason).toBe('marketplace_duplicate');
+  });
+
+  test('repeat_inquiry_same_account carries lb_terminal_reason="repeat_inquiry_same_account"', () => {
+    const lb = lbCandidate({ createdAt: new Date('2025-01-01T00:00:00Z') });
+    const cls = classify(lb, cat('would_review', 'cross_inquiry_or_non_lb_sf_lead'), ctx({ linkedSiblingLbCount: 1 }));
+    expect(cls.action).toBe(ACTIONS.REPEAT_INQUIRY_SAME_ACCOUNT);
+    expect(cls.delivery_path).toBe(DELIVERY_PATHS.LB_TERMINAL_SKIPPED);
+    expect(cls.lb_terminal_reason).toBe('repeat_inquiry_same_account');
   });
 });
 
