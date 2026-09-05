@@ -146,6 +146,13 @@ const getTodayString = () => {
   return `${get('year')}-${get('month')}-${get('day')}`;
 };
 
+// Add N days to a YYYY-MM-DD string. UTC-based math to avoid DST/TZ drift.
+const addDaysToDate = (dateStr, days) => {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  return dt.getUTCFullYear() + '-' + String(dt.getUTCMonth() + 1).padStart(2, '0') + '-' + String(dt.getUTCDate()).padStart(2, '0');
+};
+
 // Google OAuth Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -25735,25 +25742,44 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       .select('id, first_name, last_name, hourly_rate, commission_percentage, status, availability, role, salary_start_date, created_at')
       .eq('user_id', userId);
 
-    // 2. Ledger entries for period (paginated)
+    // 2. Ledger entries for period (paginated) — includes prior-period entries
+    // that are still unpaid (payout_batch_id IS NULL), so late-adds that
+    // slipped into a closed period surface on the current payroll and get
+    // paid in the next batch. Without this, positive stranded rows are
+    // invisible (fetchPriorCash only shows negatives) and never paid.
     const fetchLedgerEntries = async () => {
-      let all = [];
-      let from = 0;
-      const pageSize = 1000;
-      while (true) {
-        let q = supabase.from('cleaner_ledger')
-          .select('team_member_id, job_id, type, amount, metadata, payout_batch_id, effective_date, note')
-          .eq('user_id', userId)
-          .range(from, from + pageSize - 1);
+      const paginate = async (applyFilters) => {
+        const out = [];
+        let from = 0;
+        const pageSize = 1000;
+        while (true) {
+          let q = supabase.from('cleaner_ledger')
+            .select('team_member_id, job_id, type, amount, metadata, payout_batch_id, effective_date, note')
+            .eq('user_id', userId)
+            .range(from, from + pageSize - 1);
+          q = applyFilters(q);
+          const { data: page, error } = await q;
+          if (error) { console.error('[Payroll] Ledger fetch error:', error); break; }
+          out.push(...(page || []));
+          if (!page || page.length < pageSize) break;
+          from += pageSize;
+        }
+        return out;
+      };
+      // In-period entries (any status)
+      const inPeriod = await paginate((q) => {
         if (startDate) q = q.gte('effective_date', startDate);
         if (endDate) q = q.lte('effective_date', endDate);
-        const { data: page, error } = await q;
-        if (error) { console.error('[Payroll] Ledger fetch error:', error); break; }
-        all = all.concat(page || []);
-        if (!page || page.length < pageSize) break;
-        from += pageSize;
+        return q;
+      });
+      // Prior-period unpaid entries (stranded — surface here so they render + get swept)
+      let priorUnpaid = [];
+      if (startDate) {
+        priorUnpaid = await paginate((q) =>
+          q.lt('effective_date', startDate).is('payout_batch_id', null).neq('type', 'payout')
+        );
       }
-      return all;
+      return inPeriod.concat(priorUnpaid);
     };
 
     // 3. Jobs for business revenue + revenueJobs + job details (paginated)
@@ -25777,36 +25803,15 @@ app.get('/api/payroll', authenticateToken, async (req, res) => {
       return all;
     };
 
-    // 4. Prior period debt per member — two sources:
-    // A) Unpaid entries before current period (no batch yet)
-    // B) Negative paid batches from prior periods (cash debt carry-forward)
+    // 4. Prior period debt per member — negative paid batches (cash carry-forward).
+    // Prior-period UNPAID entries (positive or negative) are now surfaced by
+    // fetchLedgerEntries above so they render per-job and get swept into the
+    // next batch; summing them here too would double-count.
     const fetchPriorCash = async () => {
       if (!startDate) return {};
       const result = {};
 
-      // A) Unpaid entries before current period (not yet in any batch)
-      let priorEntries = [];
-      let from = 0;
-      const pageSize = 1000;
-      while (true) {
-        const { data: page, error } = await supabase.from('cleaner_ledger')
-          .select('team_member_id, amount')
-          .eq('user_id', userId)
-          .is('payout_batch_id', null)
-          .neq('type', 'payout')
-          .lt('effective_date', startDate)
-          .range(from, from + pageSize - 1);
-        if (error) break;
-        priorEntries = priorEntries.concat(page || []);
-        if (!page || page.length < pageSize) break;
-        from += pageSize;
-      }
-      (priorEntries || []).forEach(e => {
-        const mid = e.team_member_id;
-        result[mid] = (result[mid] || 0) + parseFloat(e.amount);
-      });
-
-      // B) Negative paid batches from prior periods — debt carry-forward
+      // Negative paid batches from prior periods — debt carry-forward.
       // When a batch is negative (cleaner owes), marking it paid acknowledges
       // the debt but doesn't recover the money. It carries to the next period.
       // Exclude batches already recovered by a subsequent batch.
@@ -39240,19 +39245,38 @@ async function createLedgerEntriesForCompletedJob(jobId, userId, options = {}) {
 
   // Late-addition handling for tip/incentive: if a member already has any
   // settled (paid-out) row for this job, the original pay period is closed.
-  // New tip/incentive rows for that member must land in the CURRENT period
-  // (today) instead of the job date — same rule as syncJobIncentiveLedger.
-  // Earning rows still use the job date: earnings are derived from the
-  // work itself, not from a user mutation that can happen "late".
+  // New tip/incentive rows must land AFTER that closed period so they surface
+  // on the current payroll page and are swept into the next batch.
+  // Using max(today, latestPaidPeriodEnd + 1) — plain `today` was wrong when
+  // the late addition happened the SAME calendar day as the job (today ===
+  // job date === period_end), which orphaned the row in a settled period.
+  // Earnings still use the job date: they derive from the work itself.
   const { data: jobSettledRows } = await supabase
     .from('cleaner_ledger')
-    .select('team_member_id')
+    .select('team_member_id, payout_batch_id')
     .eq('job_id', jobId)
     .not('payout_batch_id', 'is', null);
   const settledMembersForJob = new Set((jobSettledRows || []).map(r => r.team_member_id));
   const todayDate = getTodayString();
-  const lateEffectiveDateFor = (memberId) =>
-    settledMembersForJob.has(memberId) ? todayDate : effectiveDate;
+  const settledBatchIds = [...new Set((jobSettledRows || []).map(r => r.payout_batch_id).filter(Boolean))];
+  const latestPeriodEndByMember = {};
+  if (settledBatchIds.length > 0) {
+    const { data: settledBatches } = await supabase
+      .from('cleaner_payout_batch')
+      .select('team_member_id, period_end')
+      .in('id', settledBatchIds);
+    (settledBatches || []).forEach(b => {
+      const cur = latestPeriodEndByMember[b.team_member_id];
+      if (!cur || b.period_end > cur) latestPeriodEndByMember[b.team_member_id] = b.period_end;
+    });
+  }
+  const lateEffectiveDateFor = (memberId) => {
+    if (!settledMembersForJob.has(memberId)) return effectiveDate;
+    const periodEnd = latestPeriodEndByMember[memberId];
+    if (!periodEnd) return todayDate;
+    const dayAfterPeriod = addDaysToDate(periodEnd, 1);
+    return todayDate > dayAfterPeriod ? todayDate : dayAfterPeriod;
+  };
 
   // Revenue for salary = service_price + additional_fees (discount is for customer, not cleaner pay)
   // Subtract third-party fees (Stripe processing, etc.) — cleaners don't earn commission on those
@@ -39665,12 +39689,13 @@ async function syncJobIncentiveLedger(jobId, userId) {
 
   // Late-addition handling: if a member's earnings on this job were already
   // settled in a paid batch, that pay period is closed. A newly-added
-  // incentive must land in the CURRENT period (effective_date = today)
-  // instead of the job's scheduled date — otherwise it disappears into
-  // prior-balance carryover rather than appearing in this week's payroll.
+  // incentive must land AFTER that closed period so it surfaces on the
+  // current payroll page — max(today, latestPaidPeriodEnd + 1). Plain `today`
+  // was wrong when today equals the closed period's end date (same-day late
+  // add), which stranded the row inside a settled period.
   const { data: settledRows } = await supabase
     .from('cleaner_ledger')
-    .select('team_member_id')
+    .select('team_member_id, payout_batch_id')
     .eq('job_id', jobId)
     .not('payout_batch_id', 'is', null);
   const settledMembers = new Set((settledRows || []).map(r => r.team_member_id));
@@ -39678,10 +39703,29 @@ async function syncJobIncentiveLedger(jobId, userId) {
   const jobDate = job.scheduled_date
     ? String(job.scheduled_date).split('T')[0].split(' ')[0]
     : today;
+  const settledBatchIdsForInc = [...new Set((settledRows || []).map(r => r.payout_batch_id).filter(Boolean))];
+  const latestPeriodEndByMemberInc = {};
+  if (settledBatchIdsForInc.length > 0) {
+    const { data: settledBatchesInc } = await supabase
+      .from('cleaner_payout_batch')
+      .select('team_member_id, period_end')
+      .in('id', settledBatchIdsForInc);
+    (settledBatchesInc || []).forEach(b => {
+      const cur = latestPeriodEndByMemberInc[b.team_member_id];
+      if (!cur || b.period_end > cur) latestPeriodEndByMemberInc[b.team_member_id] = b.period_end;
+    });
+  }
   // Cancelled jobs have no "earned-on" date — the incentive is paid in the
   // current period regardless of when the job was scheduled.
-  const effectiveDateFor = (memberId) =>
-    (isCancelledJob || settledMembers.has(memberId)) ? today : jobDate;
+  const effectiveDateFor = (memberId) => {
+    if (isCancelledJob || settledMembers.has(memberId)) {
+      const periodEnd = latestPeriodEndByMemberInc[memberId];
+      if (!periodEnd) return today;
+      const dayAfterPeriod = addDaysToDate(periodEnd, 1);
+      return today > dayAfterPeriod ? today : dayAfterPeriod;
+    }
+    return jobDate;
+  };
 
   const memberIdsToProcess = new Set([
     ...teamMemberIds,
@@ -40891,14 +40935,18 @@ async function createPayoutBatchForMember(userId, teamMemberId, periodStart, per
     if (r.errors.length) console.warn(`[Payout] completeScheduledJobs partial errors for member ${teamMemberId}:`, r.errors);
   }
 
-  // Fetch unpaid ledger entries in the period
+  // Fetch unpaid ledger entries up to periodEnd. Deliberately NOT filtered by
+  // periodStart — any stranded row from a prior period (e.g. late-add that
+  // slipped into a closed period before the late-effective fix landed) must
+  // be swept into the next batch so the cleaner actually gets paid. The
+  // .lte(periodEnd) cap prevents pulling in future entries when someone
+  // reprocesses a historical period.
   const { data: unpaidEntries, error: fetchError } = await supabase
     .from('cleaner_ledger')
     .select('id, amount, type')
     .eq('user_id', userId)
     .eq('team_member_id', teamMemberId)
     .is('payout_batch_id', null)
-    .gte('effective_date', periodStart)
     .lte('effective_date', periodEnd)
     .neq('type', 'payout'); // Don't include previous payout entries
 

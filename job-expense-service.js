@@ -113,11 +113,46 @@ module.exports = (supabase, logger) => {
     const intent = ledgerIntent(expense)
     if (!intent) return { action: 'skipped', reason: 'no_ledger_needed' }
 
-    // Use the job's scheduled_date so the entry falls in the same payroll period
+    // Default effective_date = job.scheduled_date (falls in same payroll period).
+    // But if this member's earnings on this job are already settled in a paid
+    // batch, that period is closed — bump to max(today, latestPaidPeriodEnd + 1)
+    // so the reimbursement lands in the current period and gets paid next batch.
     let effectiveDate = (expense.approved_at || new Date().toISOString()).split('T')[0]
+    let jobScheduledDate = null
     if (expense.job_id) {
       const { data: job } = await supabase.from('jobs').select('scheduled_date').eq('id', expense.job_id).maybeSingle()
-      if (job?.scheduled_date) effectiveDate = String(job.scheduled_date).split('T')[0].split(' ')[0]
+      if (job?.scheduled_date) {
+        jobScheduledDate = String(job.scheduled_date).split('T')[0].split(' ')[0]
+        effectiveDate = jobScheduledDate
+      }
+    }
+    if (expense.job_id && expense.team_member_id) {
+      const { data: settledRows } = await supabase
+        .from('cleaner_ledger')
+        .select('payout_batch_id')
+        .eq('job_id', expense.job_id)
+        .eq('team_member_id', expense.team_member_id)
+        .not('payout_batch_id', 'is', null)
+      const settledBatchIds = [...new Set((settledRows || []).map(r => r.payout_batch_id).filter(Boolean))]
+      if (settledBatchIds.length > 0) {
+        const { data: batches } = await supabase
+          .from('cleaner_payout_batch')
+          .select('period_end')
+          .in('id', settledBatchIds)
+        let latestPeriodEnd = null
+        for (const b of (batches || [])) {
+          if (!latestPeriodEnd || b.period_end > latestPeriodEnd) latestPeriodEnd = b.period_end
+        }
+        if (latestPeriodEnd) {
+          const [y, m, d] = String(latestPeriodEnd).split('-').map(Number)
+          const dt = new Date(Date.UTC(y, m - 1, d + 1))
+          const dayAfter = dt.getUTCFullYear() + '-' + String(dt.getUTCMonth() + 1).padStart(2, '0') + '-' + String(dt.getUTCDate()).padStart(2, '0')
+          const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date())
+          const g = (t) => (parts.find(p => p.type === t) || {}).value
+          const today = `${g('year')}-${g('month')}-${g('day')}`
+          effectiveDate = today > dayAfter ? today : dayAfter
+        }
+      }
     }
 
     // Check for existing ledger row by metadata.source_id (idempotency key)
