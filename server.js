@@ -49,6 +49,7 @@ const { recordJobCreate: recordLbLinkageJobCreate } = require('./lib/lb-linkage-
 const { startDrainer: startLbOutboundDrainer } = require('./workers/leadbridge-outbound-drainer');
 const { startDrainer: startZbOutboundDrainer } = require('./workers/zb-outbound-drainer');
 const { startReconcileCron: startZbFutureReconcileCron } = require('./workers/zb-future-reconcile-cron');
+const { startMissingJobsCron: startZbMissingJobsCron } = require('./workers/zb-missing-jobs-cron');
 const {
   startAvailabilityReconcileCron: startZbAvailabilityReconcileCron,
 } = require('./workers/zb-availability-reconcile-cron');
@@ -1114,7 +1115,11 @@ app.use('/api', (req, res, next) => {
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Zenbooker Integration (loosely coupled — delete this line + zenbooker-sync.js to remove)
-try { app.use('/api/zenbooker', require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger)); } catch (e) { console.log('Zenbooker module not loaded:', e.message); }
+let zenbookerRouter = null;
+try {
+  zenbookerRouter = require('./zenbooker-sync')(supabase, logger, createLedgerEntriesForCompletedJob, rebuildJobLedger);
+  app.use('/api/zenbooker', zenbookerRouter);
+} catch (e) { console.log('Zenbooker module not loaded:', e.message); }
 try { app.use('/api/zb-outbound', require('./zb-outbound')(supabase, logger)); } catch (e) { console.log('ZB outbound module not loaded:', e.message); }
 try { app.use('/api/identity-conflicts', require('./identity-conflicts')(supabase, logger)); } catch (e) { console.log('Identity conflicts module not loaded:', e.message); }
 try { app.use('/api/integrations/leadbridge', require('./leadbridge-service')(supabase, logger)); } catch (e) { console.log('LeadBridge module not loaded:', e.message); }
@@ -39050,6 +39055,22 @@ app.listen(PORT, async () => {
     startZbFutureReconcileCron({ supabase, logger, updateJobStatusFn: jobStatusServiceUpdate });
   } catch (e) {
     logger.error(`[ZBFutureReconcileCron] Failed to start: ${e.message}`);
+  }
+
+  // ZB missing-jobs cron. Companion to the reconcile cron above — catches the
+  // reverse drift where ZB has a job (typically a future recurring instance)
+  // SF has never received a job.created webhook for. Same gating pattern:
+  // ZB_MISSING_JOBS_ENABLED='true' to run; ZB_MISSING_JOBS_APPLY='true' for
+  // writes. See workers/zb-missing-jobs-cron.js.
+  try {
+    const zbSyncJobsFn = zenbookerRouter?._helpers?.syncJobs;
+    if (!zbSyncJobsFn) {
+      logger.error('[ZBMissingJobsCron] zenbookerRouter._helpers.syncJobs unavailable — cron not started');
+    } else {
+      startZbMissingJobsCron({ supabase, logger, syncJobsFn: zbSyncJobsFn });
+    }
+  } catch (e) {
+    logger.error(`[ZBMissingJobsCron] Failed to start: ${e.message}`);
   }
 
   // ZB team-member availability reconciliation cron. Nightly pull of provider
