@@ -1359,120 +1359,32 @@ describe('GET /jobs — is_first_job_for_customer', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// Recurring-job visibility filter (migration 079 + /settings toggle)
+// Recurring-job visibility — recurring jobs always appear in the
+// response. The old is_recurring gate was replaced by the
+// customer-history filter (proofpix_new_customers_only), which is a
+// strict superset: any prior booking → hidden, regardless of whether
+// the job schedule is recurring or one-off.
 // ─────────────────────────────────────────────────────────────────────
 
-describe('GET /jobs — recurring-job visibility', () => {
+describe('GET /jobs — recurring jobs always included', () => {
   beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
   afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
 
-  test('default (flag off) hides is_recurring=true jobs; keeps false + NULL', async () => {
+  test('returns is_recurring=true, false, and NULL rows together', async () => {
     const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b' }],  // no flag column → falsy → hide
-      proofpix_connections: [seedConnection(1)],
-      jobs: [
-        makeJob({ id: 700, status: 'confirmed', is_recurring: true }),        // hidden
-        makeJob({ id: 701, status: 'confirmed', is_recurring: false }),       // shown
-        makeJob({ id: 702, status: 'confirmed' }),                            // is_recurring absent → NULL → shown
-      ],
-    });
-    const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
-      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
-    expect(res.status).toBe(200);
-    const ids = res.body.jobs.map((j) => j.id).sort();
-    expect(ids).toEqual(['701', '702']);
-  });
-
-  test('flag on (users.proofpix_show_recurring_jobs=true) surfaces recurring jobs', async () => {
-    const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
       proofpix_connections: [seedConnection(1)],
       jobs: [
         makeJob({ id: 700, status: 'confirmed', is_recurring: true }),
         makeJob({ id: 701, status: 'confirmed', is_recurring: false }),
+        makeJob({ id: 702, status: 'confirmed' }),   // is_recurring absent → NULL
       ],
     });
     const res = await request(makeApp(supa))
       .get('/api/integrations/proofpix/jobs?status=all&limit=100')
       .set('Authorization', `Bearer ${accessTokenFor(1)}`);
     expect(res.status).toBe(200);
-    const ids = res.body.jobs.map((j) => j.id).sort();
-    expect(ids).toEqual(['700', '701']);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────
-// Per-request include_recurring override
-// ─────────────────────────────────────────────────────────────────────
-
-describe('GET /jobs — include_recurring per-request override', () => {
-  beforeEach(() => { process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED] = 'true'; });
-  afterEach(() => { delete process.env[FLAGS.PROOFPIX_INTEGRATION_ENABLED]; });
-
-  test('include_recurring=true overrides workspace default OFF (shows recurring)', async () => {
-    const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b' /* flag off */ }],
-      proofpix_connections: [seedConnection(1)],
-      jobs: [
-        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
-        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
-      ],
-    });
-    const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?status=all&limit=100&include_recurring=true')
-      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
-    expect(res.status).toBe(200);
-    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['800', '801']);
-    expect(res.body.filters.include_recurring).toBe(true);
-    expect(res.body.filters.workspace_show_recurring_jobs).toBe(false);
-  });
-
-  test('include_recurring=false overrides workspace default ON (hides recurring)', async () => {
-    const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
-      proofpix_connections: [seedConnection(1)],
-      jobs: [
-        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
-        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
-      ],
-    });
-    const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?status=all&limit=100&include_recurring=false')
-      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
-    expect(res.status).toBe(200);
-    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['801']);
-    expect(res.body.filters.include_recurring).toBe(false);
-    expect(res.body.filters.workspace_show_recurring_jobs).toBe(true);
-  });
-
-  test('absent include_recurring falls back to workspace setting', async () => {
-    const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b', proofpix_show_recurring_jobs: true }],
-      proofpix_connections: [seedConnection(1)],
-      jobs: [
-        makeJob({ id: 800, status: 'confirmed', is_recurring: true }),
-        makeJob({ id: 801, status: 'confirmed', is_recurring: false }),
-      ],
-    });
-    const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?status=all&limit=100')
-      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
-    expect(res.status).toBe(200);
-    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['800', '801']);
-    expect(res.body.filters.include_recurring).toBe(true);
-  });
-
-  test('include_recurring="yes" → 400', async () => {
-    const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
-      proofpix_connections: [seedConnection(1)],
-    });
-    const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?include_recurring=yes')
-      .set('Authorization', `Bearer ${accessTokenFor(1)}`);
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+    expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['700', '701', '702']);
   });
 });
 
@@ -1532,9 +1444,9 @@ describe('GET /jobs — since= date filter', () => {
     expect(res.body.error.code).toBe('INVALID_PAYLOAD');
   });
 
-  test('since combines with include_recurring override', async () => {
+  test('since drops stale rows and keeps future recurring + one-off', async () => {
     const supa = makeFakeSupabase({
-      users: [{ id: 1, business_name: 'A', email: 'a@b' /* flag off */ }],
+      users: [{ id: 1, business_name: 'A', email: 'a@b' }],
       proofpix_connections: [seedConnection(1)],
       jobs: [
         makeJob({ id: 910, status: 'scheduled', scheduled_date: '2025-01-01', is_recurring: true }),   // stale recurring
@@ -1543,7 +1455,7 @@ describe('GET /jobs — since= date filter', () => {
       ],
     });
     const res = await request(makeApp(supa))
-      .get('/api/integrations/proofpix/jobs?status=open&limit=100&since=2026-08-21&include_recurring=true')
+      .get('/api/integrations/proofpix/jobs?status=open&limit=100&since=2026-08-21')
       .set('Authorization', `Bearer ${accessTokenFor(1)}`);
     expect(res.status).toBe(200);
     expect(res.body.jobs.map((j) => j.id).sort()).toEqual(['911', '912']);
