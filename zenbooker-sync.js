@@ -2881,5 +2881,9 @@ module.exports = (supabase, logger, createLedgerEntriesForCompletedJob, rebuildJ
     }
   })
 
+  // Programmatic access for background workers (e.g. the missing-jobs cron
+  // that catches recurring-instance drift ZB doesn't webhook us about).
+  router._helpers = { syncJobs }
+
   return router
 }
