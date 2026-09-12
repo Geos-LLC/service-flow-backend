@@ -32818,7 +32818,9 @@ app.get('/api/customers/:customerId/files', authenticateToken, async (req, res) 
 
     const { data: files, error } = await supabase
       .from('customer_files')
-      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at')
+      // source + proofpix_metadata so the Files tab can badge ProofPix
+      // rows and show captured_by (same fields as GET /jobs/:id/files).
+      .select('id, customer_id, job_id, filename, file_url, mime_type, size_bytes, uploaded_by, uploaded_at, source, proofpix_metadata')
       .eq('customer_id', customerId)
       .is('deleted_at', null)
       .order('uploaded_at', { ascending: false })
