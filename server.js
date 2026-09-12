@@ -33,6 +33,54 @@ require('dotenv').config();
 const logger = require('./logger');
 
 // ═══════════════════════════════════════════════════════════════
+// Payroll safety constants — enforced by the manager-salary
+// auto-generator + rate/availability rebuilders. Together they
+// prevent three failure modes observed 2026-09-12:
+//   • auto-drift into pre-ledger dates (Queeny: 140 rows before
+//     2026-04-12 cutoff summing to $5,040 that never batched)
+//   • surprise multi-month back-fills when salary_start_date is
+//     backdated (Georgiy: setting start=2026-05-03 on 2026-09-06
+//     silently generated 127 daily rows = $15,240 retroactive)
+//   • duplicate rows on dates that already have a paid entry
+//     (Ekaterina: 63 dates with a paid twin + orphan unpaid twin)
+// ═══════════════════════════════════════════════════════════════
+const LEDGER_CUTOFF_DATE = '2026-04-12'; // Ledger go-live — auto-gen never generates rows earlier
+const MAX_MANAGER_SALARY_BACKFILL_DAYS = 14; // Cap on retroactive daily salary rows per rebuild pass
+
+/**
+ * Clamp desired start date for manager-salary auto-generation to the
+ * safe floor: never before LEDGER_CUTOFF_DATE, never more than
+ * MAX_MANAGER_SALARY_BACKFILL_DAYS days before today. Returns YYYY-MM-DD.
+ */
+function clampSalaryBackfillStart(desiredStartYmd, todayYmd) {
+  if (!desiredStartYmd) return todayYmd;
+  const backfillFloor = (() => {
+    const d = new Date(todayYmd + 'T00:00:00');
+    d.setDate(d.getDate() - MAX_MANAGER_SALARY_BACKFILL_DAYS);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  })();
+  // Return the latest (most recent) of desired/cutoff/backfill — ISO dates sort lexicographically.
+  return [desiredStartYmd, LEDGER_CUTOFF_DATE, backfillFloor].sort().pop();
+}
+
+/**
+ * Return the set of effective_date values (YYYY-MM-DD) that already have a
+ * PAID manager-salary ledger row for this team member. Rebuilders skip these
+ * to avoid creating an unpaid twin alongside a settled row (Ekaterina bug).
+ */
+async function getPaidManagerSalaryDates(supabase, userId, teamMemberId) {
+  const { data } = await supabase.from('cleaner_ledger')
+    .select('effective_date')
+    .eq('user_id', userId)
+    .eq('team_member_id', parseInt(teamMemberId))
+    .is('job_id', null)
+    .eq('type', 'earning')
+    .contains('metadata', { is_manager_salary: true })
+    .not('payout_batch_id', 'is', null);
+  return new Set((data || []).map(r => r.effective_date));
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Centralized job-status write path + LeadBridge outbound drainer.
 // EVERY mutation of `jobs.status` in this file MUST route through
 // updateJobStatus. The CI guard (scripts/check-job-status-writes.js)
@@ -24228,7 +24276,12 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
           const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
           const mgrStart = mgrInfo.salary_start_date ? String(mgrInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
           const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrInfo.user_id).order('scheduled_date', { ascending: true }).limit(1);
-          const rangeStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+          const desiredStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+          const rangeStart = clampSalaryBackfillStart(desiredStart, todayStr);
+          if (rangeStart !== desiredStart) {
+            console.log(`[TeamMember] Salary backfill clamped for manager ${actualTeamMemberId}: desired=${desiredStart} → clamped=${rangeStart} (cutoff=${LEDGER_CUTOFF_DATE}, max_days=${MAX_MANAGER_SALARY_BACKFILL_DAYS})`);
+          }
+          const paidDates = await getPaidManagerSalaryDates(supabase, mgrInfo.user_id, actualTeamMemberId);
           const parsedAvail = typeof mgrInfo.availability === 'string' ? JSON.parse(mgrInfo.availability) : mgrInfo.availability;
           const hr = parseFloat(mgrInfo.hourly_rate);
           const salEntries = [];
@@ -24236,6 +24289,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
           const end = new Date(todayStr + 'T00:00:00');
           while (d <= end) {
             const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            if (paidDates.has(ds)) { d.setDate(d.getDate() + 1); continue; } // skip dates with a paid row (Ekaterina bug)
             const sh = calculateScheduledHoursFromAvailability(parsedAvail, ds, ds);
             if (sh > 0) salEntries.push({ user_id: mgrInfo.user_id, team_member_id: parseInt(actualTeamMemberId), job_id: null, type: 'earning', amount: parseFloat((sh * hr).toFixed(2)), effective_date: ds, note: `Scheduled salary: ${sh.toFixed(1)}h × $${hr}/hr (${ds})`, metadata: { scheduled_hours: sh, hourly_rate: hr, is_manager_salary: true }, created_by: mgrInfo.user_id });
             d.setDate(d.getDate() + 1);
@@ -24243,7 +24297,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
           for (let c = 0; c < salEntries.length; c += 100) {
             await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
           }
-          console.log(`[TeamMember] Rebuilt ${salEntries.length} salary entries for manager ${actualTeamMemberId} after rate change`);
+          console.log(`[TeamMember] Rebuilt ${salEntries.length} salary entries for manager ${actualTeamMemberId} after rate change (range ${rangeStart} → ${todayStr}, ${paidDates.size} paid dates skipped)`);
         }
       } catch (e) { console.error('Manager salary rebuild after rate change:', e); }
     }
@@ -25263,7 +25317,12 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
         const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth()+1).padStart(2,'0') + '-' + String(new Date().getDate()).padStart(2,'0');
         const mgrStart = mgrCheck.salary_start_date ? String(mgrCheck.salary_start_date).split('T')[0].split(' ')[0] : null;
         const { data: ej } = await supabase.from('jobs').select('scheduled_date').eq('user_id', mgrCheck.user_id).order('scheduled_date', { ascending: true }).limit(1);
-        const rangeStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+        const desiredStart = mgrStart || (ej?.[0]?.scheduled_date ? String(ej[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+        const rangeStart = clampSalaryBackfillStart(desiredStart, todayStr);
+        if (rangeStart !== desiredStart) {
+          console.log(`[PayRate] Salary backfill clamped for manager ${memberId}: desired=${desiredStart} → clamped=${rangeStart} (cutoff=${LEDGER_CUTOFF_DATE}, max_days=${MAX_MANAGER_SALARY_BACKFILL_DAYS})`);
+        }
+        const paidDates = await getPaidManagerSalaryDates(supabase, mgrCheck.user_id, memberId);
         const parsedAvail = typeof mgrCheck.availability === 'string' ? JSON.parse(mgrCheck.availability) : mgrCheck.availability;
         const hr = parseFloat(mgrCheck.hourly_rate);
         const salEntries = [];
@@ -25271,12 +25330,13 @@ app.put('/api/team-members/:memberId/pay-rates/:rateId', authenticateToken, asyn
         const end = new Date(todayStr + 'T00:00:00');
         while (d <= end) {
           const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+          if (paidDates.has(ds)) { d.setDate(d.getDate() + 1); continue; } // skip dates with a paid row (Ekaterina bug)
           const sh = calculateScheduledHoursFromAvailability(parsedAvail, ds, ds);
           if (sh > 0) salEntries.push({ user_id: mgrCheck.user_id, team_member_id: parseInt(memberId), job_id: null, type: 'earning', amount: parseFloat((sh * hr).toFixed(2)), effective_date: ds, note: `Scheduled salary: ${sh.toFixed(1)}h × $${hr}/hr (${ds})`, metadata: { scheduled_hours: sh, hourly_rate: hr, is_manager_salary: true }, created_by: mgrCheck.user_id });
           d.setDate(d.getDate() + 1);
         }
         for (let c = 0; c < salEntries.length; c += 100) await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
-        console.log(`[PayRate] Rebuilt ${salEntries.length} salary entries for manager ${memberId}`);
+        console.log(`[PayRate] Rebuilt ${salEntries.length} salary entries for manager ${memberId} (range ${rangeStart} → ${todayStr}, ${paidDates.size} paid dates skipped)`);
       }
     } catch (e) { console.error('Manager salary rebuild after pay rate change:', e); }
 
@@ -25506,13 +25566,24 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
     if (hourlyRate === 0 && commPct === 0) continue;
 
     const mgrStart = mgr.salary_start_date ? String(mgr.salary_start_date).split('T')[0].split(' ')[0] : null;
-    const effectiveStart = (mgrStart && (!periodStart || mgrStart > periodStart)) ? mgrStart : (periodStart || mgrStart || todayStr);
+    const rawEffectiveStart = (mgrStart && (!periodStart || mgrStart > periodStart)) ? mgrStart : (periodStart || mgrStart || todayStr);
+    // Clamp to safe backfill floor — prevents auto-drift into pre-ledger dates
+    // and surprise multi-month backfills. Only affects backfill *inserts*;
+    // the query period for existing rows is unaffected (they're read separately
+    // in fetchLedgerEntries with the caller-supplied startDate).
+    const effectiveStart = clampSalaryBackfillStart(rawEffectiveStart, todayStr);
     if (!effectiveStart || effectiveStart > effectiveEnd) continue;
+    if (effectiveStart !== rawEffectiveStart) {
+      console.log(`[Payroll] Auto-gen backfill clamped for ${mgr.first_name} ${mgr.last_name}: desired=${rawEffectiveStart} → clamped=${effectiveStart} (cutoff=${LEDGER_CUTOFF_DATE}, max_days=${MAX_MANAGER_SALARY_BACKFILL_DAYS})`);
+    }
 
     // Deactivated managers/schedulers: don't auto-generate new salary/commission
-    // rows, and delete any unpaid auto-generated rows already inserted for them
-    // in this period (self-heal from before this guard existed — e.g. Queeny).
-    // Paid rows are immutable per Constitution §3.1 and are left alone.
+    // rows, and delete ALL unpaid auto-generated rows for them regardless of
+    // date. The prior in-period-only scope left Queeny-style multi-month phantom
+    // backlogs surfacing via the fetchLedgerEntries prior-unpaid sweep. Widened
+    // to full-history unpaid delete on 2026-09-12 after Queeny showed $6,948 in
+    // stranded rows spanning 2025-09 → 2026-06. Paid rows remain immutable per
+    // Constitution §3.1 (guarded by is('payout_batch_id', null)).
     if ((mgr.status || '').toLowerCase() === 'inactive') {
       const { data: stalePhantomRows } = await supabase.from('cleaner_ledger')
         .select('id, metadata')
@@ -25520,15 +25591,13 @@ async function ensureManagerEntriesForPeriod(supabase, userId, managers, periodS
         .eq('team_member_id', mgr.id)
         .is('job_id', null)
         .eq('type', 'earning')
-        .is('payout_batch_id', null)
-        .gte('effective_date', effectiveStart)
-        .lte('effective_date', effectiveEnd);
+        .is('payout_batch_id', null);
       const phantomIds = (stalePhantomRows || [])
         .filter(r => r.metadata?.is_manager_salary || r.metadata?.is_manager_commission)
         .map(r => r.id);
       if (phantomIds.length > 0) {
         await supabase.from('cleaner_ledger').delete().in('id', phantomIds).is('payout_batch_id', null);
-        console.log(`[Payroll] Deleted ${phantomIds.length} phantom manager entries for inactive ${mgr.first_name} ${mgr.last_name} (${effectiveStart} to ${effectiveEnd})`);
+        console.log(`[Payroll] Deleted ${phantomIds.length} phantom manager entries for inactive ${mgr.first_name} ${mgr.last_name} (all-history sweep)`);
       }
       continue;
     }
@@ -27236,7 +27305,12 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
         const mgrStart = memberInfo.salary_start_date ? String(memberInfo.salary_start_date).split('T')[0].split(' ')[0] : null;
         // Find earliest job date for this user
         const { data: earliestJob } = await supabase.from('jobs').select('scheduled_date').eq('user_id', teamMember.user_id).order('scheduled_date', { ascending: true }).limit(1);
-        const rangeStart = mgrStart || (earliestJob?.[0]?.scheduled_date ? String(earliestJob[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+        const desiredStart = mgrStart || (earliestJob?.[0]?.scheduled_date ? String(earliestJob[0].scheduled_date).split('T')[0].split(' ')[0] : todayStr);
+        const rangeStart = clampSalaryBackfillStart(desiredStart, todayStr);
+        if (rangeStart !== desiredStart) {
+          console.log(`[Availability] Salary backfill clamped for manager ${id}: desired=${desiredStart} → clamped=${rangeStart} (cutoff=${LEDGER_CUTOFF_DATE}, max_days=${MAX_MANAGER_SALARY_BACKFILL_DAYS})`);
+        }
+        const paidDates = await getPaidManagerSalaryDates(supabase, teamMember.user_id, id);
 
         const parsedAvail = typeof availability === 'string' ? JSON.parse(availability) : availability;
         const hourlyRate = parseFloat(memberInfo.hourly_rate);
@@ -27247,6 +27321,7 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
         const rangeEndDate = new Date(todayStr + 'T00:00:00');
         while (salDayStart <= rangeEndDate) {
           const dayStr = salDayStart.getFullYear() + '-' + String(salDayStart.getMonth()+1).padStart(2,'0') + '-' + String(salDayStart.getDate()).padStart(2,'0');
+          if (paidDates.has(dayStr)) { salDayStart.setDate(salDayStart.getDate() + 1); continue; } // skip already-paid dates
           const scheduledHours = calculateScheduledHoursFromAvailability(parsedAvail, dayStr, dayStr);
           if (scheduledHours > 0) {
             salEntries.push({
@@ -27269,7 +27344,7 @@ app.put('/api/team-members/:id/availability', authenticateToken, async (req, res
             await supabase.from('cleaner_ledger').insert(salEntries.slice(c, c + 100));
           }
         }
-        console.log(`[Availability] Rebuilt ${salEntries.length} salary entries for manager ${id}`);
+        console.log(`[Availability] Rebuilt ${salEntries.length} salary entries for manager ${id} (range ${rangeStart} → ${todayStr}, ${paidDates.size} paid dates skipped)`);
       } catch (salErr) {
         console.error('Error rebuilding manager salary after availability change:', salErr);
       }
